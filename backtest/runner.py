@@ -349,7 +349,9 @@ def apply_damage_to_ticks(
             ts=_iso_utc(epoch),
             px=px_dec if px_dec is not None else Decimal("0"),
             epoch=epoch,
-            vol_1m=vol_1m if isinstance(vol_1m, Decimal) else (None if vol_1m is None else _p_decimal(vol_1m, "0")),
+            vol_1m=vol_1m
+            if isinstance(vol_1m, Decimal)
+            else (None if vol_1m is None else _p_decimal(vol_1m, "0")),
             bid=getattr(t, "bid", None),
             ask=getattr(t, "ask", None),
         )
@@ -472,14 +474,25 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool) -> None:
 
 def _write_json_artifacts(summary: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Write backtest summary artifacts to ./logs (relative to current working directory).
+    Write backtest summary artifacts.
+
+    Default output dir:
+      - C:\Argus\ops\logs
+
+    Optional override:
+      - set env var ARGUS_BT_ARTIFACT_DIR to a different folder
+
+    Writes:
       - bt_summary_latest.json
       - bt_summary_YYYYMMDD_HHMMSS.json  (UTC)
+
     Uses atomic replace to avoid partial writes (Task Scheduler safety).
     Returns: (timestamped_path, latest_path) as strings, or (None, None) on failure.
     """
     try:
-        out_dir = os.path.join(os.getcwd(), "logs")
+        # LINE ABOVE: try:
+        # Prefer ops logs dir so Task Scheduler + wrappers land artifacts in the same place.
+        out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or r"C:\Argus\ops\logs"
         os.makedirs(out_dir, exist_ok=True)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
