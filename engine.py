@@ -1,7 +1,9 @@
-﻿# engine.py
+﻿#!/usr/bin/env python3
+# engine.py
 from decimal import Decimal
 from typing import Optional, Tuple, Any, List, Dict
 import random
+
 from confluence import TFState
 from decisions import DecisionSnapshot, EngineEvent
 from strategy_phase2 import ma200_exit_level, StrategyState
@@ -389,9 +391,12 @@ def _compute_liquidity(
         return None
 
     try:
-        # Update baseline from candle close (requires Candle.volume)
+        # Update baseline from candle close (requires volume; backtests may only provide tick.vol_1m)
         if closed_1m is not None:
             v = getattr(closed_1m, "volume", None)
+            # --------- LINE ABOVE: v = getattr(closed_1m, "volume", None)
+            if v is None:
+                v = getattr(tick, "vol_1m", None)
             if v is not None:
                 le.update_on_1m_close(v)
 
@@ -399,7 +404,7 @@ def _compute_liquidity(
         ask = getattr(tick, "ask", None)
 
         # --------- LINE ABOVE: ask = getattr(tick, "ask", None)
-        # âœ… FIX: atr_norm fallback for candle-close backtests (tick usually lacks atr_norm)
+        # ✅ FIX: atr_norm fallback for candle-close backtests (tick usually lacks atr_norm)
         atr_norm = getattr(tick, "atr_norm", None)
         if atr_norm is None:
             atr_norm = atr_norm_fallback
@@ -456,9 +461,8 @@ def _apply_liquidity_overlay_to_confluence(
             if p > 0:
                 eff_score = max(0, min(100, int(eff_score) - p))
                 eff_reason = eff_reason + f" | liq_penalty=-{p}"
-        if not ok:
-            hard_blocks.append("BLOCK:LIQUIDITY")
-        return eff_score, eff_gate, eff_reason, hard_blocks
+        # NOTE: do not hard-block in PENALIZE mode; it is a score-only overlay.
+        return eff_score, eff_gate, eff_reason, []
 
     if mode == "BLOCK":
         hard_blocks.append("BLOCK:LIQUIDITY")
@@ -577,6 +581,7 @@ def _argus_apply_feature_damage(
     except Exception:
         pass
 
+    # --------- LINE ABOVE: pass
     st_1m_tf2 = _argus_damage_tfstate(st_1m_tf, tf="1m", profile=profile, rng=rng)
     st_5m_tf2 = _argus_damage_tfstate(st_5m_tf, tf="5m", profile=profile, rng=rng)
     st_1h_tf2 = _argus_damage_tfstate(st_1h_tf, tf="1h", profile=profile, rng=rng)
@@ -624,14 +629,20 @@ def _verify_tf_snapshots(
     parts.append(f"1h={'OK' if st_1h_tf is not None else 'NONE'}")
 
     if st_1m_tf is not None:
-        parts.append(f"1m_sig={int(st_1m_tf.signal)} 1m_trend={int(bool(st_1m_tf.trend_ok))} 1m_score={int(st_1m_tf.score)}")
+        parts.append(
+            f"1m_sig={int(st_1m_tf.signal)} 1m_trend={int(bool(st_1m_tf.trend_ok))} 1m_score={int(st_1m_tf.score)}"
+        )
         if int(st_1m_tf.signal) == 0 and (not bool(st_1m_tf.trend_ok)) and int(st_1m_tf.score) == 0:
             parts.append("WARN:1M_DEGENERATE_ALL_ZERO")
 
     if st_5m_tf is not None:
-        parts.append(f"5m_sig={int(st_5m_tf.signal)} 5m_trend={int(bool(st_5m_tf.trend_ok))} 5m_score={int(st_5m_tf.score)}")
+        parts.append(
+            f"5m_sig={int(st_5m_tf.signal)} 5m_trend={int(bool(st_5m_tf.trend_ok))} 5m_score={int(st_5m_tf.score)}"
+        )
     if st_1h_tf is not None:
-        parts.append(f"1h_sig={int(st_1h_tf.signal)} 1h_trend={int(bool(st_1h_tf.trend_ok))} 1h_score={int(st_1h_tf.score)}")
+        parts.append(
+            f"1h_sig={int(st_1h_tf.signal)} 1h_trend={int(bool(st_1h_tf.trend_ok))} 1h_score={int(st_1h_tf.score)}"
+        )
 
     _add_event(snap, "TF_SNAPSHOT_VERIFY", " | ".join(parts))
 
@@ -652,7 +663,12 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     if closed_1m is not None:
         state.last_candle_close_1m = closed_1m.close
         state.last_candle_start_1m = closed_1m.start_epoch
-        state.last_candle_volume_1m = getattr(closed_1m, "volume", None)
+        # --------- LINE ABOVE: state.last_candle_start_1m = closed_1m.start_epoch
+        # Backtests often don't populate Candle.volume; prefer tick.vol_1m if present.
+        v_close = getattr(closed_1m, "volume", None)
+        if v_close is None:
+            v_close = getattr(tick, "vol_1m", None)
+        state.last_candle_volume_1m = v_close
         state.last_st_1m = state.strat_1m.on_candle_close(closed_1m.close)
 
     if closed_5m is not None:
@@ -783,7 +799,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.structure_reasons = str(structure.reasons or "")
 
     # --------- LINE ABOVE: if structure is not None:
-    # âœ… Phase 5B: provide a deterministic atr_norm fallback for backtests.
+    # ✅ Phase 5B: provide a deterministic atr_norm fallback for backtests.
     # Priority:
     #   1) tick.atr_norm (if live feed provides it)
     #   2) regime.vol (already in snap.vol post-regime-eval)
@@ -801,7 +817,27 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     if atr_norm_fb is None:
         atr_norm_fb = vol  # may still be None; that's fine (truthful)
 
-    # Phase 5B: Liquidity
+    # --------- LINE ABOVE: atr_norm_fb = vol  # may still be None; that's fine (truthful)
+    # Extra fallbacks for candle-close BTs:
+    #  - StrategyState may carry atr_norm / atr even if tick/regime don't.
+    if atr_norm_fb is None:
+        try:
+            atrn = getattr(st_1m, "atr_norm", None)
+            if atrn is not None:
+                atr_norm_fb = _as_decimal(atrn, "0")
+        except Exception:
+            pass
+
+    if atr_norm_fb is None:
+        try:
+            atr = getattr(st_1m, "atr", None)
+            if atr is not None and px > 0:
+                atr_norm_fb = _as_decimal(atr, "0") / px
+        except Exception:
+            pass
+
+    # --------- LINE ABOVE:         except Exception:
+    # ✅ REQUIRED: actually compute liquidity before referencing `liq`
     liq = _compute_liquidity(
         state,
         tick=tick,
@@ -810,25 +846,67 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         cfg=cfg,
         atr_norm_fallback=atr_norm_fb,
     )
+
+    # --------- LINE ABOVE: liq = _compute_liquidity(
+    if liq is None:
+        # Only emit when we have a real entry setup AND the tick has the raw inputs
+        try:
+            entry_signal_ok_dbg = bool(st_1m.trend_ok and st_1m.signal == 1)
+        except Exception:
+            entry_signal_ok_dbg = False
+
+        bid_dbg = getattr(tick, "bid", None)
+        ask_dbg = getattr(tick, "ask", None)
+        vol_dbg = getattr(tick, "vol_1m", None)
+
+        if entry_signal_ok_dbg and bid_dbg is not None and ask_dbg is not None:
+            le_dbg = getattr(state, "liquidity_engine", None)
+            _add_event(
+                snap,
+                "LIQ_DEBUG_MISSING",
+                (
+                    f"liq=None | USE_LIQUIDITY_FILTERS={int(_bool_cfg(cfg,'USE_LIQUIDITY_FILTERS',False))} "
+                    f"USE_LIQUIDITY={int(_bool_cfg(cfg,'USE_LIQUIDITY',False))} "
+                    f"has_liquidity_engine={int(le_dbg is not None)} "
+                    f"tick_bid={safe_str(bid_dbg)} tick_ask={safe_str(ask_dbg)} tick_vol_1m={safe_str(vol_dbg)} "
+                    f"atr_norm_fb={safe_str(atr_norm_fb)}"
+                ),
+            )
+
     if liq is not None:
         snap.liq_ok = bool(getattr(liq, "ok", True))
         snap.liq_spread_bps = getattr(liq, "spread_bps", None)
         snap.liq_vol_1m = getattr(liq, "vol_1m", None)
 
         # --------- LINE ABOVE: snap.liq_vol_1m = getattr(liq, "vol_1m", None)
-        # âœ… FIX: baseline/atr_norm should come from LiquidityResult, but if evaluate() doesn't
-        # populate them, fall back to reading from the engine when possible.
+        # ✅ FIX: ensure backtests don't leave baseline/atr_norm as None forever.
+        # Prefer values on LiquidityResult; if missing, pull from LiquidityEngine; else fall back to runner-provided fb.
         snap.liq_vol_baseline = getattr(liq, "vol_baseline", None)
+
         if snap.liq_vol_baseline is None:
             try:
                 le = getattr(state, "liquidity_engine", None)
-                snap.liq_vol_baseline = getattr(le, "vol_baseline", None) or getattr(le, "baseline", None)
+                vb = getattr(le, "vol_baseline", None)
+
+                # LiquidityEngine may expose baseline as:
+                #   - method vol_baseline()
+                #   - attribute vol_baseline
+                #   - attribute _vol_baseline / baseline / etc.
+                if callable(vb):
+                    snap.liq_vol_baseline = vb()
+                else:
+                    snap.liq_vol_baseline = vb
+
+                if snap.liq_vol_baseline is None and le is not None:
+                    snap.liq_vol_baseline = getattr(le, "_vol_baseline", None)
+                if snap.liq_vol_baseline is None and le is not None:
+                    snap.liq_vol_baseline = getattr(le, "baseline", None)
             except Exception:
                 pass
 
         snap.liq_atr_norm = getattr(liq, "atr_norm", None)
         if snap.liq_atr_norm is None:
-            snap.liq_atr_norm = atr_norm_fb
+            snap.liq_atr_norm = atr_norm_fb  # may be None; truthful fallback
 
         snap.liq_mode = str(getattr(liq, "mode", "") or "")
         snap.liq_penalty_points = int(getattr(liq, "penalty_points", 0) or 0)
@@ -1164,8 +1242,12 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     extra=f"gate={safe_str(conf_gate)} present={int(conf_present)} blocked={int(conf_blocked)}",
                 )
 
+        # --------- LINE ABOVE: if cooldown_remaining == 0 and entry_signal_ok and conf_ok:
+        # ✅ FIX: call can_enter() once; avoid side-effects / nondeterminism.
         if cooldown_remaining == 0 and entry_signal_ok and conf_ok:
             allowed, why = state.risk.can_enter(now_e, cfg)
+
+            # --------- LINE ABOVE: allowed, why = state.risk.can_enter(now_e, cfg)
             if not allowed:
                 action = "HOLD"
                 action_reason = "ENTRY_BLOCKED"
@@ -1190,10 +1272,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                         f"daily_realized={getattr(state.risk,'daily_realized_pnl_usd',Decimal('0')):.2f}"
                     ),
                 )
-
-        if cooldown_remaining == 0 and entry_signal_ok and conf_ok:
-            allowed, why = state.risk.can_enter(now_e, cfg)
-            if allowed:
+            else:
                 qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
 
                 qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
@@ -1279,10 +1358,6 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     )
 
                     action = ev_name
-            else:
-                action = "HOLD"
-                action_reason = "ENTRY_BLOCKED"
-                risk_blocked_reason = why
 
     track_holds = _bool_cfg(cfg, "TRACK_HOLD_REASONS", True)
     if track_holds and (not state.ledger.in_pos()):
@@ -1351,5 +1426,5 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     snap.risk_blocked_reason = risk_blocked_reason
     snap.next_poll_s = float(next_poll)
 
+    # --------- LINE ABOVE: snap.next_poll_s = float(next_poll)
     return snap
-

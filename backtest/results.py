@@ -184,6 +184,12 @@ class BacktestResults:
     _saw_entry_attempt_event: bool = False
 
     # -------------------------
+    # Phase 7.1: run identity (optional; runner injects into summary too)
+    # -------------------------
+    run_id: Optional[str] = None
+    mode: str = "bt"
+
+    # -------------------------
     # Event accounting helpers
     # -------------------------
     def add_event(self, name: str, detail: str = "", snapshot: Any = None) -> None:
@@ -481,7 +487,7 @@ class BacktestResults:
         avg_mfe = (sum(mfes) / Decimal(len(mfes))) if mfes else None
         avg_mae = (sum(maes) / Decimal(len(maes))) if maes else None
 
-        return {
+        out: Dict[str, Any] = {
             "symbol": self.symbol,
             "start_epoch": int(self.start_epoch),
             "end_epoch": int(self.end_epoch),
@@ -528,6 +534,13 @@ class BacktestResults:
             "p10_entry_vol_baseline": (None if self.p10_entry_vol_baseline is None else f"{self.p10_entry_vol_baseline:.4f}"),
             "p90_entry_atr_norm": (None if self.p90_entry_atr_norm is None else f"{self.p90_entry_atr_norm:.6f}"),
         }
+
+        # Phase 7.1: include run identity if known (runner will usually inject)
+        if self.run_id:
+            out["run_id"] = str(self.run_id)
+        out["mode"] = str(self.mode or "bt")
+
+        return out
 
     # -------------------------
     # Writers

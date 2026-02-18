@@ -11,6 +11,10 @@ from utils import utc_ts
 # Paths
 # =========================
 def logs_dir() -> str:
+    # --------- LINE ABOVE: def logs_dir() -> str:
+    env = os.environ.get("ARGUS_LOG_DIR", "").strip()
+    if env:
+        return env
     return os.path.join(os.path.dirname(__file__), "logs")
 
 
@@ -20,6 +24,17 @@ def signals_csv_path() -> str:
 
 def events_csv_path() -> str:
     return os.path.join(logs_dir(), "live_events.csv")
+
+
+# --------- LINE ABOVE: def events_csv_path() -> str:
+def bt_events_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Backtest-only events file.
+      - if run_id is provided -> bt_events_<run_id>.csv
+      - else -> bt_events.csv
+    """
+    name = "bt_events.csv" if not run_id else f"bt_events_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
 
 
 # =========================
@@ -37,90 +52,95 @@ def _signals_header() -> List[str]:
     """
     return [
         # base
-        "ts", "symbol", "price", "epoch",
-
+        "ts",
+        "symbol",
+        "price",
+        "epoch",
         # candle (include V for liquidity baseline proof)
-        "candle_start", "candle_close", "candle_volume_1m",
-
+        "candle_start",
+        "candle_close",
+        "candle_volume_1m",
         # indicators
-        "ma_fast", "ma_slow", "ma50", "ma200",
-
+        "ma_fast",
+        "ma_slow",
+        "ma50",
+        "ma200",
         # signal
-        "signal", "trend_ok",
-        "score", "reasons",
-
+        "signal",
+        "trend_ok",
+        "score",
+        "reasons",
         # Phase 3 ledger
-        "cash_usd", "position_qty", "avg_entry_px",
-        "equity_usd", "exposure_usd",
-        "unrl_pnl_usd", "realized_pnl_usd",
-
+        "cash_usd",
+        "position_qty",
+        "avg_entry_px",
+        "equity_usd",
+        "exposure_usd",
+        "unrl_pnl_usd",
+        "realized_pnl_usd",
         # Shadow-style exit levels
-        "hold_s", "peak_price",
-        "take_profit", "stop_loss", "trail_stop",
-
+        "hold_s",
+        "peak_price",
+        "take_profit",
+        "stop_loss",
+        "trail_stop",
         # Distances + trend invalidation
-        "dist_ma200_pct", "dist_tp_pct", "dist_sl_pct", "dist_trail_pct",
+        "dist_ma200_pct",
+        "dist_tp_pct",
+        "dist_sl_pct",
+        "dist_trail_pct",
         "trend_below_count",
-
         # MFE / MAE
-        "mfe_pct", "mae_pct",
-
+        "mfe_pct",
+        "mae_pct",
         # Ops / action
         "stale_data",
-        "action", "action_reason",
+        "action",
+        "action_reason",
         "cooldown_remaining_s",
         "risk_blocked_reason",
-        "paused", "next_poll_s",
-
+        "paused",
+        "next_poll_s",
         # Phase 3.5 Confluence
         "confluence_score",
         "confluence_reasons",
         "score_5m",
         "score_1h",
         "confluence_gate",
-
         # =========================
         # Phase 4
         # =========================
         "regime",
         "trend_strength",
         "vol",
-
         "vol_used",
         "vol_sizing_qty",
         "vol_reason",
         "sizing_note",
-
         "ac_base_score",
         "ac_base_gate",
         "ac_adjusted_score",
         "ac_adjusted_gate",
         "ac_delta",
         "ac_reason",
-
         # =========================
-        # Phase 5A â€” Market Structure
+        # Phase 5A — Market Structure
         # =========================
         "nearest_support",
         "nearest_resistance",
         "dist_support",
         "dist_resistance",
-
         "near_support",
         "near_resistance",
-
         "broke_up",
         "broke_down",
         "retest_ok",
         "failed_retest",
-
         "rejection_at_res",
         "rejection_at_sup",
-
         "structure_reasons",
-
         # =========================
-        # Phase 5B â€” Liquidity Filters (proof fields)
+        # Phase 5B — Liquidity Filters (proof fields)
         # =========================
         "liq_ok",
         "liq_spread_bps",
@@ -130,9 +150,8 @@ def _signals_header() -> List[str]:
         "liq_mode",
         "liq_penalty_points",
         "liq_reasons",
-
         # =========================
-        # Phase 5C â€” Session Behavior (full fields)
+        # Phase 5C — Session Behavior (full fields)
         # =========================
         "session",
         "session_labels",
@@ -160,13 +179,11 @@ def _events_header() -> List[str]:
         "confluence_score",
         "confluence_gate",
         "confluence_reasons",
-
         # Phase 4
         "regime",
         "ac_adjusted_gate",
         "vol_used",
         "sizing_note",
-
         # Phase 5B/5C (append-only)
         "liq_ok",
         "liq_spread_bps",
@@ -261,6 +278,23 @@ def append_event_row(row: List[Any]) -> None:
         return
 
 
+# --------- LINE ABOVE: def append_event_row(row: List[Any]) -> None:
+def append_event_row_to_path(path: str, row: List[Any]) -> None:
+    hdr = _events_header()
+    _ensure_csv_has_header(path, hdr)
+
+    try:
+        # force width stability
+        out = ["" for _ in hdr]
+        for i in range(min(len(row), len(hdr))):
+            out[i] = row[i]
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            _csv_writer(f).writerow([_coerce_str(x) for x in out])
+    except Exception:
+        return
+
+
 def log_bt_event(
     *,
     symbol: str,
@@ -282,6 +316,9 @@ def log_bt_event(
     sizing_note: str = "",
     notify_title: str = "",
     notify_body: str = "",
+    # --------- LINE ABOVE: notify_body: str = "",
+    # Optional explicit sink (e.g., bt_events_csv_path()).
+    path: Optional[str] = None,
     # accept schema drift (Phase 5+ additions) without crashing
     **kwargs: Any,
 ) -> None:
@@ -315,7 +352,11 @@ def log_bt_event(
         rowd[k] = "" if v is None else v
 
     row = [_coerce_str(rowd.get(col, "")) for col in hdr]
-    append_event_row(row)
+
+    if path:
+        append_event_row_to_path(path, row)
+    else:
+        append_event_row(row)
 
 
 def log_event(symbol: str, event: str, detail: str) -> None:
@@ -532,4 +573,3 @@ def is_kill_switch_on(cfg: Dict[str, Any]) -> bool:
 def is_paused(cfg: Dict[str, Any]) -> bool:
     fname = cfg.get("PAUSE_FILE", "PAUSE")
     return os.path.exists(os.path.join(os.path.dirname(__file__), str(fname)))
-

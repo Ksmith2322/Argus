@@ -1,9 +1,16 @@
+#!/usr/bin/env python3
 # backtest/runner.py
 from __future__ import annotations
 
 import os
+import sys
+
+# add repo root so `import config` works when running as a script
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import json
 import random
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -16,6 +23,7 @@ from state import BotState
 from engine import step
 from io_logs import (
     ensure_logs,
+    logs_dir,  # ✅ canonical log root (same sink as live logs)
     log_signal_snapshot,
     log_bt_event,
     signals_csv_path,
@@ -25,17 +33,132 @@ from feed_coinbase import make_http
 
 # --------- LINE ABOVE: from feed_coinbase import make_http
 # IMPORTANT:
-# - Use RELATIVE imports inside the backtest package so `python -m backtest.runner` works.
-from .loader import load_candles_csv
-from .feed import ticks_from_close_series, PriceTick
-from .results import (
-    BacktestResults,
-    Trade,
-    parse_buy_event_message,
-    parse_sell_event_message,
-)
+# - Prefer RELATIVE imports inside the backtest package so `python -m backtest.runner` works.
+# - Provide fallback ABSOLUTE imports so `python backtest/runner.py` can still work.
+try:
+    from .loader import load_candles_csv
+    from .feed import ticks_from_close_series, PriceTick
+    from .results import (
+        BacktestResults,
+        Trade,
+        parse_buy_event_message,
+        parse_sell_event_message,
+    )
+except Exception:
+    from backtest.loader import load_candles_csv
+    from backtest.feed import ticks_from_close_series, PriceTick
+    from backtest.results import (
+        BacktestResults,
+        Trade,
+        parse_buy_event_message,
+        parse_sell_event_message,
+    )
 
 
+# ----------------------------
+# Phase 7.1: Run Identity + Artifact Contract (backtest)
+# ----------------------------
+def _utc_ts_compact() -> str:
+    # line above: def _utc_ts_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _new_run_id(prefix: str = "bt") -> str:
+    # line above: def _new_run_id(prefix: str = "bt") -> str:
+    return f"{prefix}_{_utc_ts_compact()}_{secrets.token_hex(4)}"
+
+
+def _artifact_root() -> str:
+    # line above: def _artifact_root() -> str:
+    # Canonical artifact root for ALL run-scoped outputs.
+    # Defaults to argus-lab so CP + backtest land in one place.
+    return os.environ.get("ARGUS_ARTIFACT_ROOT", r"C:\Argus\argus-lab")
+
+
+def _artifact_out_dir() -> str:
+    # line above: def _artifact_out_dir() -> str:
+    return os.path.join(_artifact_root(), "ops", "logs")
+
+
+def _bt_paths(run_id: str) -> Dict[str, str]:
+    # line above: def _bt_paths(run_id: str) -> Dict[str, str]:
+    out_dir = _artifact_out_dir()
+    return {
+        "out_dir": out_dir,
+        "bt_log": os.path.join(out_dir, f"bt_{run_id}.log"),
+        "bt_summary": os.path.join(out_dir, f"bt_summary_{run_id}.json"),
+        "bt_summary_latest": os.path.join(out_dir, "bt_summary_latest.json"),
+        "events": os.path.join(out_dir, f"events_{run_id}.csv"),
+        "signals": os.path.join(out_dir, f"signals_{run_id}.csv"),
+        "equity": os.path.join(out_dir, f"equity_{run_id}.csv"),
+        "trades": os.path.join(out_dir, f"trades_{run_id}.csv"),
+        "event_counts": os.path.join(out_dir, f"event_counts_{run_id}.csv"),
+        "entry_attempts": os.path.join(out_dir, f"entry_attempts_{run_id}.csv"),
+        "run_header": os.path.join(out_dir, f"run_header_{run_id}.json"),
+    }
+
+
+def _stable_hash(obj: Any) -> str:
+    # line above: def _stable_hash(obj: Any) -> str:
+    try:
+        s = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        s = str(obj)
+    import hashlib
+
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+def _get_git_sha(repo_root: str) -> str:
+    # line above: def _get_git_sha(repo_root: str) -> str:
+    try:
+        head = os.path.join(repo_root, ".git", "HEAD")
+        if not os.path.exists(head):
+            return "unknown"
+        ref = open(head, "r", encoding="utf-8").read().strip()
+        if ref.startswith("ref:"):
+            ref_path = os.path.join(repo_root, ".git", ref.split(":", 1)[1].strip())
+            if os.path.exists(ref_path):
+                return open(ref_path, "r", encoding="utf-8").read().strip()[:12]
+        return ref[:12]
+    except Exception:
+        return "unknown"
+
+
+def _write_json_atomic(path: str, obj: Any) -> bool:
+    # line above: def _write_json_atomic(path: str, obj: Any) -> bool:
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _append_log_line(path: str, msg: str) -> None:
+    # line above: def _append_log_line(path: str, msg: str) -> None:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def _csv_sanitize(v: Any) -> str:
+    # line above: def _csv_sanitize(v: Any) -> str:
+    # Hard rule: no commas/newlines in CSV fields (we're not using a real CSV writer here).
+    try:
+        s = "" if v is None else str(v)
+    except Exception:
+        s = ""
+    return s.replace("\r", " ").replace("\n", " ").replace(",", " ")
+
+
+# ----------------------------
+# Env helpers (existing)
+# ----------------------------
 def _as_int_env(name: str, default: Optional[int] = None) -> Optional[int]:
     v = os.environ.get(name)
     if v is None or v == "":
@@ -349,9 +472,7 @@ def apply_damage_to_ticks(
             ts=_iso_utc(epoch),
             px=px_dec if px_dec is not None else Decimal("0"),
             epoch=epoch,
-            vol_1m=vol_1m
-            if isinstance(vol_1m, Decimal)
-            else (None if vol_1m is None else _p_decimal(vol_1m, "0")),
+            vol_1m=vol_1m if isinstance(vol_1m, Decimal) else (None if vol_1m is None else _p_decimal(vol_1m, "0")),
             bid=getattr(t, "bid", None),
             ask=getattr(t, "ask", None),
         )
@@ -384,7 +505,10 @@ def _bt_event_row(
     name: str,
     msg: str,
 ) -> Dict[str, Any]:
+    run_id = os.environ.get("ARGUS_RUN_ID", "")
     return dict(
+        ts=str(getattr(snap, "ts", "") or ""),
+        run_id=run_id,
         symbol=symbol,
         epoch=int(getattr(snap, "epoch", 0)),
         price=getattr(snap, "px", ""),
@@ -408,6 +532,9 @@ def _bt_event_row(
         sizing_note=str(getattr(snap, "sizing_note", "") or ""),
         liq_ok=getattr(snap, "liq_ok", None),
         liq_spread_bps=getattr(snap, "liq_spread_bps", None),
+        liq_vol_1m=getattr(snap, "liq_vol_1m", None),
+        liq_vol_baseline=getattr(snap, "liq_vol_baseline", None),
+        liq_atr_norm=getattr(snap, "liq_atr_norm", None),
         session=str(getattr(snap, "session", "") or ""),
         notify_title=str(getattr(ev, "notify_title", "") or ""),
         notify_body=str(getattr(ev, "notify_body", "") or ""),
@@ -420,6 +547,8 @@ def _record_entry_attempt_metrics(out: Any, snap: Any, tick: Optional[Any] = Non
       - Prefer snap.liq_* fields if present
       - Else compute spread_bps from (tick.bid, tick.ask) or (snap.bid, snap.ask)
       - Use tick.vol_1m as fallback for liq_vol_1m
+      - Baseline/atr_norm can only come from snap (or be computed upstream);
+        we pass them through if present.
     """
     if not hasattr(out, "record_entry_attempt"):
         return
@@ -455,10 +584,11 @@ def _record_entry_attempt_metrics(out: Any, snap: Any, tick: Optional[Any] = Non
         return
 
 
-def _truncate_backtest_logs_if_requested(*, enabled: bool) -> None:
+def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir: str) -> None:
     """
-    Backtests should not append across runs; it destroys analysis even if CSV is well-quoted.
+    Backtests should not append across runs.
     Default: enabled.
+    Also removes any legacy "shared" bt_events/bt_signals if present.
     """
     if not enabled:
         return
@@ -471,45 +601,60 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool) -> None:
         except Exception:
             pass
 
+    # Also remove any same-run outputs if rerunning same run_id intentionally
+    for p in (os.path.join(out_dir, f"events_{run_id}.csv"), os.path.join(out_dir, f"signals_{run_id}.csv")):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
-def _write_json_artifacts(summary: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+
+def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_csv: str, out_dir: str) -> Optional[str]:
     """
-    Write backtest summary artifacts.
-
-    Default output dir:
-      - C:\Argus\ops\logs
-
-    Optional override:
-      - set env var ARGUS_BT_ARTIFACT_DIR to a different folder
-
-    Writes:
-      - bt_summary_latest.json
-      - bt_summary_YYYYMMDD_HHMMSS.json  (UTC)
-
-    Uses atomic replace to avoid partial writes (Task Scheduler safety).
-    Returns: (timestamped_path, latest_path) as strings, or (None, None) on failure.
+    Emit run header for reproducibility.
     """
     try:
         # LINE ABOVE: try:
-        # Prefer ops logs dir so Task Scheduler + wrappers land artifacts in the same place.
-        out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or r"C:\Argus\ops\logs"
-        os.makedirs(out_dir, exist_ok=True)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        hdr = {
+            "run_id": run_id,
+            "mode": mode,
+            "git_sha": _get_git_sha(repo_root),
+            "config_hash": _stable_hash(cfg),
+            "symbol": str(cfg.get("SYMBOL", "")),
+            "timeframes": [str(cfg.get("TF_FAST", "1m")), str(cfg.get("TF_SLOW", "5m"))],
+            "data_root": os.path.dirname(os.path.abspath(candles_csv)),
+            "start_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "repo_root": repo_root,
+            "artifact_root": _artifact_root(),
+            "artifact_dir": out_dir,
+            "candles_csv": os.path.abspath(candles_csv),
+        }
+        path = os.path.join(out_dir, f"run_header_{run_id}.json")
+        ok = _write_json_atomic(path, hdr)
+        return path if ok else None
+    except Exception:
+        return None
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        path_ts = os.path.join(out_dir, f"bt_summary_{ts}.json")
+
+def _write_bt_summary(*, run_id: str, summary: Dict[str, Any], out_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Write run-scoped summary artifacts.
+
+    Writes:
+      - bt_summary_<run_id>.json
+      - bt_summary_latest.json (optional convenience)
+    """
+    try:
+        # LINE ABOVE: try:
+        os.makedirs(out_dir, exist_ok=True)
+        path_run = os.path.join(out_dir, f"bt_summary_{run_id}.json")
         path_latest = os.path.join(out_dir, "bt_summary_latest.json")
 
-        tmp1 = path_ts + ".tmp"
-        with open(tmp1, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-        os.replace(tmp1, path_ts)
-
-        tmp2 = path_latest + ".tmp"
-        with open(tmp2, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-        os.replace(tmp2, path_latest)
-
-        return path_ts, path_latest
+        ok1 = _write_json_atomic(path_run, summary)
+        ok2 = _write_json_atomic(path_latest, summary)
+        return (path_run if ok1 else None, path_latest if ok2 else None)
     except Exception:
         return None, None
 
@@ -530,6 +675,15 @@ def run_backtest(
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     synth_spread_bps = float(cfg.get("BT_SYNTH_SPREAD_BPS", 0.0) or 0.0)
 
+    # Phase 7.1: establish run_id + artifact dir EARLY
+    run_id = os.environ.get("ARGUS_RUN_ID") or _new_run_id("bt")
+    os.environ["ARGUS_RUN_ID"] = run_id
+    os.environ["ARGUS_MODE"] = "backtest"
+
+    out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or _artifact_out_dir()
+    paths = _bt_paths(run_id)
+    os.makedirs(out_dir, exist_ok=True)
+
     # Speed knobs (runner-only)
     bt_print_events = _as_bool_env("BT_PRINT_EVENTS", False)
     bt_log_flush_n = _as_int_env("BT_LOG_FLUSH_N", 2000) or 2000
@@ -542,14 +696,38 @@ def run_backtest(
     # Argus feature sabotage: pass profile to engine via cfg["ARGUS_PROFILE"]
     argus_profile = _to_argus_profile_dict(damage)
     if argus_profile is not None:
-        cfg = {**cfg, "ARGUS_PROFILE": argus_profile, "ARGUS_SEED": int(damage.seed if damage else 1337)}
+        cfg = {
+            **cfg,
+            "ARGUS_PROFILE": argus_profile,
+            "ARGUS_SEED": int(damage.seed if damage else 1337),
+        }
 
     state = BotState.from_config(cfg)
     symbol = state.symbol
 
     if write_logs:
-        _truncate_backtest_logs_if_requested(enabled=bt_truncate_logs)
+        _truncate_backtest_logs_if_requested(enabled=bt_truncate_logs, run_id=run_id, out_dir=out_dir)
         ensure_logs()
+
+    # Emit run header (Phase 7.1)
+    _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
+
+    # Create per-run event/signal CSV headers (Phase 7.1)
+    if write_logs:
+        try:
+            if not os.path.exists(paths["events"]):
+                with open(paths["events"], "w", encoding="utf-8") as f:
+                    f.write(
+                        "ts,run_id,symbol,epoch,price,event,detail,paused,stale,action,action_reason,"
+                        "risk_blocked_reason,confluence_score,confluence_gate,confluence_reasons,regime,"
+                        "ac_adjusted_gate,vol_used,sizing_note,liq_ok,liq_spread_bps,liq_vol_1m,liq_vol_baseline,"
+                        "liq_atr_norm,session,notify_title,notify_body\n"
+                    )
+            if not os.path.exists(paths["signals"]):
+                with open(paths["signals"], "w", encoding="utf-8") as f:
+                    f.write("ts,run_id,symbol,epoch,price,signal,detail\n")
+        except Exception:
+            pass
 
     candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
     if not candles:
@@ -587,8 +765,28 @@ def run_backtest(
             return
         if not bt_event_buf:
             return
+
         for r in bt_event_buf:
-            log_bt_event(**r)
+            try:
+                log_bt_event(**r)
+            except Exception:
+                pass
+            try:
+                line = (
+                    f"{_csv_sanitize(r.get('ts',''))},{_csv_sanitize(r.get('run_id',''))},{_csv_sanitize(r.get('symbol',''))},"
+                    f"{_csv_sanitize(r.get('epoch',''))},{_csv_sanitize(r.get('price',''))},{_csv_sanitize(r.get('event',''))},"
+                    f"{_csv_sanitize(r.get('detail',''))},{_csv_sanitize(r.get('paused',''))},{_csv_sanitize(r.get('stale',''))},"
+                    f"{_csv_sanitize(r.get('action',''))},{_csv_sanitize(r.get('action_reason',''))},{_csv_sanitize(r.get('risk_blocked_reason',''))},"
+                    f"{_csv_sanitize(r.get('confluence_score',''))},{_csv_sanitize(r.get('confluence_gate',''))},{_csv_sanitize(r.get('confluence_reasons',''))},"
+                    f"{_csv_sanitize(r.get('regime',''))},{_csv_sanitize(r.get('ac_adjusted_gate',''))},{_csv_sanitize(r.get('vol_used',''))},"
+                    f"{_csv_sanitize(r.get('sizing_note',''))},{_csv_sanitize(r.get('liq_ok',''))},{_csv_sanitize(r.get('liq_spread_bps',''))},"
+                    f"{_csv_sanitize(r.get('liq_vol_1m',''))},{_csv_sanitize(r.get('liq_vol_baseline',''))},{_csv_sanitize(r.get('liq_atr_norm',''))},"
+                    f"{_csv_sanitize(r.get('session',''))},{_csv_sanitize(r.get('notify_title',''))},{_csv_sanitize(r.get('notify_body',''))}\n"
+                )
+                _append_log_line(paths["events"], line.rstrip("\n"))
+            except Exception:
+                pass
+
         bt_event_buf.clear()
 
     http = make_http()
@@ -597,6 +795,7 @@ def run_backtest(
         for tick in ticks:
             i += 1
 
+            # synth bid/ask for candle-close ticks (measurable spread stats)
             if (getattr(tick, "bid", None) is None or getattr(tick, "ask", None) is None) and synth_spread_bps > 0:
                 try:
                     bid, ask = _synth_bid_ask(_p_decimal(getattr(tick, "px", "0"), "0"), spread_bps=synth_spread_bps)
@@ -624,15 +823,20 @@ def run_backtest(
                 msg = str(getattr(ev, "message", "") or "")
 
                 # --------- LINE ABOVE: msg = str(getattr(ev, "message", "") or "")
+                # ✅ PATCH: engine may emit ENTRY_ATTEMPT/ENTRY_METRICS; runner owns attempt boundary in backtest
+                if name in ("ENTRY_ATTEMPT", "ENTRY_METRICS"):
+                    continue
+
                 # ✅ PATCH-1: always pass snapshot so BacktestResults can sample fields when available
                 try:
                     out.add_event(name, msg, snapshot=snap)
                 except Exception:
                     pass
 
-                # Inject ENTRY_ATTEMPT once per tick if engine emitted a buy intent
-                if name in BUY_EVENTS and not attempted_this_tick:
+                # Record attempt + explicit metrics once per tick on first *measurable* boundary (BUY or MISSED_BUY_*)
+                if (name in BUY_EVENTS or name.startswith("MISSED_BUY_")) and not attempted_this_tick:
                     attempted_this_tick = True
+
                     attempt_msg = f"ATTEMPT | px={getattr(snap, 'px', '')} event={name} {msg}".strip()
 
                     # --------- LINE ABOVE: attempt_msg = f"ATTEMPT | px=..."
@@ -679,8 +883,8 @@ def run_backtest(
                             )
                         )
 
-                # --------- LINE ABOVE: if name in BUY_EVENTS and not attempted_this_tick:
-                # ✅ PATCH-2: fallback sampling from tick bid/ask even if snap.liq_* missing
+                # --------- LINE ABOVE: if (name in BUY_EVENTS or name.startswith("MISSED_BUY_")) and not attempted_this_tick:
+                # ✅ PATCH-2: entry metrics sampling (also for missed-buy reasons)
                 if name in BUY_EVENTS or name.startswith("MISSED_BUY_"):
                     _record_entry_attempt_metrics(out, snap, tick)
 
@@ -741,6 +945,15 @@ def run_backtest(
                     log_signal_snapshot(snap, symbol=symbol, price=getattr(snap, "px", None))
                 except Exception:
                     pass
+                try:
+                    sig_line = (
+                        f"{_csv_sanitize(getattr(snap, 'ts', '') or '')},{run_id},{symbol},{int(getattr(snap, 'epoch', 0))},"
+                        f"{_csv_sanitize(getattr(snap, 'px', ''))},{_csv_sanitize(getattr(snap, 'action', '') or '')},"
+                        f"{_csv_sanitize(getattr(snap, 'action_reason', '') or '')}\n"
+                    )
+                    _append_log_line(paths["signals"], sig_line.rstrip("\n"))
+                except Exception:
+                    pass
 
         _flush_bt_events()
 
@@ -759,6 +972,10 @@ def run_backtest(
 
 if __name__ == "__main__":
     # --------- LINE ABOVE: if __name__ == "__main__":
+    os.environ.setdefault("ARGUS_ARTIFACT_ROOT", r"C:\Argus\argus-lab")
+    os.environ.setdefault("ARGUS_RUN_ID", _new_run_id("bt"))
+    os.environ.setdefault("ARGUS_MODE", "backtest")
+
     default_csv = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),  # repo root
         "data",
@@ -780,8 +997,16 @@ if __name__ == "__main__":
     )
 
     # --------- LINE ABOVE: res = run_backtest(...)
-    # ✅ Phase 6: emit machine-readable artifacts for automation (Task Scheduler-safe)
     summary = res.summary()
-    _write_json_artifacts(summary)
+    run_id = os.environ.get("ARGUS_RUN_ID") or _new_run_id("bt")
+    out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or _artifact_out_dir()
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        summary = {**summary, "run_id": run_id, "mode": "bt", "artifact_dir": out_dir}
+    except Exception:
+        pass
+
+    _write_bt_summary(run_id=run_id, summary=summary, out_dir=out_dir)
 
     print(summary)

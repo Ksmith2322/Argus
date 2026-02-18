@@ -1,3 +1,58 @@
+# -----------------------------
+# Argus: end-of-night housekeeping
+# -----------------------------
+
+# 0) Go to repo
+Set-Location C:\Argus\repo
+
+# 1) Quick sanity: see what changed
+git status
+
+# 2) If you see ONLY code changes you want to keep:
+git add -A
+git commit -m "nightly: small fixes / refactors"
+# If nothing to commit, git will tell you.
+
+# 3) Prove determinism + generate artifacts (logs land in C:\Argus\ops\logs)
+cmd.exe /c C:\Argus\ops\run_backtest.cmd
+Get-ChildItem C:\Argus\ops\logs\bt_summary*.json | Sort LastWriteTime -Descending | Select -First 2 Name,LastWriteTime
+
+# 4) (Optional) start live in a separate window
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c C:\Argus\ops\run_live.cmd" -WindowStyle Normal
+
+# 5) Confirm repo is still clean AFTER runs (no runtime junk)
+Set-Location C:\Argus\repo
+git status
+Get-ChildItem C:\Argus\repo -Filter *.log
+
+
+
+
+
+
+!!!!!opt 1
+
+Set-Location C:\Argus\repo
+C:\Argus\.venv\Scripts\python.exe -m runner_live
+
+
+
+Set-Location C:\Argus\repo
+C:\Argus\.venv\Scripts\python.exe -m backtest.runner
+
+
+!!!!!opt 2
+
+
+# LIVE (paper)
+cmd.exe /c C:\Argus\ops\run_live.cmd
+
+# BACKTEST
+cmd.exe /c C:\Argus\ops\run_backtest.cmd
+
+
+Legacy
+
 # enter venv
 C:\Argus\.venv\Scripts\Activate.ps1
 
@@ -12,6 +67,7 @@ python -m repo.runner_live
 # BACKTEST
 Set-Location C:\Argus
 python -m repo.backtest.runner
+
 
 
 
