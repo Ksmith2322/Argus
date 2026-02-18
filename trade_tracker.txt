@@ -1,0 +1,33 @@
+=== NOVA TRADE TRACKER (MISSED BUYS + HOLD REASONS) ===
+Last update: 2026-02-12 10:31:53 CST
+
+Totals:
+  - MISSED_BUY total: 0
+  - HOLD total:       886
+
+Missed buy counters:
+  - MISSED_BUY_NO_CASH: 0
+  - MISSED_BUY_EXPOSURE_CAP: 0
+  - MISSED_BUY_MIN_ORDER: 0
+  - MISSED_BUY_RISK_LOCKOUT: 0
+  - MISSED_BUY_MAX_TRADES_PER_DAY: 0
+  - MISSED_BUY_DAILY_MAX_LOSS: 0
+  - MISSED_BUY_CONFLUENCE: 0
+  - MISSED_BUY_ENTRY_BLOCKED: 0
+
+Hold reason counters:
+  - HOLD_WARMUP_NO_1M_STATE: 0
+  - HOLD_PAUSED: 0
+  - HOLD_STALE_DATA: 643
+  - HOLD_COOLDOWN: 17
+  - HOLD_NO_SIGNAL: 22
+  - HOLD_NO_TREND_OK: 189
+  - HOLD_CONFLUENCE: 15
+  - HOLD_ENTRY_SIGNAL_FALSE: 0
+  - HOLD_ENTRY_NO_SIZE: 0
+  - HOLD_IN_POSITION: 0
+  - HOLD_OTHER: 0
+
+Last event:
+  reason: HOLD_STALE_DATA
+  detail: stale tick guard | px=1905.15 | 1m:score=80|signal=0|trend_ok=1; 5m:score=20|signal=0|trend_ok=0; 1h:score=40|signal=1|trend_ok=0; base=42; confluence=42; gate=HOLD; mode=IGNORE_MISSING_TFS | struct= | liq=

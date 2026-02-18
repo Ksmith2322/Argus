@@ -1,0 +1,19 @@
+﻿# venv / caches
+.venv/
+__pycache__/
+*.pyc
+
+# logs / outputs
+logs/
+*.log
+*.csv
+
+# secrets
+.env
+secrets/
+tmp/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/

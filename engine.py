@@ -1,0 +1,1355 @@
+# engine.py
+from decimal import Decimal
+from typing import Optional, Tuple, Any, List, Dict
+import random
+
+from .confluence import TFState
+from .decisions import DecisionSnapshot, EngineEvent
+from .strategy_phase2 import ma200_exit_level, StrategyState
+from .utils import pct_dist, safe_str
+
+# Phase 5A
+from .structure import StructureResult
+
+# Phase 5B
+from .liquidity import LiquidityResult  # noqa: F401
+
+# Phase 5C
+from .session import classify_session, apply_session_to_score
+
+
+def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
+    if min_dist is None:
+        return float(cfg["POLL_MED_SECONDS"])
+
+    if min_dist <= Decimal(str(cfg["TURBO_PCT"])):
+        return float(cfg["POLL_TURBO_SECONDS"])
+
+    if in_pos:
+        if min_dist <= Decimal(str(cfg["NEAR_EXIT_PCT"])):
+            return float(cfg["POLL_FAST_SECONDS"])
+        return float(cfg["POLL_MED_SECONDS"])
+
+    if min_dist <= Decimal(str(cfg["NEAR_ENTRY_PCT"])):
+        return float(cfg["POLL_MED_SECONDS"])
+
+    return float(cfg["POLL_SLOW_SECONDS"])
+
+
+def _bool_cfg(cfg: dict, k: str, default: bool = False) -> bool:
+    v = cfg.get(k, default)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(v)
+
+
+def _as_decimal(v: Any, default: str = "0") -> Decimal:
+    if v is None:
+        return Decimal(default)
+    if isinstance(v, Decimal):
+        return v
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return Decimal(default)
+
+
+def _normalize_epoch_seconds(e: int) -> int:
+    """
+    Normalize epoch units to seconds (ms -> s) everywhere.
+    """
+    if not e:
+        return 0
+    if e >= 100_000_000_000:
+        return int(e // 1000)
+    return int(e)
+
+
+def _compute_buy_qty_and_reason(ledger, px: Decimal, cfg: dict) -> Tuple[Decimal, str]:
+    """
+    Supports either:
+      - ledger.compute_buy_qty(px, cfg) -> Decimal
+      - ledger.compute_buy_qty(px, cfg) -> (Decimal, reason)
+      - ledger.compute_buy_qty(cfg, px) -> Decimal or (Decimal, reason)
+      - ledger.compute_buy_qty_and_reason(px, cfg) -> (Decimal, reason)
+    """
+    if hasattr(ledger, "compute_buy_qty_and_reason"):
+        out = ledger.compute_buy_qty_and_reason(px, cfg)
+        if isinstance(out, tuple) and len(out) == 2:
+            return Decimal(out[0]), str(out[1])
+        return Decimal(out), "OK"
+
+    for args in ((px, cfg), (cfg, px)):
+        try:
+            out: Any = ledger.compute_buy_qty(*args)
+            if isinstance(out, tuple) and len(out) == 2:
+                return Decimal(out[0]), str(out[1])
+            out_d = Decimal(out)
+            return out_d, "OK" if out_d > 0 else "BLOCKED"
+        except TypeError:
+            continue
+
+    return Decimal("0"), "BUY_QTY_FUNC_MISMATCH"
+
+
+def _missed_buy_event_from_risk_reason(risk_reason: str) -> str:
+    rr = (risk_reason or "").upper()
+    if "MAX_TRADES" in rr:
+        return "MISSED_BUY_MAX_TRADES_PER_DAY"
+    if "DAILY_MAX_LOSS" in rr:
+        return "MISSED_BUY_DAILY_MAX_LOSS"
+    if "LOCKOUT" in rr or "COOLDOWN" in rr:
+        return "MISSED_BUY_RISK_LOCKOUT"
+    return "MISSED_BUY_RISK_LOCKOUT"
+
+
+def _missed_buy_event_from_qty_reason(qty_reason: str) -> str:
+    qr = (qty_reason or "").upper()
+    if "NO_CASH" in qr:
+        return "MISSED_BUY_NO_CASH"
+    if "EXPOSURE" in qr or "CAP" in qr:
+        return "MISSED_BUY_EXPOSURE_CAP"
+    if "MIN_ORDER" in qr:
+        return "MISSED_BUY_MIN_ORDER"
+    return (
+        "MISSED_BUY_MIN_ORDER" if "MIN" in qr
+        else "MISSED_BUY_EXPOSURE_CAP" if "CAP" in qr
+        else "MISSED_BUY_NO_CASH"
+    )
+
+
+def _fmt_lockout(now_epoch: int, lockout_until_epoch: int) -> str:
+    if not lockout_until_epoch:
+        return "0"
+    return f"{lockout_until_epoch} (rem={max(0, int(lockout_until_epoch - now_epoch))}s)"
+
+
+def _to_tf_state(st: Optional[StrategyState], tf: str) -> Optional[TFState]:
+    """
+    CRITICAL INVARIANT:
+      - if StrategyState is missing, return None (so ignore_missing_tfs can work)
+      - never synthesize zeros here (zeros belong in ConfluenceEngine.norm()).
+    """
+    if st is None:
+        return None
+    return TFState(
+        tf=tf,
+        signal=int(st.signal),
+        trend_ok=bool(st.trend_ok),
+        score=int(st.score),
+        reasons=str(st.reasons or ""),
+    )
+
+
+def _add_event(
+    snap: DecisionSnapshot,
+    name: str,
+    message: str,
+    notify_title: Optional[str] = None,
+    notify_body: Optional[str] = None,
+):
+    # --------- LINE ABOVE: notify_body: Optional[str] = None,
+    snap.events.append(
+        EngineEvent(
+            name=name,
+            message=message,
+            notify_title=notify_title,
+            notify_body=notify_body,
+        )
+    )
+
+
+# --------- LINE ABOVE: def _add_event(
+def _emit_missed_buy(
+    snap: DecisionSnapshot,
+    *,
+    event: str,
+    prefix: str,
+    px: Decimal,
+    confluence_min_score: int,
+    cooldown_remaining: int,
+    equity: Decimal,
+    exposure: Decimal,
+    extra: str = "",
+) -> None:
+    """
+    Canonical missed-buy emitter:
+      - deterministic message format
+      - always includes the proof fields we care about (conf + struct + liq)
+      - keeps reason buckets stable across refactors
+    """
+    liq_part = (
+        f"spread_bps={safe_str(getattr(snap,'liq_spread_bps',None))} "
+        f"vol_1m={safe_str(getattr(snap,'liq_vol_1m',None))} "
+        f"baseline={safe_str(getattr(snap,'liq_vol_baseline',None))} "
+        f"atr_norm={safe_str(getattr(snap,'liq_atr_norm',None))} "
+        f"liq_mode={safe_str(getattr(snap,'liq_mode',''))} "
+        f"liq_ok={safe_str(getattr(snap,'liq_ok',None))} "
+        f"liq_reasons={safe_str(getattr(snap,'liq_reasons',''))}"
+    )
+    conf_part = (
+        f"conf_score={safe_str(getattr(snap,'confluence_score',None))} "
+        f"min={int(confluence_min_score)} gate={safe_str(getattr(snap,'confluence_gate',''))} "
+        f"conf_reasons={safe_str(getattr(snap,'confluence_reasons',''))}"
+    )
+    struct_part = f"struct={safe_str(getattr(snap,'structure_reasons',''))}"
+    sess_part = f"session={safe_str(getattr(snap,'session',''))} labels={safe_str(getattr(snap,'session_labels',''))}"
+
+    msg = (
+        f"{prefix} | px={px} equity={equity:.2f} exposure={exposure:.2f} "
+        f"cooldown_remaining={int(cooldown_remaining)}s | "
+        f"{conf_part} | {struct_part} | {liq_part} | {sess_part}"
+    )
+    if extra:
+        msg = msg + " | " + str(extra)
+
+    _add_event(snap, event, msg)
+
+
+def _should_bump_hold(state, now_epoch: int, cfg: dict) -> bool:
+    """
+    Throttle HOLD bumps so you don't spam the tracker every tick.
+    """
+    every_s = int(cfg.get("HOLD_BUMP_EVERY_SECONDS", 300))
+    if every_s <= 0:
+        return False
+
+    last = int(getattr(state, "last_hold_bump_epoch", 0) or 0)
+    if last == 0:
+        state.last_hold_bump_epoch = now_epoch
+        return True
+
+    if (now_epoch - last) >= every_s:
+        state.last_hold_bump_epoch = now_epoch
+        return True
+
+    return False
+
+
+def _classify_hold_reason(
+    *,
+    paused: bool,
+    stale: bool,
+    cooldown_remaining: int,
+    entry_signal_ok: bool,
+    conf_ok: bool,
+    conf_score: Optional[int],
+    conf_min: int,
+    st_1m: StrategyState,
+) -> Tuple[str, str]:
+    if paused:
+        return "HOLD_PAUSED", "PAUSE_FILE present"
+    if stale:
+        return "HOLD_STALE_DATA", "stale tick guard"
+    if cooldown_remaining > 0:
+        return "HOLD_COOLDOWN", f"cooldown_remaining_s={cooldown_remaining}"
+    if not entry_signal_ok:
+        if not bool(st_1m.trend_ok):
+            return "HOLD_NO_TREND_OK", f"trend_ok=0 score={st_1m.score} reasons={st_1m.reasons}"
+        if int(st_1m.signal) != 1:
+            return "HOLD_NO_SIGNAL", f"signal={st_1m.signal} score={st_1m.score} reasons={st_1m.reasons}"
+        return "HOLD_ENTRY_SIGNAL_FALSE", f"trend_ok={int(st_1m.trend_ok)} signal={st_1m.signal}"
+    if not conf_ok:
+        return "HOLD_CONFLUENCE", f"conf_score={safe_str(conf_score)} min={conf_min}"
+    return "HOLD_OTHER", f"trend_ok={int(st_1m.trend_ok)} signal={st_1m.signal} conf={safe_str(conf_score)}"
+
+
+def _map_trade_event(cfg: dict, would_name: str) -> str:
+    if not _bool_cfg(cfg, "USE_SHOULD_EVENTS", False):
+        return would_name
+    if would_name == "WOULD_BUY":
+        return "SHOULD_BUY"
+    if would_name == "WOULD_SELL":
+        return "SHOULD_SELL"
+    return would_name
+
+
+def _compute_volatility_fraction(state, cfg: dict) -> Tuple[Optional[Decimal], str]:
+    try:
+        strat = getattr(state, "strat_1m", None)
+        ind = getattr(strat, "ind", None)
+        if ind is None:
+            return None, "NO_INDICATOR_ENGINE"
+
+        win = int(cfg.get("VOL_LOOKBACK", cfg.get("VOL_WINDOW", 20)))
+        win = max(5, min(500, win))
+
+        vol = ind.volatility(win)
+        if vol is None:
+            return None, "VOL_NONE"
+
+        vol = _as_decimal(vol, "0")
+        if vol <= 0:
+            return None, "VOL_NONPOS"
+
+        return vol, "VOL_OK"
+    except Exception as e:
+        return None, f"VOL_ERR:{e}"
+
+
+def _apply_phase4_vol_sizing(
+    *,
+    state,
+    px: Decimal,
+    qty_cap: Decimal,
+    cfg: dict,
+) -> Tuple[Decimal, str, Optional[Decimal], Optional[Decimal]]:
+    use_vol = _bool_cfg(cfg, "USE_VOL_SIZING", False)
+    if not use_vol:
+        return qty_cap, "VOL_SIZING_DISABLED", None, None
+
+    if not hasattr(state, "risk") or state.risk is None:
+        return qty_cap, "NO_RISK_MANAGER", None, None
+
+    if not hasattr(state.risk, "size_by_vol"):
+        return qty_cap, "RISK_NO_SIZE_BY_VOL", None, None
+
+    vol, vol_reason = _compute_volatility_fraction(state, cfg)
+    if vol is None:
+        fallback = _bool_cfg(cfg, "VOL_FALLBACK_TO_CAPS", True)
+        if fallback:
+            return qty_cap, f"{vol_reason}|fallback_caps", None, None
+        return Decimal("0"), vol_reason, None, None
+
+    qty_vol, why = state.risk.size_by_vol(px, vol, cfg)
+    qty_vol_d = _as_decimal(qty_vol, "0")
+    if qty_vol_d <= 0:
+        fallback = _bool_cfg(cfg, "VOL_FALLBACK_TO_CAPS", True)
+        if fallback:
+            return qty_cap, f"{why}|fallback_caps", vol, qty_vol_d
+        return Decimal("0"), why, vol, qty_vol_d
+
+    final_qty = min(qty_cap, qty_vol_d)
+    return final_qty, f"VOL_APPLIED vol={vol} ({why})", vol, qty_vol_d
+
+
+def _ensure_state_has_regime_inputs(st_1m: StrategyState, vol: Optional[Decimal]):
+    if vol is None:
+        return
+    try:
+        setattr(st_1m, "volatility", vol)
+    except Exception:
+        pass
+
+
+def _compute_structure(
+    state,
+    *,
+    px: Decimal,
+    closed_1m,
+    cfg: dict,
+) -> Optional[StructureResult]:
+    if not _bool_cfg(cfg, "USE_STRUCTURE", False):
+        return None
+
+    se = getattr(state, "structure_engine", None)
+    if se is None:
+        return None
+
+    try:
+        if closed_1m is not None:
+            state.last_closed_candle_1m = closed_1m
+            se.update_on_close(closed_1m)
+
+        last_closed = getattr(state, "last_closed_candle_1m", None)
+        return se.evaluate(px, last_closed)
+    except Exception:
+        return None
+
+
+def _compute_liquidity(
+    state,
+    *,
+    tick,
+    px: Decimal,
+    closed_1m,
+    cfg: dict,
+    atr_norm_fallback: Optional[Decimal] = None,
+) -> Optional[Any]:
+    """
+    Phase 5B:
+      - LiquidityEngine verdict based on bid/ask + vol baseline + ATR norm.
+      - Baseline updated on 1m candle close if volume is available.
+
+    IMPORTANT:
+      - Candle-close backtests often do NOT have tick.atr_norm.
+      - We accept atr_norm_fallback (typically regime vol or 1m volatility fraction)
+        so liq_atr_norm doesn't stay None forever in backtests.
+    """
+    # NOTE: your .env uses USE_LIQUIDITY_FILTERS; support both keys.
+    if not (_bool_cfg(cfg, "USE_LIQUIDITY_FILTERS", False) or _bool_cfg(cfg, "USE_LIQUIDITY", False)):
+        return None
+
+    le = getattr(state, "liquidity_engine", None)
+    if le is None:
+        return None
+
+    try:
+        # Update baseline from candle close (requires Candle.volume)
+        if closed_1m is not None:
+            v = getattr(closed_1m, "volume", None)
+            if v is not None:
+                le.update_on_1m_close(v)
+
+        bid = getattr(tick, "bid", None)
+        ask = getattr(tick, "ask", None)
+
+        # --------- LINE ABOVE: ask = getattr(tick, "ask", None)
+        # ✅ FIX: atr_norm fallback for candle-close backtests (tick usually lacks atr_norm)
+        atr_norm = getattr(tick, "atr_norm", None)
+        if atr_norm is None:
+            atr_norm = atr_norm_fallback
+
+        # Prefer tick.vol_1m; fallback to closed_1m.volume if present; then state.last_candle_volume_1m
+        vol_1m = getattr(tick, "vol_1m", None)
+        if vol_1m is None and closed_1m is not None:
+            vol_1m = getattr(closed_1m, "volume", None)
+        if vol_1m is None:
+            vol_1m = getattr(state, "last_candle_volume_1m", None)
+
+        return le.evaluate(bid=bid, ask=ask, vol_1m=vol_1m, atr_norm=atr_norm)
+    except Exception:
+        return None
+
+
+def _apply_liquidity_overlay_to_confluence(
+    *,
+    eff_score: Optional[int],
+    eff_gate: str,
+    eff_reason: str,
+    liq: Optional[Any],
+) -> Tuple[Optional[int], str, str, List[str]]:
+    """
+    Phase 5B:
+      - If liq.mode == BLOCK and liq.ok == False -> hard block (engine sets conf_ok False)
+      - If liq.mode == PENALIZE -> subtract penalty_points from score
+      - Always annotate eff_reason with liquidity details when present.
+    """
+    if liq is None:
+        return eff_score, eff_gate, eff_reason, []
+
+    mode = str(getattr(liq, "mode", "") or "").upper()
+    ok = bool(getattr(liq, "ok", True))
+    reasons = str(getattr(liq, "reasons", "") or "")
+    penalty = getattr(liq, "penalty_points", None)
+
+    hard_blocks: List[str] = []
+
+    if reasons:
+        eff_reason = (eff_reason + " | " if eff_reason else "") + f"liq:{reasons}"
+    else:
+        eff_reason = (eff_reason + " | " if eff_reason else "") + "liq:OK"
+
+    if ok:
+        return eff_score, eff_gate, eff_reason, []
+
+    if mode == "PENALIZE":
+        if eff_score is not None and penalty is not None:
+            try:
+                p = int(penalty)
+            except Exception:
+                p = 0
+            if p > 0:
+                eff_score = max(0, min(100, int(eff_score) - p))
+                eff_reason = eff_reason + f" | liq_penalty=-{p}"
+        if not ok:
+            hard_blocks.append("BLOCK:LIQUIDITY")
+        return eff_score, eff_gate, eff_reason, hard_blocks
+
+    if mode == "BLOCK":
+        hard_blocks.append("BLOCK:LIQUIDITY")
+        return eff_score, eff_gate, eff_reason, hard_blocks
+
+    hard_blocks.append("BLOCK:LIQUIDITY_MODE_UNKNOWN")
+    return eff_score, eff_gate, eff_reason, hard_blocks
+
+
+def _gate_from_score(eff_score: Optional[int], min_score: int) -> str:
+    if eff_score is None:
+        return "NONE"
+    try:
+        s = int(eff_score)
+    except Exception:
+        return "NONE"
+    return "TRADE" if s >= int(min_score) else "WATCH"
+
+
+def _argus_profile(cfg: dict) -> Optional[Dict[str, Any]]:
+    p = cfg.get("ARGUS_PROFILE")
+    return p if isinstance(p, dict) and p else None
+
+
+def _argus_rng(cfg: dict, profile: Dict[str, Any]) -> random.Random:
+    seed = cfg.get("ARGUS_SEED", None)
+    if seed is None:
+        seed = profile.get("seed", 1337)
+    try:
+        seed_i = int(seed)
+    except Exception:
+        seed_i = 1337
+    return random.Random(seed_i)
+
+
+def _argus_flip_signal(sig: int) -> int:
+    if sig == 1:
+        return 0
+    if sig == 0:
+        return 1
+    return sig
+
+
+def _argus_damage_tfstate(
+    st: Optional[TFState],
+    *,
+    tf: str,
+    profile: Dict[str, Any],
+    rng: random.Random,
+) -> Optional[TFState]:
+    if st is None:
+        return None
+
+    tf_dropout = profile.get("tf_dropout")
+    if isinstance(tf_dropout, str):
+        tf_dropout = [tf_dropout]
+    if isinstance(tf_dropout, list) and tf in [str(x) for x in tf_dropout]:
+        return None
+
+    out = TFState(
+        tf=st.tf,
+        signal=int(st.signal),
+        trend_ok=bool(st.trend_ok),
+        score=int(st.score),
+        reasons=str(st.reasons or ""),
+    )
+
+    flip_pct = profile.get("signal_flip_pct", 0.0)
+    try:
+        flip_p = float(flip_pct)
+    except Exception:
+        flip_p = 0.0
+    if flip_p > 0 and rng.random() < flip_p:
+        out.signal = _argus_flip_signal(int(out.signal))
+        out.reasons = (out.reasons + " | " if out.reasons else "") + "ARGUS:signal_flip"
+
+    bump = profile.get("fake_score_bump", 0)
+    try:
+        bump_i = int(bump)
+    except Exception:
+        bump_i = 0
+    if bump_i != 0:
+        out.score = int(max(0, min(100, out.score + bump_i)))
+        out.reasons = (out.reasons + " | " if out.reasons else "") + f"ARGUS:score_bump={bump_i}"
+
+    noise = profile.get("score_noise", 0)
+    try:
+        noise_i = int(noise)
+    except Exception:
+        noise_i = 0
+    if noise_i > 0:
+        n = rng.randint(-noise_i, +noise_i)
+        if n != 0:
+            out.score = int(max(0, min(100, out.score + n)))
+            out.reasons = (out.reasons + " | " if out.reasons else "") + f"ARGUS:score_noise={n:+d}"
+
+    return out
+
+
+def _argus_apply_feature_damage(
+    *,
+    cfg: dict,
+    snap: DecisionSnapshot,
+    st_1m_tf: Optional[TFState],
+    st_5m_tf: Optional[TFState],
+    st_1h_tf: Optional[TFState],
+) -> Tuple[Optional[TFState], Optional[TFState], Optional[TFState], Optional[str], bool]:
+    profile = _argus_profile(cfg)
+    if profile is None:
+        return st_1m_tf, st_5m_tf, st_1h_tf, None, False
+
+    rng = _argus_rng(cfg, profile)
+
+    try:
+        snap.argus_profile = str(profile.get("name", "argus"))
+    except Exception:
+        pass
+
+    st_1m_tf2 = _argus_damage_tfstate(st_1m_tf, tf="1m", profile=profile, rng=rng)
+    st_5m_tf2 = _argus_damage_tfstate(st_5m_tf, tf="5m", profile=profile, rng=rng)
+    st_1h_tf2 = _argus_damage_tfstate(st_1h_tf, tf="1h", profile=profile, rng=rng)
+
+    force_regime = profile.get("force_regime")
+    forced_regime_label: Optional[str] = None
+    if force_regime is not None and str(force_regime).strip() != "":
+        forced_regime_label = str(force_regime).strip().upper()
+        try:
+            snap.argus_forced_regime = forced_regime_label
+        except Exception:
+            pass
+
+    force_liq_block = bool(profile.get("force_liq_block", False))
+    if force_liq_block:
+        try:
+            snap.argus_forced_liq_block = True
+        except Exception:
+            pass
+
+    return st_1m_tf2, st_5m_tf2, st_1h_tf2, forced_regime_label, force_liq_block
+
+
+def _verify_tf_snapshots(
+    snap: DecisionSnapshot,
+    *,
+    st_1m_tf: Optional[TFState],
+    st_5m_tf: Optional[TFState],
+    st_1h_tf: Optional[TFState],
+    cfg: dict,
+) -> None:
+    """
+    Tier-1 verification instrumentation:
+      - confirm 1m is present (post-warmup)
+      - confirm 5m/1h are sometimes None (normal)
+      - confirm signal/trend_ok/score aren't degenerate (always 0/False)
+    """
+    if not _bool_cfg(cfg, "VERIFY_TF_SNAPSHOTS", True):
+        return
+
+    # --------- LINE ABOVE: if not _bool_cfg(cfg, "VERIFY_TF_SNAPSHOTS", True):
+    parts: List[str] = []
+    parts.append(f"1m={'OK' if st_1m_tf is not None else 'NONE'}")
+    parts.append(f"5m={'OK' if st_5m_tf is not None else 'NONE'}")
+    parts.append(f"1h={'OK' if st_1h_tf is not None else 'NONE'}")
+
+    if st_1m_tf is not None:
+        parts.append(f"1m_sig={int(st_1m_tf.signal)} 1m_trend={int(bool(st_1m_tf.trend_ok))} 1m_score={int(st_1m_tf.score)}")
+        if int(st_1m_tf.signal) == 0 and (not bool(st_1m_tf.trend_ok)) and int(st_1m_tf.score) == 0:
+            parts.append("WARN:1M_DEGENERATE_ALL_ZERO")
+
+    if st_5m_tf is not None:
+        parts.append(f"5m_sig={int(st_5m_tf.signal)} 5m_trend={int(bool(st_5m_tf.trend_ok))} 5m_score={int(st_5m_tf.score)}")
+    if st_1h_tf is not None:
+        parts.append(f"1h_sig={int(st_1h_tf.signal)} 1h_trend={int(bool(st_1h_tf.trend_ok))} 1h_score={int(st_1h_tf.score)}")
+
+    _add_event(snap, "TF_SNAPSHOT_VERIFY", " | ".join(parts))
+
+
+def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot:
+    symbol = state.symbol
+    px = _as_decimal(getattr(tick, "px", None), "0")
+    now_e = int(getattr(tick, "epoch", 0))
+
+    # --------- LINE ABOVE: now_e = int(getattr(tick, "epoch", 0))
+    now_e = _normalize_epoch_seconds(now_e)
+
+    # Update candle builders
+    _, closed_1m = state.candles_1m.on_tick(tick)
+    _, closed_5m = state.candles_5m.on_tick(tick)
+    _, closed_1h = state.candles_1h.on_tick(tick)
+
+    if closed_1m is not None:
+        state.last_candle_close_1m = closed_1m.close
+        state.last_candle_start_1m = closed_1m.start_epoch
+        state.last_candle_volume_1m = getattr(closed_1m, "volume", None)
+        state.last_st_1m = state.strat_1m.on_candle_close(closed_1m.close)
+
+    if closed_5m is not None:
+        state.last_candle_close_5m = closed_5m.close
+        state.last_candle_start_5m = closed_5m.start_epoch
+        state.last_st_5m = state.strat_5m.on_candle_close(closed_5m.close)
+
+    if closed_1h is not None:
+        state.last_candle_close_1h = closed_1h.close
+        state.last_candle_start_1h = closed_1h.start_epoch
+        state.last_st_1h = state.strat_1h.on_candle_close(closed_1h.close)
+
+    st_1m = state.last_st_1m
+    candle_close_1m = state.last_candle_close_1m
+    candle_start_1m = state.last_candle_start_1m
+
+    # Compute session info early
+    sess = classify_session(now_e, cfg)
+
+    # Warmup guard
+    if st_1m is None or candle_close_1m is None or candle_start_1m is None:
+        snap = DecisionSnapshot(symbol=symbol, ts=tick.ts, epoch=now_e, px=px, paused=paused)
+        snap.stale = False
+
+        snap.session = sess.session
+        snap.session_labels = sess.labels
+        snap.session_bonus_points = int(sess.bonus_points)
+        snap.session_risk_mult = sess.risk_mult
+        snap.session_reason = sess.reason
+
+        snap.action = "HOLD"
+        snap.action_reason = "WARMUP_NO_1M_STATE"
+        snap.cash_usd = state.ledger.cash_usd
+        snap.position_qty = state.ledger.position_qty
+        snap.avg_entry_px = state.ledger.avg_entry_px
+        snap.equity_usd = state.ledger.equity_usd(px)
+        snap.exposure_usd = state.ledger.exposure_usd(px)
+        snap.unrl_pnl_usd = state.ledger.unrealized_pnl_usd(px, cfg)
+        snap.realized_pnl_usd = state.ledger.realized_pnl_usd
+        snap.trades_today = getattr(state.risk, "trades_today", 0)
+        snap.daily_realized_usd = getattr(state.risk, "daily_realized_pnl_usd", Decimal("0"))
+        snap.lockout_until_epoch = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+        snap.cooldown_remaining_s = max(0, state.cooldown_until_epoch - now_e)
+        snap.next_poll_s = float(cfg["POLL_FAST_SECONDS"])
+        return snap
+
+    # Stale guard
+    stale = False
+    if state.last_good_tick_epoch is None:
+        state.last_good_tick_epoch = now_e
+
+    if (now_e - state.last_good_tick_epoch) > int(cfg["STALE_TICK_SECONDS"]):
+        stale = True
+
+    if not stale:
+        state.last_good_tick_epoch = now_e
+        state.stale_logged = False
+
+    emit_actions = (not paused) and (not stale)
+
+    snap = DecisionSnapshot(symbol=symbol, ts=tick.ts, epoch=now_e, px=px, paused=paused)
+    snap.stale = stale
+
+    snap.session = sess.session
+    snap.session_labels = sess.labels
+    snap.session_bonus_points = int(sess.bonus_points)
+    snap.session_risk_mult = sess.risk_mult
+    snap.session_reason = sess.reason
+
+    # Candle + indicator columns
+    snap.candle_start_1m = candle_start_1m
+    snap.candle_close_1m = candle_close_1m
+    snap.candle_volume_1m = getattr(state, "last_candle_volume_1m", None)
+    snap.ma_fast = getattr(st_1m, "ma_fast", None)
+    snap.ma_slow = getattr(st_1m, "ma_slow", None)
+    snap.ma50 = getattr(st_1m, "ma50", None)
+    snap.ma200 = getattr(st_1m, "ma200", None)
+    snap.reasons_1m = str(getattr(st_1m, "reasons", "") or "")
+
+    # Phase 4: Vol + Regime
+    vol, _ = _compute_volatility_fraction(state, cfg)
+    snap.vol = vol
+    _ensure_state_has_regime_inputs(st_1m, vol)
+
+    try:
+        if getattr(state, "regime_engine", None) is not None:
+            rr = state.regime_engine.evaluate(st_1m)
+            if rr is not None:
+                state.regime = rr
+    except Exception as e:
+        _add_event(snap, "REGIME_EVAL_FAIL", str(e))
+
+    if getattr(state, "regime", None) is not None:
+        snap.regime = str(getattr(state.regime, "regime", "UNKNOWN"))
+        snap.trend_strength = _as_decimal(getattr(state.regime, "trend_strength", None), "0")
+        try:
+            snap.vol = _as_decimal(getattr(state.regime, "vol", None), str(snap.vol or "0"))
+        except Exception:
+            pass
+    else:
+        snap.regime = "UNKNOWN"
+        snap.trend_strength = None
+
+    # Phase 5A: Structure
+    structure: Optional[StructureResult] = _compute_structure(
+        state,
+        px=px,
+        closed_1m=closed_1m,
+        cfg=cfg,
+    )
+    if structure is not None:
+        snap.nearest_support = structure.nearest_support
+        snap.nearest_resistance = structure.nearest_resistance
+        snap.dist_support = structure.dist_support
+        snap.dist_resistance = structure.dist_resistance
+
+        snap.near_support = bool(structure.near_support)
+        snap.near_resistance = bool(structure.near_resistance)
+
+        snap.broke_up = bool(structure.broke_up)
+        snap.broke_down = bool(structure.broke_down)
+        snap.retest_ok = bool(structure.retest_ok)
+        snap.failed_retest = bool(structure.failed_retest)
+
+        snap.rejection_at_res = bool(structure.rejection_at_res)
+        snap.rejection_at_sup = bool(structure.rejection_at_sup)
+
+        snap.structure_reasons = str(structure.reasons or "")
+
+    # --------- LINE ABOVE: if structure is not None:
+    # ✅ Phase 5B: provide a deterministic atr_norm fallback for backtests.
+    # Priority:
+    #   1) tick.atr_norm (if live feed provides it)
+    #   2) regime.vol (already in snap.vol post-regime-eval)
+    #   3) raw vol fraction from indicator engine (vol)
+    atr_norm_fb: Optional[Decimal] = None
+    try:
+        atr_norm_fb = _as_decimal(getattr(tick, "atr_norm", None), "0") if getattr(tick, "atr_norm", None) is not None else None
+    except Exception:
+        atr_norm_fb = None
+    if atr_norm_fb is None:
+        try:
+            atr_norm_fb = _as_decimal(getattr(state.regime, "vol", None), "0") if getattr(state, "regime", None) is not None else None
+        except Exception:
+            atr_norm_fb = None
+    if atr_norm_fb is None:
+        atr_norm_fb = vol  # may still be None; that's fine (truthful)
+
+    # Phase 5B: Liquidity
+    liq = _compute_liquidity(
+        state,
+        tick=tick,
+        px=px,
+        closed_1m=closed_1m,
+        cfg=cfg,
+        atr_norm_fallback=atr_norm_fb,
+    )
+    if liq is not None:
+        snap.liq_ok = bool(getattr(liq, "ok", True))
+        snap.liq_spread_bps = getattr(liq, "spread_bps", None)
+        snap.liq_vol_1m = getattr(liq, "vol_1m", None)
+
+        # --------- LINE ABOVE: snap.liq_vol_1m = getattr(liq, "vol_1m", None)
+        # ✅ FIX: baseline/atr_norm should come from LiquidityResult, but if evaluate() doesn't
+        # populate them, fall back to reading from the engine when possible.
+        snap.liq_vol_baseline = getattr(liq, "vol_baseline", None)
+        if snap.liq_vol_baseline is None:
+            try:
+                le = getattr(state, "liquidity_engine", None)
+                snap.liq_vol_baseline = getattr(le, "vol_baseline", None) or getattr(le, "baseline", None)
+            except Exception:
+                pass
+
+        snap.liq_atr_norm = getattr(liq, "atr_norm", None)
+        if snap.liq_atr_norm is None:
+            snap.liq_atr_norm = atr_norm_fb
+
+        snap.liq_mode = str(getattr(liq, "mode", "") or "")
+        snap.liq_penalty_points = int(getattr(liq, "penalty_points", 0) or 0)
+        snap.liq_reasons = str(getattr(liq, "reasons", "") or "")
+
+    # Risk day reset
+    payload = state.risk.ensure_day(now_e, cfg)
+    if payload:
+        _add_event(snap, "RISK_DAY_RESET", payload["msg"])
+
+    cooldown_remaining = max(0, state.cooldown_until_epoch - now_e)
+
+    # Confluence (base) then overlays (session/liquidity)
+    base_conf = None
+
+    st_1m_tf = _to_tf_state(state.last_st_1m, "1m")
+    st_5m_tf = _to_tf_state(state.last_st_5m, "5m")
+    st_1h_tf = _to_tf_state(state.last_st_1h, "1h")
+
+    # --------- LINE ABOVE: st_1h_tf = _to_tf_state(state.last_st_1h, "1h")
+    _verify_tf_snapshots(snap, st_1m_tf=st_1m_tf, st_5m_tf=st_5m_tf, st_1h_tf=st_1h_tf, cfg=cfg)
+
+    st_1m_tf, st_5m_tf, st_1h_tf, forced_regime_label, forced_liq_block = _argus_apply_feature_damage(
+        cfg=cfg,
+        snap=snap,
+        st_1m_tf=st_1m_tf,
+        st_5m_tf=st_5m_tf,
+        st_1h_tf=st_1h_tf,
+    )
+
+    if forced_regime_label:
+        snap.regime = forced_regime_label
+
+    try:
+        base_conf = state.confluence.evaluate(
+            st_1m=st_1m_tf,
+            st_5m=st_5m_tf,
+            st_1h=st_1h_tf,
+            structure=structure,
+        )
+        state.last_conf = base_conf
+    except Exception as e:
+        state.last_conf = None
+        _add_event(snap, "CONFLUENCE_EVAL_FAIL", str(e))
+
+    require_confluence = _bool_cfg(cfg, "REQUIRE_CONFLUENCE", True)
+    confluence_min_score = int(cfg.get("CONFLUENCE_MIN_SCORE", cfg.get("CONFLUENCE_TRADE_SCORE", 80)))
+
+    base_score: Optional[int] = None
+    base_gate: str = ""
+    base_reasons: str = ""
+    if base_conf is not None:
+        base_score = int(getattr(base_conf, "confluence_score", 0) or 0)
+        base_gate = str(getattr(base_conf, "gate", "") or "")
+        base_reasons = str(getattr(base_conf, "reasons", "") or "")
+
+    use_adaptive = _bool_cfg(cfg, "USE_ADAPTIVE_CONFLUENCE", False)
+    eff_score: Optional[int] = base_score
+    eff_gate: str = base_gate
+    eff_reason: str = base_reasons
+
+    if require_confluence:
+        if base_conf is None:
+            eff_score = None
+            eff_gate = "NONE"
+            eff_reason = "NO_CONFLUENCE_SNAPSHOT"
+        else:
+            if use_adaptive and getattr(state, "adaptive_confluence", None) is not None:
+                try:
+                    adj = state.adaptive_confluence.adjust(
+                        base_conf,
+                        regime=getattr(state, "regime", None),
+                        trend_strength=snap.trend_strength,
+                        vol=snap.vol,
+                    )
+
+                    snap.ac_base_score = int(getattr(adj, "base_score", base_score or 0))
+                    snap.ac_base_gate = str(getattr(adj, "base_gate", base_gate))
+                    snap.ac_adjusted_score = int(getattr(adj, "adjusted_score", base_score or 0))
+                    snap.ac_adjusted_gate = str(getattr(adj, "adjusted_gate", base_gate))
+                    snap.ac_delta = int(getattr(adj, "score_delta", 0))
+                    snap.ac_reason = str(getattr(adj, "reason", ""))
+
+                    eff_score = int(snap.ac_adjusted_score)
+                    eff_gate = str(snap.ac_adjusted_gate)
+                    eff_reason = str(snap.ac_reason)
+                except Exception as e:
+                    _add_event(snap, "ADAPTIVE_CONFLUENCE_FAIL", str(e))
+                    eff_score = base_score
+                    eff_gate = base_gate
+                    eff_reason = base_reasons
+            else:
+                snap.ac_base_score = base_score
+                snap.ac_base_gate = base_gate
+                snap.ac_adjusted_score = base_score
+                snap.ac_adjusted_gate = base_gate
+                snap.ac_delta = 0
+                snap.ac_reason = "ADAPTIVE_DISABLED"
+
+    # Phase 5C: session overlay onto effective confluence
+    if _bool_cfg(cfg, "USE_SESSION_MODIFIERS", False):
+        before = eff_score
+        eff_score = apply_session_to_score(score=eff_score, session_info=sess, cfg=cfg)
+        if before is not None and eff_score is not None and eff_score != before:
+            delta = int(eff_score) - int(before)
+            sign = "+" if delta >= 0 else ""
+            eff_reason = (
+                (eff_reason + " | " if eff_reason else "")
+                + f"session_bonus={sign}{delta} ({sess.session}:{sess.labels})"
+            )
+
+    # Phase 5B: liquidity overlay onto effective confluence
+    eff_score, eff_gate, eff_reason, liq_blocks = _apply_liquidity_overlay_to_confluence(
+        eff_score=eff_score,
+        eff_gate=eff_gate,
+        eff_reason=eff_reason,
+        liq=liq,
+    )
+
+    # Argus: optional forced liquidity block AFTER overlay (hard block semantics)
+    if forced_liq_block:
+        liq_blocks = list(liq_blocks) + ["BLOCK:ARGUS_FORCED_LIQ"]
+        eff_reason = (eff_reason + " | " if eff_reason else "") + "liq:ARGUS_FORCED_BLOCK"
+
+    # Re-derive gate from post-overlay score
+    if require_confluence and eff_gate not in ("NONE", "BLOCK"):
+        eff_gate = _gate_from_score(eff_score, confluence_min_score)
+
+    snap.confluence_score = None if eff_score is None else int(eff_score)
+    snap.confluence_gate = str(eff_gate or "")
+    snap.confluence_reasons = str(eff_reason or "")
+
+    # Entry gating: confluence is a SIZING overlay, not a hard veto (preferred method).
+    # Only veto if confluence is required but missing/blocked, or liquidity has hard blocks.
+    # --------- LINE ABOVE: snap.confluence_reasons = str(eff_reason or "")
+    conf_gate = str(snap.confluence_gate or "")
+    conf_present = conf_gate not in ("", "NONE")
+    conf_blocked = conf_gate in ("BLOCK",)
+
+    conf_size_mult = Decimal(str(cfg.get("CONFLUENCE_SIZE_MULT_WHEN_NOT_TRADE", "0.25")))
+    conf_veto = bool(require_confluence and (not conf_present or conf_blocked))
+
+    conf_ok = (not conf_veto)
+    if liq_blocks:
+        conf_ok = False
+
+    # Trend invalidation (1m close based)
+    if closed_1m is not None and state.last_st_1m is not None:
+        exit_level = ma200_exit_level(
+            state.last_st_1m.ma200,
+            _as_decimal(cfg.get("MA200_BAND_PCT", "0.001"), "0.001"),
+        )
+        if state.ledger.in_pos() and exit_level is not None:
+            if closed_1m.close < exit_level:
+                state.trend_below_count += 1
+            else:
+                state.trend_below_count = 0
+        else:
+            state.trend_below_count = 0
+
+    # Portfolio stats
+    equity = state.ledger.equity_usd(px)
+    exposure = state.ledger.exposure_usd(px)
+    unrl_pnl = state.ledger.unrealized_pnl_usd(px, cfg)
+    realized_pnl = state.ledger.realized_pnl_usd
+
+    # Exit levels
+    take_profit = stop_loss = trail_stop = None
+    hold_s = 0
+
+    if state.ledger.in_pos() and state.ledger.avg_entry_px is not None:
+        state.peak_price = px if state.peak_price is None else max(state.peak_price, px)
+
+        take_profit_pct = _as_decimal(cfg.get("TAKE_PROFIT_PCT", "0.03"), "0.03")
+        stop_loss_pct = _as_decimal(cfg.get("STOP_LOSS_PCT", "0.02"), "0.02")
+        trail_stop_pct = _as_decimal(cfg.get("TRAIL_STOP_PCT", "0.015"), "0.015")
+
+        take_profit = state.ledger.avg_entry_px * (Decimal("1") + take_profit_pct)
+        stop_loss = state.ledger.avg_entry_px * (Decimal("1") - stop_loss_pct)
+        trail_stop = state.peak_price * (Decimal("1") - trail_stop_pct)
+    else:
+        state.peak_price = None
+        state.entry_epoch = None
+
+    if state.ledger.in_pos() and state.entry_epoch is not None:
+        hold_s = max(0, now_e - state.entry_epoch)
+
+    # MFE/MAE
+    track_mfe_mae = _bool_cfg(cfg, "TRACK_MFE_MAE", True)
+    if track_mfe_mae and state.ledger.in_pos() and state.ledger.avg_entry_px is not None:
+        entry_px = state.ledger.avg_entry_px
+        state.high_since_entry = px if state.high_since_entry is None else max(state.high_since_entry, px)
+        state.low_since_entry = px if state.low_since_entry is None else min(state.low_since_entry, px)
+
+        if entry_px > 0 and state.high_since_entry is not None:
+            cur_mfe = (state.high_since_entry - entry_px) / entry_px
+            if cur_mfe > state.mfe_pct:
+                state.mfe_pct = cur_mfe
+
+        if entry_px > 0 and state.low_since_entry is not None:
+            cur_mae = (state.low_since_entry - entry_px) / entry_px
+            if cur_mae < state.mae_pct:
+                state.mae_pct = cur_mae
+
+    # Distances (adaptive polling)
+    dist_ma200 = pct_dist(px, st_1m.ma200)
+    dist_tp = pct_dist(px, take_profit)
+    dist_sl = pct_dist(px, stop_loss)
+    dist_trail = pct_dist(px, trail_stop)
+
+    dists: List[Decimal] = [d for d in [dist_ma200, dist_tp, dist_sl, dist_trail] if d is not None]
+    min_dist = min(dists) if dists else None
+
+    action = "HOLD"
+    action_reason = ""
+    risk_blocked_reason = ""
+
+    # EXIT (paper sell)
+    if state.ledger.in_pos() and state.ledger.avg_entry_px is not None:
+        would_sell_action = "WOULD_SELL"
+
+        if stop_loss is not None and px <= stop_loss:
+            action = would_sell_action
+            action_reason = "STOP_LOSS"
+        else:
+            if hold_s < int(cfg["MIN_HOLD_SECONDS"]):
+                action = "HOLD"
+                action_reason = f"MIN_HOLD ({hold_s}s<{cfg['MIN_HOLD_SECONDS']}s)"
+            else:
+                if state.trend_below_count >= int(cfg["TREND_INVALIDATION_CLOSES"]):
+                    action = would_sell_action
+                    action_reason = f"TREND_INVALIDATION ({state.trend_below_count} closes < MA200_band)"
+                elif trail_stop is not None and px <= trail_stop:
+                    action = would_sell_action
+                    action_reason = "TRAIL_STOP"
+                elif take_profit is not None and px >= take_profit:
+                    action = would_sell_action
+                    action_reason = "TAKE_PROFIT"
+
+        if action == would_sell_action and emit_actions:
+            eff_sell, proceeds, realized_trade = state.ledger.sell_all(px, now_e, cfg)
+            state.risk.record_exit(realized_trade, now_e, cfg)
+
+            ev_name = _map_trade_event(cfg, "WOULD_SELL")
+            msg = (
+                f"{action_reason} | px={px} eff_sell={eff_sell:.2f} qty=ALL proceeds={proceeds:.2f} "
+                f"realized_trade={realized_trade:.2f} daily_realized={state.risk.daily_realized_pnl_usd:.2f} "
+                f"score={st_1m.score} {st_1m.reasons} | "
+                f"conf_score={safe_str(snap.confluence_score)} gate={snap.confluence_gate} | "
+                f"regime={snap.regime} | struct={safe_str(getattr(snap,'structure_reasons',''))} | "
+                f"liq={safe_str(getattr(snap,'liq_reasons',''))}"
+            )
+            _add_event(
+                snap,
+                ev_name,
+                msg,
+                notify_title="SELL",
+                notify_body=(
+                    f"{symbol} | {action_reason}\npx={px}\nproceeds={proceeds:.2f}\nrealized_trade={realized_trade:.2f}\n"
+                    f"daily_realized={state.risk.daily_realized_pnl_usd:.2f}\nscore={st_1m.score} {st_1m.reasons}\n"
+                    f"confluence={safe_str(snap.confluence_score)} gate={snap.confluence_gate}\n"
+                    f"regime={snap.regime}\nstructure={safe_str(getattr(snap,'structure_reasons',''))}\n"
+                    f"liquidity={safe_str(getattr(snap,'liq_reasons',''))}"
+                ),
+            )
+
+            action = ev_name
+            state.cooldown_until_epoch = now_e + int(cfg["COOLDOWN_SECONDS"])
+            state.trend_below_count = 0
+            state.peak_price = None
+            state.entry_epoch = None
+            state.mfe_pct = Decimal("0")
+            state.mae_pct = Decimal("0")
+            state.high_since_entry = None
+            state.low_since_entry = None
+
+    # ENTRY (paper buy)
+    if (not state.ledger.in_pos()) and emit_actions:
+        entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
+
+        # --------- LINE ABOVE: entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
+        # Canonical "attempt" definition for measurability:
+        # Attempt = BUY intent pre-overlays (signal/trend), regardless of confluence/risk/liq/size outcome.
+        if cooldown_remaining == 0 and entry_signal_ok:
+            _add_event(
+                snap,
+                "ENTRY_ATTEMPT",
+                (
+                    f"ENTRY_ATTEMPT | px={px} score_1m={st_1m.score} reasons_1m={safe_str(st_1m.reasons)} | "
+                    f"session={safe_str(getattr(snap,'session',''))} labels={safe_str(getattr(snap,'session_labels',''))}"
+                ),
+            )
+
+        if cooldown_remaining > 0 and entry_signal_ok:
+            _emit_missed_buy(
+                snap,
+                event="MISSED_BUY_COOLDOWN",
+                prefix="COOLDOWN_BLOCK",
+                px=px,
+                confluence_min_score=confluence_min_score,
+                cooldown_remaining=int(cooldown_remaining),
+                equity=equity,
+                exposure=exposure,
+                extra=f"cooldown_until_epoch={int(state.cooldown_until_epoch)}",
+            )
+
+        if cooldown_remaining == 0 and entry_signal_ok and liq is not None:
+            mode_u = str(getattr(liq, "mode", "") or "").upper()
+            ok_b = bool(getattr(liq, "ok", True))
+            if mode_u == "BLOCK" and (not ok_b):
+                _emit_missed_buy(
+                    snap,
+                    event="MISSED_BUY_LIQUIDITY",
+                    prefix="LIQUIDITY_BLOCK",
+                    px=px,
+                    confluence_min_score=confluence_min_score,
+                    cooldown_remaining=int(cooldown_remaining),
+                    equity=equity,
+                    exposure=exposure,
+                )
+
+        if cooldown_remaining == 0 and entry_signal_ok and (not conf_ok):
+            if bool(require_confluence and (not conf_present or conf_blocked)):
+                _emit_missed_buy(
+                    snap,
+                    event="MISSED_BUY_CONFLUENCE",
+                    prefix="CONFLUENCE_VETO",
+                    px=px,
+                    confluence_min_score=confluence_min_score,
+                    cooldown_remaining=int(cooldown_remaining),
+                    equity=equity,
+                    exposure=exposure,
+                    extra=f"gate={safe_str(conf_gate)} present={int(conf_present)} blocked={int(conf_blocked)}",
+                )
+
+        if cooldown_remaining == 0 and entry_signal_ok and conf_ok:
+            allowed, why = state.risk.can_enter(now_e, cfg)
+            if not allowed:
+                action = "HOLD"
+                action_reason = "ENTRY_BLOCKED"
+                risk_blocked_reason = why
+
+                ev = _missed_buy_event_from_risk_reason(why)
+                lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+                lockout_fmt = _fmt_lockout(now_e, lockout_until)
+
+                _emit_missed_buy(
+                    snap,
+                    event=ev,
+                    prefix="RISK_BLOCK",
+                    px=px,
+                    confluence_min_score=confluence_min_score,
+                    cooldown_remaining=int(cooldown_remaining),
+                    equity=equity,
+                    exposure=exposure,
+                    extra=(
+                        f"risk_reason={safe_str(why)} lockout_until={lockout_fmt} "
+                        f"trades_today={getattr(state.risk,'trades_today',0)} "
+                        f"daily_realized={getattr(state.risk,'daily_realized_pnl_usd',Decimal('0')):.2f}"
+                    ),
+                )
+
+        if cooldown_remaining == 0 and entry_signal_ok and conf_ok:
+            allowed, why = state.risk.can_enter(now_e, cfg)
+            if allowed:
+                qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+
+                qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
+                    state=state,
+                    px=px,
+                    qty_cap=_as_decimal(qty_cap, "0"),
+                    cfg=cfg,
+                )
+                snap.vol_used = vol_used
+                snap.vol_sizing_qty = qty_vol
+                snap.vol_reason = sizing_note.split(" ", 1)[0] if sizing_note else ""
+                snap.sizing_note = sizing_note
+
+                if require_confluence:
+                    if str(conf_gate) != "TRADE":
+                        try:
+                            m = _as_decimal(conf_size_mult, "0.25")
+                        except Exception:
+                            m = Decimal("0.25")
+                        m = max(Decimal("0"), min(Decimal("1"), m))
+                        if m != Decimal("1"):
+                            qty = _as_decimal(qty, "0") * m
+                            snap.sizing_note = (snap.sizing_note + " | " if snap.sizing_note else "") + f"conf_mult={m} gate={conf_gate}"
+                            _add_event(
+                                snap,
+                                "CONFLUENCE_SIZE_DOWN",
+                                f"conf_gate={conf_gate} mult={m} px={px} eff_score={safe_str(snap.confluence_score)} min={int(confluence_min_score)}",
+                            )
+
+                if qty <= 0:
+                    action = "HOLD"
+                    action_reason = "ENTRY_NO_SIZE"
+                    risk_blocked_reason = f"{qty_reason}|{sizing_note}"
+
+                    ev = _missed_buy_event_from_qty_reason(qty_reason)
+                    _emit_missed_buy(
+                        snap,
+                        event=ev,
+                        prefix="SIZE_BLOCK",
+                        px=px,
+                        confluence_min_score=confluence_min_score,
+                        cooldown_remaining=int(cooldown_remaining),
+                        equity=equity,
+                        exposure=exposure,
+                        extra=f"qty_reason={safe_str(qty_reason)} sizing_note={safe_str(sizing_note)} qty_cap={qty_cap} qty_final={qty}",
+                    )
+                else:
+                    action_reason = "ENTRY (1m signal + confluence gate)"
+
+                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                    state.risk.record_entry(now_e, cfg)
+
+                    state.entry_epoch = now_e
+                    state.peak_price = px
+                    state.trend_below_count = 0
+                    state.mfe_pct = Decimal("0")
+                    state.mae_pct = Decimal("0")
+                    state.high_since_entry = px
+                    state.low_since_entry = px
+
+                    ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                    msg = (
+                        f"{action_reason} | {sizing_note} | px={px} qty={qty:.8f} fill_px={fill_px:.2f} total_cost={total_cost:.2f} "
+                        f"equity={state.ledger.equity_usd(px):.2f} cash={state.ledger.cash_usd:.2f} trades_today={state.risk.trades_today} "
+                        f"score={st_1m.score} {st_1m.reasons} | "
+                        f"conf_score={safe_str(snap.confluence_score)} gate={snap.confluence_gate} | "
+                        f"regime={snap.regime} | struct={safe_str(getattr(snap,'structure_reasons',''))} | "
+                        f"liq={safe_str(getattr(snap,'liq_reasons',''))}"
+                    )
+                    _add_event(
+                        snap,
+                        ev_name,
+                        msg,
+                        notify_title="BUY",
+                        notify_body=(
+                            f"{symbol} | {action_reason}\n{sizing_note}\npx={px}\nqty={qty:.8f}\n"
+                            f"total_cost={total_cost:.2f}\nequity={state.ledger.equity_usd(px):.2f}\n"
+                            f"score={st_1m.score} {st_1m.reasons}\n"
+                            f"confluence={safe_str(snap.confluence_score)} gate={snap.confluence_gate}\n"
+                            f"regime={snap.regime}\nstructure={safe_str(getattr(snap,'structure_reasons',''))}\n"
+                            f"liquidity={safe_str(getattr(snap,'liq_reasons',''))}"
+                        ),
+                    )
+
+                    action = ev_name
+            else:
+                action = "HOLD"
+                action_reason = "ENTRY_BLOCKED"
+                risk_blocked_reason = why
+
+    track_holds = _bool_cfg(cfg, "TRACK_HOLD_REASONS", True)
+    if track_holds and (not state.ledger.in_pos()):
+        hold_key, hold_detail = _classify_hold_reason(
+            paused=paused,
+            stale=stale,
+            cooldown_remaining=int(cooldown_remaining),
+            entry_signal_ok=bool(st_1m.trend_ok and st_1m.signal == 1),
+            conf_ok=bool(conf_ok),
+            conf_score=(None if snap.confluence_score is None else int(snap.confluence_score)),
+            conf_min=int(confluence_min_score),
+            st_1m=st_1m,
+        )
+        if _should_bump_hold(state, now_e, cfg):
+            tracker_enabled = _bool_cfg(cfg, "TRADE_TRACKER_ENABLED", True)
+            disable_in_bt = _bool_cfg(cfg, "DISABLE_TRADE_TRACKER_IN_BACKTEST", True) and _bool_cfg(cfg, "BACKTEST_MODE", False)
+            if tracker_enabled and (not disable_in_bt) and getattr(state, "tracker", None) is not None:
+                state.tracker.bump(
+                    hold_key,
+                    f"{hold_detail} | px={px} | {snap.confluence_reasons} | struct={safe_str(getattr(snap,'structure_reasons',''))} | liq={safe_str(getattr(snap,'liq_reasons',''))}",
+                )
+
+    next_poll = choose_poll_seconds(cfg, in_pos=state.ledger.in_pos(), min_dist=min_dist)
+    if st_1m.ma200 is None:
+        next_poll = float(cfg["POLL_FAST_SECONDS"])
+
+    snap.sig_1m = int(st_1m.signal)
+    snap.trend_ok_1m = bool(st_1m.trend_ok)
+    snap.score_1m = int(st_1m.score)
+
+    snap.score_5m = None if state.last_st_5m is None else int(state.last_st_5m.score)
+    snap.score_1h = None if state.last_st_1h is None else int(state.last_st_1h.score)
+
+    snap.cash_usd = state.ledger.cash_usd
+    snap.position_qty = state.ledger.position_qty
+    snap.avg_entry_px = state.ledger.avg_entry_px
+    snap.equity_usd = equity
+    snap.exposure_usd = exposure
+    snap.unrl_pnl_usd = unrl_pnl
+    snap.realized_pnl_usd = realized_pnl
+
+    snap.trades_today = getattr(state.risk, "trades_today", 0)
+    snap.daily_realized_usd = getattr(state.risk, "daily_realized_pnl_usd", Decimal("0"))
+    snap.lockout_until_epoch = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+    snap.cooldown_remaining_s = int(cooldown_remaining)
+
+    snap.hold_s = int(hold_s)
+    snap.trend_below_count = int(state.trend_below_count)
+
+    snap.peak_price = state.peak_price
+    snap.take_profit = take_profit
+    snap.stop_loss = stop_loss
+    snap.trail_stop = trail_stop
+
+    snap.dist_ma200 = dist_ma200
+    snap.dist_tp = dist_tp
+    snap.dist_sl = dist_sl
+    snap.dist_trail = dist_trail
+    snap.min_dist = min_dist
+
+    snap.mfe_pct = state.mfe_pct
+    snap.mae_pct = state.mae_pct
+
+    snap.action = action
+    snap.action_reason = action_reason
+    snap.risk_blocked_reason = risk_blocked_reason
+    snap.next_poll_s = float(next_poll)
+
+    return snap

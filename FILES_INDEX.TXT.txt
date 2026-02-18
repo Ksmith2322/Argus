@@ -1,0 +1,78 @@
+FILES INDEX (one line per file; no prose)
+
+FORMAT:
+file | TYPE | ROLE | CALLED BY | CALLS INTO | OWNS STATE | READS | WRITES | RISK TAGS
+
+--- ROOT PACKAGE (repo) ---
+
+**init**.py | SUPPORT | package marker | n/a | n/a | NO | none | none | none
+
+config.py | CORE | config loader + defaults + env override surface | runner_live,backtest/runner,_debug_step,engine/state (indirect) | none | NO | env,.env (via dotenv) | none | config,env
+
+engine.py | CORE | main decision step: TF states + overlays (regime/structure/liquidity/session) + entry/exit + events | runner_live,backtest/runner,_debug_step | candles,indicators,strategy_phase2,confluence,adaptive_confluence,regime,structure,liquidity,session,ledger,risk,decisions,trade_tracker (via state) | YES | cfg,ticks,state sub-engine caches | none | orchestration,state-coupling,accounting,time
+
+state.py | CORE | BotState factory + owns sub-engines + caches last_* snapshots | runner_live,backtest/runner,_debug_step,engine | candles,confluence,ledger,risk,strategy_phase2,trade_tracker,regime,adaptive_confluence,structure,liquidity | YES | cfg | none | state,fanout
+
+decisions.py | CORE | DecisionSnapshot + EngineEvent schema + CSV-safe field mapping | engine,runners,io_logs | none | YES | none | none | schema,stability
+
+utils.py | SUPPORT | time helpers + safe string conversion | many | none | NO | none | none | time
+
+candles.py | CORE | Candle + CandleBuilder (1m/5m/1h aggregation) | state,engine,backtest | none | YES | ticks,OHLCV rows | none | time,state
+
+indicators.py | CORE | indicator engine (SMA/EMA/etc) | strategy_phase2,candles,engine,backtest | none | YES | candle closes | none | state,math
+
+strategy_phase2.py | CORE | Phase 2 strategy rules → StrategyState (soft scoring + gates) | state,engine,backtest | indicators | YES | cfg,candle closes | none | signal-model,gating-policy
+
+confluence.py | CORE | confluence scoring from TF StrategyStates (+ structure hints) | state,engine | structure | YES | cfg,TF states,structure | none | state,scoring
+
+adaptive_confluence.py | CORE | regime-aware confluence adjustment | state,engine | confluence,regime | YES | cfg,confluence,regime | none | state,policy
+
+regime.py | SUPPORT | regime detection (trend/range labels) | state,engine | indicators (via state/strategy inputs) | YES | cfg,prices/indicators | none | state
+
+structure.py | CORE | market structure engine: S/R, breaks, retests, rejection checks | state,engine,confluence | candles | YES | cfg,candles | none | state,heuristics
+
+liquidity.py | CORE | liquidity engine/result: spread/vol baseline/atr_norm/penalties + reasons | state,engine | none | YES | cfg,tick bid/ask/vol/atr_norm | none | time,state,marketdata
+
+session.py | POLICY | session classifier + score bonus + risk multiplier | engine | none | NO (cached into state) | epoch,cfg | none | time,policy
+
+ledger.py | CORE | VirtualLedger: fills, exposure, PnL, position lifecycle | state,engine,backtest/results tooling | none | YES | cfg,price,qty | none | accounting,state
+
+pnl_shadow.py | SUPPORT | shadow fill + pnl math helpers | ledger,engine,backtest tooling | none | NO | cfg,mid px | none | accounting
+
+risk.py | CORE | RiskManager: day reset, max trades, loss limits, cooldown | state,engine | none | YES | cfg,epoch | none | accounting,time,state
+
+io_logs.py | IO (CANONICAL) | canonical signals/events schemas + safe CSV writers + kill/pause | runner_live,backtest/runner | utils,decisions | NO | filesystem,env | repo/logs/*.csv | CSV,schema,filesystem
+
+logger.py | IO (LEGACY) | duplicate CSV/log writer w/ import fallbacks | unknown/legacy | utils (fallback import) | NO | filesystem | repo/logs/*.csv,repo/logs/argus_logger_debug.log | DUPLICATE-IO,drift-risk
+
+feed_coinbase.py | INTEGRATION | coinbase HTTP price fetch + preload history | runner_live,backtest tools (download) | requests,candles/indicators helpers | NO | network | none | network,rate-limit
+
+notify.py | INTEGRATION | discord webhook notifier | runner_live | requests | NO | cfg,network | network side-effect | side-effects,network
+
+trade_tracker.py | STATE+IO | hold/missed-buy counters + txt report | state,engine,backtest (indirect) | os,re,datetime | YES | filesystem,cfg | repo/trade_tracker.txt | side-effects,feedback-loop
+
+_debug_step.py | TOOL | one-shot debug tick through engine.step | manual | config,state,engine,feed_coinbase | NO | cfg | stdout | debug
+
+runner_live.py | ENTRYPOINT | live loop orchestration (preload → loop → log snapshots/events) | ENTRYPOINT | config,state,feed_coinbase,engine,io_logs,notify,utils | YES | cfg,env,network,filesystem | repo/logs/*.csv,discord | time,network,CSV,shutdown-noise,LEGACY-PACKAGE-BOOTSTRAP
+
+main.py | ENTRYPOINT (LEGACY/WRONG) | runpy shim pointing to nova_scripts.Argus.runner_live | manual | runpy | NO | none | none | HAZARD-OLD-PACKAGE
+
+run_main.py | ENTRYPOINT (LEGACY/WRONG) | sys.path shim to nova_scripts.trade_bot.main | manual | runpy,sys.path | NO | filesystem | none | HAZARD-OLD-PACKAGE
+
+--- BACKTEST PACKAGE (repo/backtest) ---
+
+backtest/**init**.py | SUPPORT | package marker | n/a | n/a | NO | none | none | none
+
+backtest/loader.py | SUPPORT | load candle CSV → CandleRow list | backtest/runner | csv | NO | data/*.csv | none | data,time
+
+backtest/feed.py | SUPPORT | CandleRow → PriceTick stream (optional synth spread) | backtest/runner | none | NO | candles,cfg | none | time,liquidity-sim
+
+backtest/results.py | CORE | derive metrics from events/snapshots (expectancy, DD, winrate, etc) | backtest/runner | csv,re,json | YES | logs/events CSV or in-memory | summary dict | accounting,metrics
+
+backtest/runner.py | ENTRYPOINT | backtest loop orchestration | ENTRYPOINT | loader,feed,config,state,engine,io_logs,results | YES | data/*.csv,cfg,env | repo/logs/*.csv | CSV,accounting,reproducibility
+
+backtest/download_candles.py | TOOL | download coinbase candles → CSV | manual | requests | NO | network | data/*.csv | network,data
+
+backtest/from_live_events.py | TOOL | reconstruct trades from live_events.csv | manual | csv,re | NO | repo/logs/live_events.csv | trades CSV | accounting,forensics
+
+backtest/run_backtest.py | ENTRYPOINT (LEGACY/WRONG) | sys.path shim to nova_scripts.trade_bot.backtest.runner | manual | runpy,sys.path | NO | filesystem | none | HAZARD-OLD-PACKAGE
