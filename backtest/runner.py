@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -465,6 +466,37 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool) -> None:
             pass
 
 
+def _write_json_artifacts(summary: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Write backtest summary artifacts to ./logs (relative to current working directory).
+      - bt_summary_latest.json
+      - bt_summary_YYYYMMDD_HHMMSS.json  (UTC)
+    Uses atomic replace to avoid partial writes (Task Scheduler safety).
+    Returns: (timestamped_path, latest_path) as strings, or (None, None) on failure.
+    """
+    try:
+        out_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path_ts = os.path.join(out_dir, f"bt_summary_{ts}.json")
+        path_latest = os.path.join(out_dir, "bt_summary_latest.json")
+
+        tmp1 = path_ts + ".tmp"
+        with open(tmp1, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+        os.replace(tmp1, path_ts)
+
+        tmp2 = path_latest + ".tmp"
+        with open(tmp2, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+        os.replace(tmp2, path_latest)
+
+        return path_ts, path_latest
+    except Exception:
+        return None, None
+
+
 def run_backtest(
     *,
     candles_csv: str,
@@ -732,4 +764,9 @@ if __name__ == "__main__":
         write_logs=write_logs,
     )
 
-    print(res.summary())
+    # --------- LINE ABOVE: res = run_backtest(...)
+    # ✅ Phase 6: emit machine-readable artifacts for automation (Task Scheduler-safe)
+    summary = res.summary()
+    _write_json_artifacts(summary)
+
+    print(summary)

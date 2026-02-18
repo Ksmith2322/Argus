@@ -1,13 +1,17 @@
-cd C:\Argus
-.\.venv\Scripts\activate
-python -m nova_scripts.Argus.main
+# enter venv
+C:\Argus\.venv\Scripts\Activate.ps1
 
+# verify you are in the venv
+python --version
+(Get-Command python).Source
 
+# LIVE
+Set-Location C:\Argus
+python -m repo.runner_live
 
-cd C:\Argus
-.\.venv\Scripts\python.exe -m nova_scripts.Argus.backtest.runner
-
-
+# BACKTEST
+Set-Location C:\Argus
+python -m repo.backtest.runner
 
 
 
