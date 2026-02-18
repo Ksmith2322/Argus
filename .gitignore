@@ -1,19 +1,27 @@
-﻿# venv / caches
-.venv/
+﻿# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
 
-# logs / outputs
+# --- Env / secrets ---
+.env
+*.env
+
+# --- Runtime outputs ---
 logs/
 *.log
 *.csv
+*.json
 
-# secrets
-.env
-secrets/
-tmp/
+# --- Backtest artifacts (if you want to keep JSON in C:\Argus\logs, not repo) ---
+bt_summary_latest.json
+bt_summary_*.json
 
-# OS / editor
-Thumbs.db
+# --- OS / editor ---
 .DS_Store
+Thumbs.db
 .vscode/

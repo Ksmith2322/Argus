@@ -11,25 +11,23 @@ from typing import Any, Optional
 
 
 # --- BOOTSTRAP FOR FILE EXECUTION --------------------------------------------
-# Allows BOTH:
-#   1) python -m nova_scripts.Argus.runner_live
-#   2) python nova_scripts/Argus/runner_live.py
+# Repo-root layout (C:\Argus\repo\*.py):
+# Allows:
+#   1) python -m runner_live
+#   2) python runner_live.py
 #
-# Ensures repo root is on sys.path and package is set so `from .x import y` works.
+# Ensures repo root is on sys.path so `from config import ...` works.
 if __package__ in (None, ""):
     # line above: here = os.path.dirname(os.path.abspath(__file__))
-    here = os.path.dirname(os.path.abspath(__file__))                 # .../nova_scripts/Argus
-    project_root = os.path.abspath(os.path.join(here, "..", ".."))    # .../Nova
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    __package__ = "nova_scripts.Argus"
-
+    here = os.path.dirname(os.path.abspath(__file__))   # ...\repo
+    if here not in sys.path:
+        sys.path.insert(0, here)
 
 # --- PACKAGE IMPORTS ----------------------------------------------------------
-# line above: from .config import load_config
-from .config import load_config
-from .feed_coinbase import make_http, fetch_spot_price, preload_indicator_history
-from .io_logs import (
+# line above: from config import load_config
+from config import load_config
+from feed_coinbase import make_http, fetch_spot_price, preload_indicator_history
+from io_logs import (
     ensure_logs,
     ensure_signals_header_matches_file,
     is_kill_switch_on,
@@ -37,10 +35,10 @@ from .io_logs import (
     log_event,
     log_signal_snapshot,
 )
-from .notify import maybe_notify_discord
-from .state import BotState
-from .engine import step
-from .utils import safe_str
+from notify import maybe_notify_discord
+from state import BotState
+from engine import step
+from utils import safe_str
 
 
 def _load_cfg(cfg_path: Optional[str] = None) -> dict[str, Any]:
@@ -91,16 +89,78 @@ def _load_cfg(cfg_path: Optional[str] = None) -> dict[str, Any]:
             pass
 
     # Final fallback: zero-arg load_config; cfg_path ignored
+    cfg = load_config()
     try:
-        cfg = load_config()
-        # Add breadcrumb so you *see* this in your events log
+        log_event(
+            "?",
+            "CFG_PATH_IGNORED",
+            f"load_config signature={sig} does not accept path; ignored cfg_path={cfg_path}",
+        )
+    except Exception:
+        pass
+    return cfg
+
+
+async def _close_http(http: Any) -> None:
+    """
+    Close http client whether close() is sync or async.
+    """
+    # line above: close = getattr(http, "close", None)
+    try:
+        close = getattr(http, "close", None)
+        if not callable(close):
+            return
+        r = close()
+        if inspect.isawaitable(r):
+            await r
+    except Exception:
+        pass
+
+
+def _clamp_tick_time(*, state: Any, tick: Any, cfg: dict[str, Any], symbol: str) -> None:
+    """
+    Enforce:
+      1) epoch present and not wildly drifting vs system time
+      2) monotonic non-decreasing epoch across ticks (no rewinds)
+
+    Mutates tick.epoch and tick.ts (best-effort).
+    """
+    # line above: now_sys = int(time.time())
+    now_sys = int(time.time())
+    te = int(getattr(tick, "epoch", 0) or 0)
+    max_drift = int(cfg.get("MAX_EPOCH_DRIFT_SECONDS", 3600))  # default: 1h
+
+    changed = False
+    orig = te
+
+    # 1) Clamp missing/invalid/drift
+    if te <= 0 or abs(te - now_sys) > max_drift:
+        te = now_sys
+        changed = True
+
+    # 2) Monotonic clamp
+    last_te = int(getattr(state, "_last_tick_epoch", 0) or 0)
+    if last_te > 0 and te < last_te:
+        te = last_te
+        changed = True
+
+    setattr(state, "_last_tick_epoch", te)
+
+    # Apply to tick (best-effort)
+    try:
+        setattr(tick, "epoch", te)
+    except Exception:
+        pass
+    try:
+        setattr(tick, "ts", time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(te)) + "+00:00")
+    except Exception:
+        pass
+
+    if changed:
         try:
-            log_event("?", "CFG_PATH_IGNORED", f"load_config signature={sig} does not accept path; ignored cfg_path={cfg_path}")
+            log_event(symbol, "EPOCH_CLAMP", f"tick.epoch={orig} -> {te} (max_drift={max_drift}s, last={last_te})")
         except Exception:
             pass
-        return cfg
-    except Exception:
-        raise
 
 
 async def run_live(*, cfg_path: Optional[str] = None, dry_run: bool = True, once: bool = False) -> int:
@@ -150,10 +210,15 @@ async def run_live(*, cfg_path: Optional[str] = None, dry_run: bool = True, once
 
     print(f"[START] PAPER LEDGER (NO LIVE ORDERS) | {symbol}")
     print(f"  feed: {cfg.get('COINBASE_SPOT_URL', '')}")
-    print(f"  logs: ./logs | kill={cfg.get('KILL_SWITCH_FILE', 'KILL_SWITCH.txt')} pause={cfg.get('PAUSE_FILE', 'PAUSE.txt')}")
+    print(
+        "  logs: ./logs | "
+        f"kill={cfg.get('KILL_SWITCH_FILE', 'KILL_SWITCH.txt')} "
+        f"pause={cfg.get('PAUSE_FILE', 'PAUSE.txt')}"
+    )
     print(f"  dry_run={int(bool(dry_run))} once={int(bool(once))}")
 
     fail_count = 0
+    did_one = False
 
     try:
         while True:
@@ -174,27 +239,9 @@ async def run_live(*, cfg_path: Optional[str] = None, dry_run: bool = True, once
                 fail_count = 0
 
                 # --------- LINE ABOVE: fail_count = 0
-                # Guard against stale/incorrect tick epochs (prevents "day rewind" risk resets)
+                # Guard against stale/incorrect tick epochs + enforce monotonic time
                 try:
-                    now_sys = int(time.time())
-                    te = int(getattr(tick, "epoch", 0) or 0)
-                    max_drift = int(cfg.get("MAX_EPOCH_DRIFT_SECONDS", 3600))  # default: 1h
-
-                    # If epoch is missing OR drifts too far from system time, clamp it.
-                    if te <= 0 or abs(te - now_sys) > max_drift:
-                        try:
-                            setattr(tick, "epoch", now_sys)
-                        except Exception:
-                            pass
-                        try:
-                            # Optional: align tick.ts too (not required for correctness)
-                            setattr(tick, "ts", time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_sys)) + "+00:00")
-                        except Exception:
-                            pass
-                        try:
-                            log_event(symbol, "EPOCH_CLAMP", f"tick.epoch={te} -> {now_sys} (drift>{max_drift}s)")
-                        except Exception:
-                            pass
+                    _clamp_tick_time(state=state, tick=tick, cfg=cfg, symbol=symbol)
                 except Exception:
                     pass
 
@@ -259,7 +306,10 @@ async def run_live(*, cfg_path: Optional[str] = None, dry_run: bool = True, once
             except Exception:
                 pass
 
-            if once:
+            did_one = True
+
+            # Hard-stop for once=True (prevents “why did it loop?” confusion)
+            if once and did_one:
                 return 0
 
             await asyncio.sleep(float(getattr(snap, "next_poll_s", 1.0)))
@@ -276,12 +326,7 @@ async def run_live(*, cfg_path: Optional[str] = None, dry_run: bool = True, once
         print(traceback.format_exc())
         return 1
     finally:
-        try:
-            close = getattr(http, "close", None)
-            if callable(close):
-                await close()
-        except Exception:
-            pass
+        await _close_http(http)
 
 
 if __name__ == "__main__":

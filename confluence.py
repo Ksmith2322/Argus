@@ -1,4 +1,4 @@
-# confluence.py
+﻿# confluence.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 # Phase 5A
-from .structure import StructureResult
+from structure import StructureResult
 
 
 def _as_decimal(x: Any, default: str = "0") -> Decimal:
@@ -56,7 +56,7 @@ class TFState:
     tf: str                    # "1m", "5m", "1h"
     signal: int                # 1 = bullish bias, 0 = neutral
     trend_ok: bool
-    score: int                 # 0–100 (per-TF heuristic)
+    score: int                 # 0â€“100 (per-TF heuristic)
     reasons: str
 
 
@@ -80,8 +80,8 @@ ConfluenceSnapshot = ConfluenceResult
 
 class ConfluenceEngine:
     """
-    Phase 3.5 – Multi-timeframe confluence engine.
-    Phase 5A – Optional structure overlay (support/resistance, break-retest, rejection).
+    Phase 3.5 â€“ Multi-timeframe confluence engine.
+    Phase 5A â€“ Optional structure overlay (support/resistance, break-retest, rejection).
 
     "Done" condition for Phase 5A here:
       - structure influences score and/or gate deterministically
@@ -131,7 +131,7 @@ class ConfluenceEngine:
         self.conflict_penalty = _clamp_i(self.conflict_penalty, 0, 50)
 
         # -------------------------
-        # Phase 5A — Structure overlay knobs
+        # Phase 5A â€” Structure overlay knobs
         # -------------------------
         self.use_structure = _as_bool(self.cfg.get("USE_STRUCTURE", False), False)
 
@@ -241,7 +241,7 @@ class ConfluenceEngine:
         if self.struct_block_long_when_breaking_down and bool(getattr(structure, "broke_down", False)):
             blocks.append("BLOCK:STRUCT_BREAK_DOWN")
 
-        # “below support” proxy: if we have a support level and price is below it
+        # â€œbelow supportâ€ proxy: if we have a support level and price is below it
         nearest_support = getattr(structure, "nearest_support", None)
         dist_support = getattr(structure, "dist_support", None)
         if self.struct_block_long_below_support and nearest_support is not None:
@@ -259,7 +259,7 @@ class ConfluenceEngine:
         st_1m: Optional[TFState],
         st_5m: Optional[TFState],
         st_1h: Optional[TFState],
-        structure: Optional[StructureResult] = None,   # ✅ Phase 5A optional
+        structure: Optional[StructureResult] = None,   # âœ… Phase 5A optional
     ) -> ConfluenceResult:
 
         def norm(st: Optional[TFState], tf: str) -> TFState:
@@ -352,7 +352,7 @@ class ConfluenceEngine:
             if hard_blocks:
                 gate = "WATCH" if conf_score >= self.watch_threshold else "HOLD"
 
-        # Reasons: make causality explicit (base → align → struct → bump → blocks)
+        # Reasons: make causality explicit (base â†’ align â†’ struct â†’ bump â†’ blocks)
         reasons: List[str] = []
         reasons.append(f"1m:score={s1.score}|signal={s1.signal}|trend_ok={int(s1.trend_ok)}")
         reasons.append(f"5m:score={s5.score}|signal={s5.signal}|trend_ok={int(s5.trend_ok)}")
@@ -415,3 +415,4 @@ if __name__ == "__main__":
         structure=None,
     )
     print(res)
+

@@ -1,21 +1,20 @@
-# engine.py
+﻿# engine.py
 from decimal import Decimal
 from typing import Optional, Tuple, Any, List, Dict
 import random
-
-from .confluence import TFState
-from .decisions import DecisionSnapshot, EngineEvent
-from .strategy_phase2 import ma200_exit_level, StrategyState
-from .utils import pct_dist, safe_str
+from confluence import TFState
+from decisions import DecisionSnapshot, EngineEvent
+from strategy_phase2 import ma200_exit_level, StrategyState
+from utils import pct_dist, safe_str
 
 # Phase 5A
-from .structure import StructureResult
+from structure import StructureResult
 
 # Phase 5B
-from .liquidity import LiquidityResult  # noqa: F401
+from liquidity import LiquidityResult  # noqa: F401
 
 # Phase 5C
-from .session import classify_session, apply_session_to_score
+from session import classify_session, apply_session_to_score
 
 
 def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
@@ -400,7 +399,7 @@ def _compute_liquidity(
         ask = getattr(tick, "ask", None)
 
         # --------- LINE ABOVE: ask = getattr(tick, "ask", None)
-        # ✅ FIX: atr_norm fallback for candle-close backtests (tick usually lacks atr_norm)
+        # âœ… FIX: atr_norm fallback for candle-close backtests (tick usually lacks atr_norm)
         atr_norm = getattr(tick, "atr_norm", None)
         if atr_norm is None:
             atr_norm = atr_norm_fallback
@@ -784,7 +783,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.structure_reasons = str(structure.reasons or "")
 
     # --------- LINE ABOVE: if structure is not None:
-    # ✅ Phase 5B: provide a deterministic atr_norm fallback for backtests.
+    # âœ… Phase 5B: provide a deterministic atr_norm fallback for backtests.
     # Priority:
     #   1) tick.atr_norm (if live feed provides it)
     #   2) regime.vol (already in snap.vol post-regime-eval)
@@ -817,7 +816,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.liq_vol_1m = getattr(liq, "vol_1m", None)
 
         # --------- LINE ABOVE: snap.liq_vol_1m = getattr(liq, "vol_1m", None)
-        # ✅ FIX: baseline/atr_norm should come from LiquidityResult, but if evaluate() doesn't
+        # âœ… FIX: baseline/atr_norm should come from LiquidityResult, but if evaluate() doesn't
         # populate them, fall back to reading from the engine when possible.
         snap.liq_vol_baseline = getattr(liq, "vol_baseline", None)
         if snap.liq_vol_baseline is None:
@@ -1353,3 +1352,4 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     snap.next_poll_s = float(next_poll)
 
     return snap
+

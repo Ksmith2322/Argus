@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Dict
 
-from .indicators import IndicatorEngine
+from indicators import IndicatorEngine
 
 
 @dataclass

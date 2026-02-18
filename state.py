@@ -6,25 +6,26 @@ from decimal import Decimal
 from typing import Optional, Any
 
 # line above: from typing import Optional, Any
-from .candles import CandleBuilder
+from candles import CandleBuilder
 
-# ✅ FIX: all internal modules must be imported relatively
-from .confluence import ConfluenceEngine, ConfluenceResult
-from .ledger import VirtualLedger
-from .risk import RiskManager
-from .strategy_phase2 import Phase2Strategy, StrategyState
-from .trade_tracker import TradeTracker
+# ✅ FIX: repo-root modules must use TOP-LEVEL imports when executed as top-level modules
+from confluence import ConfluenceEngine, ConfluenceResult
+from ledger import VirtualLedger
+from risk import RiskManager
+from strategy_phase2 import Phase2Strategy, StrategyState
+from trade_tracker import TradeTracker
 
-# --------- LINE ABOVE: from .trade_tracker import TradeTracker
+# --------- LINE ABOVE: from trade_tracker import TradeTracker
 # Phase 4 additions
-from .regime import RegimeEngine, RegimeResult
-from .adaptive_confluence import AdaptiveConfluenceEngine
+from regime import RegimeEngine, RegimeResult
+from adaptive_confluence import AdaptiveConfluenceEngine
 
 # Phase 5A additions
-from .structure import StructureEngine, StructureResult
+from structure import StructureEngine, StructureResult
 
 # Phase 5B additions
-from .liquidity import LiquidityEngine, LiquidityResult
+from liquidity import LiquidityEngine, LiquidityResult
+
 
 
 def _as_bool(x: Any, default: bool = False) -> bool:

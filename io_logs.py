@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # io_logs.py
 # line above: import csv
 import csv
 import os
 from typing import Any, Dict, List, Optional, Union
-
-from .utils import utc_ts
+from utils import utc_ts
 
 
 # =========================
@@ -100,7 +99,7 @@ def _signals_header() -> List[str]:
         "ac_reason",
 
         # =========================
-        # Phase 5A — Market Structure
+        # Phase 5A â€” Market Structure
         # =========================
         "nearest_support",
         "nearest_resistance",
@@ -121,7 +120,7 @@ def _signals_header() -> List[str]:
         "structure_reasons",
 
         # =========================
-        # Phase 5B — Liquidity Filters (proof fields)
+        # Phase 5B â€” Liquidity Filters (proof fields)
         # =========================
         "liq_ok",
         "liq_spread_bps",
@@ -133,7 +132,7 @@ def _signals_header() -> List[str]:
         "liq_reasons",
 
         # =========================
-        # Phase 5C — Session Behavior (full fields)
+        # Phase 5C â€” Session Behavior (full fields)
         # =========================
         "session",
         "session_labels",
@@ -533,3 +532,4 @@ def is_kill_switch_on(cfg: Dict[str, Any]) -> bool:
 def is_paused(cfg: Dict[str, Any]) -> bool:
     fname = cfg.get("PAUSE_FILE", "PAUSE")
     return os.path.exists(os.path.join(os.path.dirname(__file__), str(fname)))
+

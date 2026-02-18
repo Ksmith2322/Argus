@@ -9,22 +9,23 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional, List, Tuple, Any, Dict, Iterable
 
-# ✅ FIX: import engine-layer modules from the parent package (Argus)
-from ..config import load_config
-from ..state import BotState
-from ..engine import step
-from ..io_logs import (
+# ✅ FIX (repo layout): engine-layer modules live at repo root (C:\Argus\repo\*.py)
+# LINE ABOVE: from typing import Optional, List, Tuple, Any, Dict, Iterable
+from config import load_config
+from state import BotState
+from engine import step
+from io_logs import (
     ensure_logs,
     log_signal_snapshot,
     log_bt_event,
     signals_csv_path,
     events_csv_path,
 )
-from ..feed_coinbase import make_http
+from feed_coinbase import make_http
 
-# --------- LINE ABOVE: from ..feed_coinbase import make_http
+# --------- LINE ABOVE: from feed_coinbase import make_http
 # IMPORTANT:
-# - Use RELATIVE imports inside the backtest package so `python -m ...Argus.backtest.runner` works reliably.
+# - Use RELATIVE imports inside the backtest package so `python -m backtest.runner` works.
 from .loader import load_candles_csv
 from .feed import ticks_from_close_series, PriceTick
 from .results import (
@@ -131,7 +132,10 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
         cfg["POLL_FAST_SECONDS"] = float(bt_poll_fast)
 
     # Optional: force "should" events so parsing is consistent in backtests
-    cfg["USE_SHOULD_EVENTS"] = _as_bool_env("BT_USE_SHOULD_EVENTS", bool(cfg.get("USE_SHOULD_EVENTS", False)))
+    cfg["USE_SHOULD_EVENTS"] = _as_bool_env(
+        "BT_USE_SHOULD_EVENTS",
+        bool(cfg.get("USE_SHOULD_EVENTS", False)),
+    )
 
     # --------- LINE ABOVE: cfg["USE_SHOULD_EVENTS"] = _as_bool_env(...)
     # ✅ Backtest measurability: ALWAYS synth bid/ask unless explicitly disabled.
@@ -618,8 +622,7 @@ def run_backtest(
                     attempted_this_tick = True
                     attempt_msg = f"ATTEMPT | px={getattr(snap, 'px', '')} event={name} {msg}".strip()
 
-                    # --------- LINE ABOVE: attempt_msg = f"ATTEMPT | px={getattr(snap, 'px', '')} event={name} {msg}".strip()
-                    # Debug visibility: prove whether engine is producing baseline/atr_norm fields at entry time.
+                    # --------- LINE ABOVE: attempt_msg = f"ATTEMPT | px=..."
                     metrics_msg = (
                         "METRICS | "
                         f"liq_spread_bps={getattr(snap, 'liq_spread_bps', None)} "
@@ -647,7 +650,6 @@ def run_backtest(
                             )
                         )
 
-                    # --------- LINE ABOVE: attempt_msg = f"ATTEMPT | px=..."
                     try:
                         out.add_event("ENTRY_ATTEMPT", attempt_msg, snapshot=snap)
                     except Exception:
@@ -745,7 +747,7 @@ def run_backtest(
 if __name__ == "__main__":
     # --------- LINE ABOVE: if __name__ == "__main__":
     default_csv = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),  # .../Argus
+        os.path.dirname(os.path.dirname(__file__)),  # repo root
         "data",
         "eth_usd_1m.csv",
     )

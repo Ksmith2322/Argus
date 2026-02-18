@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import os
 import traceback
 import logging
@@ -67,7 +67,7 @@ def _load_utils_utc_ts() -> Optional[Any]:
     """
     # line above: try:
     try:
-        from .utils import utc_ts  # package mode
+from utils import utc_ts  # package mode
         LOG.debug("[utc_ts] import=relative OK")
         return utc_ts
     except Exception as e1:
@@ -189,7 +189,7 @@ def _signals_header() -> List[str]:
         "ac_reason",
 
         # =========================
-        # Phase 5A — Market Structure
+        # Phase 5A â€” Market Structure
         # =========================
         "nearest_support",
         "nearest_resistance",
@@ -210,7 +210,7 @@ def _signals_header() -> List[str]:
         "structure_reasons",
 
         # =========================
-        # Phase 5B — Liquidity Filters (APPENDED)
+        # Phase 5B â€” Liquidity Filters (APPENDED)
         # =========================
         "liq_ok",
         "liq_spread_bps",
@@ -591,3 +591,4 @@ def is_kill_switch_on(cfg: Dict[str, Any]) -> bool:
 def is_paused(cfg: Dict[str, Any]) -> bool:
     fname = str(cfg.get("PAUSE_FILE", "PAUSE.txt"))
     return os.path.exists(os.path.join(os.path.dirname(__file__), fname))
+

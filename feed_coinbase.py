@@ -1,4 +1,4 @@
-# feed_coinbase.py
+﻿# feed_coinbase.py
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 # line above: import requests
-from .utils import utc_ts, now_unix
+from utils import utc_ts, now_unix
 
 
 # =============================================================================
@@ -153,7 +153,7 @@ def fetch_coinbase_ticker_sync(
 
 
 # =============================================================================
-# Candles (sync) — for indicators + volume
+# Candles (sync) â€” for indicators + volume
 # =============================================================================
 
 def fetch_coinbase_candles_sync(
@@ -208,7 +208,7 @@ def fetch_coinbase_candles_sync(
 
 
 # =============================================================================
-# Back-compat: spot price (async) — NOW includes bid/ask/vol_1m best-effort
+# Back-compat: spot price (async) â€” NOW includes bid/ask/vol_1m best-effort
 # =============================================================================
 
 async def fetch_spot_price(http: requests.Session, cfg: Dict[str, Any]) -> PriceTick:
@@ -225,7 +225,7 @@ async def fetch_spot_price(http: requests.Session, cfg: Dict[str, Any]) -> Price
 
 
 # =============================================================================
-# Live tick (async) — includes bid/ask + best-effort 1m volume
+# Live tick (async) â€” includes bid/ask + best-effort 1m volume
 # =============================================================================
 
 async def fetch_tick(
@@ -355,3 +355,4 @@ async def preload_indicator_history(
             continue
 
     return seeded
+

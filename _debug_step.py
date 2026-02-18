@@ -4,10 +4,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from decimal import Decimal
 
-from .config import load_config
-from .state import BotState
-from .engine import step
-from .feed_coinbase import make_http
+from config import load_config
+from state import BotState
+from engine import step
+from feed_coinbase import make_http
 
 def main():
     cfg = load_config()

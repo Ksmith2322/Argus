@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Dict, Any
 
-from .utils import pct_dist
+from utils import pct_dist
 
 
 def _d(x: Any, default: str = "0") -> Decimal:

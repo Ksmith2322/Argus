@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Tuple, Union, Any
 
-# ✅ Keep this import if your live runner uses feed_coinbase.PriceTick
-# If you later unify tick types across live/backtest, this still works because we only use getattr().
-from .feed_coinbase import PriceTick
+# ✅ FIX: repo-root modules are imported as top-level when running `python -m backtest.runner`
+# line above: from typing import Optional, Tuple, Union, Any
+from feed_coinbase import PriceTick
 
 
 @dataclass

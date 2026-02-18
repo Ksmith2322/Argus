@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional, Any, Union
 
-from .confluence import ConfluenceResult
-from .regime import RegimeResult
+from confluence import ConfluenceResult
+from regime import RegimeResult
 
 
 def _as_decimal(x: Any, default: str = "0") -> Decimal:

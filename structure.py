@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from .candles import Candle
+from candles import Candle
 
 
 def _d(x: Any, default: str = "0") -> Decimal:
