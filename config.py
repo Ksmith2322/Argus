@@ -52,7 +52,14 @@ def _clamp_float(x: float, lo: float, hi: float) -> float:
 
 
 def load_config() -> dict:
-    load_dotenv()
+    # Optional: allow pinning a specific .env file
+    # (useful when you later split lab/prod)
+    dotenv_path = os.getenv("DOTENV_PATH", "").strip()
+    if dotenv_path:
+        load_dotenv(dotenv_path=dotenv_path)
+    else:
+        load_dotenv()
+
     cfg: dict = {}
 
     # -------------------------
@@ -213,16 +220,11 @@ def load_config() -> dict:
     # Confluence
     # -------------------------
     # --------- LINE ABOVE: # Confluence
-    # Validation-friendly defaults (env can still override):
-    # - allow trading with partial TF coverage
-    # - remove HTF hard confirmation (temporarily)
-    # - lower trade threshold to generate attempts
     cfg["CONFLUENCE_WATCH_SCORE"] = _i("CONFLUENCE_WATCH_SCORE", "50")
     cfg["CONFLUENCE_TRADE_SCORE"] = _i("CONFLUENCE_TRADE_SCORE", "65")
 
     cfg["REQUIRE_CONFLUENCE"] = _b("REQUIRE_CONFLUENCE", "true")
     # --------- LINE ABOVE: cfg["REQUIRE_CONFLUENCE"] = _b("REQUIRE_CONFLUENCE", "true")
-    # Keep MIN_SCORE synced to TRADE_SCORE unless explicitly overridden
     cfg["CONFLUENCE_MIN_SCORE"] = _i("CONFLUENCE_MIN_SCORE", str(cfg["CONFLUENCE_TRADE_SCORE"]))
 
     cfg["USE_SHOULD_EVENTS"] = _b("USE_SHOULD_EVENTS", "false")
@@ -474,4 +476,5 @@ def load_config() -> dict:
 
     cfg["HOLD_BUMP_EVERY_SECONDS"] = _clamp_int(cfg["HOLD_BUMP_EVERY_SECONDS"], 0, 86_400)
 
+    # --------- LINE ABOVE: cfg["HOLD_BUMP_EVERY_SECONDS"] = _clamp_int(cfg["HOLD_BUMP_EVERY_SECONDS"], 0, 86_400)
     return cfg

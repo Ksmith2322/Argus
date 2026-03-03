@@ -23,11 +23,17 @@ from state import BotState
 from engine import step
 from io_logs import (
     ensure_logs,
-    logs_dir,  # ✅ canonical log root (same sink as live logs)
+    logs_dir,
     log_signal_snapshot,
     log_bt_event,
     signals_csv_path,
     events_csv_path,
+    log_bt_signal_snapshot,   # ✅ run-scoped signals
+    log_bt_equity,            # ✅ run-scoped equity
+    bt_events_csv_path,       # ✅ run-scoped events path helper
+    bt_signals_csv_path,      # ✅ run-scoped signals path helper
+    bt_equity_csv_path,       # ✅ run-scoped equity path helper
+    ensure_signals_header_matches_path,  # ✅ header upgrade for run-scoped signals
 )
 from feed_coinbase import make_http
 
@@ -56,7 +62,7 @@ except Exception:
 
 
 # ----------------------------
-# Phase 7.1: Run Identity + Artifact Contract (backtest)
+# Phase 7: Run Identity + Artifact Contract (backtest)
 # ----------------------------
 def _utc_ts_compact() -> str:
     # line above: def _utc_ts_compact() -> str:
@@ -71,13 +77,17 @@ def _new_run_id(prefix: str = "bt") -> str:
 def _artifact_root() -> str:
     # line above: def _artifact_root() -> str:
     # Canonical artifact root for ALL run-scoped outputs.
-    # Defaults to argus-lab so CP + backtest land in one place.
-    return os.environ.get("ARGUS_ARTIFACT_ROOT", r"C:\Argus\argus-lab")
+    # Defaults to repo root when not provided.
+    return os.environ.get("ARGUS_ARTIFACT_ROOT", r"C:\Argus\repo")
 
 
 def _artifact_out_dir() -> str:
     # line above: def _artifact_out_dir() -> str:
-    return os.path.join(_artifact_root(), "ops", "logs")
+    # Canonical out dir for backtest artifacts.
+    return os.environ.get(
+        "ARGUS_BT_ARTIFACT_DIR",
+        os.path.join(_artifact_root(), "ops", "logs"),
+    )
 
 
 def _bt_paths(run_id: str) -> Dict[str, str]:
@@ -94,8 +104,33 @@ def _bt_paths(run_id: str) -> Dict[str, str]:
         "trades": os.path.join(out_dir, f"trades_{run_id}.csv"),
         "event_counts": os.path.join(out_dir, f"event_counts_{run_id}.csv"),
         "entry_attempts": os.path.join(out_dir, f"entry_attempts_{run_id}.csv"),
+        "entry_attempt_detail": os.path.join(out_dir, f"entry_attempt_detail_{run_id}.csv"),
         "run_header": os.path.join(out_dir, f"run_header_{run_id}.json"),
     }
+
+
+def _ensure_bt_sandbox_live_paths() -> None:
+    """
+    CRITICAL:
+    Backtest must NEVER write to the canonical live_* artifacts.
+
+    We enforce this in-Python (not just in PowerShell), because any module that
+    builds defaults before reading env will otherwise mutate live files.
+    """
+    # line above: def _ensure_bt_sandbox_live_paths() -> None:
+    mode = (os.environ.get("ARGUS_MODE") or "").strip().lower()
+    # accept "bt" or "backtest" (you had drift in earlier runs)
+    if mode not in ("bt", "backtest"):
+        return
+
+    out_dir = _artifact_out_dir()
+    os.makedirs(out_dir, exist_ok=True)
+
+    os.environ.setdefault("LIVE_EVENTS_CSV", os.path.join(out_dir, "bt_sandbox_live_events.csv"))
+    os.environ.setdefault("LIVE_SIGNALS_CSV", os.path.join(out_dir, "bt_sandbox_live_signals.csv"))
+
+    # Optional: if any downstream code branches on this
+    os.environ.setdefault("ARGUS_DISABLE_LIVE_ARTIFACTS", "1")
 
 
 def _stable_hash(obj: Any) -> str:
@@ -148,7 +183,6 @@ def _append_log_line(path: str, msg: str) -> None:
 
 def _csv_sanitize(v: Any) -> str:
     # line above: def _csv_sanitize(v: Any) -> str:
-    # Hard rule: no commas/newlines in CSV fields (we're not using a real CSV writer here).
     try:
         s = "" if v is None else str(v)
     except Exception:
@@ -157,7 +191,7 @@ def _csv_sanitize(v: Any) -> str:
 
 
 # ----------------------------
-# Env helpers (existing)
+# Env helpers
 # ----------------------------
 def _as_int_env(name: str, default: Optional[int] = None) -> Optional[int]:
     v = os.environ.get(name)
@@ -212,40 +246,33 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
     """
     Make a backtest-safe config overlay without mutating the original dict.
     """
+    # line above: def _ensure_bt_cfg(cfg: dict) -> dict:
     cfg = {**cfg}
 
-    # Backtest-mode toggles (used by engine/state)
     cfg["BACKTEST_MODE"] = True
 
-    # Backtest safety: stale tick guard should never suppress actions during candle-jumps.
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     cfg["STALE_TICK_SECONDS"] = max(int(cfg.get("STALE_TICK_SECONDS", 120)), tf_1m_s + 5)
 
-    # Optional: make tracker safer for backtests (prevents WinError 5 when file is open)
     cfg.setdefault("TRADE_TRACKER_NON_ATOMIC_WRITES", True)
 
-    # Optional: disable tracker during backtest via env without editing config.py
     cfg["DISABLE_TRADE_TRACKER_IN_BACKTEST"] = _as_bool_env(
         "DISABLE_TRADE_TRACKER_IN_BACKTEST",
         bool(cfg.get("DISABLE_TRADE_TRACKER_IN_BACKTEST", True)),
     )
 
-    # Optional: override confluence minimum for quick experiments:
     bt_conf_min = _as_int_env("BT_CONFLUENCE_MIN", None)
     if bt_conf_min is not None:
         cfg["CONFLUENCE_MIN_SCORE"] = int(bt_conf_min)
 
-    # Optional: override start cash for experiments:
     bt_start_cash = _as_decimal_env("BT_START_CASH", None)
     if bt_start_cash is not None:
         cfg["START_CASH_USD"] = bt_start_cash
 
-    # Optional: override USD_PER_TRADE (if you’re not using vol sizing)
     bt_usd_per_trade = _as_decimal_env("BT_USD_PER_TRADE", None)
     if bt_usd_per_trade is not None:
         cfg["USD_PER_TRADE"] = bt_usd_per_trade
 
-    # Optional: override poll knobs (sometimes useful when debugging logs)
     bt_summary_every = _as_int_env("BT_SUMMARY_EVERY_SECONDS", None)
     if bt_summary_every is not None:
         cfg["SUMMARY_EVERY_SECONDS"] = int(bt_summary_every)
@@ -254,18 +281,15 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
     if bt_poll_fast is not None:
         cfg["POLL_FAST_SECONDS"] = float(bt_poll_fast)
 
-    # Optional: force "should" events so parsing is consistent in backtests
     cfg["USE_SHOULD_EVENTS"] = _as_bool_env(
         "BT_USE_SHOULD_EVENTS",
         bool(cfg.get("USE_SHOULD_EVENTS", False)),
     )
 
-    # --------- LINE ABOVE: cfg["USE_SHOULD_EVENTS"] = _as_bool_env(...)
     # ✅ Backtest measurability: ALWAYS synth bid/ask unless explicitly disabled.
-    # Candle-close backtests don't have L2, so spread stats will be None otherwise.
     synth_env = _as_float_env("BT_SYNTH_SPREAD_BPS", None)
     if synth_env is not None:
-        synth = float(synth_env)  # allow explicit override including 0
+        synth = float(synth_env)
     else:
         synth_cfg = float(cfg.get("BT_SYNTH_SPREAD_BPS", 0.0) or 0.0)
         if synth_cfg > 0.0:
@@ -274,14 +298,11 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
             synth = float(cfg.get("LIQ_SYNTH_SPREAD_FLOOR_BPS", 8) or 8)
 
     cfg["BT_SYNTH_SPREAD_BPS"] = float(synth)
-
     return cfg
 
 
 def _p_decimal(d: Any, default: str = "0") -> Decimal:
-    """
-    Best-effort Decimal coercion.
-    """
+    # line above: def _p_decimal(d: Any, default: str = "0") -> Decimal:
     if d is None:
         return Decimal(default)
     if isinstance(d, Decimal):
@@ -293,9 +314,6 @@ def _p_decimal(d: Any, default: str = "0") -> Decimal:
 
 
 def _extract_first_event(snap, names: set[str]) -> Optional[Any]:
-    """
-    Prefer the first matching event in the order emitted by engine.
-    """
     for ev in (getattr(snap, "events", None) or []):
         if getattr(ev, "name", "") in names:
             return ev
@@ -306,15 +324,7 @@ def _iso_utc(epoch: int) -> str:
     return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
 
 
-def _synth_bid_ask(
-    px: Decimal,
-    *,
-    spread_bps: float,
-) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-    """
-    Deterministically synthesize bid/ask around px using a configured spread_bps.
-    spread_bps=10 => total spread 0.10% => +/- 0.05% around mid.
-    """
+def _synth_bid_ask(px: Decimal, *, spread_bps: float) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     if spread_bps <= 0:
         return None, None
     try:
@@ -328,9 +338,6 @@ def _synth_bid_ask(
 
 
 def _spread_bps_from_bid_ask(bid: Any, ask: Any) -> Optional[Decimal]:
-    """
-    Compute spread in bps from bid/ask: (ask-bid)/mid * 10_000.
-    """
     try:
         b = _p_decimal(bid, "0")
         a = _p_decimal(ask, "0")
@@ -344,19 +351,16 @@ def _spread_bps_from_bid_ask(bid: Any, ask: Any) -> Optional[Decimal]:
         return None
 
 
-# --------- LINE ABOVE: def _spread_bps_from_bid_ask(
 @dataclass(frozen=True)
 class DamageProfile:
     name: str = "baseline"
 
-    # --- Tick / data integrity damage ---
     data_dropout_pct: float = 0.0
     freeze_px_pct: float = 0.0
     vol_zero_pct: float = 0.0
     epoch_jitter_s: int = 0
     max_freeze_run: int = 5
 
-    # --- Feature sabotage ---
     tf_dropout: Optional[List[str]] = None
     signal_flip_pct: float = 0.0
     fake_score_bump: int = 0
@@ -364,7 +368,6 @@ class DamageProfile:
     force_regime: Optional[str] = None
     force_liq_block: bool = False
 
-    # --- Determinism ---
     seed: int = 1337
 
 
@@ -497,14 +500,7 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def _bt_event_row(
-    *,
-    symbol: str,
-    snap: Any,
-    ev: Any,
-    name: str,
-    msg: str,
-) -> Dict[str, Any]:
+def _bt_event_row(*, symbol: str, snap: Any, ev: Any, name: str, msg: str) -> Dict[str, Any]:
     run_id = os.environ.get("ARGUS_RUN_ID", "")
     return dict(
         ts=str(getattr(snap, "ts", "") or ""),
@@ -542,18 +538,9 @@ def _bt_event_row(
 
 
 def _record_entry_attempt_metrics(out: Any, snap: Any, tick: Optional[Any] = None) -> None:
-    """
-    Record entry-time metrics with fallbacks:
-      - Prefer snap.liq_* fields if present
-      - Else compute spread_bps from (tick.bid, tick.ask) or (snap.bid, snap.ask)
-      - Use tick.vol_1m as fallback for liq_vol_1m
-      - Baseline/atr_norm can only come from snap (or be computed upstream);
-        we pass them through if present.
-    """
     if not hasattr(out, "record_entry_attempt"):
         return
 
-    # --------- LINE ABOVE: if not hasattr(out, "record_entry_attempt"):
     liq_spread_bps = getattr(snap, "liq_spread_bps", None)
     liq_vol_1m = getattr(snap, "liq_vol_1m", None)
     liq_vol_baseline = getattr(snap, "liq_vol_baseline", None)
@@ -590,10 +577,10 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir:
     Default: enabled.
     Also removes any legacy "shared" bt_events/bt_signals if present.
     """
+    # line above: def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir: str) -> None:
     if not enabled:
         return
 
-    # --------- LINE ABOVE: if not enabled:
     for p in (signals_csv_path(), events_csv_path()):
         try:
             if os.path.exists(p):
@@ -601,8 +588,15 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir:
         except Exception:
             pass
 
-    # Also remove any same-run outputs if rerunning same run_id intentionally
     for p in (os.path.join(out_dir, f"events_{run_id}.csv"), os.path.join(out_dir, f"signals_{run_id}.csv")):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    # also drop any run-scoped files we generate via io_logs helpers
+    for p in (bt_events_csv_path(run_id), bt_signals_csv_path(run_id), bt_equity_csv_path(run_id)):
         try:
             if os.path.exists(p):
                 os.remove(p)
@@ -611,11 +605,7 @@ def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir:
 
 
 def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_csv: str, out_dir: str) -> Optional[str]:
-    """
-    Emit run header for reproducibility.
-    """
     try:
-        # LINE ABOVE: try:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         hdr = {
             "run_id": run_id,
@@ -638,19 +628,33 @@ def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_cs
         return None
 
 
-def _write_bt_summary(*, run_id: str, summary: Dict[str, Any], out_dir: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Write run-scoped summary artifacts.
-
-    Writes:
-      - bt_summary_<run_id>.json
-      - bt_summary_latest.json (optional convenience)
-    """
+def _write_bt_summary(
+    *,
+    run_id: str,
+    summary: Dict[str, Any],
+    out_dir: str,
+    paths: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     try:
-        # LINE ABOVE: try:
         os.makedirs(out_dir, exist_ok=True)
         path_run = os.path.join(out_dir, f"bt_summary_{run_id}.json")
         path_latest = os.path.join(out_dir, "bt_summary_latest.json")
+
+        if paths:
+            summary = {
+                **summary,
+                "run_id": run_id,
+                "mode": summary.get("mode") or "bt",
+                "artifact_dir": out_dir,
+                "signals_csv": os.path.abspath(paths.get("signals", "")) if paths.get("signals") else None,
+                "events_csv": os.path.abspath(paths.get("events", "")) if paths.get("events") else None,
+                "equity_csv": os.path.abspath(paths.get("equity", "")) if paths.get("equity") else None,
+                "trades_csv": os.path.abspath(paths.get("trades", "")) if paths.get("trades") else None,
+                "event_counts_csv": os.path.abspath(paths.get("event_counts", "")) if paths.get("event_counts") else None,
+                "entry_attempts_csv": os.path.abspath(paths.get("entry_attempts", "")) if paths.get("entry_attempts") else None,
+                "entry_attempt_detail_csv": os.path.abspath(paths.get("entry_attempt_detail", "")) if paths.get("entry_attempt_detail") else None,
+                "run_header_json": os.path.abspath(paths.get("run_header", "")) if paths.get("run_header") else None,
+            }
 
         ok1 = _write_json_atomic(path_run, summary)
         ok2 = _write_json_atomic(path_latest, summary)
@@ -670,17 +674,22 @@ def run_backtest(
 ) -> BacktestResults:
     cfg = cfg_override if cfg_override is not None else load_config()
 
-    # --------- LINE ABOVE: cfg = cfg_override if cfg_override is not None else load_config()
     cfg = _ensure_bt_cfg(cfg)
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     synth_spread_bps = float(cfg.get("BT_SYNTH_SPREAD_BPS", 0.0) or 0.0)
 
-    # Phase 7.1: establish run_id + artifact dir EARLY
+    # Phase 7: establish mode + run_id EARLY
     run_id = os.environ.get("ARGUS_RUN_ID") or _new_run_id("bt")
     os.environ["ARGUS_RUN_ID"] = run_id
-    os.environ["ARGUS_MODE"] = "backtest"
 
-    out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or _artifact_out_dir()
+    # IMPORTANT: match your PowerShell contract (ARGUS_MODE=bt)
+    os.environ["ARGUS_MODE"] = "bt"
+
+    # Enforce sandboxing of LIVE_* CSVs (prevents mutation of live_events/signals)
+    _ensure_bt_sandbox_live_paths()
+
+    # Canonical artifact sink for the run
+    out_dir = _artifact_out_dir()
     paths = _bt_paths(run_id)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -705,29 +714,22 @@ def run_backtest(
     state = BotState.from_config(cfg)
     symbol = state.symbol
 
+    # ---- run-scoped artifact paths (single source of truth) ----
+    events_path = bt_events_csv_path(run_id)
+    signals_path = bt_signals_csv_path(run_id)
+    equity_path = bt_equity_csv_path(run_id)
+
     if write_logs:
         _truncate_backtest_logs_if_requested(enabled=bt_truncate_logs, run_id=run_id, out_dir=out_dir)
-        ensure_logs()
+        ensure_logs()  # creates sandbox LIVE_* + upgrades sandbox header if needed
 
-    # Emit run header (Phase 7.1)
-    _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
-
-    # Create per-run event/signal CSV headers (Phase 7.1)
-    if write_logs:
-        try:
-            if not os.path.exists(paths["events"]):
-                with open(paths["events"], "w", encoding="utf-8") as f:
-                    f.write(
-                        "ts,run_id,symbol,epoch,price,event,detail,paused,stale,action,action_reason,"
-                        "risk_blocked_reason,confluence_score,confluence_gate,confluence_reasons,regime,"
-                        "ac_adjusted_gate,vol_used,sizing_note,liq_ok,liq_spread_bps,liq_vol_1m,liq_vol_baseline,"
-                        "liq_atr_norm,session,notify_title,notify_body\n"
-                    )
-            if not os.path.exists(paths["signals"]):
-                with open(paths["signals"], "w", encoding="utf-8") as f:
-                    f.write("ts,run_id,symbol,epoch,price,signal,detail\n")
-        except Exception:
-            pass
+        # Ensure run-scoped headers exist and are compatible
+        os.makedirs(out_dir, exist_ok=True)
+        ensure_signals_header_matches_path(signals_path)  # no-op if missing
+        # Header creation happens lazily via io_logs append helpers, but we ensure directory now.
+        _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
+    else:
+        _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
 
     candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
     if not candles:
@@ -745,7 +747,7 @@ def run_backtest(
     trades: List[Trade] = []
     open_trade: Optional[Trade] = None
 
-    BUY_EVENTS = {"WOULD_BUY", "SHOULD_BUY"}
+    BUY_EVENTS = {"WOULD_BUY", "SHOULD_BUY", "ENTRY_FILLED"}
     SELL_EVENTS = {"WOULD_SELL", "SHOULD_SELL"}
 
     out = BacktestResults(
@@ -757,39 +759,15 @@ def run_backtest(
         trades=trades,
         equity_curve=equity_curve,
     )
-
-    bt_event_buf: List[Dict[str, Any]] = []
-
-    def _flush_bt_events() -> None:
-        if not write_logs:
-            return
-        if not bt_event_buf:
-            return
-
-        for r in bt_event_buf:
-            try:
-                log_bt_event(**r)
-            except Exception:
-                pass
-            try:
-                line = (
-                    f"{_csv_sanitize(r.get('ts',''))},{_csv_sanitize(r.get('run_id',''))},{_csv_sanitize(r.get('symbol',''))},"
-                    f"{_csv_sanitize(r.get('epoch',''))},{_csv_sanitize(r.get('price',''))},{_csv_sanitize(r.get('event',''))},"
-                    f"{_csv_sanitize(r.get('detail',''))},{_csv_sanitize(r.get('paused',''))},{_csv_sanitize(r.get('stale',''))},"
-                    f"{_csv_sanitize(r.get('action',''))},{_csv_sanitize(r.get('action_reason',''))},{_csv_sanitize(r.get('risk_blocked_reason',''))},"
-                    f"{_csv_sanitize(r.get('confluence_score',''))},{_csv_sanitize(r.get('confluence_gate',''))},{_csv_sanitize(r.get('confluence_reasons',''))},"
-                    f"{_csv_sanitize(r.get('regime',''))},{_csv_sanitize(r.get('ac_adjusted_gate',''))},{_csv_sanitize(r.get('vol_used',''))},"
-                    f"{_csv_sanitize(r.get('sizing_note',''))},{_csv_sanitize(r.get('liq_ok',''))},{_csv_sanitize(r.get('liq_spread_bps',''))},"
-                    f"{_csv_sanitize(r.get('liq_vol_1m',''))},{_csv_sanitize(r.get('liq_vol_baseline',''))},{_csv_sanitize(r.get('liq_atr_norm',''))},"
-                    f"{_csv_sanitize(r.get('session',''))},{_csv_sanitize(r.get('notify_title',''))},{_csv_sanitize(r.get('notify_body',''))}\n"
-                )
-                _append_log_line(paths["events"], line.rstrip("\n"))
-            except Exception:
-                pass
-
-        bt_event_buf.clear()
+    # set run identity if the results object supports it
+    try:
+        out.run_id = run_id
+        out.mode = "bt"
+    except Exception:
+        pass
 
     http = make_http()
+
     try:
         i = 0
         for tick in ticks:
@@ -813,8 +791,21 @@ def run_backtest(
 
             snap = step(state, tick, cfg, paused=False, http=http)
 
+            # run-scoped equity curve + optional equity CSV
             if bt_equity_every_n <= 1 or (i % bt_equity_every_n == 0):
-                equity_curve.append((int(snap.epoch), _p_decimal(getattr(snap, "equity_usd", "0"), "0")))
+                eq_val = _p_decimal(getattr(snap, "equity_usd", getattr(snap, "equity", "0")), "0")
+                equity_curve.append((int(getattr(snap, "epoch", 0)), eq_val))
+                if write_logs:
+                    try:
+                        log_bt_equity(
+                            run_id=run_id,
+                            epoch=int(getattr(snap, "epoch", 0)),
+                            equity_usd=eq_val,
+                            cash_usd=getattr(snap, "cash_usd", getattr(snap, "cash", "")),
+                            position_qty=getattr(snap, "position_qty", getattr(snap, "qty", "")),
+                        )
+                    except Exception:
+                        pass
 
             attempted_this_tick = False
 
@@ -822,24 +813,15 @@ def run_backtest(
                 name = str(getattr(ev, "name", "") or "")
                 msg = str(getattr(ev, "message", "") or "")
 
-                # --------- LINE ABOVE: msg = str(getattr(ev, "message", "") or "")
-                # ✅ PATCH: engine may emit ENTRY_ATTEMPT/ENTRY_METRICS; runner owns attempt boundary in backtest
+                # Runner owns attempt boundaries; engine debug events can exist but we don't re-count them here.
                 if name in ("ENTRY_ATTEMPT", "ENTRY_METRICS"):
                     continue
 
-                # ✅ PATCH-1: always pass snapshot so BacktestResults can sample fields when available
-                try:
-                    out.add_event(name, msg, snapshot=snap)
-                except Exception:
-                    pass
-
-                # Record attempt + explicit metrics once per tick on first *measurable* boundary (BUY or MISSED_BUY_*)
+                # Record attempt once per tick on first boundary (BUY or MISSED_BUY_*)
                 if (name in BUY_EVENTS or name.startswith("MISSED_BUY_")) and not attempted_this_tick:
                     attempted_this_tick = True
 
                     attempt_msg = f"ATTEMPT | px={getattr(snap, 'px', '')} event={name} {msg}".strip()
-
-                    # --------- LINE ABOVE: attempt_msg = f"ATTEMPT | px=..."
                     metrics_msg = (
                         "METRICS | "
                         f"liq_spread_bps={getattr(snap, 'liq_spread_bps', None)} "
@@ -851,67 +833,114 @@ def run_backtest(
                         f"tick_ask={getattr(tick, 'ask', None)}"
                     )
 
+                    # Counts + sampling are owned by BacktestResults
                     try:
                         out.add_event("ENTRY_METRICS", metrics_msg, snapshot=snap)
                     except Exception:
                         pass
-
-                    if write_logs:
-                        bt_event_buf.append(
-                            _bt_event_row(
-                                symbol=symbol,
-                                snap=snap,
-                                ev=ev,
-                                name="ENTRY_METRICS",
-                                msg=metrics_msg,
-                            )
-                        )
-
                     try:
                         out.add_event("ENTRY_ATTEMPT", attempt_msg, snapshot=snap)
                     except Exception:
                         pass
 
                     if write_logs:
-                        bt_event_buf.append(
-                            _bt_event_row(
+                        try:
+                            log_bt_event(
                                 symbol=symbol,
-                                snap=snap,
-                                ev=ev,
-                                name="ENTRY_ATTEMPT",
-                                msg=attempt_msg,
+                                epoch=int(getattr(snap, "epoch", 0)),
+                                price=getattr(snap, "px", ""),
+                                event="ENTRY_METRICS",
+                                detail=metrics_msg,
+                                paused=bool(getattr(snap, "paused", False)),
+                                stale=bool(getattr(snap, "stale", False)),
+                                action=str(getattr(snap, "action", "")),
+                                action_reason=str(getattr(snap, "action_reason", "")),
+                                risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                                confluence_score=getattr(snap, "confluence_score", None),
+                                confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                                confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                                regime=str(getattr(snap, "regime", "") or ""),
+                                ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                                vol_used=getattr(snap, "vol_used", None),
+                                sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                                notify_title=str(getattr(ev, "notify_title", "") or ""),
+                                notify_body=str(getattr(ev, "notify_body", "") or ""),
+                                path=events_path,
                             )
-                        )
+                            log_bt_event(
+                                symbol=symbol,
+                                epoch=int(getattr(snap, "epoch", 0)),
+                                price=getattr(snap, "px", ""),
+                                event="ENTRY_ATTEMPT",
+                                detail=attempt_msg,
+                                paused=bool(getattr(snap, "paused", False)),
+                                stale=bool(getattr(snap, "stale", False)),
+                                action=str(getattr(snap, "action", "")),
+                                action_reason=str(getattr(snap, "action_reason", "")),
+                                risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                                confluence_score=getattr(snap, "confluence_score", None),
+                                confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                                confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                                regime=str(getattr(snap, "regime", "") or ""),
+                                ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                                vol_used=getattr(snap, "vol_used", None),
+                                sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                                notify_title=str(getattr(ev, "notify_title", "") or ""),
+                                notify_body=str(getattr(ev, "notify_body", "")),
+                                path=events_path,
+                            )
+                        except Exception:
+                            pass
 
-                # --------- LINE ABOVE: if (name in BUY_EVENTS or name.startswith("MISSED_BUY_")) and not attempted_this_tick:
-                # ✅ PATCH-2: entry metrics sampling (also for missed-buy reasons)
+                # Entry attempt sampling (for BUY and MISSED_BUY_*)
                 if name in BUY_EVENTS or name.startswith("MISSED_BUY_"):
                     _record_entry_attempt_metrics(out, snap, tick)
 
+                # Always count/log event itself
+                try:
+                    out.add_event(name, msg, snapshot=snap)
+                except Exception:
+                    pass
+
                 if write_logs:
-                    bt_event_buf.append(
-                        _bt_event_row(
+                    try:
+                        log_bt_event(
                             symbol=symbol,
-                            snap=snap,
-                            ev=ev,
-                            name=name,
-                            msg=msg,
+                            epoch=int(getattr(snap, "epoch", 0)),
+                            price=getattr(snap, "px", ""),
+                            event=name,
+                            detail=msg,
+                            paused=bool(getattr(snap, "paused", False)),
+                            stale=bool(getattr(snap, "stale", False)),
+                            action=str(getattr(snap, "action", "")),
+                            action_reason=str(getattr(snap, "action_reason", "")),
+                            risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                            confluence_score=getattr(snap, "confluence_score", None),
+                            confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                            confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                            regime=str(getattr(snap, "regime", "") or ""),
+                            ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                            vol_used=getattr(snap, "vol_used", None),
+                            sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                            notify_title=str(getattr(ev, "notify_title", "") or ""),
+                            notify_body=str(getattr(ev, "notify_body", "") or ""),
+                            path=events_path,
                         )
-                    )
-                    if len(bt_event_buf) >= int(bt_log_flush_n):
-                        _flush_bt_events()
+                    except Exception:
+                        pass
 
                 if bt_print_events:
                     print("[BT_EVENT]", name, msg)
 
-            buy_ev = _extract_first_event(snap, BUY_EVENTS)
+            # Trade extraction (depends on events; your engine may emit WOULD/SHOULD)
+            buy_ev = _extract_first_event(snap, {"WOULD_BUY", "SHOULD_BUY"})
             if buy_ev is not None:
                 p = parse_buy_event_message(buy_ev.message)
                 fill_px = p.get("fill_px") or p.get("px") or Decimal("0")
                 qty = p.get("qty") or Decimal("0")
 
                 open_trade = Trade(
-                    entry_epoch=int(snap.epoch),
+                    entry_epoch=int(getattr(snap, "epoch", 0)),
                     entry_px=_p_decimal(fill_px, "0"),
                     qty=_p_decimal(qty, "0"),
                 )
@@ -923,7 +952,7 @@ def run_backtest(
                 exit_px = p.get("eff_sell") or p.get("px") or Decimal("0")
 
                 if open_trade is not None and open_trade.exit_epoch is None:
-                    open_trade.exit_epoch = int(snap.epoch)
+                    open_trade.exit_epoch = int(getattr(snap, "epoch", 0))
                     open_trade.exit_px = _p_decimal(exit_px, "0")
                     open_trade.realized_usd = _p_decimal(p.get("realized_trade", "0"), "0")
 
@@ -940,22 +969,19 @@ def run_backtest(
 
                     open_trade = None
 
+            # ---- run-scoped signals ----
             if write_logs and (bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
                 try:
+                    # keep legacy call (writes to sandbox LIVE_SIGNALS_CSV) for compatibility
                     log_signal_snapshot(snap, symbol=symbol, price=getattr(snap, "px", None))
                 except Exception:
                     pass
                 try:
-                    sig_line = (
-                        f"{_csv_sanitize(getattr(snap, 'ts', '') or '')},{run_id},{symbol},{int(getattr(snap, 'epoch', 0))},"
-                        f"{_csv_sanitize(getattr(snap, 'px', ''))},{_csv_sanitize(getattr(snap, 'action', '') or '')},"
-                        f"{_csv_sanitize(getattr(snap, 'action_reason', '') or '')}\n"
-                    )
-                    _append_log_line(paths["signals"], sig_line.rstrip("\n"))
+                    # canonical: run-scoped, full schema
+                    log_bt_signal_snapshot(snap, run_id=run_id, symbol=symbol, price=getattr(snap, "px", None))
+                    ensure_signals_header_matches_path(signals_path)
                 except Exception:
                     pass
-
-        _flush_bt_events()
 
     finally:
         try:
@@ -963,18 +989,52 @@ def run_backtest(
         except Exception:
             pass
 
+    # compute final equity from ledger
     last_close = _p_decimal(candles[-1].close, "0")
     end_equity = _p_decimal(state.ledger.equity_usd(last_close), "0")
     out.end_equity = end_equity
+
+    # Write canonical per-run artifacts (via BacktestResults helpers)
+    if write_logs:
+        try:
+            out.write_trades_csv(paths["trades"])
+        except Exception as e:
+            _append_log_line(paths["bt_log"], f"[WARN] trades write failed: {e}")
+
+        try:
+            out.write_event_counts_csv(paths["event_counts"])
+        except Exception as e:
+            _append_log_line(paths["bt_log"], f"[WARN] event_counts write failed: {e}")
+
+        try:
+            out.write_entry_attempt_stats_csv(paths["entry_attempts"])
+        except Exception as e:
+            _append_log_line(paths["bt_log"], f"[WARN] entry_attempts write failed: {e}")
+
+        # Phase 7.1 detail CSV (if you included it in results.py)
+        try:
+            if hasattr(out, "write_entry_attempt_detail_csv"):
+                out.write_entry_attempt_detail_csv(paths["entry_attempt_detail"])
+        except Exception as e:
+            _append_log_line(paths["bt_log"], f"[WARN] entry_attempt_detail write failed: {e}")
+
+        # Summary artifacts (run-scoped + latest)
+        try:
+            _write_bt_summary(run_id=run_id, summary=out.summary(), out_dir=out_dir, paths=paths)
+        except Exception:
+            pass
 
     return out
 
 
 if __name__ == "__main__":
     # --------- LINE ABOVE: if __name__ == "__main__":
-    os.environ.setdefault("ARGUS_ARTIFACT_ROOT", r"C:\Argus\argus-lab")
+    os.environ.setdefault("ARGUS_ARTIFACT_ROOT", r"C:\Argus\repo")
     os.environ.setdefault("ARGUS_RUN_ID", _new_run_id("bt"))
-    os.environ.setdefault("ARGUS_MODE", "backtest")
+    os.environ.setdefault("ARGUS_MODE", "bt")
+
+    # enforce sandbox paths even when run as a script
+    _ensure_bt_sandbox_live_paths()
 
     default_csv = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),  # repo root
@@ -996,17 +1056,4 @@ if __name__ == "__main__":
         write_logs=write_logs,
     )
 
-    # --------- LINE ABOVE: res = run_backtest(...)
-    summary = res.summary()
-    run_id = os.environ.get("ARGUS_RUN_ID") or _new_run_id("bt")
-    out_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR") or _artifact_out_dir()
-    os.makedirs(out_dir, exist_ok=True)
-
-    try:
-        summary = {**summary, "run_id": run_id, "mode": "bt", "artifact_dir": out_dir}
-    except Exception:
-        pass
-
-    _write_bt_summary(run_id=run_id, summary=summary, out_dir=out_dir)
-
-    print(summary)
+    print(res.summary())

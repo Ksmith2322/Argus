@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 _BUY_RE = re.compile(r"qty=([0-9.]+)")
@@ -23,6 +23,14 @@ _REASON_RE = re.compile(r"\breason=([^|]+)")
 _RISK_BLOCK_RE = re.compile(r"\brisk_blocked_reason=([^|]+)")
 _LIQ_RE = re.compile(r"\bliq_([a-zA-Z0-9_]+)=([-0-9.]+|[A-Za-z_]+)")
 _GATE_HINT_RE = re.compile(r"\bgate=([A-Z0-9_]+)")
+
+# Phase 7.1: optional extraction of required volume from reasons/detail
+_VOL_NEED_RE = re.compile(r"\bvol_need>=([0-9.]+)")
+
+# Parse current "liq:" block format:
+#   liq:spread_bps=8.00;vol_1m=...;vol_base=...;vol_need>=...;atr_norm=...;...
+_LIQ_BLOCK_RE = re.compile(r"\bliq:([^|]+)")
+_LIQ_KV_RE = re.compile(r"([a-zA-Z0-9_]+)(?:=|>=)([-0-9.]+)")
 
 
 def _safe_decimal(x: Any, default: str = "0") -> Decimal:
@@ -138,6 +146,25 @@ class Trade:
 
 
 @dataclass
+class AttemptSample:
+    event: str
+    epoch: int
+    px: Optional[Decimal] = None
+
+    liq_ok: Optional[bool] = None
+    liq_spread_bps: Optional[Decimal] = None
+    liq_vol_1m: Optional[Decimal] = None
+    liq_vol_baseline: Optional[Decimal] = None
+    liq_vol_need: Optional[Decimal] = None
+    liq_atr_norm: Optional[Decimal] = None
+
+    confluence_gate: str = ""
+    action: str = ""
+    risk_blocked_reason: str = ""
+    liq_reasons: str = ""
+
+
+@dataclass
 class BacktestResults:
     symbol: str
     start_epoch: int
@@ -169,6 +196,9 @@ class BacktestResults:
     entry_atr_norm: List[Decimal] = field(default_factory=list)
     entry_vol_baseline: List[Decimal] = field(default_factory=list)
 
+    # Phase 7.1: per-attempt detail samples (one row per attempt boundary)
+    attempt_samples: List[AttemptSample] = field(default_factory=list)
+
     # Computed summary stats (populated by finalize())
     finalized: bool = False
     median_entry_spread_bps: Optional[Decimal] = None
@@ -181,7 +211,13 @@ class BacktestResults:
     p10_entry_vol_baseline: Optional[Decimal] = None
     p90_entry_atr_norm: Optional[Decimal] = None
 
-    _saw_entry_attempt_event: bool = False
+    # -------------------------
+    # Phase 7.0: accounting invariants
+    # -------------------------
+    entry_blocked_total: int = 0
+    entry_attempt_gap: int = 0
+    attempt_invariants_ok: bool = True
+    attempt_invariants_msg: str = ""
 
     # -------------------------
     # Phase 7.1: run identity (optional; runner injects into summary too)
@@ -196,85 +232,80 @@ class BacktestResults:
         """
         Canonical ingest for engine events.
 
-        Key behavior:
-          - event_counts increments for EVERY event (normalized to UPPER for stability)
-          - ENTRY_ATTEMPT increments entry_attempts (canonical if present at all)
-          - MISSED_BUY_* increments missed_buy_counts + bucket counters
-          - WOULD/SHOULD_BUY increments entry_filled (and attempts only if ENTRY_ATTEMPT is not in use)
-          - optional: sample liquidity distributions from snapshot if provided, else parse from detail
+        HARD RULE (Phase 7 Step 1):
+          - Attempts are counted ONLY from classification events:
+              MISSED_BUY_* and WOULD_BUY/SHOULD_BUY (and optionally ENTRY_FILLED)
+          - ENTRY_ATTEMPT is treated as debug-only (NEVER counted as an attempt)
+
+        This makes attempt boundary provable even if engine/runner accidentally emits ENTRY_ATTEMPT.
         """
         k = str(name or "").strip()
         if not k:
             return
 
-        # --------- LINE ABOVE: if not k:
         upper = k.upper()
         self.event_counts[upper] = int(self.event_counts.get(upper, 0)) + 1
 
-        # 0) Canonical attempt boundary (runner-injected)
+        # 0) ENTRY_ATTEMPT is NOT an attempt boundary anymore.
+        # It is debug-only. Do NOT sample or parse it, because it often contains
+        # an embedded MISSED_BUY payload and would double-sample distributions.
         if upper == "ENTRY_ATTEMPT":
-            self._saw_entry_attempt_event = True
-            self.entry_attempts += 1
-
-            # Sampling at attempt boundary (preferred: snapshot)
-            if snapshot is not None:
-                self.record_entry_attempt(snapshot)
-            else:
-                self._parse_liq_from_detail(detail)
             return
 
-        # 1) Missed buys: exact reason key counts + bucket counts
+        # 1) Missed buys are classification events => attempts.
         if upper.startswith("MISSED_BUY_"):
             self.missed_buy_counts[upper] = int(self.missed_buy_counts.get(upper, 0)) + 1
 
-            # Buckets (canonical)
-            if upper.startswith("MISSED_BUY_LIQ"):
+            # Buckets (more robust mapping to your current event names)
+            if "LIQ" in upper:
                 self.entry_block_liquidity += 1
-            elif upper.startswith("MISSED_BUY_CONFL"):
+            elif "CONFL" in upper:
                 self.entry_block_confluence += 1
-            elif upper.startswith("MISSED_BUY_RISK"):
+            elif "RISK" in upper:
                 self.entry_block_risk += 1
-            elif upper.startswith("MISSED_BUY_NO_SIZE") or upper.startswith("MISSED_BUY_MIN_ORDER") or upper.startswith("MISSED_BUY_EXPOSURE"):
+            elif ("MIN_ORDER" in upper) or ("EXPOSURE" in upper) or ("NO_CASH" in upper) or ("SIZE" in upper):
                 self.entry_block_size += 1
             else:
                 self.entry_block_other += 1
 
-            # Attempts:
-            # - If ENTRY_ATTEMPT exists anywhere in this run, do NOT count attempts here.
-            # - Otherwise (legacy runner), MISSED_BUY_* implies an attempt happened.
-            if not self._saw_entry_attempt_event:
-                self.entry_attempts += 1
+            self.entry_attempts += 1
 
-            # Sampling at attempt boundary
+            # Phase 7.1: per-attempt row capture
+            self._record_attempt_sample(upper, detail, snapshot)
+
+            # Distribution sampling: prefer snapshot; otherwise parse from detail
             if snapshot is not None:
                 self.record_entry_attempt(snapshot)
             else:
                 self._parse_liq_from_detail(detail)
             return
 
-        # --------- LINE ABOVE: if upper.startswith("MISSED_BUY_"):
-        # 2) Filled attempts: WOULD/SHOULD_BUY = "entry signal produced"
-        if upper in ("WOULD_BUY", "SHOULD_BUY"):
+        # 2) Filled entry is also a classification event => attempts.
+        if upper in ("WOULD_BUY", "SHOULD_BUY", "ENTRY_FILLED"):
             self.entry_filled += 1
+            self.entry_attempts += 1
 
-            # Attempts only if we are in legacy mode (no ENTRY_ATTEMPT events)
-            if not self._saw_entry_attempt_event:
-                self.entry_attempts += 1
+            # Phase 7.1: per-attempt row capture
+            self._record_attempt_sample(upper, detail, snapshot)
 
-            # Sampling at attempt boundary
+            # Distribution sampling: prefer snapshot; otherwise parse from detail
             if snapshot is not None:
                 self.record_entry_attempt(snapshot)
             else:
                 self._parse_liq_from_detail(detail)
             return
 
-        # 3) Best-effort: if detail contains liq_* tokens, collect them (not an attempt)
+        # 3) Best-effort: if detail contains liq tokens, collect them (not an attempt)
         if detail:
             self._parse_liq_from_detail(detail)
 
     def _parse_liq_from_detail(self, detail: str) -> None:
         """
-        Parse liq_* tokens from event message detail if present.
+        Parse liquidity tokens from event message detail if present.
+
+        Supports:
+          - liq_spread_bps=..., liq_vol_1m=... (legacy liq_* tokens)
+          - liq:spread_bps=...;vol_1m=...;vol_base=...;atr_norm=... (current format)
 
         IMPORTANT: do NOT coerce non-numeric placeholders (e.g., "None") into 0s.
         If we can't parse a real number, we treat it as missing.
@@ -282,22 +313,43 @@ class BacktestResults:
         if not detail:
             return
 
-        # --------- LINE ABOVE: if not detail:
+        # 1) legacy liq_* tokens (if present)
         for m in _LIQ_RE.finditer(detail):
             key = (m.group(1) or "").lower()
             val_raw = (m.group(2) or "").strip()
 
             v = _maybe_decimal(val_raw)
             if v is None:
-                continue  # <-- critical: do not inject fake zeros
+                continue
 
             if key == "spread_bps":
                 self.entry_spread_bps.append(v)
             elif key in ("vol_1m", "vol1m"):
                 self.entry_vol_1m.append(v)
-            elif key in ("vol_baseline", "volbaseline"):
+            elif key in ("vol_baseline", "volbaseline", "vol_base", "volbase"):
                 self.entry_vol_baseline.append(v)
             elif key in ("atr_norm", "atrnorm"):
+                self.entry_atr_norm.append(v)
+
+        # 2) current "liq:" block format
+        mb = _LIQ_BLOCK_RE.search(detail)
+        if not mb:
+            return
+
+        block = (mb.group(1) or "").strip()
+        for km in _LIQ_KV_RE.finditer(block):
+            k = (km.group(1) or "").lower()
+            v = _maybe_decimal(km.group(2))
+            if v is None:
+                continue
+
+            if k == "spread_bps":
+                self.entry_spread_bps.append(v)
+            elif k in ("vol_1m", "vol1m"):
+                self.entry_vol_1m.append(v)
+            elif k in ("vol_base", "volbaseline", "vol_baseline"):
+                self.entry_vol_baseline.append(v)
+            elif k in ("atr_norm", "atrnorm"):
                 self.entry_atr_norm.append(v)
 
     def record_entry_attempt(
@@ -310,16 +362,15 @@ class BacktestResults:
         liq_atr_norm: Any = None,
     ) -> None:
         """
-        Runner-side sampling hook.
+        Sampling hook.
 
         Supported call shapes:
           A) record_entry_attempt(snapshot_obj)
           B) record_entry_attempt(liq_spread_bps=..., liq_vol_1m=..., ...)
 
-        IMPORTANT: we only append values that are actually present.
+        IMPORTANT: only append values that are actually present.
         We do NOT turn None/"None"/non-numeric into 0.
         """
-        # --------- LINE ABOVE: def record_entry_attempt(
         if (
             snap_or_none is not None
             and liq_spread_bps is None
@@ -327,10 +378,17 @@ class BacktestResults:
             and liq_vol_baseline is None
             and liq_atr_norm is None
         ):
-            liq_spread_bps = getattr(snap_or_none, "liq_spread_bps", None)
-            liq_vol_1m = getattr(snap_or_none, "liq_vol_1m", None)
-            liq_vol_baseline = getattr(snap_or_none, "liq_vol_baseline", None)
-            liq_atr_norm = getattr(snap_or_none, "liq_atr_norm", None)
+            # tolerate dict snapshots too
+            if isinstance(snap_or_none, dict):
+                liq_spread_bps = snap_or_none.get("liq_spread_bps")
+                liq_vol_1m = snap_or_none.get("liq_vol_1m")
+                liq_vol_baseline = snap_or_none.get("liq_vol_baseline")
+                liq_atr_norm = snap_or_none.get("liq_atr_norm")
+            else:
+                liq_spread_bps = getattr(snap_or_none, "liq_spread_bps", None)
+                liq_vol_1m = getattr(snap_or_none, "liq_vol_1m", None)
+                liq_vol_baseline = getattr(snap_or_none, "liq_vol_baseline", None)
+                liq_atr_norm = getattr(snap_or_none, "liq_atr_norm", None)
 
         v = _maybe_decimal(liq_spread_bps)
         if v is not None:
@@ -348,6 +406,144 @@ class BacktestResults:
         if v is not None:
             self.entry_atr_norm.append(v)
 
+    def _record_attempt_sample(self, event_name: str, detail: str, snapshot: Any) -> None:
+        """
+        Phase 7.1: capture one row per attempt boundary (MISSED_BUY_* or WOULD/SHOULD/ENTRY_FILLED).
+        We capture from snapshot when available; otherwise we best-effort parse from detail.
+        """
+        epoch = 0
+        px: Optional[Decimal] = None
+
+        liq_ok: Optional[bool] = None
+        liq_spread_bps: Optional[Decimal] = None
+        liq_vol_1m: Optional[Decimal] = None
+        liq_vol_baseline: Optional[Decimal] = None
+        liq_atr_norm: Optional[Decimal] = None
+        liq_reasons = ""
+
+        risk_blocked_reason = ""
+        confluence_gate = ""
+        action = ""
+
+        # Snapshot-first
+        if snapshot is not None:
+            try:
+                epoch = int(getattr(snapshot, "epoch", 0) or 0)
+            except Exception:
+                epoch = 0
+
+            px = _maybe_decimal(getattr(snapshot, "px", None))
+
+            liq_ok_v = getattr(snapshot, "liq_ok", None)
+            if liq_ok_v is not None:
+                try:
+                    liq_ok = bool(liq_ok_v)
+                except Exception:
+                    liq_ok = None
+
+            liq_spread_bps = _maybe_decimal(getattr(snapshot, "liq_spread_bps", None))
+            liq_vol_1m = _maybe_decimal(getattr(snapshot, "liq_vol_1m", None))
+            liq_vol_baseline = _maybe_decimal(getattr(snapshot, "liq_vol_baseline", None))
+            liq_atr_norm = _maybe_decimal(getattr(snapshot, "liq_atr_norm", None))
+
+            liq_reasons = str(getattr(snapshot, "liq_reasons", "") or "")
+            risk_blocked_reason = str(getattr(snapshot, "risk_blocked_reason", "") or "")
+            confluence_gate = str(getattr(snapshot, "confluence_gate", "") or "")
+            action = str(getattr(snapshot, "action", "") or "")
+
+        # If snapshot missing, parse minimal fields from detail
+        if snapshot is None and detail:
+            # epoch isn't reliably in the string; keep 0 unless you pass it separately
+            px = _maybe_decimal(_d(_PX_RE.search(detail)))
+            # gate/action/risk reason are best-effort
+            m = _GATE_HINT_RE.search(detail)
+            if m:
+                confluence_gate = (m.group(1) or "").strip()
+
+            m = _ACTION_RE.search(detail)
+            if m:
+                action = (m.group(1) or "").strip()
+
+            m = _RISK_BLOCK_RE.search(detail)
+            if m:
+                risk_blocked_reason = (m.group(1) or "").strip()
+
+            # Pull liq fields from current "liq:" block
+            mb = _LIQ_BLOCK_RE.search(detail)
+            if mb:
+                block = (mb.group(1) or "").strip()
+                for km in _LIQ_KV_RE.finditer(block):
+                    k = (km.group(1) or "").lower()
+                    v = _maybe_decimal(km.group(2))
+                    if v is None:
+                        continue
+                    if k == "spread_bps":
+                        liq_spread_bps = v
+                    elif k in ("vol_1m", "vol1m"):
+                        liq_vol_1m = v
+                    elif k in ("vol_base", "volbaseline", "vol_baseline"):
+                        liq_vol_baseline = v
+                    elif k in ("atr_norm", "atrnorm"):
+                        liq_atr_norm = v
+
+        # Extract vol_need from detail and/or reasons
+        src = " ".join([str(detail or ""), str(liq_reasons or "")]).strip()
+        vol_need = None
+        if src:
+            m = _VOL_NEED_RE.search(src)
+            if m:
+                vol_need = _maybe_decimal(m.group(1))
+
+        self.attempt_samples.append(
+            AttemptSample(
+                event=str(event_name or ""),
+                epoch=int(epoch),
+                px=px,
+                liq_ok=liq_ok,
+                liq_spread_bps=liq_spread_bps,
+                liq_vol_1m=liq_vol_1m,
+                liq_vol_baseline=liq_vol_baseline,
+                liq_vol_need=vol_need,
+                liq_atr_norm=liq_atr_norm,
+                confluence_gate=confluence_gate,
+                action=action,
+                risk_blocked_reason=risk_blocked_reason,
+                liq_reasons=liq_reasons,
+            )
+        )
+
+    def _finalize_attempt_invariants(self) -> None:
+        """
+        Phase 7 Step 1 invariant:
+          attempts == filled + blocked_total
+          gap == 0
+        """
+        blocked_total = (
+            int(self.entry_block_liquidity)
+            + int(self.entry_block_confluence)
+            + int(self.entry_block_risk)
+            + int(self.entry_block_size)
+            + int(self.entry_block_other)
+        )
+        filled = int(self.entry_filled)
+        attempts = int(self.entry_attempts)
+
+        gap = attempts - (filled + blocked_total)
+
+        self.entry_blocked_total = int(blocked_total)
+        self.entry_attempt_gap = int(gap)
+
+        if gap != 0:
+            self.attempt_invariants_ok = False
+            self.attempt_invariants_msg = (
+                f"ATTEMPT_INVARIANT_FAIL gap={gap} attempts={attempts} filled={filled} blocked_total={blocked_total} "
+                f"(liq={self.entry_block_liquidity} confl={self.entry_block_confluence} risk={self.entry_block_risk} "
+                f"size={self.entry_block_size} other={self.entry_block_other})"
+            )
+        else:
+            self.attempt_invariants_ok = True
+            self.attempt_invariants_msg = "OK"
+
     def finalize(self) -> None:
         """
         Compute medians/quantiles for distributions (cheap, deterministic).
@@ -356,7 +552,6 @@ class BacktestResults:
         if self.finalized:
             return
 
-        # --------- LINE ABOVE: if self.finalized:
         self.median_entry_spread_bps = _median_dec(self.entry_spread_bps)
         self.median_entry_vol_1m = _median_dec(self.entry_vol_1m)
         self.median_entry_vol_baseline = _median_dec(self.entry_vol_baseline)
@@ -367,6 +562,7 @@ class BacktestResults:
         self.p10_entry_vol_baseline = _quantile_dec(self.entry_vol_baseline, 0.10)
         self.p90_entry_atr_norm = _quantile_dec(self.entry_atr_norm, 0.90)
 
+        self._finalize_attempt_invariants()
         self.finalized = True
 
     # -------------------------
@@ -493,7 +689,6 @@ class BacktestResults:
             "end_epoch": int(self.end_epoch),
             "start_equity": str(self.start_equity),
             "end_equity": str(self.end_equity),
-
             "pnl_usd": str(self.pnl_usd()),
             "realized_total_usd": str(gross),
             "total_return_pct": f"{self.total_return_pct():.4f}",
@@ -509,13 +704,10 @@ class BacktestResults:
             "profit_factor": f"{self.profit_factor():.4f}",
             "avg_trade_duration_s": int(avg_dur),
             "exposure_pct": f"{self.exposure_pct():.4f}",
-
             "avg_mfe_pct_points": (None if avg_mfe is None else f"{avg_mfe:.4f}"),
             "avg_mae_pct_points": (None if avg_mae is None else f"{avg_mae:.4f}"),
-
             "event_counts": dict(self.event_counts),
             "missed_buy_counts": dict(self.missed_buy_counts),
-
             "entry_attempts": int(self.entry_attempts),
             "entry_filled": int(self.entry_filled),
             "entry_block_liquidity": int(self.entry_block_liquidity),
@@ -523,87 +715,99 @@ class BacktestResults:
             "entry_block_risk": int(self.entry_block_risk),
             "entry_block_size": int(self.entry_block_size),
             "entry_block_other": int(self.entry_block_other),
-
-            "median_entry_spread_bps": (None if self.median_entry_spread_bps is None else f"{self.median_entry_spread_bps:.4f}"),
+            "entry_blocked_total": int(self.entry_blocked_total),
+            "entry_attempt_gap": int(self.entry_attempt_gap),
+            "attempt_invariants_ok": bool(self.attempt_invariants_ok),
+            "attempt_invariants_msg": str(self.attempt_invariants_msg),
+            "median_entry_spread_bps": (
+                None if self.median_entry_spread_bps is None else f"{self.median_entry_spread_bps:.4f}"
+            ),
             "median_entry_vol_1m": (None if self.median_entry_vol_1m is None else f"{self.median_entry_vol_1m:.4f}"),
-            "median_entry_vol_baseline": (None if self.median_entry_vol_baseline is None else f"{self.median_entry_vol_baseline:.4f}"),
-            "median_entry_atr_norm": (None if self.median_entry_atr_norm is None else f"{self.median_entry_atr_norm:.6f}"),
-
+            "median_entry_vol_baseline": (
+                None if self.median_entry_vol_baseline is None else f"{self.median_entry_vol_baseline:.4f}"
+            ),
+            "median_entry_atr_norm": (
+                None if self.median_entry_atr_norm is None else f"{self.median_entry_atr_norm:.6f}"
+            ),
             "p90_entry_spread_bps": (None if self.p90_entry_spread_bps is None else f"{self.p90_entry_spread_bps:.4f}"),
             "p10_entry_vol_1m": (None if self.p10_entry_vol_1m is None else f"{self.p10_entry_vol_1m:.4f}"),
-            "p10_entry_vol_baseline": (None if self.p10_entry_vol_baseline is None else f"{self.p10_entry_vol_baseline:.4f}"),
+            "p10_entry_vol_baseline": (
+                None if self.p10_entry_vol_baseline is None else f"{self.p10_entry_vol_baseline:.4f}"
+            ),
             "p90_entry_atr_norm": (None if self.p90_entry_atr_norm is None else f"{self.p90_entry_atr_norm:.6f}"),
         }
 
-        # Phase 7.1: include run identity if known (runner will usually inject)
         if self.run_id:
             out["run_id"] = str(self.run_id)
         out["mode"] = str(self.mode or "bt")
-
         return out
 
     # -------------------------
     # Writers
     # -------------------------
-    def write_equity_curve_csv(self, path: str):
+    def write_equity_curve_csv(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
             w.writerow(["epoch", "equity_usd"])
             for epoch, eq in self.equity_curve:
                 w.writerow([int(epoch), str(eq)])
 
-    def write_trades_csv(self, path: str):
+    def write_trades_csv(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "symbol",
-                "entry_epoch",
-                "exit_epoch",
-                "duration_s",
-                "entry_px",
-                "exit_px",
-                "qty",
-                "realized_usd",
-                "realized_return_pct",
-                "mfe_pct_points",
-                "mae_pct_points",
-            ])
+            w = csv.writer(f, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+            w.writerow(
+                [
+                    "symbol",
+                    "entry_epoch",
+                    "exit_epoch",
+                    "duration_s",
+                    "entry_px",
+                    "exit_px",
+                    "qty",
+                    "realized_usd",
+                    "realized_return_pct",
+                    "mfe_pct_points",
+                    "mae_pct_points",
+                ]
+            )
             for t in self.trades:
-                w.writerow([
-                    self.symbol,
-                    int(t.entry_epoch),
-                    "" if t.exit_epoch is None else int(t.exit_epoch),
-                    "" if t.duration_s() is None else int(t.duration_s()),
-                    str(t.entry_px),
-                    "" if t.exit_px is None else str(t.exit_px),
-                    str(t.qty),
-                    "" if t.realized_usd is None else str(t.realized_usd),
-                    "" if t.realized_return_pct() is None else f"{t.realized_return_pct():.6f}",
-                    "" if t.mfe_pct is None else str(t.mfe_pct),
-                    "" if t.mae_pct is None else str(t.mae_pct),
-                ])
+                w.writerow(
+                    [
+                        self.symbol,
+                        int(t.entry_epoch),
+                        "" if t.exit_epoch is None else int(t.exit_epoch),
+                        "" if t.duration_s() is None else int(t.duration_s()),
+                        str(t.entry_px),
+                        "" if t.exit_px is None else str(t.exit_px),
+                        str(t.qty),
+                        "" if t.realized_usd is None else str(t.realized_usd),
+                        "" if t.realized_return_pct() is None else f"{t.realized_return_pct():.6f}",
+                        "" if t.mfe_pct is None else str(t.mfe_pct),
+                        "" if t.mae_pct is None else str(t.mae_pct),
+                    ]
+                )
 
-    def write_summary_json(self, path: str):
+    def write_summary_json(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.summary(), f, indent=2, sort_keys=True)
 
-    def write_event_counts_csv(self, path: str):
+    def write_event_counts_csv(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
             w.writerow(["event", "count"])
             for k in sorted(self.event_counts.keys()):
                 w.writerow([k, int(self.event_counts.get(k, 0))])
 
-    def write_entry_attempt_stats_csv(self, path: str):
+    def write_entry_attempt_stats_csv(self, path: str) -> None:
         self.finalize()
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
             w.writerow(["metric", "value"])
             w.writerow(["entry_attempts", int(self.entry_attempts)])
             w.writerow(["entry_filled", int(self.entry_filled)])
@@ -613,15 +817,69 @@ class BacktestResults:
             w.writerow(["entry_block_size", int(self.entry_block_size)])
             w.writerow(["entry_block_other", int(self.entry_block_other)])
 
-            w.writerow(["median_entry_spread_bps", "" if self.median_entry_spread_bps is None else str(self.median_entry_spread_bps)])
+            w.writerow(["entry_blocked_total", int(self.entry_blocked_total)])
+            w.writerow(["entry_attempt_gap", int(self.entry_attempt_gap)])
+            w.writerow(["attempt_invariants_ok", int(1 if self.attempt_invariants_ok else 0)])
+            w.writerow(["attempt_invariants_msg", str(self.attempt_invariants_msg)])
+
+            w.writerow(
+                ["median_entry_spread_bps", "" if self.median_entry_spread_bps is None else str(self.median_entry_spread_bps)]
+            )
             w.writerow(["median_entry_vol_1m", "" if self.median_entry_vol_1m is None else str(self.median_entry_vol_1m)])
-            w.writerow(["median_entry_vol_baseline", "" if self.median_entry_vol_baseline is None else str(self.median_entry_vol_baseline)])
+            w.writerow(
+                ["median_entry_vol_baseline", "" if self.median_entry_vol_baseline is None else str(self.median_entry_vol_baseline)]
+            )
             w.writerow(["median_entry_atr_norm", "" if self.median_entry_atr_norm is None else str(self.median_entry_atr_norm)])
 
             w.writerow(["p90_entry_spread_bps", "" if self.p90_entry_spread_bps is None else str(self.p90_entry_spread_bps)])
             w.writerow(["p10_entry_vol_1m", "" if self.p10_entry_vol_1m is None else str(self.p10_entry_vol_1m)])
-            w.writerow(["p10_entry_vol_baseline", "" if self.p10_entry_vol_baseline is None else str(self.p10_entry_vol_baseline)])
+            w.writerow(
+                ["p10_entry_vol_baseline", "" if self.p10_entry_vol_baseline is None else str(self.p10_entry_vol_baseline)]
+            )
             w.writerow(["p90_entry_atr_norm", "" if self.p90_entry_atr_norm is None else str(self.p90_entry_atr_norm)])
+
+    def write_entry_attempt_detail_csv(self, path: str) -> None:
+        """
+        Phase 7.1: one row per attempt boundary.
+        """
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+            w.writerow(
+                [
+                    "event",
+                    "epoch",
+                    "px",
+                    "liq_ok",
+                    "liq_spread_bps",
+                    "liq_vol_1m",
+                    "liq_vol_baseline",
+                    "liq_vol_need",
+                    "liq_atr_norm",
+                    "confluence_gate",
+                    "action",
+                    "risk_blocked_reason",
+                    "liq_reasons",
+                ]
+            )
+            for a in self.attempt_samples:
+                w.writerow(
+                    [
+                        a.event,
+                        int(a.epoch),
+                        "" if a.px is None else str(a.px),
+                        "" if a.liq_ok is None else (1 if a.liq_ok else 0),
+                        "" if a.liq_spread_bps is None else str(a.liq_spread_bps),
+                        "" if a.liq_vol_1m is None else str(a.liq_vol_1m),
+                        "" if a.liq_vol_baseline is None else str(a.liq_vol_baseline),
+                        "" if a.liq_vol_need is None else str(a.liq_vol_need),
+                        "" if a.liq_atr_norm is None else str(a.liq_atr_norm),
+                        str(a.confluence_gate or ""),
+                        str(a.action or ""),
+                        str(a.risk_blocked_reason or ""),
+                        str(a.liq_reasons or ""),
+                    ]
+                )
 
 
 def _d(m: Optional[re.Match], idx: int = 1) -> Optional[Decimal]:

@@ -2,6 +2,7 @@
 # liquidity.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Deque, Dict, Optional
@@ -154,10 +155,20 @@ class LiquidityEngine:
       - LIQ_MODE = BLOCK or PENALIZE
       - BLOCK: any violated condition -> ok=False
       - PENALIZE: violations accumulate penalty_points; ok stays True unless hard-block threshold is enabled
+
+    Backtest override knob (what you asked for):
+      - Set env var BT_LIQUIDITY_MODE=OFF  -> disables liquidity entirely in backtest
+      - Set env var BT_LIQUIDITY_MODE=RELAX -> keeps liquidity "enabled" but removes the volume/atr gates so fills can happen
+      - You can also set cfg["BT_LIQUIDITY_MODE"] to the same values; env wins.
     """
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
+
+        # --------- LINE ABOVE: self.cfg = cfg
+        # Backtest override knob (env wins). Only applied when BACKTEST_MODE is true.
+        self._is_backtest = _as_bool(cfg.get("BACKTEST_MODE", False), False)
+        self._bt_liq_mode = str(os.getenv("BT_LIQUIDITY_MODE", cfg.get("BT_LIQUIDITY_MODE", ""))).strip().upper()
 
         # Master enable (canonical)
         self.enabled = _as_bool(
@@ -182,7 +193,12 @@ class LiquidityEngine:
         self.max_spread_bps = _d(cfg.get("LIQ_MAX_SPREAD_BPS", "25"), "25")
 
         # Volume thresholds (hard floors; optional)
-        self.min_vol_1m = _d(cfg.get("LIQ_MIN_VOL_1M", "0"), "0")
+        # --------- LINE ABOVE: self.max_spread_bps = _d(cfg.get("LIQ_MAX_SPREAD_BPS", "25"), "25")
+        # Backward/forward compat: accept multiple keys (your config.py uses LIQ_MIN_VOL_USD_1M)
+        self.min_vol_1m = _d(
+            cfg.get("LIQ_MIN_VOL_1M", cfg.get("LIQ_MIN_VOL_USD_1M", "0")),
+            "0",
+        )
 
         # Rolling baseline threshold: require v1 >= vbase * mult (if both exist)
         self.min_vol_mult = _d(cfg.get("LIQ_MIN_VOL_MULT", "1.2"), "1.2")
@@ -211,7 +227,24 @@ class LiquidityEngine:
         # (Even if vol_hist is empty, this stays None; once populated, it's stable.)
         self._last_vol_baseline: Optional[Decimal] = None
 
-    # --------- LINE ABOVE: def __init__(self, cfg: Dict[str, Any]):
+        # --------- LINE ABOVE: self._last_vol_baseline: Optional[Decimal] = None
+        # Apply backtest override knob AFTER all defaults are loaded.
+        # OFF: disable liquidity so backtests can generate fills (removes MISSED_BUY_LIQUIDITY blocks).
+        # RELAX: keep liquidity on, but relax the typical blockers (volume + atr min).
+        if self._is_backtest and self._bt_liq_mode:
+            if self._bt_liq_mode in ("OFF", "DISABLE", "0", "FALSE"):
+                self.enabled = False
+            elif self._bt_liq_mode in ("RELAX", "EASY"):
+                self.enabled = True
+                # Remove the usual "no fill" offenders
+                self.min_vol_1m = Decimal("0")
+                self.min_vol_mult = Decimal("0")
+                self.atr_norm_min = Decimal("0")
+                self.atr_norm_max = Decimal("0")
+                self.block_on_missing_volume = False
+                self.block_on_missing_atr = False
+                # Keep spread gate unless you explicitly disable it via config
+                # (If you want spread ignored too, set LIQ_MAX_SPREAD_BPS=0 in env/cfg)
 
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "LiquidityEngine":

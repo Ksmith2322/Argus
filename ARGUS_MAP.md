@@ -1,324 +1,239 @@
-You don’t need to “see anything” to update the map—your latest runner changes *force* a couple updates because the truth moved:
+# ARGUS MAP — UPDATED (repo-root + Phase 7 backtest artifact contract)
 
-* **Artifacts are not under `C:\Argus\ops\logs\` anymore** (per the runner you posted). They’re under **`C:\Argus\argus-lab\ops\logs\`** via `ARGUS_ARTIFACT_ROOT` default.
-* Backtest now emits **per-run `events_<run_id>.csv` + `signals_<run_id>.csv`** (and optionally still writes canonical `io_logs.py` sinks if you call them).
-* Kill/Pause file locations in the map are likely wrong unless you verified `io_logs.py` (you wrote “ABSOLUTE, VERIFIED”, but the map says `C:\Argus\repo\KILL_SWITCH.txt`; your current ecosystem has been pushing “artifact_root = argus-lab”; those are different roots).
-
-Below is an **ARGUS_MAP vNext** that matches the runner you pasted + the bt artifacts you’re actually reading.
+This map reflects your **current working reality**:
+- You run backtest successfully from **`C:\Argus\repo`** via **`.\backtest\runner.py`**
+- Backtest writes **run-scoped artifacts** under **`C:\Argus\repo\ops\logs\`**
+- Backtest must **never mutate** canonical live files because `LIVE_*_CSV` are sandboxed
 
 ---
 
-# ARGUS MAP (call graph + sources of truth) — UPDATED FOR CURRENT BACKTEST ARTIFACTS
+## 0) Repo layout (source-of-truth roots)
 
-===============================================================================
+**Repo root (canonical):**
+- `C:\Argus\repo`
 
-1. ENTRYPOINTS (WHAT YOU ACTUALLY RUN)
-   ===============================================================================
+**Python venv (canonical):**
+- `C:\Argus\.venv\Scripts\python.exe`
 
-PRIMARY (SCHEDULER-SAFE WRAPPERS) ✅
+**Backtest package:**
+- `C:\Argus\repo\backtest\`
 
-* Live (manual run):
-
-  * cmd.exe /c C:\Argus\ops\run_live.cmd
-
-* Backtest (manual run):
-
-  * cmd.exe /c C:\Argus\ops\run_backtest.cmd
-
-PRIMARY (AUTOMATION) ✅
-
-* Nightly backtest:
-
-  * Task Scheduler: Argus_Nightly_Backtest
-  * Runs: C:\Windows\System32\cmd.exe /c C:\Argus\ops\run_backtest.cmd
-
-* Weekly backup verify:
-
-  * Task Scheduler: Argus_Weekly_Backup_Verify
-  * Runs: powershell.exe -ExecutionPolicy Bypass -File C:\Argus\ops\backup_verify.ps1
-
-DEVELOPER CONVENIENCE (OPTIONAL)
-
-* Live (direct module run):
-
-  * Set-Location C:\Argus\repo
-  * C:\Argus.venv\Scripts\python.exe -m runner_live
-
-* Backtest (direct module run):
-
-  * Set-Location C:\Argus\repo
-  * C:\Argus.venv\Scripts\python.exe -m backtest.runner
-
-LEGACY / DO NOT USE (HAZARDOUS IF PRESENT)
-
-* Anything that references "nova_scripts" namespace
-* Any old sys.path shim entrypoints
-
-===============================================================================
-2) CANONICAL SOURCES OF TRUTH (ONLY ONE EACH)
-=============================================
-
-Config loading / env surface:
-
-* config.py  -> load_config()
-
-Bot state ownership:
-
-* state.py   -> BotState
-
-Core decision step / orchestration:
-
-* engine.py  -> step(state, tick, cfg, ...)
-
-Snapshot schema / event objects:
-
-* decisions.py -> DecisionSnapshot + EngineEvent (or equivalent)
-
-Signal + event CSV schema AND writers:
-
-* CANONICAL:
-
-  * io_logs.py
-* NON-CANONICAL (DUPLICATE / DRIFT RISK):
-
-  * logger.py (legacy; should not be used)
-
-Market / trading logic:
-
-* strategy_phase2.py
-* confluence.py
-* adaptive_confluence.py
-* structure.py
-* regime.py
-* liquidity.py
-* session.py
-
-Data and math:
-
-* candles.py
-* indicators.py
-* ledger.py
-* pnl_shadow.py
-
-Risk:
-
-* risk.py
-
-Optional trade tracking:
-
-* trade_tracker.py
-
-Notify:
-
-* notify.py
-
-===============================================================================
-3) CORE CALL CHAINS (WHAT CALLS WHAT)
-=====================================
-
-LIVE LOOP
-runner_live
--> feed_coinbase.py        (HTTP spot / preload / ticks)
--> state.BotState
--> engine.step(...)
--> candles.py
--> indicators.py
--> strategy_phase2.py
--> structure.py
--> liquidity.py
--> session.py
--> regime.py
--> confluence.py
--> adaptive_confluence.py
--> ledger.py
--> risk.py
--> decisions.py
--> io_logs.py              (write signals/events CSV)
--> notify.py               (optional)
-
-BACKTEST LOOP (CURRENT REALITY)
-backtest.runner
--> backtest.loader         (CSV -> CandleRow)
--> backtest.feed           (CandleRow -> PriceTick)
--> state.BotState
--> engine.step(...)
--> io_logs.py              (canonical sink via log_bt_event/log_signal_snapshot)
--> backtest.results        (derive metrics from events + snapshots)
-
-Additionally, backtest.runner emits run-scoped artifacts (Phase 7.1+):
--> events_<run_id>.csv
--> signals_<run_id>.csv
--> run_header_<run_id>.json
--> bt_summary_<run_id>.json
--> bt_summary_latest.json
-
-TOOLS (OPTIONAL)
-backtest.download_candles
--> requests -> CSV in repo/data/
-
-_debug_step
--> single engine.step() with one tick
-
-===============================================================================
-4) I/O SURFACES (WHERE FILES ARE WRITTEN) — CORRECTED
-=====================================================
-
-CANONICAL ARTIFACT ROOT (PHASE 7.1 CONTRACT, FROM backtest.runner) ✅
-
-* ARGUS_ARTIFACT_ROOT defaults to:
-
-  * C:\Argus\argus-lab
-
-Backtest artifact directory:
-
-* C:\Argus\argus-lab\ops\logs\
-
-  * bt_<run_id>.log                      (if you actually write to it)
-  * events_<run_id>.csv                  (runner writes directly)
-  * signals_<run_id>.csv                 (runner writes directly)
-  * run_header_<run_id>.json
-  * bt_summary_<run_id>.json
-  * bt_summary_latest.json
-
-NOTE: Your analysis one-liner confirms this is where you’re reading:
-
-* C:\Argus\argus-lab\ops\logs\bt_summary_latest.json
-* C:\Argus\argus-lab\ops\logs\events_<run_id>.csv
-
-LIVE WRAPPER LOGS (SEPARATE SURFACE)
-
-* C:\Argus\ops\logs\
-
-  * live_*.log  (from run_live.cmd)
-  * bt_*.log    (from run_backtest.cmd wrapper logs, if you log wrapper output here)
-
-CSV OUTPUTS (io_logs.py PATHS)
-
-* io_logs.py still writes its own canonical sinks (signals_csv_path/events_csv_path)
-* backtest.runner ALSO writes per-run CSVs (events_<run_id>.csv, signals_<run_id>.csv)
-  -> These two can diverge if both are enabled and not intentionally unified.
-
-CANDLE DATA / FIXTURES
-
-* C:\Argus\repo\data\eth_usd_1m.csv   (default in runner **main**)
-
-KILL / PAUSE FILES (STATUS: MUST MATCH io_logs.py IMPLEMENTATION)
-
-* Map SHOULD NOT assert these paths unless you verified io_logs.py.
-
-  * If you want them tied to artifact root, they should live under:
-    C:\Argus\argus-lab\KILL_SWITCH.txt / PAUSE.txt (or /ops/)
-  * If you want them tied to repo root, they live under:
-    C:\Argus\repo\KILL_SWITCH.txt / PAUSE.txt
-    Pick one and make every reader use the same resolver.
-
-BACKUPS ✅
-
-* C:\ArgusBackups\
-
-  * argus_backup_YYYYMMDD_HHMMSS.zip
-
-===============================================================================
-5) CONFIG & ENV KNOBS (MATERIAL BEHAVIOR CHANGES ONLY)
-======================================================
-
-Execution / timing
-
-* BACKTEST_MODE
-* CANDLE_SECONDS
-* STALE_TICK_SECONDS
-
-Liquidity
-
-* USE_LIQUIDITY_FILTERS / USE_LIQUIDITY
-* LIQ_MODE (BLOCK | PENALIZE)
-* LIQ_MAX_SPREAD_BPS
-* LIQ_MIN_VOL_1M
-* LIQ_MIN_VOL_MULT
-* LIQ_VOL_BASELINE_WINDOW
-* LIQ_SYNTH_SPREAD_FLOOR_BPS
-* LIQ_SYNTH_SPREAD_ATR_MULT_BPS
-
-Backtest-only helpers
-
-* ARGUS_ARTIFACT_ROOT                 (NEW: governs backtest artifact root)
-* ARGUS_BT_ARTIFACT_DIR               (optional override; defaults to <artifact_root>\ops\logs)
-* BT_SYNTH_SPREAD_BPS
-* BT_TRUNCATE_LOGS
-* BT_WRITE_LOGS
-* BT_PRINT_EVENTS
-* BT_LOG_FLUSH_N
-* BT_SIGNAL_LOG_EVERY_N
-* BT_EQUITY_EVERY_N
-* DISABLE_TRADE_TRACKER_IN_BACKTEST
-
-Confluence
-
-* CONFLUENCE_MIN_SCORE
-* REQUIRE_CONFLUENCE
-* USE_SHOULD_EVENTS / BT_USE_SHOULD_EVENTS
-
-Adversarial testing
-
-* ARGUS_PROFILE
-* ARGUS_SEED
-
-===============================================================================
-6) KNOWN HAZARDS (CURRENT REALITY)
-==================================
-
-* logger.py duplicates CSV writing -> schema drift risk
-
-* Two event streams exist in backtest:
-
-  1. canonical io_logs.py sink via log_bt_event/log_signal_snapshot
-  2. per-run CSVs written directly by runner (events_<run_id>.csv, signals_<run_id>.csv)
-     If you don’t unify them, “truth” depends on which file you read.
-
-* KILL/PAUSE path ambiguity (repo-root vs artifact-root) will bite you in automation.
-  The map must not claim a path until the resolver is single-source.
-
-* Summary metrics must be derived from artifacts/events (avoid hidden counters)
-
-* Parity blocker remains:
-
-  * median_entry_vol_baseline still None
-  * median_entry_atr_norm still None
-    You now proved the attempt boundary is firing (ENTRY_ATTEMPT 8, ENTRY_METRICS 4, MISSED_BUY_LIQUIDITY 4).
-    That means the missing medians are now almost certainly a *data plumbing* issue, not “no attempts”.
-
-===============================================================================
-7) STATUS (AS OF TODAY)
-=======================
-
-✅ Backtest artifacts confirmed under:
-
-* C:\Argus\argus-lab\ops\logs\
-
-  * bt_summary_latest.json
-  * events_<run_id>.csv
-
-✅ Attempt boundary present in events:
-
-* ENTRY_ATTEMPT exists
-* ENTRY_METRICS exists
-* MISSED_BUY_LIQUIDITY exists
-
-NEXT (EASY WIN TARGET)
-
-* Unify “truth source” for backtest events:
-
-  * Either stop writing io_logs.py bt sink during backtest
-  * OR stop writing per-run CSV and only rely on io_logs.py
-  * OR make io_logs.py write to the per-run file via run_id (best long-term)
+**Ops + artifacts (canonical):**
+- `C:\Argus\repo\ops\logs\`
 
 ---
 
-## Two “easy wins” I’d do *right now* (no extra code archaeology)
+## 1) Entry points (what you actually run)
 
-1. **Update the map’s file paths** to reflect `ARGUS_ARTIFACT_ROOT = C:\Argus\argus-lab` as the *actual* backtest artifact root (done above).
+### Backtest (canonical)
+**Preferred (script run):**
+- `C:\Argus\.venv\Scripts\python.exe .\backtest\runner.py`
 
-2. **Stop asserting KILL/PAUSE locations** in the map until you’ve chosen the single resolver.
-   The current map claims `C:\Argus\repo\KILL_SWITCH.txt` as “verified”; your system is otherwise moving toward `argus-lab` as the run root. That mismatch is a future “why didn’t it stop?” incident.
+**Also valid (module run)**
+- `C:\Argus\.venv\Scripts\python.exe -m backtest.runner`
+  - requires: `backtest/__init__.py` ✅ (you have it)
 
-If you want, paste just the top of `io_logs.py` where it defines `KILL_SWITCH` / `PAUSE` / `logs_dir()` / `events_csv_path()` and I’ll lock the map to the exact resolver you’re actually running.
+### Live (canonical)
+(Depends on your live runner name; map assumes you have a live loop somewhere like `runner_live.py`.)
+- `C:\Argus\.venv\Scripts\python.exe .\runner_live.py`
+  - or scheduled wrapper under `ops\` (if you use one)
+
+---
+
+## 2) Runtime call graph (high-level)
+
+### Backtest loop
+`backtest/runner.py`
+→ `config.load_config()`
+→ `_ensure_bt_cfg()` (backtest-safe overlay)
+→ `state.BotState.from_config(cfg)`
+→ `backtest.loader.load_candles_csv(...)`
+→ `backtest.feed.ticks_from_close_series(...)`
+→ (optional) `apply_damage_to_ticks(...)`
+→ `engine.step(state, tick, cfg, paused=False, http=http)`
+→ `io_logs.log_signal_snapshot(snap, ...)`  (sandboxed live_* in BT)
+→ `io_logs.log_bt_event(...)` (event sink; should be per-run or sandbox)
+→ `backtest.results.BacktestResults` aggregates events/snapshots
+→ writer methods:
+   - `write_equity_curve_csv`
+   - `write_trades_csv`
+   - `write_event_counts_csv`
+   - `write_entry_attempt_stats_csv`
+   - `write_entry_attempt_detail_csv` (if implemented)
+→ `_write_bt_summary()` emits `bt_summary_<run>.json` + `bt_summary_latest.json`
+
+### Live loop (conceptual)
+`runner_live.py` (or equivalent)
+→ feed (exchange / broker)
+→ `engine.step(...)`
+→ `io_logs.log_signal_snapshot(...)` (real live_* default or env override)
+→ `io_logs.log_bt_event(...)` (events sink)
+→ notify/trade executor (if enabled)
+
+---
+
+## 3) “One source of truth” ownership
+
+### Config / env
+- `config.py` → `load_config()`
+  - owns defaults + env override surface
+
+### State ownership
+- `state.py` → `BotState`
+  - owns: ledger, positions, caches, last ticks, regime/session derived state
+
+### Decision/step orchestration
+- `engine.py` → `step(state, tick, cfg, paused, http=...)`
+  - owns: calls into indicators/strategy/regime/liquidity/session/etc
+  - emits: snapshot + events list
+
+### Logging schema + durable CSV writing (canonical)
+- `io_logs.py`
+  - owns schemas:
+    - `_signals_header()`
+    - `_events_header()`
+  - owns path resolution:
+    - `logs_dir()`
+    - `signals_csv_path()`
+    - `events_csv_path()`
+  - owns translation:
+    - `snapshot_to_signal_row()`  (**only** allowed snap→CSV mapping)
+  - owns safety:
+    - `ensure_signals_header_matches_file()` (append-only upgrade)
+
+### Backtest metrics & invariants (canonical)
+- `backtest/results.py` → `BacktestResults`
+  - owns: attempt accounting, event counts, derived stats, summary()
+
+### Market logic (subsystems)
+- `strategy_phase2.py` (entry/exit logic)
+- `confluence.py` / `adaptive_confluence.py`
+- `regime.py`
+- `structure.py`
+- `liquidity.py`
+- `session.py`
+- `risk.py`
+- `ledger.py`
+- `indicators.py`
+- `candles.py`
+
+---
+
+## 4) Artifact contract (Phase 7)
+
+### Canonical artifact directory (backtest)
+**`ARGUS_BT_ARTIFACT_DIR` default:**
+- `C:\Argus\repo\ops\logs\`
+
+Runner emits **per-run** artifacts (expected per run_id):
+- `events_<run_id>.csv`
+- `signals_<run_id>.csv`
+- `equity_<run_id>.csv`
+- `trades_<run_id>.csv`
+- `event_counts_<run_id>.csv`
+- `entry_attempts_<run_id>.csv`
+- `entry_attempt_detail_<run_id>.csv` (optional)
+- `run_header_<run_id>.json`
+- `bt_summary_<run_id>.json`
+
+Latest pointer (single file, overwritten each run):
+- `bt_summary_latest.json`  ✅ (you have this)
+
+**Decision point (keep it clean):**
+- Either **add** `bt_latest.json` (tiny pointer `{ "run_id": "..." }`)
+- Or **delete/stop using** any tooling that expects `bt_latest.json`
+  - your error showed tooling expecting it even though it doesn’t exist
+
+---
+
+## 5) Sandbox rule (non-negotiable)
+
+Backtest must not mutate the canonical live files:
+- `...\ops\logs\live_events.csv`
+- `...\ops\logs\live_signals.csv`
+
+### How it is enforced now
+In backtest mode (`ARGUS_MODE=bt`), runner sets (or expects):
+- `LIVE_EVENTS_CSV = C:\Argus\repo\ops\logs\live_events_bt_sandbox.csv`
+- `LIVE_SIGNALS_CSV = C:\Argus\repo\ops\logs\live_signals_bt_sandbox.csv`
+
+And `io_logs.py` respects those env vars in:
+- `events_csv_path()`
+- `signals_csv_path()`
+
+**Net effect:** backtest calls to `log_signal_snapshot()` / `log_bt_event()` go to sandbox files, not production `live_*.csv`.
+
+---
+
+## 6) Attempt accounting boundary (final rule)
+
+**Attempt boundary = classification events only** (emitted by engine):
+One of:
+- `WOULD_BUY`
+- `SHOULD_BUY`
+- `ENTRY_FILLED`
+- `MISSED_BUY_*`
+
+**Debug-only (must not be counted / sampled):**
+- `ENTRY_ATTEMPT`
+- `ENTRY_METRICS` (you may store it, but don’t let it create double counting)
+
+**Invariants (must hold):**
+- `entry_attempts == entry_filled + entry_blocked_total`
+- `ENTRY_ATTEMPT == ENTRY_METRICS` (if you emit both as debug per attempt)
+- `entry_attempt_gap == 0`
+- `attempt_invariants_ok == True`
+
+You’re already seeing these pass in your summary output.
+
+---
+
+## 7) Control-plane / services (only if you run them)
+
+If you have a local control plane (seen previously):
+- Windows Services: `ArgusControlPlane`, `cphs`, `cplspcon`
+- Those are **not** part of the backtest runner artifact contract unless you explicitly route them into the same `ops\logs` root with a separate namespace.
+
+Rule: **CP artifacts and backtest artifacts cannot share run_id folders or “latest” pointers.**
+
+---
+
+## 8) Ops toggles (kill/pause)
+
+Current implementation (from `io_logs.py`):
+- `is_kill_switch_on(cfg)` checks:
+  - `os.path.exists(os.path.join(os.path.dirname(__file__), cfg["KILL_SWITCH_FILE"]))`
+
+- `is_paused(cfg)` checks:
+  - `os.path.exists(os.path.join(os.path.dirname(__file__), cfg["PAUSE_FILE"]))`
+
+**Implication:** these files live relative to `io_logs.py` location unless you redesign them.
+If `io_logs.py` is at repo root, toggles resolve near:
+- `C:\Argus\repo\KILL_SWITCH` (or whatever cfg sets)
+- `C:\Argus\repo\PAUSE`
+
+---
+
+## 9) Determinism / diffing artifacts (PowerShell note)
+
+In PowerShell, `fc` is commonly aliased and can bite you (as you saw).
+Use one of these instead:
+
+**Option A — cmd fc**
+- `cmd.exe /c fc .\ops\logs\events_$run1.csv .\ops\logs\events_$run2.csv`
+
+**Option B — Compare-Object**
+- `Compare-Object (Get-Content $e1) (Get-Content $e2) | Select -First 50`
+
+---
+
+## 10) “Done” definition for Phase 7 closure
+
+You’re “done” when all are true, from `C:\Argus\repo`, repeated twice:
+
+1) Backtest invocation is stable (no module-path drift)
+2) All per-run artifacts exist under `C:\Argus\repo\ops\logs\`
+3) `bt_summary_latest.json` points to the most recent run and contains correct paths
+4) Events + equity artifacts are deterministic (diff clean except run_id/timestamps)
+
+---

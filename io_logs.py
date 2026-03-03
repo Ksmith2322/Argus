@@ -1,9 +1,9 @@
 ﻿#!/usr/bin/env python3
 # io_logs.py
-# line above: import csv
 import csv
 import os
 from typing import Any, Dict, List, Optional, Union
+
 from utils import utc_ts
 
 
@@ -11,29 +11,71 @@ from utils import utc_ts
 # Paths
 # =========================
 def logs_dir() -> str:
-    # --------- LINE ABOVE: def logs_dir() -> str:
+    # line above: def logs_dir() -> str:
+    # Canonical log root:
+    # 1) explicit override always wins
     env = os.environ.get("ARGUS_LOG_DIR", "").strip()
     if env:
         return env
+
+    # 2) backtest contract (when runner/wrappers set it)
+    mode = os.environ.get("ARGUS_MODE", "").strip().lower()
+    bt_dir = os.environ.get("ARGUS_BT_ARTIFACT_DIR", "").strip()
+    if bt_dir and mode in ("bt", "backtest"):
+        return bt_dir
+
+    # 3) default: repo-local logs folder
     return os.path.join(os.path.dirname(__file__), "logs")
 
 
 def signals_csv_path() -> str:
+    # line above: def signals_csv_path() -> str:
+    # ✅ CRITICAL: respect sandbox override if set (prevents live_* mutation during backtest)
+    p = os.environ.get("LIVE_SIGNALS_CSV", "").strip()
+    if p:
+        return p
     return os.path.join(logs_dir(), "live_signals.csv")
 
 
 def events_csv_path() -> str:
+    # line above: def events_csv_path() -> str:
+    # ✅ CRITICAL: respect sandbox override if set (prevents live_* mutation during backtest)
+    p = os.environ.get("LIVE_EVENTS_CSV", "").strip()
+    if p:
+        return p
     return os.path.join(logs_dir(), "live_events.csv")
 
 
-# --------- LINE ABOVE: def events_csv_path() -> str:
 def bt_events_csv_path(run_id: Optional[str] = None) -> str:
     """
     Backtest-only events file.
       - if run_id is provided -> bt_events_<run_id>.csv
       - else -> bt_events.csv
     """
+    # line above: def bt_events_csv_path(run_id: Optional[str] = None) -> str:
     name = "bt_events.csv" if not run_id else f"bt_events_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
+def bt_signals_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Backtest-only signals file.
+      - if run_id is provided -> bt_signals_<run_id>.csv
+      - else -> bt_signals.csv
+    """
+    # line above: def bt_signals_csv_path(run_id: Optional[str] = None) -> str:
+    name = "bt_signals.csv" if not run_id else f"bt_signals_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
+def bt_equity_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Backtest-only equity file.
+      - if run_id is provided -> equity_<run_id>.csv   (canonical)
+      - else -> equity.csv
+    """
+    # line above: def bt_equity_csv_path(run_id: Optional[str] = None) -> str:
+    name = "equity.csv" if not run_id else f"equity_{run_id}.csv"
     return os.path.join(logs_dir(), name)
 
 
@@ -191,6 +233,10 @@ def _events_header() -> List[str]:
     ]
 
 
+def _equity_header() -> List[str]:
+    return ["epoch", "equity_usd", "cash_usd", "position_qty"]
+
+
 # =========================
 # CSV primitives (NO manual joining, ever)
 # =========================
@@ -254,7 +300,6 @@ def ensure_logs() -> None:
     os.makedirs(logs_dir(), exist_ok=True)
     _ensure_csv_has_header(signals_csv_path(), _signals_header())
     _ensure_csv_has_header(events_csv_path(), _events_header())
-    # safe append-only schema upgrade for signals (optional but helpful)
     ensure_signals_header_matches_file()
 
 
@@ -278,7 +323,6 @@ def append_event_row(row: List[Any]) -> None:
         return
 
 
-# --------- LINE ABOVE: def append_event_row(row: List[Any]) -> None:
 def append_event_row_to_path(path: str, row: List[Any]) -> None:
     hdr = _events_header()
     _ensure_csv_has_header(path, hdr)
@@ -316,10 +360,7 @@ def log_bt_event(
     sizing_note: str = "",
     notify_title: str = "",
     notify_body: str = "",
-    # --------- LINE ABOVE: notify_body: str = "",
-    # Optional explicit sink (e.g., bt_events_csv_path()).
     path: Optional[str] = None,
-    # accept schema drift (Phase 5+ additions) without crashing
     **kwargs: Any,
 ) -> None:
     hdr = _events_header()
@@ -347,7 +388,7 @@ def log_bt_event(
         "sizing_note": sizing_note,
     }
 
-    # Merge any new fields safely: only hdr fields will be written
+    # allow append-only extension columns without schema drift: fill by header order
     for k, v in kwargs.items():
         rowd[k] = "" if v is None else v
 
@@ -485,7 +526,36 @@ def append_signal_row(row: Union[List[Any], Dict[str, Any]]) -> None:
     hdr = _signals_header()
 
     try:
-        # --------- LINE ABOVE: try:
+        if isinstance(row, dict):
+            row = [row.get(col, "") for col in hdr]
+        elif isinstance(row, tuple):
+            row = list(row)
+        elif not isinstance(row, list):
+            row = [row]
+
+        # Drop accidental header-as-data
+        if row and len(row) >= len(hdr):
+            if [str(x) for x in row[: len(hdr)]] == hdr:
+                return
+
+        # Force width stability
+        if len(row) < len(hdr):
+            row = list(row) + ([""] * (len(hdr) - len(row)))
+        elif len(row) > len(hdr):
+            row = list(row)[: len(hdr)]
+
+        _ensure_csv_has_header(path, hdr)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            _csv_writer(f).writerow([_coerce_str(x) for x in row])
+    except Exception:
+        return
+
+
+def append_signal_row_to_path(path: str, row: Union[List[Any], Dict[str, Any]]) -> None:
+    # line above: def append_signal_row_to_path(path: str, row: Union[List[Any], Dict[str, Any]]) -> None:
+    hdr = _signals_header()
+
+    try:
         if isinstance(row, dict):
             row = [row.get(col, "") for col in hdr]
         elif isinstance(row, tuple):
@@ -528,6 +598,21 @@ def log_signal_snapshot(
     append_signal_row(row)
 
 
+def log_bt_signal_snapshot(
+    snap: Any,
+    *,
+    run_id: str,
+    symbol: Optional[str] = None,
+    price: Optional[Any] = None,
+) -> None:
+    """
+    Backtest-only signal logging to a run-scoped file.
+    """
+    # line above: def log_bt_signal_snapshot(
+    row = snapshot_to_signal_row(snap, symbol=symbol, price=price)
+    append_signal_row_to_path(bt_signals_csv_path(run_id), row)
+
+
 def ensure_signals_header_matches_file() -> None:
     """
     Safe header upgrade (append-only).
@@ -552,7 +637,6 @@ def ensure_signals_header_matches_file() -> None:
     if existing == desired:
         return
 
-    # only upgrade if existing is exact prefix (safe append-only upgrades)
     if len(existing) <= len(desired) and existing == desired[: len(existing)]:
         rows[0] = desired
         try:
@@ -560,6 +644,86 @@ def ensure_signals_header_matches_file() -> None:
                 _csv_writer(f).writerows(rows)
         except Exception:
             return
+
+
+def ensure_signals_header_matches_path(path: str) -> None:
+    """
+    Same as ensure_signals_header_matches_file(), but operates on an explicit path.
+    This is what backtests should call for run-scoped signals files.
+    """
+    # line above: def ensure_signals_header_matches_path(path: str) -> None:
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    existing = rows[0]
+    desired = _signals_header()
+
+    if existing == desired:
+        return
+
+    if len(existing) <= len(desired) and existing == desired[: len(existing)]:
+        rows[0] = desired
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                _csv_writer(f).writerows(rows)
+        except Exception:
+            return
+
+
+# =========================
+# Equity logging (Phase 7 contract)
+# =========================
+def append_equity_row_to_path(path: str, epoch: int, equity_usd: Any, cash_usd: Any, position_qty: Any) -> None:
+    """
+    Equity file schema:
+      epoch,equity_usd,cash_usd,position_qty
+    """
+    # line above: def append_equity_row_to_path(path: str, epoch: int, equity_usd: Any, cash_usd: Any, position_qty: Any) -> None:
+    hdr = _equity_header()
+    _ensure_csv_has_header(path, hdr)
+
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            _csv_writer(f).writerow(
+                [
+                    _coerce_str(int(epoch)),
+                    _coerce_str(equity_usd),
+                    _coerce_str(cash_usd),
+                    _coerce_str(position_qty),
+                ]
+            )
+    except Exception:
+        return
+
+
+def log_bt_equity(
+    *,
+    run_id: str,
+    epoch: int,
+    equity_usd: Any,
+    cash_usd: Any,
+    position_qty: Any,
+) -> None:
+    """
+    Backtest-only equity logging to a run-scoped file.
+    """
+    # line above: def log_bt_equity(
+    append_equity_row_to_path(
+        bt_equity_csv_path(run_id),
+        epoch=int(epoch),
+        equity_usd=equity_usd,
+        cash_usd=cash_usd,
+        position_qty=position_qty,
+    )
 
 
 # =========================
