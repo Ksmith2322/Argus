@@ -8,7 +8,9 @@ __pycache__/
 venv/
 
 # --- Env / secrets ---
-.env
+# .env is tracked intentionally for PC1/PC2 sync (paper trading only — no real keys)
+# Remove this comment and uncomment the lines below before adding real API credentials
+# .env
 *.env
 .env.*
 
