@@ -1,9 +1,39 @@
 #!/usr/bin/env python3
 # backtest/runner.py
+#!/usr/bin/env python3
+# backtest/runner.py
 from __future__ import annotations
 
 import os
 import sys
+
+# line above: import sys
+# ----------------------------
+# Phase 7: BT env defaults MUST be set before importing io_logs (or anything that might log)
+# ----------------------------
+def _set_env_if_missing_or_blank(key: str, value: str) -> None:
+    # line above: def _set_env_if_missing_or_blank(key: str, value: str) -> None:
+    cur = os.environ.get(key, "")
+    if cur is None or str(cur).strip() == "":
+        os.environ[key] = value
+
+_set_env_if_missing_or_blank("ARGUS_MODE", "bt")
+_set_env_if_missing_or_blank("ARGUS_ARTIFACT_ROOT", r"C:\Argus\repo")
+_set_env_if_missing_or_blank("ARGUS_BT_ARTIFACT_DIR", os.path.join(os.environ["ARGUS_ARTIFACT_ROOT"], "ops", "logs"))
+
+# Sandbox LIVE_* paths for backtest (must happen before io_logs import)
+def _ensure_bt_sandbox_live_paths_early() -> None:
+    # line above: def _ensure_bt_sandbox_live_paths_early() -> None:
+    mode = (os.environ.get("ARGUS_MODE") or "").strip().lower()
+    if mode not in ("bt", "backtest"):
+        return
+    out_dir = os.environ["ARGUS_BT_ARTIFACT_DIR"]
+    os.makedirs(out_dir, exist_ok=True)
+    _set_env_if_missing_or_blank("LIVE_EVENTS_CSV", os.path.join(out_dir, "bt_sandbox_live_events.csv"))
+    _set_env_if_missing_or_blank("LIVE_SIGNALS_CSV", os.path.join(out_dir, "bt_sandbox_live_signals.csv"))
+    _set_env_if_missing_or_blank("ARGUS_DISABLE_LIVE_ARTIFACTS", "1")
+
+_ensure_bt_sandbox_live_paths_early()
 
 # add repo root so `import config` works when running as a script
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -251,6 +281,12 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
 
     cfg["BACKTEST_MODE"] = True
 
+    # Backtest has no async fill-back loop — ADAPTER mode would emit intents that
+    # never update the ledger, causing the engine to re-enter on every eligible tick.
+    # Force ENGINE mode so the engine calls ledger.buy/sell directly and position
+    # state is correct for the next tick's risk/sizing checks.
+    cfg["EXECUTION_MODE"] = "ENGINE"
+
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     cfg["STALE_TICK_SECONDS"] = max(int(cfg.get("STALE_TICK_SECONDS", 120)), tf_1m_s + 5)
 
@@ -298,6 +334,36 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
             synth = float(cfg.get("LIQ_SYNTH_SPREAD_FLOOR_BPS", 8) or 8)
 
     cfg["BT_SYNTH_SPREAD_BPS"] = float(synth)
+
+    # ── Phase 12: empirical friction injection ─────────────────────────────
+    # FRICTION_MODE: off (default) | constant | conditional | monte_carlo
+    # FRICTION_REPORT_PATH: explicit path to friction_report_*.json
+    # FRICTION_REPORT_LATEST: if "1", auto-load latest from log dir
+    # In constant mode, SLIPPAGE_BPS is overridden with p50 from the report.
+    # conditional/monte_carlo modes are applied per-tick by the walk-forward
+    # and stress harnesses; here we only handle the constant override.
+    friction_mode = os.environ.get("FRICTION_MODE", "off").strip().lower()
+    if friction_mode not in ("", "off", "none"):
+        try:
+            from backtest.friction_injector import load_friction_report, load_latest_friction_report, FrictionInjector
+            fp = os.environ.get("FRICTION_REPORT_PATH", "").strip()
+            if fp and os.path.exists(fp):
+                report = load_friction_report(fp)
+            elif os.environ.get("FRICTION_REPORT_LATEST", "").strip() in ("1", "true", "yes"):
+                log_dir = os.environ.get("ARGUS_LOG_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "ops", "logs"))
+                report = load_latest_friction_report(log_dir)
+            else:
+                report = None
+
+            if report is not None:
+                injector = FrictionInjector(report, mode="constant")
+                if injector.all_p50_bps > 0:
+                    cfg = injector.inject_into_cfg(cfg)
+                cfg["_friction_mode"] = friction_mode
+                cfg["_friction_report_sufficient"] = injector.sufficient_data
+        except Exception:
+            pass  # friction injection is best-effort; never break a backtest run
+
     return cfg
 
 
@@ -500,43 +566,6 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def _bt_event_row(*, symbol: str, snap: Any, ev: Any, name: str, msg: str) -> Dict[str, Any]:
-    run_id = os.environ.get("ARGUS_RUN_ID", "")
-    return dict(
-        ts=str(getattr(snap, "ts", "") or ""),
-        run_id=run_id,
-        symbol=symbol,
-        epoch=int(getattr(snap, "epoch", 0)),
-        price=getattr(snap, "px", ""),
-        event=name,
-        detail=msg,
-        paused=bool(getattr(snap, "paused", False)),
-        stale=bool(getattr(snap, "stale", False)),
-        action=str(getattr(snap, "action", "")),
-        action_reason=str(getattr(snap, "action_reason", "")),
-        risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
-        confluence_score=(
-            None
-            if getattr(snap, "confluence_score", None) is None
-            else _safe_int(getattr(snap, "confluence_score", 0), 0)
-        ),
-        confluence_gate=str(getattr(snap, "confluence_gate", "")),
-        confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
-        regime=str(getattr(snap, "regime", "") or ""),
-        ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
-        vol_used=getattr(snap, "vol_used", None),
-        sizing_note=str(getattr(snap, "sizing_note", "") or ""),
-        liq_ok=getattr(snap, "liq_ok", None),
-        liq_spread_bps=getattr(snap, "liq_spread_bps", None),
-        liq_vol_1m=getattr(snap, "liq_vol_1m", None),
-        liq_vol_baseline=getattr(snap, "liq_vol_baseline", None),
-        liq_atr_norm=getattr(snap, "liq_atr_norm", None),
-        session=str(getattr(snap, "session", "") or ""),
-        notify_title=str(getattr(ev, "notify_title", "") or ""),
-        notify_body=str(getattr(ev, "notify_body", "") or ""),
-    )
-
-
 def _record_entry_attempt_metrics(out: Any, snap: Any, tick: Optional[Any] = None) -> None:
     if not hasattr(out, "record_entry_attempt"):
         return
@@ -571,34 +600,41 @@ def _record_entry_attempt_metrics(out: Any, snap: Any, tick: Optional[Any] = Non
         return
 
 
-def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir: str) -> None:
+def _truncate_backtest_logs_if_requested(*, enabled: bool, paths: Dict[str, str]) -> None:
     """
     Backtests should not append across runs.
     Default: enabled.
-    Also removes any legacy "shared" bt_events/bt_signals if present.
+
+    NOTE: We only delete files under the *canonical* out_dir for this run.
+    We do NOT touch repo\\logs or any other drift directories here.
     """
-    # line above: def _truncate_backtest_logs_if_requested(*, enabled: bool, run_id: str, out_dir: str) -> None:
+    # line above: def _truncate_backtest_logs_if_requested(*, enabled: bool, paths: Dict[str, str]) -> None:
     if not enabled:
         return
 
+    # drop any legacy shared (non-run-scoped) files the io_logs module might use
     for p in (signals_csv_path(), events_csv_path()):
         try:
-            if os.path.exists(p):
+            if p and os.path.exists(p):
                 os.remove(p)
         except Exception:
             pass
 
-    for p in (os.path.join(out_dir, f"events_{run_id}.csv"), os.path.join(out_dir, f"signals_{run_id}.csv")):
+    # drop canonical run-scoped outputs for this run_id (if rerun with same ID)
+    for k in ("events", "signals", "equity", "trades", "event_counts", "entry_attempts", "entry_attempt_detail"):
+        p = paths.get(k)
         try:
-            if os.path.exists(p):
+            if p and os.path.exists(p):
                 os.remove(p)
         except Exception:
             pass
 
-    # also drop any run-scoped files we generate via io_logs helpers
-    for p in (bt_events_csv_path(run_id), bt_signals_csv_path(run_id), bt_equity_csv_path(run_id)):
+    # drop any run-scoped files generated via io_logs helpers (if they differ)
+    for p in (bt_events_csv_path(os.environ.get("ARGUS_RUN_ID", "")),
+              bt_signals_csv_path(os.environ.get("ARGUS_RUN_ID", "")),
+              bt_equity_csv_path(os.environ.get("ARGUS_RUN_ID", ""))):
         try:
-            if os.path.exists(p):
+            if p and os.path.exists(p):
                 os.remove(p)
         except Exception:
             pass
@@ -673,8 +709,8 @@ def run_backtest(
     damage: Optional[DamageProfile] = None,
 ) -> BacktestResults:
     cfg = cfg_override if cfg_override is not None else load_config()
-
     cfg = _ensure_bt_cfg(cfg)
+
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     synth_spread_bps = float(cfg.get("BT_SYNTH_SPREAD_BPS", 0.0) or 0.0)
 
@@ -685,22 +721,34 @@ def run_backtest(
     # IMPORTANT: match your PowerShell contract (ARGUS_MODE=bt)
     os.environ["ARGUS_MODE"] = "bt"
 
+    # Canonical artifact sink for the run (single source of truth)
+    out_dir = _artifact_out_dir()
+    os.makedirs(out_dir, exist_ok=True)
+
+    # CRITICAL: export the chosen sink so io_logs (and anything else) can’t drift to repo\logs
+    # line above: out_dir = _artifact_out_dir()
+    os.environ["ARGUS_ARTIFACT_ROOT"] = _artifact_root()
+    os.environ["ARGUS_BT_ARTIFACT_DIR"] = out_dir
+    # compat knobs (in case io_logs uses different env names)
+    os.environ["ARGUS_LOG_DIR"] = out_dir
+    os.environ["ARGUS_LOGS_DIR"] = out_dir
+
     # Enforce sandboxing of LIVE_* CSVs (prevents mutation of live_events/signals)
     _ensure_bt_sandbox_live_paths()
 
-    # Canonical artifact sink for the run
-    out_dir = _artifact_out_dir()
     paths = _bt_paths(run_id)
-    os.makedirs(out_dir, exist_ok=True)
 
     # Speed knobs (runner-only)
     bt_print_events = _as_bool_env("BT_PRINT_EVENTS", False)
-    bt_log_flush_n = _as_int_env("BT_LOG_FLUSH_N", 2000) or 2000
     bt_signal_log_every_n = _as_int_env("BT_SIGNAL_LOG_EVERY_N", 1) or 1
     bt_equity_every_n = _as_int_env("BT_EQUITY_EVERY_N", 1) or 1
 
     # Backtest log hygiene (default ON)
     bt_truncate_logs = _as_bool_env("BT_TRUNCATE_LOGS", True)
+
+    # ---- Phase 7 testing window knobs ----
+    # Line above: bt_truncate_logs = _as_bool_env("BT_TRUNCATE_LOGS", True)
+    bt_last_n = _as_bool_env("BACKTEST_LAST_N", True)  # if limit is set, prefer last N candles by default
 
     # Argus feature sabotage: pass profile to engine via cfg["ARGUS_PROFILE"]
     argus_profile = _to_argus_profile_dict(damage)
@@ -718,20 +766,26 @@ def run_backtest(
     events_path = bt_events_csv_path(run_id)
     signals_path = bt_signals_csv_path(run_id)
     equity_path = bt_equity_csv_path(run_id)
+    # note: io_logs helpers may point into out_dir; if they don't, you will SEE IT immediately
 
     if write_logs:
-        _truncate_backtest_logs_if_requested(enabled=bt_truncate_logs, run_id=run_id, out_dir=out_dir)
+        _truncate_backtest_logs_if_requested(enabled=bt_truncate_logs, paths=paths)
         ensure_logs()  # creates sandbox LIVE_* + upgrades sandbox header if needed
 
         # Ensure run-scoped headers exist and are compatible
-        os.makedirs(out_dir, exist_ok=True)
-        ensure_signals_header_matches_path(signals_path)  # no-op if missing
-        # Header creation happens lazily via io_logs append helpers, but we ensure directory now.
+        ensure_signals_header_matches_path(signals_path)  # create/upgrade header for run-scoped signals
+        paths["run_header"] = os.path.join(out_dir, f"run_header_{run_id}.json")
         _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
     else:
         _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
 
     candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
+
+    # ---- Phase 7 testing window: force last N candles if requested ----
+    # Line above: candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
+    if limit is not None and limit > 0 and bt_last_n and len(candles) > limit:
+        candles = candles[-limit:]
+
     if not candles:
         raise RuntimeError("No candles loaded. Check CSV format/path.")
 
@@ -844,6 +898,7 @@ def run_backtest(
                         pass
 
                     if write_logs:
+                        # write the synthetic boundary events into the SAME events file
                         try:
                             log_bt_event(
                                 symbol=symbol,
@@ -919,7 +974,7 @@ def run_backtest(
                             confluence_gate=str(getattr(snap, "confluence_gate", "")),
                             confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
                             regime=str(getattr(snap, "regime", "") or ""),
-                            ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                            ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "")),
                             vol_used=getattr(snap, "vol_used", None),
                             sizing_note=str(getattr(snap, "sizing_note", "") or ""),
                             notify_title=str(getattr(ev, "notify_title", "") or ""),
@@ -972,14 +1027,15 @@ def run_backtest(
             # ---- run-scoped signals ----
             if write_logs and (bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
                 try:
-                    # keep legacy call (writes to sandbox LIVE_SIGNALS_CSV) for compatibility
+                    # legacy compatibility (writes to sandbox LIVE_SIGNALS_CSV)
                     log_signal_snapshot(snap, symbol=symbol, price=getattr(snap, "px", None))
                 except Exception:
                     pass
+
                 try:
-                    # canonical: run-scoped, full schema
-                    log_bt_signal_snapshot(snap, run_id=run_id, symbol=symbol, price=getattr(snap, "px", None))
+                    # canonical run-scoped
                     ensure_signals_header_matches_path(signals_path)
+                    log_bt_signal_snapshot(snap, run_id=run_id, symbol=symbol, price=getattr(snap, "px", None))
                 except Exception:
                     pass
 
@@ -1033,6 +1089,12 @@ if __name__ == "__main__":
     os.environ.setdefault("ARGUS_RUN_ID", _new_run_id("bt"))
     os.environ.setdefault("ARGUS_MODE", "bt")
 
+    # canonical sink (export before any io_logs defaults get computed)
+    out_dir = _artifact_out_dir()
+    os.environ.setdefault("ARGUS_BT_ARTIFACT_DIR", os.path.join(_artifact_root(), "ops", "logs"))
+    os.environ.setdefault("ARGUS_LOG_DIR", out_dir)
+    os.environ.setdefault("ARGUS_LOGS_DIR", out_dir)
+
     # enforce sandbox paths even when run as a script
     _ensure_bt_sandbox_live_paths()
 
@@ -1044,8 +1106,15 @@ if __name__ == "__main__":
 
     candles_csv = os.environ.get("BACKTEST_CSV", default_csv)
     fmt = os.environ.get("BACKTEST_FORMAT", "auto")
-    limit = os.environ.get("BACKTEST_LIMIT")
-    limit_n = int(limit) if limit and str(limit).isdigit() else None
+
+    # Convenience: BACKTEST_DAYS overrides BACKTEST_LIMIT if set
+    # Line above: fmt = os.environ.get("BACKTEST_FORMAT", "auto")
+    days = os.environ.get("BACKTEST_DAYS")
+    if days and str(days).strip().replace(".", "", 1).isdigit():
+        limit_n = int(float(str(days).strip()) * 1440)
+    else:
+        limit = os.environ.get("BACKTEST_LIMIT")
+        limit_n = int(limit) if limit and str(limit).isdigit() else None
 
     write_logs = _as_bool_env("BT_WRITE_LOGS", True)
 

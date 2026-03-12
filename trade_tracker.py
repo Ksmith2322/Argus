@@ -1,4 +1,33 @@
 # trade_tracker.py
+"""
+Operator-facing hold / missed-buy counter for Argus.
+
+Purpose
+-------
+This module is intentionally *not* the canonical trade lifecycle record.
+
+It exists only to provide lightweight operator feedback such as:
+- why entries were skipped
+- why the engine is holding
+- high-level counts of non-trade outcomes
+
+Non-goals
+---------
+Do not use this file as authoritative accounting truth for:
+- closed trade lifecycle reconstruction
+- realized PnL reconciliation
+- entry/exit fill lineage
+- trade journal reporting
+
+Those belong in the dedicated execution / reconciliation artifact surface
+(e.g. trade_journal_<run>.csv, fills, orders, positions, daily summary).
+
+Design rule
+-----------
+Keep this module simple, side-effect-light, and non-blocking.
+It must never become a mixed responsibility "journal + counters" hybrid.
+"""
+
 import os
 import re
 from dataclasses import dataclass, field
@@ -18,8 +47,8 @@ DEFAULT_KEYS = [
     "MISSED_BUY_RISK_LOCKOUT",
     "MISSED_BUY_MAX_TRADES_PER_DAY",
     "MISSED_BUY_DAILY_MAX_LOSS",
-    "MISSED_BUY_CONFLUENCE",     # keep explicit (engine logs this)
-    "MISSED_BUY_ENTRY_BLOCKED",  # optional if you ever log it
+    "MISSED_BUY_CONFLUENCE",
+    "MISSED_BUY_ENTRY_BLOCKED",
 
     # --- Holds (new) ---
     "HOLD_WARMUP_NO_1M_STATE",
@@ -31,7 +60,7 @@ DEFAULT_KEYS = [
     "HOLD_CONFLUENCE",
     "HOLD_ENTRY_SIGNAL_FALSE",
     "HOLD_ENTRY_NO_SIZE",
-    "HOLD_IN_POSITION",  # useful: in-pos but holding (not an exit condition)
+    "HOLD_IN_POSITION",
     "HOLD_OTHER",
 ]
 
@@ -69,51 +98,54 @@ def _sum_keys(counts: Dict[str, int], keys: List[str]) -> int:
 
 @dataclass
 class TradeTracker:
+    """
+    Lightweight operator-feedback tracker.
+
+    This class deliberately tracks *reasons* and *counts*, not trade lifecycle truth.
+    It should never be treated as the source of record for closed trades, fills, or PnL.
+    """
+
     filepath: str
     counts: Dict[str, int] = field(default_factory=dict)
     last_reason: str = ""
     last_detail: str = ""
     last_update_local: str = ""
 
-    # --------- LINE ABOVE: last_update_local: str = ""
-    # Optional behavior controls:
+    # Optional behavior controls
     enabled: bool = True
-    # If True, we avoid atomic replace and instead do a best-effort overwrite. Useful on Windows
-    # when the destination file is locked (Notepad/VSCode/AV). You won't get atomicity, but you
-    # also won't crash the bot/backtest.
+
+    # If True, avoid atomic replace and instead do a best-effort overwrite.
+    # Useful on Windows when destination file is locked (Notepad / VSCode / AV).
+    # You lose atomicity, but you also avoid crashing the runtime.
     non_atomic_writes: bool = True
 
     @classmethod
     def from_config(cls, cfg: Dict) -> "TradeTracker":
         fp = cfg.get("TRADE_TRACKER_FILE", "trade_tracker.txt")
 
-        # Support "logs/..." relative paths (recommended) and plain relative paths
+        # Support "logs/..." relative paths (recommended) and plain relative paths.
         if not os.path.isabs(fp):
             fp = os.path.join(os.path.dirname(__file__), fp)
 
-        t = cls(
+        tracker = cls(
             filepath=fp,
             enabled=bool(cfg.get("TRADE_TRACKER_ENABLED", True)),
             non_atomic_writes=bool(cfg.get("TRADE_TRACKER_NON_ATOMIC_WRITES", True)),
         )
 
-        # Ensure default keys exist
         for k in DEFAULT_KEYS:
-            t.counts.setdefault(k, 0)
+            tracker.counts.setdefault(k, 0)
 
-        # --------- LINE ABOVE: for k in DEFAULT_KEYS:
-        # Load persisted state (counts + last fields) if file exists
-        t._load_existing_state()
+        tracker._load_existing_state()
 
-        # Ensure we still have defaults (in case old file missed keys)
         for k in DEFAULT_KEYS:
-            t.counts.setdefault(k, 0)
+            tracker.counts.setdefault(k, 0)
 
-        # Write immediately so file exists on startup (unless disabled)
-        t.write()
-        return t
+        # Ensure file exists on startup when enabled.
+        tracker.write()
+        return tracker
 
-    def _load_existing_state(self):
+    def _load_existing_state(self) -> None:
         if not os.path.exists(self.filepath):
             return
 
@@ -142,17 +174,20 @@ class TradeTracker:
                         if mr:
                             self.last_reason = mr.group(1).strip().strip('"')
                             continue
+
                         md = _LAST_DETAIL_RE.search(line)
                         if md:
                             self.last_detail = md.group(1).strip().strip('"')
                             continue
         except Exception:
-            # Never crash the bot due to tracker parsing
+            # Never crash the runtime because an operator-feedback file is malformed.
             return
 
-    def bump(self, key: str, detail: str = ""):
+    def bump(self, key: str, detail: str = "") -> None:
         """
-        Generic bump. Use bump_hold() / bump_missed_buy() for clarity.
+        Generic counter bump.
+
+        Use bump_hold() / bump_missed_buy() when possible for clearer intent.
         """
         if not self.enabled:
             return
@@ -170,8 +205,7 @@ class TradeTracker:
 
         self.write()
 
-    # --------- LINE ABOVE: def bump(self, key: str, detail: str = ""):
-    def bump_hold(self, reason: str, detail: str = ""):
+    def bump_hold(self, reason: str, detail: str = "") -> None:
         """
         Bump a HOLD_* reason (adds prefix if missing).
         """
@@ -183,12 +217,11 @@ class TradeTracker:
 
         key = reason if reason.startswith(HOLD_PREFIX) else f"{HOLD_PREFIX}{reason}"
         if key not in self.counts:
-            # Track new hold reasons without breaking formatting
             self.counts[key] = 0
 
         self.bump(key, detail)
 
-    def bump_missed_buy(self, reason: str, detail: str = ""):
+    def bump_missed_buy(self, reason: str, detail: str = "") -> None:
         """
         Bump a MISSED_BUY_* reason (adds prefix if missing).
         """
@@ -204,12 +237,47 @@ class TradeTracker:
 
         self.bump(key, detail)
 
-    def _build_lines(self) -> List[str]:
-        # Ensure default keys always appear (stable formatting)
+    def reset(self) -> None:
+        """
+        Reset all tracked counters.
+
+        This resets operator-feedback counts only.
+        It must not be confused with resetting trade/accounting artifacts.
+        """
+        if not self.enabled:
+            return
+
+        self.counts = {k: 0 for k in DEFAULT_KEYS}
+        self.last_reason = ""
+        self.last_detail = ""
+        self.last_update_local = local_now_str()
+        self.write()
+
+    def snapshot(self) -> Dict[str, object]:
+        """
+        Return a lightweight in-memory snapshot for debugging / UI use.
+
+        This snapshot is informational only and is not accounting truth.
+        """
         for k in DEFAULT_KEYS:
             self.counts.setdefault(k, 0)
 
-        # Keep stable ordering: missed buys first, then holds, then extras
+        missed_keys = [k for k in DEFAULT_KEYS if _is_missed_buy_key(k)]
+        hold_keys = [k for k in DEFAULT_KEYS if _is_hold_key(k)]
+
+        return {
+            "last_update_local": self.last_update_local or local_now_str(),
+            "last_reason": self.last_reason,
+            "last_detail": self.last_detail,
+            "missed_buy_total": _sum_keys(self.counts, missed_keys),
+            "hold_total": _sum_keys(self.counts, hold_keys),
+            "counts": dict(self.counts),
+        }
+
+    def _build_lines(self) -> List[str]:
+        for k in DEFAULT_KEYS:
+            self.counts.setdefault(k, 0)
+
         missed_keys = [k for k in DEFAULT_KEYS if _is_missed_buy_key(k)]
         hold_keys = [k for k in DEFAULT_KEYS if _is_hold_key(k)]
 
@@ -217,7 +285,8 @@ class TradeTracker:
         hold_total = _sum_keys(self.counts, hold_keys)
 
         lines: List[str] = []
-        lines.append("=== NOVA TRADE TRACKER (MISSED BUYS + HOLD REASONS) ===")
+        lines.append("=== ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===")
+        lines.append("NOTE: This file is not authoritative trade lifecycle or PnL truth.")
         lines.append(f"Last update: {self.last_update_local or local_now_str()}")
         lines.append("")
         lines.append("Totals:")
@@ -234,7 +303,6 @@ class TradeTracker:
         for k in hold_keys:
             lines.append(f"  - {k}: {self.counts.get(k, 0)}")
 
-        # Any future / unknown keys (non-defaults)
         extra = sorted(k for k in self.counts.keys() if k not in DEFAULT_KEYS)
         if extra:
             lines.append("")
@@ -252,8 +320,9 @@ class TradeTracker:
 
     def _atomic_replace_write(self, text: str) -> Optional[Exception]:
         """
-        Atomic write: tmp file then os.replace().
-        On Windows, os.replace() will raise PermissionError if the destination file is open/locked.
+        Atomic write via tmp file then os.replace().
+
+        On Windows, os.replace() can raise PermissionError if destination is open/locked.
         """
         try:
             tmp = self.filepath + ".tmp"
@@ -271,7 +340,7 @@ class TradeTracker:
 
     def _non_atomic_write(self, text: str) -> Optional[Exception]:
         """
-        Best-effort overwrite. Not atomic, but avoids crashing when the file is locked.
+        Best-effort overwrite. Not atomic, but avoids crashing when file is locked.
         """
         try:
             parent = os.path.dirname(self.filepath)
@@ -285,21 +354,19 @@ class TradeTracker:
         except Exception as e:
             return e
 
-    def write(self):
+    def write(self) -> None:
         if not self.enabled:
             return
 
         text = "\n".join(self._build_lines()) + "\n"
 
-        # First try atomic replace (best integrity)
         err = self._atomic_replace_write(text)
         if err is None:
             return
 
-        # If that fails (common on Windows due to file locks), optionally fall back.
         if self.non_atomic_writes:
             _ = self._non_atomic_write(text)
             return
 
-        # Strict mode: never crash the bot—just give up quietly.
+        # Strict mode still must not crash runtime.
         return

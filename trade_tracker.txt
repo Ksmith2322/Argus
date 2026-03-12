@@ -1,9 +1,10 @@
-=== NOVA TRADE TRACKER (MISSED BUYS + HOLD REASONS) ===
-Last update: 2026-02-12 10:31:53 CST
+=== ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
+NOTE: This file is not authoritative trade lifecycle or PnL truth.
+Last update: 2026-03-12 14:35:42 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       886
+  - HOLD total:       2192
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -18,16 +19,16 @@ Missed buy counters:
 Hold reason counters:
   - HOLD_WARMUP_NO_1M_STATE: 0
   - HOLD_PAUSED: 0
-  - HOLD_STALE_DATA: 643
+  - HOLD_STALE_DATA: 1841
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 22
-  - HOLD_NO_TREND_OK: 189
+  - HOLD_NO_SIGNAL: 37
+  - HOLD_NO_TREND_OK: 257
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 0
+  - HOLD_OTHER: 25
 
 Last event:
   reason: HOLD_STALE_DATA
-  detail: stale tick guard | px=1905.15 | 1m:score=80|signal=0|trend_ok=1; 5m:score=20|signal=0|trend_ok=0; 1h:score=40|signal=1|trend_ok=0; base=42; confluence=42; gate=HOLD; mode=IGNORE_MISSING_TFS | struct= | liq=
+  detail: stale tick guard | px=2066.775 | bonus_trend_up=+5 | regime=TREND_UP | base_score=93 | delta=5 | adj_score=98 | watch_th=55 | trade_th=72 | trend_strength=0.00345 | vol=0.00073 | session_bonus=+2 (NY:['session:NY', 'score_bonus:5', 'reason:UTC_hour=19']) | liq:spread=NA;vol_1m=25.78696176;vol_floor>=50000;vol_base=57.92481997783333333333333333;vol_need>=28.9624;atr_norm=0.00073385645440537396709534956329434862709604203701019287109375;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=25.78696176;vol_floor>=50000;vol_base=57.92481997783333333333333333;vol_need>=28.9624;atr_norm=0.00073385645440537396709534956329434862709604203701019287109375;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20

@@ -1,7 +1,3 @@
-# line above: import requests
-import requests
-
-# line above: #!/usr/bin/env python3
 #!/usr/bin/env python3
 """
 download_candles.py

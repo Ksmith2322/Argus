@@ -2,6 +2,7 @@
 # io_logs.py
 import csv
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 from utils import utc_ts
@@ -79,6 +80,33 @@ def bt_equity_csv_path(run_id: Optional[str] = None) -> str:
     return os.path.join(logs_dir(), name)
 
 
+def orders_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Phase 8 orders artifact.
+    """
+    # line above: def orders_csv_path(run_id: Optional[str] = None) -> str:
+    name = "orders.csv" if not run_id else f"orders_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
+def fills_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Phase 8 fills artifact.
+    """
+    # line above: def fills_csv_path(run_id: Optional[str] = None) -> str:
+    name = "fills.csv" if not run_id else f"fills_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
+def positions_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Phase 8 positions artifact.
+    """
+    # line above: def positions_csv_path(run_id: Optional[str] = None) -> str:
+    name = "positions.csv" if not run_id else f"positions_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
 # =========================
 # Canonical Schemas
 # =========================
@@ -86,32 +114,49 @@ def _signals_header() -> List[str]:
     """
     Single source of truth for the signals CSV schema.
 
-    MUST-HAVES for Phase 5 closure:
+    MUST-HAVES for Phase 8:
+      - execution identity fields
       - candle_volume_1m
-      - liquidity proof fields (spread_bps, vol_1m, baseline, atr_norm)
-      - all session fields (Phase 5C)
+      - liquidity proof fields
+      - full session fields
       - deterministic fill: every column always exists; blanks for missing
     """
     return [
         # base
         "ts",
         "symbol",
-        "price",
+        "px",     # canonical price column
+        "price",  # legacy compatibility
         "epoch",
-        # candle (include V for liquidity baseline proof)
+
+        # Phase 8 execution identity
+        "intent_id",
+        "entry_intent_id",
+        "exit_intent_id",
+        "client_order_id",
+        "order_id",
+        "trade_id",
+        "execution_mode",
+        "execution_status",
+        "execution_reason",
+
+        # candle
         "candle_start",
         "candle_close",
         "candle_volume_1m",
+
         # indicators
         "ma_fast",
         "ma_slow",
         "ma50",
         "ma200",
+
         # signal
         "signal",
         "trend_ok",
         "score",
         "reasons",
+
         # Phase 3 ledger
         "cash_usd",
         "position_qty",
@@ -120,21 +165,25 @@ def _signals_header() -> List[str]:
         "exposure_usd",
         "unrl_pnl_usd",
         "realized_pnl_usd",
+
         # Shadow-style exit levels
         "hold_s",
         "peak_price",
         "take_profit",
         "stop_loss",
         "trail_stop",
+
         # Distances + trend invalidation
         "dist_ma200_pct",
         "dist_tp_pct",
         "dist_sl_pct",
         "dist_trail_pct",
         "trend_below_count",
+
         # MFE / MAE
         "mfe_pct",
         "mae_pct",
+
         # Ops / action
         "stale_data",
         "action",
@@ -143,12 +192,14 @@ def _signals_header() -> List[str]:
         "risk_blocked_reason",
         "paused",
         "next_poll_s",
+
         # Phase 3.5 Confluence
         "confluence_score",
         "confluence_reasons",
         "score_5m",
         "score_1h",
         "confluence_gate",
+
         # =========================
         # Phase 4
         # =========================
@@ -165,6 +216,7 @@ def _signals_header() -> List[str]:
         "ac_adjusted_gate",
         "ac_delta",
         "ac_reason",
+
         # =========================
         # Phase 5A — Market Structure
         # =========================
@@ -181,8 +233,9 @@ def _signals_header() -> List[str]:
         "rejection_at_res",
         "rejection_at_sup",
         "structure_reasons",
+
         # =========================
-        # Phase 5B — Liquidity Filters (proof fields)
+        # Phase 5B — Liquidity Filters
         # =========================
         "liq_ok",
         "liq_spread_bps",
@@ -192,14 +245,20 @@ def _signals_header() -> List[str]:
         "liq_mode",
         "liq_penalty_points",
         "liq_reasons",
+
         # =========================
-        # Phase 5C — Session Behavior (full fields)
+        # Phase 5C — Session Behavior
         # =========================
         "session",
         "session_labels",
         "session_bonus_points",
         "session_risk_mult",
         "session_reason",
+
+        # Argus profile / sabotage annotations
+        "argus_profile",
+        "argus_forced_regime",
+        "argus_forced_liq_block",
     ]
 
 
@@ -213,6 +272,12 @@ def _events_header() -> List[str]:
         "detail",
         "notify_title",
         "notify_body",
+
+        # Phase 8 execution identity
+        "client_order_id",
+        "order_id",
+        "trade_id",
+
         "paused",
         "stale",
         "action",
@@ -221,12 +286,14 @@ def _events_header() -> List[str]:
         "confluence_score",
         "confluence_gate",
         "confluence_reasons",
+
         # Phase 4
         "regime",
         "ac_adjusted_gate",
         "vol_used",
         "sizing_note",
-        # Phase 5B/5C (append-only)
+
+        # Phase 5B/5C
         "liq_ok",
         "liq_spread_bps",
         "session",
@@ -237,8 +304,59 @@ def _equity_header() -> List[str]:
     return ["epoch", "equity_usd", "cash_usd", "position_qty"]
 
 
+def _orders_header() -> List[str]:
+    return [
+        "run_id",
+        "ts",
+        "order_id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "qty",
+        "order_type",
+        "limit_px",
+        "stop_px",
+        "status",
+        "filled_qty",
+        "remaining_qty",
+        "avg_fill_px",
+    ]
+
+
+def _fills_header() -> List[str]:
+    return [
+        "run_id",
+        "ts",
+        "fill_id",
+        "trade_id",
+        "order_id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "qty",
+        "price",
+        "fee",
+        "fee_currency",
+        "liquidity",
+    ]
+
+
+def _positions_header() -> List[str]:
+    return [
+        "run_id",
+        "ts",
+        "symbol",
+        "qty",
+        "avg_entry_px",
+        "mark_px",
+        "unrealized_pnl",
+        "realized_pnl",
+        "side",
+    ]
+
+
 # =========================
-# CSV primitives (NO manual joining, ever)
+# CSV primitives
 # =========================
 def _csv_writer(f):
     """
@@ -255,7 +373,6 @@ def _coerce_str(x: Any) -> str:
     if x is None:
         return ""
     s = str(x)
-    # prevent multiline CSV corruption
     if "\r" in s or "\n" in s:
         s = s.replace("\r", "\\r").replace("\n", "\\n")
     return s
@@ -272,7 +389,7 @@ def _get(snap: Any, name: str, default: Any = "") -> Any:
 def _ensure_csv_has_header(path: str, header: List[str]) -> None:
     """
     Ensures a header exists. Does NOT attempt to rewrite/upgrade headers.
-    Use ensure_signals_header_matches_file() for safe append-only upgrades.
+    Use ensure_*_header_matches_path() for safe append-only upgrades.
     """
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -296,11 +413,49 @@ def _ensure_csv_has_header(path: str, header: List[str]) -> None:
         return
 
 
+def _safe_header_upgrade(path: str, desired: List[str]) -> None:
+    """
+    Safe header upgrade (append-only).
+    Upgrades ONLY if existing header is an exact prefix of desired header.
+    """
+    # line above: if not os.path.exists(path):
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    existing = rows[0]
+    if existing == desired:
+        return
+
+    if len(existing) <= len(desired) and existing == desired[: len(existing)]:
+        rows[0] = desired
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                _csv_writer(f).writerows(rows)
+        except Exception:
+            return
+
+
 def ensure_logs() -> None:
+    """
+    Ensure canonical directories + headers exist for:
+      - sandbox LIVE_* files (signals/events)
+      - run-scoped schemas can be created on demand by append_*_to_path helpers
+    """
+    # line above: def ensure_logs() -> None:
     os.makedirs(logs_dir(), exist_ok=True)
     _ensure_csv_has_header(signals_csv_path(), _signals_header())
     _ensure_csv_has_header(events_csv_path(), _events_header())
     ensure_signals_header_matches_file()
+    ensure_events_header_matches_file()
 
 
 # =========================
@@ -312,7 +467,6 @@ def append_event_row(row: List[Any]) -> None:
     _ensure_csv_has_header(path, hdr)
 
     try:
-        # force width stability
         out = ["" for _ in hdr]
         for i in range(min(len(row), len(hdr))):
             out[i] = row[i]
@@ -328,7 +482,6 @@ def append_event_row_to_path(path: str, row: List[Any]) -> None:
     _ensure_csv_has_header(path, hdr)
 
     try:
-        # force width stability
         out = ["" for _ in hdr]
         for i in range(min(len(row), len(hdr))):
             out[i] = row[i]
@@ -337,6 +490,21 @@ def append_event_row_to_path(path: str, row: List[Any]) -> None:
             _csv_writer(f).writerow([_coerce_str(x) for x in out])
     except Exception:
         return
+
+
+def _epoch_to_iso_utc(epoch: Any) -> str:
+    """
+    Convert candle epoch (seconds) -> ISO-8601 UTC timestamp.
+    If epoch is missing/invalid/<=0, falls back to wall-clock utc_ts().
+    """
+    # line above: def _epoch_to_iso_utc(epoch: Any) -> str:
+    try:
+        e = int(epoch)
+        if e > 0:
+            return datetime.fromtimestamp(e, tz=timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        pass
+    return utc_ts()
 
 
 def log_bt_event(
@@ -360,13 +528,20 @@ def log_bt_event(
     sizing_note: str = "",
     notify_title: str = "",
     notify_body: str = "",
+    client_order_id: str = "",
+    order_id: str = "",
+    trade_id: str = "",
+    liq_ok: Any = "",
+    liq_spread_bps: Any = "",
+    session: str = "",
     path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     hdr = _events_header()
 
     rowd: Dict[str, Any] = {
-        "ts": utc_ts(),
+        # line above: rowd: Dict[str, Any] = {
+        "ts": _epoch_to_iso_utc(epoch),
         "symbol": symbol,
         "epoch": int(epoch),
         "price": price,
@@ -374,6 +549,9 @@ def log_bt_event(
         "detail": detail,
         "notify_title": notify_title,
         "notify_body": notify_body,
+        "client_order_id": client_order_id,
+        "order_id": order_id,
+        "trade_id": trade_id,
         "paused": int(bool(paused)),
         "stale": int(bool(stale)),
         "action": action,
@@ -386,9 +564,11 @@ def log_bt_event(
         "ac_adjusted_gate": ac_adjusted_gate,
         "vol_used": vol_used,
         "sizing_note": sizing_note,
+        "liq_ok": liq_ok,
+        "liq_spread_bps": liq_spread_bps,
+        "session": session,
     }
 
-    # allow append-only extension columns without schema drift: fill by header order
     for k, v in kwargs.items():
         rowd[k] = "" if v is None else v
 
@@ -430,15 +610,44 @@ def snapshot_to_signal_row(
         if col == "price" and price is not None:
             out = price
 
-        # Aliases for common schema drift (explicit and cheap)
+        # Aliases / compatibility
         if out is None:
-            if col == "price":
+            if col == "px":
                 out = _get(snap, "px", None)
+                if out is None:
+                    out = _get(snap, "price", None)
+
+            elif col == "price":
+                out = _get(snap, "price", None)
+                if out is None:
+                    out = _get(snap, "px", None)
 
             elif col == "epoch":
-                out = _get(snap, "ts_epoch", None)
+                out = _get(snap, "epoch", None)
+                if out is None:
+                    out = _get(snap, "ts_epoch", None)
                 if out is None:
                     out = _get(snap, "tick_epoch", None)
+
+            # execution aliases
+            elif col == "intent_id":
+                out = _get(snap, "intent_id", None)
+            elif col == "entry_intent_id":
+                out = _get(snap, "entry_intent_id", None)
+            elif col == "exit_intent_id":
+                out = _get(snap, "exit_intent_id", None)
+            elif col == "client_order_id":
+                out = _get(snap, "client_order_id", None)
+            elif col == "order_id":
+                out = _get(snap, "order_id", None)
+            elif col == "trade_id":
+                out = _get(snap, "trade_id", None)
+            elif col == "execution_mode":
+                out = _get(snap, "execution_mode", None)
+            elif col == "execution_status":
+                out = _get(snap, "execution_status", None)
+            elif col == "execution_reason":
+                out = _get(snap, "execution_reason", None)
 
             elif col == "candle_start":
                 out = _get(snap, "candle_start_1m", None)
@@ -466,28 +675,57 @@ def snapshot_to_signal_row(
             elif col == "position_qty":
                 out = _get(snap, "qty", None)
             elif col == "equity_usd":
-                out = _get(snap, "equity", None)
+                out = _get(snap, "equity_usd", None)
+                if out is None:
+                    out = _get(snap, "equity", None)
+            elif col == "cash_usd":
+                out = _get(snap, "cash_usd", None)
+                if out is None:
+                    out = _get(snap, "cash", None)
             elif col == "unrl_pnl_usd":
-                out = _get(snap, "unrl", None)
+                out = _get(snap, "unrl_pnl_usd", None)
+                if out is None:
+                    out = _get(snap, "unrl", None)
             elif col == "realized_pnl_usd":
-                out = _get(snap, "realized", None)
+                out = _get(snap, "realized_pnl_usd", None)
+                if out is None:
+                    out = _get(snap, "realized", None)
 
             elif col == "dist_ma200_pct":
-                out = _get(snap, "dist_ma200", None)
+                out = _get(snap, "dist_ma200_pct", None)
+                if out is None:
+                    out = _get(snap, "dist_ma200", None)
             elif col == "dist_tp_pct":
-                out = _get(snap, "dist_tp", None)
+                out = _get(snap, "dist_tp_pct", None)
+                if out is None:
+                    out = _get(snap, "dist_tp", None)
             elif col == "dist_sl_pct":
-                out = _get(snap, "dist_sl", None)
+                out = _get(snap, "dist_sl_pct", None)
+                if out is None:
+                    out = _get(snap, "dist_sl", None)
             elif col == "dist_trail_pct":
-                out = _get(snap, "dist_trail", None)
+                out = _get(snap, "dist_trail_pct", None)
+                if out is None:
+                    out = _get(snap, "dist_trail", None)
 
-            # Session field aliases (Phase 5C drift)
+            # Session field aliases
             elif col == "session_bonus_points":
-                out = _get(snap, "session_bonus", None)
+                out = _get(snap, "session_bonus_points", None)
+                if out is None:
+                    out = _get(snap, "session_bonus", None)
             elif col == "session_reason":
-                out = _get(snap, "session_reasons", None)
+                out = _get(snap, "session_reason", None)
+                if out is None:
+                    out = _get(snap, "session_reasons", None)
 
-        # Default timestamp (always present)
+            # Argus aliases
+            elif col == "argus_profile":
+                out = _get(snap, "argus_profile", None)
+            elif col == "argus_forced_regime":
+                out = _get(snap, "argus_forced_regime", None)
+            elif col == "argus_forced_liq_block":
+                out = _get(snap, "argus_forced_liq_block", None)
+
         if col == "ts" and (out is None or out == ""):
             out = utc_ts()
 
@@ -505,6 +743,7 @@ def snapshot_to_signal_row(
             "rejection_at_res",
             "rejection_at_sup",
             "liq_ok",
+            "argus_forced_liq_block",
         ):
             if out is None or out == "":
                 return ""
@@ -533,12 +772,10 @@ def append_signal_row(row: Union[List[Any], Dict[str, Any]]) -> None:
         elif not isinstance(row, list):
             row = [row]
 
-        # Drop accidental header-as-data
         if row and len(row) >= len(hdr):
             if [str(x) for x in row[: len(hdr)]] == hdr:
                 return
 
-        # Force width stability
         if len(row) < len(hdr):
             row = list(row) + ([""] * (len(hdr) - len(row)))
         elif len(row) > len(hdr):
@@ -563,12 +800,10 @@ def append_signal_row_to_path(path: str, row: Union[List[Any], Dict[str, Any]]) 
         elif not isinstance(row, list):
             row = [row]
 
-        # Drop accidental header-as-data
         if row and len(row) >= len(hdr):
             if [str(x) for x in row[: len(hdr)]] == hdr:
                 return
 
-        # Force width stability
         if len(row) < len(hdr):
             row = list(row) + ([""] * (len(hdr) - len(row)))
         elif len(row) > len(hdr):
@@ -614,69 +849,19 @@ def log_bt_signal_snapshot(
 
 
 def ensure_signals_header_matches_file() -> None:
-    """
-    Safe header upgrade (append-only).
-    Upgrades ONLY if existing header is an exact prefix of desired header.
-    """
-    scsv = signals_csv_path()
-    if not os.path.exists(scsv):
-        return
-
-    try:
-        with open(scsv, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.reader(f))
-    except Exception:
-        return
-
-    if not rows:
-        return
-
-    existing = rows[0]
-    desired = _signals_header()
-
-    if existing == desired:
-        return
-
-    if len(existing) <= len(desired) and existing == desired[: len(existing)]:
-        rows[0] = desired
-        try:
-            with open(scsv, "w", newline="", encoding="utf-8") as f:
-                _csv_writer(f).writerows(rows)
-        except Exception:
-            return
+    _safe_header_upgrade(signals_csv_path(), _signals_header())
 
 
 def ensure_signals_header_matches_path(path: str) -> None:
-    """
-    Same as ensure_signals_header_matches_file(), but operates on an explicit path.
-    This is what backtests should call for run-scoped signals files.
-    """
-    # line above: def ensure_signals_header_matches_path(path: str) -> None:
-    if not os.path.exists(path):
-        return
+    _safe_header_upgrade(path, _signals_header())
 
-    try:
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.reader(f))
-    except Exception:
-        return
 
-    if not rows:
-        return
+def ensure_events_header_matches_file() -> None:
+    _safe_header_upgrade(events_csv_path(), _events_header())
 
-    existing = rows[0]
-    desired = _signals_header()
 
-    if existing == desired:
-        return
-
-    if len(existing) <= len(desired) and existing == desired[: len(existing)]:
-        rows[0] = desired
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                _csv_writer(f).writerows(rows)
-        except Exception:
-            return
+def ensure_events_header_matches_path(path: str) -> None:
+    _safe_header_upgrade(path, _events_header())
 
 
 # =========================
@@ -727,13 +912,145 @@ def log_bt_equity(
 
 
 # =========================
+# Phase 8 artifact logging
+# =========================
+def append_dict_row_to_path(path: str, header: List[str], rowd: Dict[str, Any]) -> None:
+    """
+    Generic dict -> csv append, schema-ordered and width-stable.
+    """
+    # line above: def append_dict_row_to_path(path: str, header: List[str], rowd: Dict[str, Any]) -> None:
+    _ensure_csv_has_header(path, header)
+    try:
+        row = [_coerce_str(rowd.get(col, "")) for col in header]
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            _csv_writer(f).writerow(row)
+    except Exception:
+        return
+
+
+def log_order_row(
+    *,
+    run_id: str,
+    ts: Any,
+    order_id: Any,
+    client_order_id: Any,
+    symbol: Any,
+    side: Any,
+    qty: Any,
+    order_type: Any,
+    limit_px: Any = "",
+    stop_px: Any = "",
+    status: Any = "",
+    filled_qty: Any = "",
+    remaining_qty: Any = "",
+    avg_fill_px: Any = "",
+    path: Optional[str] = None,
+) -> None:
+    rowd = {
+        "run_id": run_id,
+        "ts": ts,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "order_type": order_type,
+        "limit_px": limit_px,
+        "stop_px": stop_px,
+        "status": status,
+        "filled_qty": filled_qty,
+        "remaining_qty": remaining_qty,
+        "avg_fill_px": avg_fill_px,
+    }
+    append_dict_row_to_path(path or orders_csv_path(run_id), _orders_header(), rowd)
+
+
+def log_fill_row(
+    *,
+    run_id: str,
+    ts: Any,
+    fill_id: Any,
+    trade_id: Any,
+    order_id: Any,
+    client_order_id: Any,
+    symbol: Any,
+    side: Any,
+    qty: Any,
+    price: Any,
+    fee: Any = "",
+    fee_currency: Any = "",
+    liquidity: Any = "",
+    path: Optional[str] = None,
+) -> None:
+    rowd = {
+        "run_id": run_id,
+        "ts": ts,
+        "fill_id": fill_id,
+        "trade_id": trade_id,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "fee": fee,
+        "fee_currency": fee_currency,
+        "liquidity": liquidity,
+    }
+    append_dict_row_to_path(path or fills_csv_path(run_id), _fills_header(), rowd)
+
+
+def log_position_row(
+    *,
+    run_id: str,
+    ts: Any,
+    symbol: Any,
+    qty: Any,
+    avg_entry_px: Any,
+    mark_px: Any = "",
+    unrealized_pnl: Any = "",
+    realized_pnl: Any = "",
+    side: Any = "",
+    path: Optional[str] = None,
+) -> None:
+    rowd = {
+        "run_id": run_id,
+        "ts": ts,
+        "symbol": symbol,
+        "qty": qty,
+        "avg_entry_px": avg_entry_px,
+        "mark_px": mark_px,
+        "unrealized_pnl": unrealized_pnl,
+        "realized_pnl": realized_pnl,
+        "side": side,
+    }
+    append_dict_row_to_path(path or positions_csv_path(run_id), _positions_header(), rowd)
+
+
+# =========================
 # Ops toggles
 # =========================
+def _resolve_toggle_path(fname: str) -> str:
+    # line above: if os.path.isabs(str(fname)):
+    try:
+        f = str(fname)
+    except Exception:
+        f = ""
+
+    if not f:
+        return os.path.join(os.path.dirname(__file__), "")
+
+    if os.path.isabs(f):
+        return f
+
+    return os.path.join(os.path.dirname(__file__), f)
+
+
 def is_kill_switch_on(cfg: Dict[str, Any]) -> bool:
     fname = cfg.get("KILL_SWITCH_FILE", "KILL_SWITCH")
-    return os.path.exists(os.path.join(os.path.dirname(__file__), str(fname)))
+    return os.path.exists(_resolve_toggle_path(str(fname)))
 
 
 def is_paused(cfg: Dict[str, Any]) -> bool:
     fname = cfg.get("PAUSE_FILE", "PAUSE")
-    return os.path.exists(os.path.join(os.path.dirname(__file__), str(fname)))
+    return os.path.exists(_resolve_toggle_path(str(fname)))

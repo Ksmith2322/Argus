@@ -1,8 +1,12 @@
 ﻿#!/usr/bin/env python3
 # engine.py
+
+from __future__ import annotations
+
 from decimal import Decimal
 from typing import Optional, Tuple, Any, List, Dict
 import random
+import uuid
 
 from confluence import TFState
 from decisions import DecisionSnapshot, EngineEvent
@@ -11,6 +15,9 @@ from utils import pct_dist, safe_str
 
 # Phase 5A
 from structure import StructureResult
+
+# Phase 18
+from trendlines import TrendlineResult
 
 # Phase 5B
 from liquidity import LiquidityResult  # noqa: F401
@@ -31,7 +38,6 @@ def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float
             return float(cfg["POLL_FAST_SECONDS"])
         return float(cfg["POLL_MED_SECONDS"])
 
-    # line above ↓: if min_dist <= Decimal(str(cfg["NEAR_ENTRY_PCT"])):
     if min_dist <= Decimal(str(cfg["NEAR_ENTRY_PCT"])):
         return float(cfg["POLL_FAST_SECONDS"])
 
@@ -72,6 +78,35 @@ def _normalize_epoch_seconds(e: int) -> int:
     return int(e)
 
 
+def _execution_mode(cfg: dict, state: Any = None) -> str:
+    mode = str(cfg.get("EXECUTION_MODE", "") or "").strip().upper()
+    if not mode and state is not None:
+        mode = str(getattr(state, "execution_mode", "") or "").strip().upper()
+    return mode or "ENGINE"
+
+
+def _adapter_mode_enabled(cfg: dict, state: Any = None) -> bool:
+    if _execution_mode(cfg, state) != "ADAPTER":
+        return False
+    if state is None:
+        return True
+    return getattr(state, "execution_adapter", None) is not None
+
+
+def _engine_mode_enabled(cfg: dict, state: Any = None) -> bool:
+    return _execution_mode(cfg, state) == "ENGINE"
+
+
+def _new_intent_id(symbol: str, side: str, epoch_s: int) -> str:
+    return f"{symbol}:{side}:{int(epoch_s)}:{uuid.uuid4().hex[:10]}"
+
+
+def _new_client_order_id(symbol: str, side: str, epoch_s: int) -> str:
+    symbol_part = str(symbol).replace("-", "").replace("/", "").upper()
+    side_part = str(side).upper()
+    return f"argus-{symbol_part}-{side_part}-{int(epoch_s)}-{uuid.uuid4().hex[:10]}"
+
+
 def _compute_buy_qty_and_reason(ledger, px: Decimal, cfg: dict) -> Tuple[Decimal, str]:
     """
     Supports either:
@@ -107,6 +142,12 @@ def _missed_buy_event_from_risk_reason(risk_reason: str) -> str:
         return "MISSED_BUY_DAILY_MAX_LOSS"
     if "LOCKOUT" in rr or "COOLDOWN" in rr:
         return "MISSED_BUY_RISK_LOCKOUT"
+    if "SPREAD" in rr:
+        return "MISSED_BUY_LIQUIDITY"
+    if "PORTFOLIO" in rr or "POSITION" in rr:
+        return "MISSED_BUY_EXPOSURE_CAP"
+    if "MARKET_DATA" in rr or "STALE" in rr:
+        return "MISSED_BUY_STALE_DATA"
     return "MISSED_BUY_RISK_LOCKOUT"
 
 
@@ -154,6 +195,9 @@ def _add_event(
     message: str,
     notify_title: Optional[str] = None,
     notify_body: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    order_id: Optional[str] = None,
+    trade_id: Optional[str] = None,
 ):
     snap.events.append(
         EngineEvent(
@@ -161,6 +205,9 @@ def _add_event(
             message=message,
             notify_title=notify_title,
             notify_body=notify_body,
+            client_order_id=client_order_id,
+            order_id=order_id,
+            trade_id=trade_id,
         )
     )
 
@@ -177,12 +224,6 @@ def _emit_missed_buy(
     exposure: Decimal,
     extra: str = "",
 ) -> None:
-    """
-    Canonical missed-buy emitter:
-      - deterministic message format
-      - always includes proof fields we care about (conf + struct + liq + session)
-      - keeps reason buckets stable across refactors
-    """
     liq_part = (
         f"spread_bps={safe_str(getattr(snap,'liq_spread_bps',None))} "
         f"vol_1m={safe_str(getattr(snap,'liq_vol_1m',None))} "
@@ -212,9 +253,6 @@ def _emit_missed_buy(
 
 
 def _should_bump_hold(state, now_epoch: int, cfg: dict) -> bool:
-    """
-    Throttle HOLD bumps so you don't spam the tracker every tick.
-    """
     every_s = int(cfg.get("HOLD_BUMP_EVERY_SECONDS", 300))
     if every_s <= 0:
         return False
@@ -362,6 +400,31 @@ def _compute_structure(
         return None
 
 
+def _compute_trendlines(
+    state,
+    *,
+    px: Decimal,
+    closed_1h,
+    cfg: dict,
+) -> Optional[TrendlineResult]:
+    if not _bool_cfg(cfg, "USE_TRENDLINES", False):
+        return None
+
+    te = getattr(state, "trendline_engine", None)
+    if te is None:
+        return None
+
+    try:
+        if closed_1h is not None:
+            state.last_closed_candle_1h = closed_1h
+            te.update_on_close(closed_1h)
+
+        last_closed = getattr(state, "last_closed_candle_1h", None)
+        return te.evaluate(px, last_closed)
+    except Exception:
+        return None
+
+
 def _compute_liquidity(
     state,
     *,
@@ -371,16 +434,6 @@ def _compute_liquidity(
     cfg: dict,
     atr_norm_fallback: Optional[Decimal] = None,
 ) -> Optional[Any]:
-    """
-    Phase 5B:
-      - LiquidityEngine verdict based on bid/ask + vol baseline + ATR norm.
-      - Baseline updated on 1m candle close if volume is available.
-
-    IMPORTANT:
-      - Candle-close backtests often do NOT have tick.atr_norm.
-      - We accept atr_norm_fallback (typically regime vol or 1m volatility fraction)
-        so liq_atr_norm doesn't stay None forever in backtests.
-    """
     if not (_bool_cfg(cfg, "USE_LIQUIDITY_FILTERS", False) or _bool_cfg(cfg, "USE_LIQUIDITY", False)):
         return None
 
@@ -436,9 +489,8 @@ def _apply_liquidity_overlay_to_confluence(
     else:
         eff_reason = (eff_reason + " | " if eff_reason else "") + "liq:OK"
 
-    if ok:
-        return eff_score, eff_gate, eff_reason, []
-
+    # PENALIZE mode: apply penalty to score regardless of ok status,
+    # then return without hard-blocking (ok=True means trade is allowed, just penalized)
     if mode == "PENALIZE":
         if eff_score is not None and penalty is not None:
             try:
@@ -448,6 +500,9 @@ def _apply_liquidity_overlay_to_confluence(
             if p > 0:
                 eff_score = max(0, min(100, int(eff_score) - p))
                 eff_reason = eff_reason + f" | liq_penalty=-{p}"
+        return eff_score, eff_gate, eff_reason, []
+
+    if ok:
         return eff_score, eff_gate, eff_reason, []
 
     if mode == "BLOCK":
@@ -625,11 +680,184 @@ def _verify_tf_snapshots(
     _add_event(snap, "TF_SNAPSHOT_VERIFY", " | ".join(parts))
 
 
+def _force_test_override(
+    *,
+    state,
+    tick,
+    cfg: dict,
+    snap: DecisionSnapshot,
+    px: Decimal,
+    now_e: int,
+    emit_actions: bool,
+) -> bool:
+    """
+    Deterministic execution smoke-test override.
+
+    Must run BEFORE warmup / trend / confluence / liquidity HOLD returns.
+    Returns True if snap was mutated into an actionable forced BUY/SELL.
+    """
+    if not emit_actions:
+        return False
+
+    force_test_buy = _bool_cfg(cfg, "FORCE_TEST_BUY", False)
+    force_test_sell = _bool_cfg(cfg, "FORCE_TEST_SELL", False)
+    force_test_only_once = _bool_cfg(cfg, "FORCE_TEST_ONLY_ONCE", True)
+
+    ledger_qty = _as_decimal(getattr(state.ledger, "position_qty", None), "0")
+    in_position = ledger_qty > 0
+
+    if force_test_buy and (not in_position):
+        already_done = bool(getattr(state, "_force_test_buy_done", False))
+        if (not force_test_only_once) or (not already_done):
+            usd_per_trade = _as_decimal(cfg.get("USD_PER_TRADE", "0"), "0")
+            min_order_usd = _as_decimal(cfg.get("MIN_ORDER_USD", "0"), "0")
+
+            qty = Decimal("0")
+            if px > 0 and usd_per_trade > 0:
+                qty = usd_per_trade / px
+
+            if px > 0 and qty > 0 and (qty * px) >= min_order_usd:
+                state._force_test_buy_done = True
+
+                snap.intent_id = _new_intent_id(state.symbol, "BUY", now_e)
+                snap.entry_intent_id = snap.intent_id
+                snap.client_order_id = _new_client_order_id(state.symbol, "BUY", now_e)
+
+                snap.execution_qty = qty
+                snap.vol_sizing_qty = qty
+                snap.vol_used = None
+                snap.vol_reason = "FORCE_TEST_BUY"
+                snap.sizing_note = "FORCE_TEST_BUY"
+
+                snap.action = "BUY"
+                snap.action_reason = "FORCE_TEST_BUY"
+                snap.execution_status = "PENDING_SUBMIT"
+                snap.execution_reason = "FORCE_TEST_BUY"
+                snap.risk_blocked_reason = ""
+                snap.next_poll_s = float(cfg.get("POLL_FAST_SECONDS", 2.0))
+
+                _add_event(
+                    snap,
+                    _map_trade_event(cfg, "WOULD_BUY"),
+                    (
+                        f"ENTRY_INTENT | FORCE_TEST_BUY | px={px} qty={qty} "
+                        f"client_order_id={snap.client_order_id}"
+                    ),
+                    notify_title="BUY",
+                    notify_body=(
+                        f"{state.symbol} BUY intent\n"
+                        f"reason=FORCE_TEST_BUY\n"
+                        f"px={px}\nqty={qty}\n"
+                        f"client_order_id={snap.client_order_id}"
+                    ),
+                    client_order_id=snap.client_order_id,
+                )
+                return True
+
+    if force_test_sell and in_position:
+        already_done = bool(getattr(state, "_force_test_sell_done", False))
+        if (not force_test_only_once) or (not already_done):
+            if ledger_qty > 0:
+                state._force_test_sell_done = True
+
+                snap.intent_id = _new_intent_id(state.symbol, "SELL", now_e)
+                snap.exit_intent_id = snap.intent_id
+                snap.client_order_id = _new_client_order_id(state.symbol, "SELL", now_e)
+
+                snap.execution_qty = ledger_qty
+                snap.vol_sizing_qty = ledger_qty
+                snap.vol_used = None
+                snap.vol_reason = "FORCE_TEST_SELL"
+                snap.sizing_note = "FORCE_TEST_SELL"
+
+                snap.action = "SELL"
+                snap.action_reason = "FORCE_TEST_SELL"
+                snap.execution_status = "PENDING_SUBMIT"
+                snap.execution_reason = "FORCE_TEST_SELL"
+                snap.risk_blocked_reason = ""
+                snap.next_poll_s = float(cfg.get("POLL_FAST_SECONDS", 2.0))
+
+                _add_event(
+                    snap,
+                    _map_trade_event(cfg, "WOULD_SELL"),
+                    (
+                        f"EXIT_INTENT | FORCE_TEST_SELL | px={px} qty={ledger_qty} "
+                        f"client_order_id={snap.client_order_id}"
+                    ),
+                    notify_title="SELL",
+                    notify_body=(
+                        f"{state.symbol} SELL intent\n"
+                        f"reason=FORCE_TEST_SELL\n"
+                        f"px={px}\nqty={ledger_qty}\n"
+                        f"client_order_id={snap.client_order_id}"
+                    ),
+                    client_order_id=snap.client_order_id,
+                )
+                return True
+
+    return False
+
+
 def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot:
+    if getattr(state, "cooldown_until_epoch", None) is None:
+        state.cooldown_until_epoch = 0
+    if getattr(state, "trend_below_count", None) is None:
+        state.trend_below_count = 0
+    if getattr(state, "last_good_tick_epoch", None) is None:
+        state.last_good_tick_epoch = None
+    if getattr(state, "stale_logged", None) is None:
+        state.stale_logged = False
+    if getattr(state, "peak_price", None) is None:
+        state.peak_price = None
+    if getattr(state, "entry_epoch", None) is None:
+        state.entry_epoch = None
+    if getattr(state, "mfe_pct", None) is None:
+        state.mfe_pct = Decimal("0")
+    if getattr(state, "mae_pct", None) is None:
+        state.mae_pct = Decimal("0")
+    if getattr(state, "high_since_entry", None) is None:
+        state.high_since_entry = None
+    if getattr(state, "low_since_entry", None) is None:
+        state.low_since_entry = None
+    if getattr(state, "last_candle_volume_1m", None) is None:
+        state.last_candle_volume_1m = None
+
     symbol = state.symbol
-    px = _as_decimal(getattr(tick, "px", None), "0")
+    exec_mode = _execution_mode(cfg, state)
+
+    raw_px = getattr(tick, "px", None)
     now_e = int(getattr(tick, "epoch", 0))
     now_e = _normalize_epoch_seconds(now_e)
+
+    if raw_px is None or str(raw_px).strip() == "":
+        snap = DecisionSnapshot(symbol=symbol, ts=getattr(tick, "ts", ""), epoch=now_e, px=Decimal("0"), paused=paused)
+        snap.stale = True
+        snap.execution_mode = exec_mode
+
+        sess = classify_session(now_e, cfg)
+        snap.session = sess.session
+        snap.session_labels = sess.labels
+        snap.session_bonus = int(sess.bonus_points)
+        snap.session_risk_mult = sess.risk_mult
+        snap.session_reasons = sess.reason
+
+        snap.action = "HOLD"
+        snap.action_reason = "NO_PX"
+        snap.cash_usd = state.ledger.cash_usd
+        snap.position_qty = state.ledger.position_qty
+        snap.avg_entry_px = state.ledger.avg_entry_px
+        snap.equity_usd = state.ledger.equity_usd(Decimal("0"))
+        snap.exposure_usd = Decimal("0")
+        snap.unrl_pnl_usd = Decimal("0")
+        snap.realized_pnl_usd = state.ledger.realized_pnl_usd
+        snap.trades_today = getattr(state.risk, "trades_today", 0)
+        snap.daily_realized_usd = getattr(state.risk, "daily_realized_pnl_usd", Decimal("0"))
+        snap.lockout_until_epoch = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+        snap.cooldown_remaining_s = max(0, int(state.cooldown_until_epoch) - now_e)
+        snap.next_poll_s = float(cfg["POLL_FAST_SECONDS"])
+        return snap
+
+    px = _as_decimal(raw_px, "0")
 
     _, closed_1m = state.candles_1m.on_tick(tick)
     _, closed_5m = state.candles_5m.on_tick(tick)
@@ -657,58 +885,69 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         state.last_st_1h = state.strat_1h.on_candle_close(closed_1h.close)
 
     st_1m = state.last_st_1m
-    candle_close_1m = state.last_candle_close_1m
-    candle_start_1m = state.last_candle_start_1m
+    candle_close_1m = getattr(state, "last_candle_close_1m", None)
+    candle_start_1m = getattr(state, "last_candle_start_1m", None)
 
     sess = classify_session(now_e, cfg)
 
-    if st_1m is None or candle_close_1m is None or candle_start_1m is None:
-        snap = DecisionSnapshot(symbol=symbol, ts=tick.ts, epoch=now_e, px=px, paused=paused)
-        snap.stale = False
-
-        snap.session = sess.session
-        snap.session_labels = sess.labels
-        snap.session_bonus_points = int(sess.bonus_points)
-        snap.session_risk_mult = sess.risk_mult
-        snap.session_reason = sess.reason
-
-        snap.action = "HOLD"
-        snap.action_reason = "WARMUP_NO_1M_STATE"
-        snap.cash_usd = state.ledger.cash_usd
-        snap.position_qty = state.ledger.position_qty
-        snap.avg_entry_px = state.ledger.avg_entry_px
-        snap.equity_usd = state.ledger.equity_usd(px)
-        snap.exposure_usd = state.ledger.exposure_usd(px)
-        snap.unrl_pnl_usd = state.ledger.unrealized_pnl_usd(px, cfg)
-        snap.realized_pnl_usd = state.ledger.realized_pnl_usd
-        snap.trades_today = getattr(state.risk, "trades_today", 0)
-        snap.daily_realized_usd = getattr(state.risk, "daily_realized_pnl_usd", Decimal("0"))
-        snap.lockout_until_epoch = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
-        snap.cooldown_remaining_s = max(0, state.cooldown_until_epoch - now_e)
-        snap.next_poll_s = float(cfg["POLL_FAST_SECONDS"])
-        return snap
-
     stale = False
-    if state.last_good_tick_epoch is None:
-        state.last_good_tick_epoch = now_e
+    backtest_mode = _bool_cfg(cfg, "BACKTEST_MODE", False)
 
-    if (now_e - state.last_good_tick_epoch) > int(cfg["STALE_TICK_SECONDS"]):
-        stale = True
-
-    if not stale:
+    if backtest_mode:
+        stale = False
         state.last_good_tick_epoch = now_e
         state.stale_logged = False
+    else:
+        if state.last_good_tick_epoch is None:
+            state.last_good_tick_epoch = now_e
+
+        if (now_e - int(state.last_good_tick_epoch)) > int(cfg["STALE_TICK_SECONDS"]):
+            stale = True
+
+        if not stale:
+            state.last_good_tick_epoch = now_e
+            state.stale_logged = False
 
     emit_actions = (not paused) and (not stale)
 
     snap = DecisionSnapshot(symbol=symbol, ts=tick.ts, epoch=now_e, px=px, paused=paused)
     snap.stale = stale
+    snap.execution_mode = exec_mode
 
     snap.session = sess.session
     snap.session_labels = sess.labels
-    snap.session_bonus_points = int(sess.bonus_points)
+    snap.session_bonus = int(sess.bonus_points)
     snap.session_risk_mult = sess.risk_mult
-    snap.session_reason = sess.reason
+    snap.session_reasons = sess.reason
+
+    snap.cash_usd = state.ledger.cash_usd
+    snap.position_qty = state.ledger.position_qty
+    snap.avg_entry_px = state.ledger.avg_entry_px
+    snap.equity_usd = state.ledger.equity_usd(px)
+    snap.exposure_usd = state.ledger.exposure_usd(px)
+    snap.unrl_pnl_usd = state.ledger.unrealized_pnl_usd(px, cfg)
+    snap.realized_pnl_usd = state.ledger.realized_pnl_usd
+    snap.trades_today = getattr(state.risk, "trades_today", 0)
+    snap.daily_realized_usd = getattr(state.risk, "daily_realized_pnl_usd", Decimal("0"))
+    snap.lockout_until_epoch = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+    snap.cooldown_remaining_s = max(0, int(state.cooldown_until_epoch) - now_e)
+
+    if _force_test_override(
+        state=state,
+        tick=tick,
+        cfg=cfg,
+        snap=snap,
+        px=px,
+        now_e=now_e,
+        emit_actions=emit_actions,
+    ):
+        return snap
+
+    if st_1m is None or candle_close_1m is None or candle_start_1m is None:
+        snap.action = "HOLD"
+        snap.action_reason = "WARMUP_NO_1M_STATE"
+        snap.next_poll_s = float(cfg["POLL_FAST_SECONDS"])
+        return snap
 
     snap.candle_start_1m = candle_start_1m
     snap.candle_close_1m = candle_close_1m
@@ -766,6 +1005,21 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.rejection_at_sup = bool(structure.rejection_at_sup)
 
         snap.structure_reasons = str(structure.reasons or "")
+
+    trendlines: Optional[TrendlineResult] = _compute_trendlines(
+        state,
+        px=px,
+        closed_1h=closed_1h,
+        cfg=cfg,
+    )
+    if trendlines is not None:
+        snap.trendline_reasons = str(trendlines.reasons or "")
+        snap.near_support_tl = bool(trendlines.near_support_tl)
+        snap.near_resist_tl = bool(trendlines.near_resist_tl)
+        snap.broke_above_resist_tl = bool(trendlines.broke_above_resist)
+        snap.broke_below_support_tl = bool(trendlines.broke_below_support)
+        snap.tl_proj_support = trendlines.proj_support
+        snap.tl_proj_resist = trendlines.proj_resist
 
     atr_norm_fb: Optional[Decimal] = None
     try:
@@ -864,9 +1118,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     if payload:
         _add_event(snap, "RISK_DAY_RESET", payload["msg"])
 
-    cooldown_remaining = max(0, state.cooldown_until_epoch - now_e)
-
-    base_conf = None
+    cooldown_remaining = max(0, int(state.cooldown_until_epoch) - now_e)
 
     st_1m_tf = _to_tf_state(state.last_st_1m, "1m")
     st_5m_tf = _to_tf_state(state.last_st_5m, "5m")
@@ -885,12 +1137,14 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     if forced_regime_label:
         snap.regime = forced_regime_label
 
+    base_conf = None
     try:
         base_conf = state.confluence.evaluate(
             st_1m=st_1m_tf,
             st_5m=st_5m_tf,
             st_1h=st_1h_tf,
             structure=structure,
+            trendlines=trendlines,
         )
         state.last_conf = base_conf
     except Exception as e:
@@ -984,7 +1238,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     conf_present = conf_gate not in ("", "NONE")
     conf_blocked = conf_gate in ("BLOCK",)
 
-    conf_size_mult = Decimal(str(cfg.get("CONFLUENCE_SIZE_MULT_WHEN_NOT_TRADE", "0.25")))
+    conf_size_mult = _as_decimal(cfg.get("CONFLUENCE_SIZE_MULT_WHEN_NOT_TRADE", "0.25"), "0.25")
     conf_veto = bool(require_confluence and (not conf_present or conf_blocked))
 
     conf_ok = (not conf_veto)
@@ -1079,52 +1333,78 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     action_reason = "TAKE_PROFIT"
 
         if action == would_sell_action and emit_actions:
-            eff_sell, proceeds, realized_trade = state.ledger.sell_all(px, now_e, cfg)
-            state.risk.record_exit(realized_trade, now_e, cfg)
-
             ev_name = _map_trade_event(cfg, "WOULD_SELL")
-            msg = (
-                f"{action_reason} | px={px} eff_sell={eff_sell:.2f} qty=ALL proceeds={proceeds:.2f} "
-                f"realized_trade={realized_trade:.2f} daily_realized={state.risk.daily_realized_pnl_usd:.2f} "
-                f"score={st_1m.score} {st_1m.reasons} | "
-                f"conf_score={safe_str(snap.confluence_score)} gate={snap.confluence_gate} | "
-                f"regime={snap.regime} | struct={safe_str(getattr(snap,'structure_reasons',''))} | "
-                f"liq={safe_str(getattr(snap,'liq_reasons',''))}"
-            )
-            _add_event(
-                snap,
-                ev_name,
-                msg,
-                notify_title="SELL",
-                notify_body=(
-                    f"{symbol} | {action_reason}\npx={px}\nproceeds={proceeds:.2f}\nrealized_trade={realized_trade:.2f}\n"
-                    f"daily_realized={state.risk.daily_realized_pnl_usd:.2f}\nscore={st_1m.score} {st_1m.reasons}\n"
-                    f"confluence={safe_str(snap.confluence_score)} gate={snap.confluence_gate}\n"
-                    f"regime={snap.regime}\nstructure={safe_str(getattr(snap,'structure_reasons',''))}\n"
-                    f"liquidity={safe_str(getattr(snap,'liq_reasons',''))}"
-                ),
-            )
 
-            action = ev_name
-            state.cooldown_until_epoch = now_e + int(cfg["COOLDOWN_SECONDS"])
-            state.trend_below_count = 0
-            state.peak_price = None
-            state.entry_epoch = None
-            state.mfe_pct = Decimal("0")
-            state.mae_pct = Decimal("0")
-            state.high_since_entry = None
-            state.low_since_entry = None
+            if _adapter_mode_enabled(cfg, state):
+                snap.intent_id = _new_intent_id(symbol, "SELL", now_e)
+                snap.exit_intent_id = snap.intent_id
+                snap.client_order_id = _new_client_order_id(symbol, "SELL", now_e)
+                snap.execution_qty = _as_decimal(state.ledger.position_qty, "0")
+                snap.execution_status = "PENDING_SUBMIT"
+                snap.execution_reason = action_reason
 
-    # ENTRY (paper buy)
+                _add_event(
+                    snap,
+                    ev_name,
+                    (
+                        f"EXIT_INTENT | reason={action_reason} px={px} qty=ALL "
+                        f"conf_score={safe_str(snap.confluence_score)} gate={snap.confluence_gate} "
+                        f"regime={snap.regime} struct={safe_str(getattr(snap,'structure_reasons',''))} "
+                        f"liq={safe_str(getattr(snap,'liq_reasons',''))}"
+                    ),
+                    notify_title="SELL",
+                    notify_body=(
+                        f"{symbol} SELL intent\n"
+                        f"reason={action_reason}\npx={px}\n"
+                        f"client_order_id={snap.client_order_id}"
+                    ),
+                    client_order_id=snap.client_order_id,
+                )
+
+                action = "SELL"
+                action_reason = "EXIT_INTENT"
+
+            else:
+                eff_sell, proceeds, realized_trade = state.ledger.sell_all(px, now_e, cfg)
+                state.risk.record_exit(realized_trade, now_e, cfg)
+
+                msg = (
+                    f"{action_reason} | px={px} eff_sell={eff_sell:.2f} qty=ALL proceeds={proceeds:.2f} "
+                    f"realized_trade={realized_trade:.2f} daily_realized={state.risk.daily_realized_pnl_usd:.2f} "
+                    f"score={st_1m.score} {st_1m.reasons} | "
+                    f"conf_score={safe_str(snap.confluence_score)} gate={snap.confluence_gate} | "
+                    f"regime={snap.regime} | struct={safe_str(getattr(snap,'structure_reasons',''))} | "
+                    f"liq={safe_str(getattr(snap,'liq_reasons',''))}"
+                )
+                _add_event(
+                    snap,
+                    ev_name,
+                    msg,
+                    notify_title="SELL",
+                    notify_body=(
+                        f"{symbol} | {action_reason}\npx={px}\nproceeds={proceeds:.2f}\n"
+                        f"realized_trade={realized_trade:.2f}\n"
+                        f"daily_realized={state.risk.daily_realized_pnl_usd:.2f}\nscore={st_1m.score} {st_1m.reasons}\n"
+                        f"confluence={safe_str(snap.confluence_score)} gate={snap.confluence_gate}\n"
+                        f"regime={snap.regime}\nstructure={safe_str(getattr(snap,'structure_reasons',''))}\n"
+                        f"liquidity={safe_str(getattr(snap,'liq_reasons',''))}"
+                    ),
+                )
+
+                action = ev_name
+                state.cooldown_until_epoch = now_e + int(cfg["COOLDOWN_SECONDS"])
+                state.trend_below_count = 0
+                state.peak_price = None
+                state.entry_epoch = None
+                state.mfe_pct = Decimal("0")
+                state.mae_pct = Decimal("0")
+                state.high_since_entry = None
+                state.low_since_entry = None
+
     if (not state.ledger.in_pos()) and emit_actions:
         entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
 
         if entry_signal_ok:
-            # NOTE: Removed synthetic ENTRY_ATTEMPT event.
-            # Attempts are counted from actual outcome events only:
-            #   - WOULD_BUY/SHOULD_BUY
-            #   - MISSED_BUY_*
-
             if cooldown_remaining > 0:
                 _emit_missed_buy(
                     snap,
@@ -1166,121 +1446,15 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             extra=f"gate={safe_str(conf_gate)}",
                         )
                     else:
-                        allowed, why = state.risk.can_enter(now_e, cfg)
-                        if not allowed:
-                            ev = _missed_buy_event_from_risk_reason(why)
-                            lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
-                            lockout_fmt = _fmt_lockout(now_e, lockout_until)
-
-                            _emit_missed_buy(
-                                snap,
-                                event=ev,
-                                prefix="RISK_BLOCK",
-                                px=px,
-                                confluence_min_score=confluence_min_score,
-                                cooldown_remaining=int(cooldown_remaining),
-                                equity=equity,
-                                exposure=exposure,
-                                extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
-                            )
-                            risk_blocked_reason = str(why or "")
-
-                        else:
-                            qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
-
-                            qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
-                                state=state,
-                                px=px,
-                                qty_cap=_as_decimal(qty_cap, "0"),
-                                cfg=cfg,
-                            )
-
-                            if require_confluence and conf_gate != "TRADE" and qty > 0:
-                                try:
-                                    qty = qty * conf_size_mult
-                                except Exception:
-                                    pass
-
-                            if qty <= 0:
-                                ev = _missed_buy_event_from_qty_reason(qty_reason)
-                                _emit_missed_buy(
-                                    snap,
-                                    event=ev,
-                                    prefix="SIZE_BLOCK",
-                                    px=px,
-                                    confluence_min_score=confluence_min_score,
-                                    cooldown_remaining=int(cooldown_remaining),
-                                    equity=equity,
-                                    exposure=exposure,
-                                    extra=f"qty_reason={safe_str(qty_reason)}",
-                                )
-                            else:
-                                fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                                state.risk.record_entry(now_e, cfg)
-
-                                state.entry_epoch = now_e
-                                state.peak_price = px
-                                state.trend_below_count = 0
-                                state.mfe_pct = Decimal("0")
-                                state.mae_pct = Decimal("0")
-                                state.high_since_entry = px
-                                state.low_since_entry = px
-
-                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                                _add_event(
-                                    snap,
-                                    ev_name,
-                                    (
-                                        f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                        f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                    ),
-                                    notify_title="BUY",
-                                    notify_body=f"{symbol} BUY px={px} qty={qty}",
-                                )
-
-                                action = ev_name
-                                action_reason = "ENTRY_FILLED"
-
-            else:
-                if require_confluence and (not conf_ok):
-                    _emit_missed_buy(
-                        snap,
-                        event="MISSED_BUY_CONFLUENCE",
-                        prefix="CONFLUENCE_VETO",
-                        px=px,
-                        confluence_min_score=confluence_min_score,
-                        cooldown_remaining=int(cooldown_remaining),
-                        equity=equity,
-                        exposure=exposure,
-                        extra=f"gate={safe_str(conf_gate)}",
-                    )
-                else:
-                    allowed, why = state.risk.can_enter(now_e, cfg)
-                    if not allowed:
-                        ev = _missed_buy_event_from_risk_reason(why)
-                        lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
-                        lockout_fmt = _fmt_lockout(now_e, lockout_until)
-
-                        _emit_missed_buy(
-                            snap,
-                            event=ev,
-                            prefix="RISK_BLOCK",
-                            px=px,
-                            confluence_min_score=confluence_min_score,
-                            cooldown_remaining=int(cooldown_remaining),
-                            equity=equity,
-                            exposure=exposure,
-                            extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
-                        )
-                        risk_blocked_reason = str(why or "")
-                    else:
                         qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+
                         qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
                             state=state,
                             px=px,
                             qty_cap=_as_decimal(qty_cap, "0"),
                             cfg=cfg,
                         )
+
                         if require_confluence and conf_gate != "TRADE" and qty > 0:
                             try:
                                 qty = qty * conf_size_mult
@@ -1301,31 +1475,232 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 extra=f"qty_reason={safe_str(qty_reason)}",
                             )
                         else:
-                            fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                            state.risk.record_entry(now_e, cfg)
+                            if hasattr(state.risk, "can_enter_with_context"):
+                                allowed, why = state.risk.can_enter_with_context(
+                                    now_epoch=now_e,
+                                    cfg=cfg,
+                                    spread_bps=getattr(snap, "liq_spread_bps", None),
+                                    proposed_qty=qty,
+                                    current_qty=state.ledger.position_qty,
+                                    px=px,
+                                    current_exposure_usd=exposure,
+                                    stale=bool(stale),
+                                    last_market_data_epoch=getattr(state, "last_good_tick_epoch", None),
+                                    symbol=symbol,
+                                )
+                            else:
+                                allowed, why = state.risk.can_enter(now_e, cfg)
 
-                            state.entry_epoch = now_e
-                            state.peak_price = px
-                            state.trend_below_count = 0
-                            state.mfe_pct = Decimal("0")
-                            state.mae_pct = Decimal("0")
-                            state.high_since_entry = px
-                            state.low_since_entry = px
+                            if not allowed:
+                                ev = _missed_buy_event_from_risk_reason(why)
+                                lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+                                lockout_fmt = _fmt_lockout(now_e, lockout_until)
 
-                            ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                            _add_event(
-                                snap,
-                                ev_name,
-                                (
-                                    f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                    f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                ),
-                                notify_title="BUY",
-                                notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                _emit_missed_buy(
+                                    snap,
+                                    event=ev,
+                                    prefix="RISK_BLOCK",
+                                    px=px,
+                                    confluence_min_score=confluence_min_score,
+                                    cooldown_remaining=int(cooldown_remaining),
+                                    equity=equity,
+                                    exposure=exposure,
+                                    extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
+                                )
+                                risk_blocked_reason = str(why or "")
+                            else:
+                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                                snap.vol_used = vol_used
+                                snap.vol_sizing_qty = qty_vol
+                                snap.execution_qty = qty
+                                snap.vol_reason = qty_reason
+                                snap.sizing_note = sizing_note
+
+                                if _adapter_mode_enabled(cfg, state):
+                                    snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                    snap.entry_intent_id = snap.intent_id
+                                    snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                    snap.execution_status = "PENDING_SUBMIT"
+                                    snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
+
+                                    _add_event(
+                                        snap,
+                                        ev_name,
+                                        (
+                                            f"ENTRY_INTENT | px={px} qty={qty} "
+                                            f"client_order_id={snap.client_order_id} | "
+                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                        ),
+                                        notify_title="BUY",
+                                        notify_body=(
+                                            f"{symbol} BUY intent\n"
+                                            f"px={px}\nqty={qty}\n"
+                                            f"client_order_id={snap.client_order_id}"
+                                        ),
+                                        client_order_id=snap.client_order_id,
+                                    )
+
+                                    action = "BUY"
+                                    action_reason = "ENTRY_INTENT"
+                                else:
+                                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                    state.risk.record_entry(now_e, cfg)
+
+                                    state.entry_epoch = now_e
+                                    state.peak_price = px
+                                    state.trend_below_count = 0
+                                    state.mfe_pct = Decimal("0")
+                                    state.mae_pct = Decimal("0")
+                                    state.high_since_entry = px
+                                    state.low_since_entry = px
+
+                                    _add_event(
+                                        snap,
+                                        ev_name,
+                                        (
+                                            f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                        ),
+                                        notify_title="BUY",
+                                        notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                    )
+
+                                    action = ev_name
+                                    action_reason = "ENTRY_FILLED"
+
+            else:
+                if require_confluence and (not conf_ok):
+                    _emit_missed_buy(
+                        snap,
+                        event="MISSED_BUY_CONFLUENCE",
+                        prefix="CONFLUENCE_VETO",
+                        px=px,
+                        confluence_min_score=confluence_min_score,
+                        cooldown_remaining=int(cooldown_remaining),
+                        equity=equity,
+                        exposure=exposure,
+                        extra=f"gate={safe_str(conf_gate)}",
+                    )
+                else:
+                    qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+                    qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
+                        state=state,
+                        px=px,
+                        qty_cap=_as_decimal(qty_cap, "0"),
+                        cfg=cfg,
+                    )
+                    if require_confluence and conf_gate != "TRADE" and qty > 0:
+                        try:
+                            qty = qty * conf_size_mult
+                        except Exception:
+                            pass
+
+                    if qty <= 0:
+                        ev = _missed_buy_event_from_qty_reason(qty_reason)
+                        _emit_missed_buy(
+                            snap,
+                            event=ev,
+                            prefix="SIZE_BLOCK",
+                            px=px,
+                            confluence_min_score=confluence_min_score,
+                            cooldown_remaining=int(cooldown_remaining),
+                            equity=equity,
+                            exposure=exposure,
+                            extra=f"qty_reason={safe_str(qty_reason)}",
+                        )
+                    else:
+                        if hasattr(state.risk, "can_enter_with_context"):
+                            allowed, why = state.risk.can_enter_with_context(
+                                now_epoch=now_e,
+                                cfg=cfg,
+                                spread_bps=getattr(snap, "liq_spread_bps", None),
+                                proposed_qty=qty,
+                                current_qty=state.ledger.position_qty,
+                                px=px,
+                                current_exposure_usd=exposure,
+                                stale=bool(stale),
+                                last_market_data_epoch=getattr(state, "last_good_tick_epoch", None),
+                                symbol=symbol,
                             )
+                        else:
+                            allowed, why = state.risk.can_enter(now_e, cfg)
 
-                            action = ev_name
-                            action_reason = "ENTRY_FILLED"
+                        if not allowed:
+                            ev = _missed_buy_event_from_risk_reason(why)
+                            lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+                            lockout_fmt = _fmt_lockout(now_e, lockout_until)
+
+                            _emit_missed_buy(
+                                snap,
+                                event=ev,
+                                prefix="RISK_BLOCK",
+                                px=px,
+                                confluence_min_score=confluence_min_score,
+                                cooldown_remaining=int(cooldown_remaining),
+                                equity=equity,
+                                exposure=exposure,
+                                extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
+                            )
+                            risk_blocked_reason = str(why or "")
+                        else:
+                            ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                            snap.vol_used = vol_used
+                            snap.vol_sizing_qty = qty_vol
+                            snap.execution_qty = qty
+                            snap.vol_reason = qty_reason
+                            snap.sizing_note = sizing_note
+
+                            if _adapter_mode_enabled(cfg, state):
+                                snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                snap.entry_intent_id = snap.intent_id
+                                snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                snap.execution_status = "PENDING_SUBMIT"
+                                snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
+
+                                _add_event(
+                                    snap,
+                                    ev_name,
+                                    (
+                                        f"ENTRY_INTENT | px={px} qty={qty} "
+                                        f"client_order_id={snap.client_order_id} | "
+                                        f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                    ),
+                                    notify_title="BUY",
+                                    notify_body=(
+                                        f"{symbol} BUY intent\n"
+                                        f"px={px}\nqty={qty}\n"
+                                        f"client_order_id={snap.client_order_id}"
+                                    ),
+                                    client_order_id=snap.client_order_id,
+                                )
+
+                                action = "BUY"
+                                action_reason = "ENTRY_INTENT"
+                            else:
+                                fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                state.risk.record_entry(now_e, cfg)
+
+                                state.entry_epoch = now_e
+                                state.peak_price = px
+                                state.trend_below_count = 0
+                                state.mfe_pct = Decimal("0")
+                                state.mae_pct = Decimal("0")
+                                state.high_since_entry = px
+                                state.low_since_entry = px
+
+                                _add_event(
+                                    snap,
+                                    ev_name,
+                                    (
+                                        f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                        f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                    ),
+                                    notify_title="BUY",
+                                    notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                )
+
+                                action = ev_name
+                                action_reason = "ENTRY_FILLED"
 
     track_holds = _bool_cfg(cfg, "TRACK_HOLD_REASONS", True)
     if track_holds and (not state.ledger.in_pos()):
@@ -1357,7 +1732,9 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
 
         if _should_bump_hold(state, now_e, cfg):
             tracker_enabled = _bool_cfg(cfg, "TRADE_TRACKER_ENABLED", True)
-            disable_in_bt = _bool_cfg(cfg, "DISABLE_TRADE_TRACKER_IN_BACKTEST", True) and _bool_cfg(cfg, "BACKTEST_MODE", False)
+            disable_in_bt = _bool_cfg(cfg, "DISABLE_TRADE_TRACKER_IN_BACKTEST", True) and _bool_cfg(
+                cfg, "BACKTEST_MODE", False
+            )
             if tracker_enabled and (not disable_in_bt) and getattr(state, "tracker", None) is not None:
                 state.tracker.bump(
                     hold_key,

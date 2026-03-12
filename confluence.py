@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # Phase 5A
 from structure import StructureResult
 
+# Phase 18
+from trendlines import TrendlineResult
+
 
 def _as_decimal(x: Any, default: str = "0") -> Decimal:
     if x is None:
@@ -157,6 +160,24 @@ class ConfluenceEngine:
         self.struct_gate_bump_max_points = _as_int(self.cfg.get("STRUCT_GATE_BUMP_MAX_POINTS", 6), 6)
         self.struct_gate_bump_max_points = _clamp_i(self.struct_gate_bump_max_points, 0, 25)
 
+        # -------------------------
+        # Phase 18 — Trendline overlay knobs
+        # -------------------------
+        self.use_trendlines = _as_bool(self.cfg.get("USE_TRENDLINES", False), False)
+
+        # Soft shaping (score adjustments)
+        self.tl_bonus_near_support = _clamp_i(_as_int(self.cfg.get("TL_BONUS_NEAR_SUPPORT", 5), 5), 0, 20)
+        self.tl_penalty_near_resist = _clamp_i(_as_int(self.cfg.get("TL_PENALTY_NEAR_RESIST", 8), 8), 0, 30)
+        self.tl_bonus_broke_above = _clamp_i(_as_int(self.cfg.get("TL_BONUS_BROKE_ABOVE_RESIST", 12), 12), 0, 30)
+        self.tl_penalty_broke_below = _clamp_i(_as_int(self.cfg.get("TL_PENALTY_BROKE_BELOW_SUPPORT", 15), 15), 0, 50)
+
+        # Descending channel penalty (resist_slope_neg=True even when not near the line)
+        self.tl_penalty_resist_slope_neg = _clamp_i(_as_int(self.cfg.get("TL_PENALTY_RESIST_SLOPE_NEG", 0), 0), 0, 30)
+
+        # Hard blocks
+        self.tl_block_long_near_resist = _as_bool(self.cfg.get("TL_BLOCK_LONG_NEAR_RESIST", False), False)
+        self.tl_block_long_broke_below = _as_bool(self.cfg.get("TL_BLOCK_LONG_BROKE_BELOW_SUPPORT", True), True)
+
     # --------- LINE ABOVE: def __init__(self, cfg: Dict[str, Any]):
 
     @classmethod
@@ -254,12 +275,55 @@ class ConfluenceEngine:
 
         return conf_score, notes, blocks, bump_pts
 
+    def _apply_trendline_overlay(
+        self,
+        conf_score: int,
+        trendlines,
+    ) -> Tuple[int, List[str], List[str]]:
+        """
+        Phase 18: adjust confluence score based on dynamic 1h trendlines.
+        Returns: (new_score, tl_notes, tl_blocks)
+        """
+        if (not self.use_trendlines) or (trendlines is None):
+            return conf_score, [], []
+
+        notes: List[str] = []
+        blocks: List[str] = []
+
+        if bool(getattr(trendlines, "near_support_tl", False)):
+            conf_score = min(100, conf_score + self.tl_bonus_near_support)
+            notes.append(f"+{self.tl_bonus_near_support}(near_support_tl)")
+
+        if bool(getattr(trendlines, "near_resist_tl", False)):
+            conf_score = max(0, conf_score - self.tl_penalty_near_resist)
+            notes.append(f"-{self.tl_penalty_near_resist}(near_resist_tl)")
+
+        if bool(getattr(trendlines, "broke_above_resist", False)):
+            conf_score = min(100, conf_score + self.tl_bonus_broke_above)
+            notes.append(f"+{self.tl_bonus_broke_above}(broke_above_resist_tl)")
+
+        if bool(getattr(trendlines, "broke_below_support", False)):
+            conf_score = max(0, conf_score - self.tl_penalty_broke_below)
+            notes.append(f"-{self.tl_penalty_broke_below}(broke_below_support_tl)")
+            if self.tl_block_long_broke_below:
+                blocks.append("BLOCK:TL_BROKE_BELOW_SUPPORT")
+
+        if self.tl_penalty_resist_slope_neg > 0 and bool(getattr(trendlines, "resist_slope_neg", False)):
+            conf_score = max(0, conf_score - self.tl_penalty_resist_slope_neg)
+            notes.append(f"-{self.tl_penalty_resist_slope_neg}(resist_slope_neg)")
+
+        if self.tl_block_long_near_resist and bool(getattr(trendlines, "near_resist_tl", False)):
+            blocks.append("BLOCK:TL_NEAR_RESIST")
+
+        return conf_score, notes, blocks
+
     def evaluate(
         self,
         st_1m: Optional[TFState],
         st_5m: Optional[TFState],
         st_1h: Optional[TFState],
-        structure: Optional[StructureResult] = None,   # âœ… Phase 5A optional
+        structure: Optional[StructureResult] = None,   # Phase 5A optional
+        trendlines=None,                               # Phase 18 optional (TrendlineResult)
     ) -> ConfluenceResult:
 
         def norm(st: Optional[TFState], tf: str) -> TFState:
@@ -317,6 +381,11 @@ class ConfluenceEngine:
             s1=s1,
         )
 
+        # -------------------------
+        # Phase 18 trendline overlay (score shaping + optional blocks)
+        # -------------------------
+        conf_score, tl_notes, tl_blocks = self._apply_trendline_overlay(conf_score, trendlines)
+
         # Gate from score (raw)
         if conf_score >= self.trade_threshold:
             gate = "TRADE"
@@ -348,6 +417,9 @@ class ConfluenceEngine:
             # Append structure blocks (only if enabled)
             hard_blocks.extend(struct_blocks)
 
+            # Append trendline blocks (Phase 18)
+            hard_blocks.extend(tl_blocks)
+
             # If we have blocks, downgrade deterministically
             if hard_blocks:
                 gate = "WATCH" if conf_score >= self.watch_threshold else "HOLD"
@@ -366,6 +438,8 @@ class ConfluenceEngine:
             reasons.append("struct=" + "|".join(struct_notes))
         if bumped:
             reasons.append(f"struct_gate_bump=+{struct_gate_bump}")
+        if tl_notes:
+            reasons.append("tl=" + "|".join(tl_notes))
 
         reasons.append(f"confluence={conf_score}")
         reasons.append(f"gate={gate}")

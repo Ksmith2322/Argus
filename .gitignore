@@ -10,16 +10,23 @@ venv/
 # --- Env / secrets ---
 .env
 *.env
+.env.*
 
 # --- Runtime outputs ---
 logs/
+ops/logs/
 *.log
 *.csv
 *.json
 
-# --- Backtest artifacts (if you want to keep JSON in C:\Argus\logs, not repo) ---
+# --- Candle data (keep this in repo for PC2 sync) ---
+!data/eth_usd_1m.csv
+
+# --- Backtest artifacts ---
 bt_summary_latest.json
 bt_summary_*.json
+backtest/trades_debug.csv
+backtest/trades_from_events.csv
 
 # --- OS / editor ---
 .DS_Store

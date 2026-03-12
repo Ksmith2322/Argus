@@ -1,10 +1,92 @@
-# line above: from __future__ import annotations
+#!/usr/bin/env python3
 # decisions.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+import hashlib
+
+
+def _safe_str(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def _dec_str(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, Decimal):
+        return str(x)
+    try:
+        return str(Decimal(str(x)))
+    except Exception:
+        return str(x)
+
+
+def _bool_int(x: Optional[bool]) -> Any:
+    if x is None:
+        return None
+    return int(bool(x))
+
+
+def _hash_key(*parts: Any) -> str:
+    raw = "|".join(_safe_str(p) for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def make_intent_id(
+    *,
+    symbol: str,
+    action: str,
+    epoch: int,
+    px: Any,
+    score: Any = "",
+) -> str:
+    """
+    Deterministic intent id for a single engine decision moment.
+    """
+    # line above: return f"intent_{_hash_key(...)}"
+    return f"intent_{_hash_key(symbol, action, epoch, _dec_str(px), score)}"
+
+
+def make_client_order_id(
+    *,
+    symbol: str,
+    action: str,
+    intent_id: str,
+    epoch: int,
+) -> str:
+    """
+    Deterministic client order id derived from intent identity.
+    This makes restart resubmission suppression possible.
+    """
+    # line above: return f"coid_{_hash_key(...)}"
+    return f"coid_{_hash_key(symbol, action, intent_id, epoch)}"
+
+
+def make_fill_fingerprint(
+    *,
+    fill_id: str = "",
+    order_id: str = "",
+    client_order_id: str = "",
+    trade_id: str = "",
+    symbol: str = "",
+    side: str = "",
+    ts: Any = "",
+    qty: Any = "",
+    px: Any = "",
+) -> str:
+    """
+    Stable fallback dedupe key when native fill_id is missing or unreliable.
+    """
+    # line above: native = _safe_str(fill_id)
+    native = _safe_str(fill_id)
+    if native:
+        return native
+
+    return f"fillfp_{_hash_key(order_id, client_order_id, trade_id, symbol, side, ts, _dec_str(qty), _dec_str(px))}"
 
 
 @dataclass
@@ -13,6 +95,40 @@ class EngineEvent:
     message: str
     notify_title: Optional[str] = None
     notify_body: Optional[str] = None
+    client_order_id: Optional[str] = None
+    order_id: Optional[str] = None
+    trade_id: Optional[str] = None
+
+    # -------------------------
+    # Phase 8 identity / dedupe
+    # -------------------------
+    intent_id: Optional[str] = None
+    entry_intent_id: Optional[str] = None
+    exit_intent_id: Optional[str] = None
+    fill_id: Optional[str] = None
+    fill_fingerprint: Optional[str] = None
+    dedupe_key: Optional[str] = None
+    recovery_state: Optional[str] = None
+    dedupe_reason: Optional[str] = None
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "message": self.message,
+            "notify_title": self.notify_title,
+            "notify_body": self.notify_body,
+            "intent_id": self.intent_id,
+            "entry_intent_id": self.entry_intent_id,
+            "exit_intent_id": self.exit_intent_id,
+            "client_order_id": self.client_order_id,
+            "order_id": self.order_id,
+            "trade_id": self.trade_id,
+            "fill_id": self.fill_id,
+            "fill_fingerprint": self.fill_fingerprint,
+            "dedupe_key": self.dedupe_key,
+            "recovery_state": self.recovery_state,
+            "dedupe_reason": self.dedupe_reason,
+        }
 
 
 @dataclass
@@ -24,10 +140,13 @@ class DecisionSnapshot:
       - live runner calls:     snap.to_row()
       - backtest runner calls: snap.to_signals_row()
 
-    Phase 5 readiness:
+    Phase 5 / Phase 8 readiness:
       - Structure fields explicit
       - Liquidity fields explicit
       - Session overlay explicit
+      - Execution identity fields explicit
+      - Execution quantity explicit
+      - Dedupe / recovery fields explicit
       - to_row() returns schema-safe aliases to prevent blank-column logging
       - EngineEvent list is always present (events default_factory)
     """
@@ -43,10 +162,39 @@ class DecisionSnapshot:
     stale: bool = False
 
     # -------------------------
+    # Phase 8 execution identity
+    # -------------------------
+    intent_id: str = ""
+    entry_intent_id: str = ""
+    exit_intent_id: str = ""
+    client_order_id: str = ""
+    order_id: str = ""
+    trade_id: str = ""
+    execution_mode: str = ""
+    execution_status: str = ""
+    execution_reason: str = ""
+
+    # -------------------------
+    # Phase 8 dedupe / recovery identity
+    # -------------------------
+    fill_id: str = ""
+    fill_fingerprint: str = ""
+    dedupe_key: str = ""
+    dedupe_reason: str = ""
+    recovery_state: str = ""
+    recovery_source: str = ""
+    action_suppressed: bool = False
+    action_suppressed_reason: str = ""
+    submit_allowed: bool = True
+    fill_apply_allowed: bool = True
+
+    # -------------------------
+    # Phase 8 execution sizing
+    # -------------------------
+    execution_qty: Optional[Decimal] = None
+
+    # -------------------------
     # Phase 5C: Session overlay
-    # NOTE: engine.py currently sets:
-    #   snap.session_bonus_points, snap.session_risk_mult, snap.session_reason
-    # This class accepts BOTH the canonical names and those legacy variants via aliases in to_row().
     # -------------------------
     session: str = ""
     session_labels: str = ""
@@ -59,7 +207,7 @@ class DecisionSnapshot:
     # -------------------------
     candle_start_1m: Optional[int] = None
     candle_close_1m: Optional[Decimal] = None
-    candle_volume_1m: Optional[Decimal] = None  # ✅ engine.py sets this
+    candle_volume_1m: Optional[Decimal] = None  # engine.py sets this
 
     # -------------------------
     # Strategy / indicators (1m)
@@ -133,6 +281,17 @@ class DecisionSnapshot:
     structure_reasons: str = ""
 
     # -------------------------
+    # Phase 18: Trendlines (1h)
+    # -------------------------
+    near_support_tl: bool = False
+    near_resist_tl: bool = False
+    broke_above_resist_tl: bool = False
+    broke_below_support_tl: bool = False
+    tl_proj_support: Optional[Decimal] = None
+    tl_proj_resist: Optional[Decimal] = None
+    trendline_reasons: str = ""
+
+    # -------------------------
     # Phase 5B liquidity
     # -------------------------
     liq_ok: Optional[bool] = None
@@ -203,6 +362,140 @@ class DecisionSnapshot:
     events: List[EngineEvent] = field(default_factory=list)
 
     # -------------------------
+    # Identity helpers
+    # -------------------------
+    def ensure_intent_identity(self) -> None:
+        """
+        Stamp deterministic intent / client order identity if missing.
+        """
+        # line above: action_u = _safe_str(self.action).upper()
+        action_u = _safe_str(self.action).upper()
+        if action_u not in {"BUY", "SELL"}:
+            return
+
+        score = self.confluence_score if self.confluence_score is not None else self.score_1m
+
+        if not self.intent_id:
+            self.intent_id = make_intent_id(
+                symbol=self.symbol,
+                action=action_u,
+                epoch=int(self.epoch),
+                px=self.px,
+                score=score,
+            )
+
+        if action_u == "BUY" and not self.entry_intent_id:
+            self.entry_intent_id = self.intent_id
+
+        if action_u == "SELL" and not self.exit_intent_id:
+            self.exit_intent_id = self.intent_id
+
+        if not self.client_order_id:
+            self.client_order_id = make_client_order_id(
+                symbol=self.symbol,
+                action=action_u,
+                intent_id=self.intent_id,
+                epoch=int(self.epoch),
+            )
+
+        if not self.dedupe_key:
+            self.dedupe_key = self.client_order_id or self.intent_id
+
+    def apply_recovery_guard(
+        self,
+        *,
+        recovery_state: str,
+        reason: str,
+        suppress_action: bool = True,
+        allow_submit: bool = False,
+    ) -> None:
+        """
+        Mark a decision as recovery-suppressed so runner logging stays explicit.
+        """
+        # line above: self.recovery_state = _safe_str(recovery_state).upper()
+        self.recovery_state = _safe_str(recovery_state).upper()
+        self.action_suppressed = bool(suppress_action)
+        self.action_suppressed_reason = _safe_str(reason)
+        self.submit_allowed = bool(allow_submit)
+        self.dedupe_reason = _safe_str(reason)
+
+        if suppress_action:
+            self.execution_status = "RECOVERY_SUPPRESSED"
+            self.execution_reason = _safe_str(reason)
+            self.risk_blocked_reason = _safe_str(reason)
+            self.action = "HOLD"
+            self.action_reason = _safe_str(reason)
+
+    def attach_order_identity(
+        self,
+        *,
+        client_order_id: str = "",
+        order_id: str = "",
+        trade_id: str = "",
+        execution_status: str = "",
+        execution_reason: str = "",
+    ) -> None:
+        # line above: if client_order_id:
+        if client_order_id:
+            self.client_order_id = _safe_str(client_order_id)
+        if order_id:
+            self.order_id = _safe_str(order_id)
+        if trade_id:
+            self.trade_id = _safe_str(trade_id)
+        if execution_status:
+            self.execution_status = _safe_str(execution_status)
+        if execution_reason:
+            self.execution_reason = _safe_str(execution_reason)
+
+        if not self.dedupe_key:
+            self.dedupe_key = (
+                self.client_order_id
+                or self.order_id
+                or self.trade_id
+                or self.intent_id
+            )
+
+    def attach_fill_identity(
+        self,
+        *,
+        fill_id: str = "",
+        order_id: str = "",
+        client_order_id: str = "",
+        trade_id: str = "",
+        side: str = "",
+        ts: Any = "",
+        qty: Any = "",
+        px: Any = "",
+    ) -> None:
+        """
+        Stamp fill identity onto the snapshot for logging / dedupe diagnostics.
+        """
+        # line above: if order_id:
+        if order_id:
+            self.order_id = _safe_str(order_id)
+        if client_order_id:
+            self.client_order_id = _safe_str(client_order_id)
+        if trade_id:
+            self.trade_id = _safe_str(trade_id)
+        if fill_id:
+            self.fill_id = _safe_str(fill_id)
+
+        self.fill_fingerprint = make_fill_fingerprint(
+            fill_id=fill_id,
+            order_id=self.order_id,
+            client_order_id=self.client_order_id,
+            trade_id=self.trade_id,
+            symbol=self.symbol,
+            side=side,
+            ts=ts,
+            qty=qty,
+            px=px,
+        )
+
+        if not self.dedupe_key:
+            self.dedupe_key = self.fill_fingerprint
+
+    # -------------------------
     # Output helpers
     # -------------------------
     def to_signals_row(self) -> Dict[str, Any]:
@@ -221,10 +514,19 @@ class DecisionSnapshot:
                 return None
             return int(bool(x))
 
-        # Pull in legacy attrs that engine.py may have set (without updating dataclass fields).
-        # This avoids AttributeError and prevents "blank columns" when names drift.
+        # Pull in legacy attrs that engine.py may have set without the dataclass
+        # knowing about them yet. This prevents drift from causing blank columns
+        # or attribute errors during logging.
         legacy_session_bonus = getattr(self, "session_bonus_points", None)
         legacy_session_reason = getattr(self, "session_reason", None)
+
+        legacy_client_order_id = getattr(self, "client_order_id", None)
+        legacy_order_id = getattr(self, "order_id", None)
+        legacy_trade_id = getattr(self, "trade_id", None)
+        legacy_execution_qty = getattr(self, "execution_qty", None)
+        legacy_fill_id = getattr(self, "fill_id", None)
+        legacy_fill_fingerprint = getattr(self, "fill_fingerprint", None)
+        legacy_dedupe_key = getattr(self, "dedupe_key", None)
 
         row: Dict[str, Any] = {
             # Canonical core
@@ -234,6 +536,31 @@ class DecisionSnapshot:
             "px": _d(self.px),
             "paused": int(bool(self.paused)),
             "stale": int(bool(self.stale)),
+
+            # Phase 8 execution identity
+            "intent_id": self.intent_id,
+            "entry_intent_id": self.entry_intent_id,
+            "exit_intent_id": self.exit_intent_id,
+            "client_order_id": self.client_order_id,
+            "order_id": self.order_id,
+            "trade_id": self.trade_id,
+            "execution_mode": self.execution_mode,
+            "execution_status": self.execution_status,
+            "execution_reason": self.execution_reason,
+
+            # Phase 8 dedupe / recovery identity
+            "fill_id": self.fill_id,
+            "fill_fingerprint": self.fill_fingerprint,
+            "dedupe_key": self.dedupe_key,
+            "dedupe_reason": self.dedupe_reason,
+            "recovery_state": self.recovery_state,
+            "recovery_source": self.recovery_source,
+            "action_suppressed": int(bool(self.action_suppressed)),
+            "action_suppressed_reason": self.action_suppressed_reason,
+            "submit_allowed": int(bool(self.submit_allowed)),
+            "fill_apply_allowed": int(bool(self.fill_apply_allowed)),
+
+            "execution_qty": _d(self.execution_qty),
 
             # Phase 5C session overlay (canonical)
             "session": self.session,
@@ -300,6 +627,15 @@ class DecisionSnapshot:
             "rejection_at_sup": int(bool(self.rejection_at_sup)),
             "structure_reasons": self.structure_reasons,
 
+            # Trendlines (Phase 18)
+            "near_support_tl": int(bool(self.near_support_tl)),
+            "near_resist_tl": int(bool(self.near_resist_tl)),
+            "broke_above_resist_tl": int(bool(self.broke_above_resist_tl)),
+            "broke_below_support_tl": int(bool(self.broke_below_support_tl)),
+            "tl_proj_support": _d(self.tl_proj_support),
+            "tl_proj_resist": _d(self.tl_proj_resist),
+            "trendline_reasons": self.trendline_reasons,
+
             # Liquidity
             "liq_ok": _b(self.liq_ok),
             "liq_spread_bps": _d(self.liq_spread_bps),
@@ -361,6 +697,24 @@ class DecisionSnapshot:
             row["session_reasons"] = str(legacy_session_reason)
 
         # ------------------------------------------------------------
+        # Execution compatibility aliases
+        # ------------------------------------------------------------
+        if legacy_client_order_id is not None and str(legacy_client_order_id) != "":
+            row["client_order_id"] = str(legacy_client_order_id)
+        if legacy_order_id is not None and str(legacy_order_id) != "":
+            row["order_id"] = str(legacy_order_id)
+        if legacy_trade_id is not None and str(legacy_trade_id) != "":
+            row["trade_id"] = str(legacy_trade_id)
+        if legacy_execution_qty is not None:
+            row["execution_qty"] = _d(legacy_execution_qty)
+        if legacy_fill_id is not None and str(legacy_fill_id) != "":
+            row["fill_id"] = str(legacy_fill_id)
+        if legacy_fill_fingerprint is not None and str(legacy_fill_fingerprint) != "":
+            row["fill_fingerprint"] = str(legacy_fill_fingerprint)
+        if legacy_dedupe_key is not None and str(legacy_dedupe_key) != "":
+            row["dedupe_key"] = str(legacy_dedupe_key)
+
+        # ------------------------------------------------------------
         # Compatibility aliases (prevents blanks if io_logs header uses old names)
         # ------------------------------------------------------------
         row["price"] = row["px"]                          # header: "price"
@@ -373,10 +727,62 @@ class DecisionSnapshot:
         row["candle_close"] = row.get("candle_close_1m")  # header: "candle_close"
 
         row["equity"] = row.get("equity_usd")             # older prints sometimes use equity
-        row["qty"] = row.get("position_qty")              # some code uses qty
+        row["qty"] = row.get("position_qty")              # some code uses qty = current position qty
+        row["exec_qty"] = row.get("execution_qty")        # execution-facing alias
+        row["order_qty"] = row.get("execution_qty")       # alternate execution-facing alias
         row["unrl"] = row.get("unrl_pnl_usd")
         row["realized"] = row.get("realized_pnl_usd")
 
         row["stale_data"] = row.get("stale")              # header: "stale_data"
 
+        # Older / alternate execution names you may already have in io_logs or analysis.
+        row["entry_order_id"] = row.get("order_id")
+        row["entry_trade_id"] = row.get("trade_id")
+        row["exec_status"] = row.get("execution_status")
+        row["exec_reason"] = row.get("execution_reason")
+
+        # Dedupe aliases
+        row["fill_key"] = row.get("fill_fingerprint")
+        row["submit_key"] = row.get("client_order_id") or row.get("intent_id")
+        row["recovery_guard"] = int(bool(self.action_suppressed))
+
         return row
+
+    def add_event(
+        self,
+        name: str,
+        message: str,
+        *,
+        notify_title: Optional[str] = None,
+        notify_body: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        order_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
+        intent_id: Optional[str] = None,
+        entry_intent_id: Optional[str] = None,
+        exit_intent_id: Optional[str] = None,
+        fill_id: Optional[str] = None,
+        fill_fingerprint: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
+        recovery_state: Optional[str] = None,
+        dedupe_reason: Optional[str] = None,
+    ) -> None:
+        self.events.append(
+            EngineEvent(
+                name=name,
+                message=message,
+                notify_title=notify_title,
+                notify_body=notify_body,
+                client_order_id=client_order_id,
+                order_id=order_id,
+                trade_id=trade_id,
+                intent_id=intent_id,
+                entry_intent_id=entry_intent_id,
+                exit_intent_id=exit_intent_id,
+                fill_id=fill_id,
+                fill_fingerprint=fill_fingerprint,
+                dedupe_key=dedupe_key,
+                recovery_state=recovery_state,
+                dedupe_reason=dedupe_reason,
+            )
+        )
