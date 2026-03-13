@@ -191,10 +191,12 @@ def load_config() -> dict:
     cfg["MA200_BAND_PCT"] = _d("MA200_BAND_PCT", "0.001")
     cfg["TREND_INVALIDATION_CLOSES"] = _i("TREND_INVALIDATION_CLOSES", "2")
     cfg["MIN_HOLD_SECONDS"] = _i("MIN_HOLD_SECONDS", "60")
+    cfg["MAX_HOLD_SECONDS"] = _i("MAX_HOLD_SECONDS", "5400")
 
     cfg["MA200_BAND_PCT"] = _clamp_decimal(cfg["MA200_BAND_PCT"], Decimal("0"), Decimal("1"))
     cfg["TREND_INVALIDATION_CLOSES"] = _clamp_int(cfg["TREND_INVALIDATION_CLOSES"], 0, 50_000)
     cfg["MIN_HOLD_SECONDS"] = _clamp_int(cfg["MIN_HOLD_SECONDS"], 0, 86_400)
+    cfg["MAX_HOLD_SECONDS"] = _clamp_int(cfg["MAX_HOLD_SECONDS"], 0, 86_400)
 
     stale_raw = _i("STALE_TICK_SECONDS", "20")
     cfg["STALE_TICK_SECONDS"] = max(10, int(stale_raw))

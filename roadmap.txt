@@ -71,12 +71,18 @@ Rules:
   Started: 2026-03-13 on PC1 (PC2 runs died twice — SSH disconnect).
   Expected completion: ~4.5 hrs from start.
 
-### Next after optimization passes:
-  1. Restart PC1 live runner with new config (MIN_SCORE=80 + regime gate)
-  2. Trendline comparison: USE_TRENDLINES=true, TL_PENALTY_RESIST_SLOPE_NEG=5
-     (penalties only — bonuses are counterproductive per 2026-03-12 test)
-  3. If trendlines help: enable in live config
-  4. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
+### Time-Stop Exit (implemented 2026-03-13):
+  MAX_HOLD_SECONDS=5400 (90 min). Closes position if held too long.
+  Data-driven: <1hr trades 41% WR (+$3.71), 1-4hr trades 3% WR (-$6.64).
+  Priority: STOP_LOSS > MIN_HOLD > TIME_STOP > TREND_INVALIDATION > TRAIL > TP.
+  Backtest comparison pending (baseline run in progress, then time-stop run).
+
+### Next steps:
+  1. Baseline backtest completes → record results (no time-stop, score=80, regime blocks)
+  2. Run time-stop backtest → compare WR/PF/PnL against baseline
+  3. Restart PC1 live runner with winning config
+  4. BTC-USD + SOL-USD backtests (cross-asset validation)
+  5. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
 

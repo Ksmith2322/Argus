@@ -1322,7 +1322,11 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 action = "HOLD"
                 action_reason = f"MIN_HOLD ({hold_s}s<{cfg['MIN_HOLD_SECONDS']}s)"
             else:
-                if state.trend_below_count >= int(cfg["TREND_INVALIDATION_CLOSES"]):
+                max_hold = int(cfg["MAX_HOLD_SECONDS"])
+                if max_hold > 0 and hold_s >= max_hold:
+                    action = would_sell_action
+                    action_reason = f"TIME_STOP ({hold_s}s>={max_hold}s)"
+                elif state.trend_below_count >= int(cfg["TREND_INVALIDATION_CLOSES"]):
                     action = would_sell_action
                     action_reason = f"TREND_INVALIDATION ({state.trend_below_count} closes < MA200_band)"
                 elif trail_stop is not None and px <= trail_stop:
