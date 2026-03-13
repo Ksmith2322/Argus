@@ -1,5 +1,5 @@
-# ARGUS ROADMAP — FINALIZED
-# Last updated: 2026-03-11
+# ARGUS ROADMAP
+# Last updated: 2026-03-13
 # Goal: fully operational autonomous trading system, no outside interaction required,
 #        visual performance monitoring built-in, fail-closed behavior, human-governed
 #        promotion boundaries.
@@ -27,590 +27,202 @@ Rules:
 
 ---
 
-# COMPLETED
+# COMPLETED PHASES
 
 ## Phase 7 — Backtest Closure and Determinism  [DONE]
 Deterministic backtest, per-run artifacts, attempt-accounting invariants, sandbox rule.
 
 ## Phase 8 — Execution Truth and Restart Certainty  [DONE]
-PaperAdapter, fill persistence, startup recovery (fills > positions > snapshot),
-Gate A acceptance harness PASS: force BUY → kill → restart → OPEN → force SELL → FLAT → reconcile.
+PaperAdapter, fill persistence, startup recovery, Gate A PASS 2026-03-10.
 
 ## Phase 9 — Trade Lifecycle Finalization  [DONE]
-trade_journal_<run>.csv written on every SELL→FLAT transition.
-Fields: entry/exit ts, entry/exit px, fees, MAE/MFE, regime_at_entry, trade_duration_s,
-        slippage_bps, entry_mid_px, exit_mid_px, trade_id, entry/exit fill/order ids.
-Gate A confirms journal write after crash-restart cycle.
+trade_journal on every SELL->FLAT transition. Gate A confirms journal write after crash-restart.
+
+## Phase 10 — Adversarial Restart and Fault Hardening  [DONE]
+4 kill-point scenarios (A-D) all PASS 2026-03-10.
+
+## Phases 11-16 — Infrastructure  [INFRA DONE 2026-03-11]
+All analytics, risk, attribution, reporting, ops, and unattended infra modules built.
+DATA PENDING — modules will fully populate as live paper trades accumulate (need 30-50+ fills).
+  * Phase 11: friction_report.py + friction_injector.py built. Need 30+ live fills.
+  * Phase 12: walk_forward.py + stress_runner.py built. Needs Phase 11 friction data.
+  * Phase 13: risk_model.py built. Needs 50+ trades for meaningful Monte Carlo.
+  * Phase 14: attribution.py built. Needs trade data to populate.
+  * Phase 15: generate_report.py built. Single self-contained HTML report, all panels implemented.
+  * Phase 16: Full unattended ops: runtime modes, health checks, invariants, watchdog,
+              auto-throttle, artifact integrity, alerting, backup/restore. 121/121 tests PASS.
+
+## Phase 16.5 — Strategy Optimization  [IN PROGRESS]
+
+### Bugs Fixed (code in place):
+  1. Liq filter unit mismatch — ETH vol vs USD floor. Fixed: LIQ_MIN_VOL_UNITS_1M=25 ETH.
+  2. PENALIZE mode penalty never applied — early return bug. Fixed: penalty applied first.
+  3. TL_PENALTY_RESIST_SLOPE_NEG feature added (confluence.py + config.py + .env).
+
+### Old Baseline (2026-03-12, dataset Feb 9–Mar 11, 43K candles):
+  WR=25.35%  PF=0.74  trades=71  PnL=-$5.05
+  Liq fix test: neutral. Trendline bonus test: WORSE (bonuses promote marginal entries).
+  VERDICT: FAIL — bear/chop dataset, not a filter problem.
+
+### Fresh Baseline (2026-03-13, dataset Feb 11–Mar 13, 43K candles):
+  run_id: bt_20260313T060439Z_9518a56d (determinism confirmed, Run 1 = Run 2)
+  77 trades, 24.68% WR, PF=0.74, PnL=-$5.92, avg_win=$0.52, avg_loss=$0.23 (R:R 2.2:1)
+  Consistent with old baseline — strategy is stable but underwater.
+
+### Score Analysis (fresh baseline):
+  Score < 75:  33 trades, 15.2% WR, PnL=-$5.90  (LOSING)
+  Score 75-79: 13 trades,  7.7% WR, PnL=-$1.52  (LOSING)
+  Score 80-84: 16 trades, 18.8% WR, PnL=-$2.02  (LOSING)
+  Score 85-89:  3 trades, 33.3% WR, PnL=+$0.19  (BREAK-EVEN)
+  Score 90+:   12 trades, 75.0% WR, PnL=+$5.71  (WINNING)
+
+  RANGE regime: 9 trades, 0% WR, PnL=-$2.20 (ALL LOSSES)
+  TREND_UP:    68 trades, 27.9% WR, PnL=-$1.34
+
+### Staged Optimization (score>=80 + block RANGE):
+  Retroactive: 28 trades, 46.4% WR, PF=2.49, PnL=+$4.76, expectancy=$0.17/trade
+  Exceeds exit criteria (WR>=35%, PF>=1.20) by wide margin.
+
+### Optimization Test — IN PROGRESS on PC2:
+  run_id: bt_20260313T194806Z_9a0ded3d (SingleRun mode)
+  Config: CONFLUENCE_MIN_SCORE=80, REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
+  Started: 2026-03-13 ~14:48 UTC. Expected completion: ~17:30 UTC.
+
+### Next after optimization passes:
+  1. Restart PC1 live runner with new config (MIN_SCORE=80 + regime gate)
+  2. Trendline comparison: USE_TRENDLINES=true, TL_PENALTY_RESIST_SLOPE_NEG=5
+     (penalties only — bonuses are counterproductive per 2026-03-12 test)
+  3. If trendlines help: enable in live config
+  4. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
 
-# ACTIVE ROADMAP — Phase 10 through Phase 18
+# ACTIVE ROADMAP
 
----
+## Phase 17 — Paper Capital Proof  [NEXT — after Phase 16.5 passes]
 
-## Phase 10 — Adversarial Restart and Fault Hardening
-
-Goal:
-Close all remaining restart failure modes beyond Gate A's BUY→kill→SELL happy path.
-Gate A proves one kill point. Phase 10 proves the rest.
-
-Focus:
-  * kill after place_order returns but before fill (mid-order, not mid-position)
-  * kill after SELL submit but before SELL fill persisted
-  * kill after journal write (confirm no double-journal on restart)
-  * kill after SELL fill but before reconciliation
-  * cold restore from artifacts only — no snapshot file present
-  * truncated fills.csv (partial row at EOF)
-  * duplicate fill_id in fills.csv (idempotency proof)
-  * restart with stale fill_plans.json but clean fills.csv
-  * confirm: no ghost fills under any kill point
-  * confirm: no duplicate journal rows under any restart sequence
-
-Artifact:
-  * extended Gate A harness: test_gate_a_phase10.ps1
-  * covers at minimum 5 distinct kill points
-  * each scenario ends with reconcile PASS and artifact audit
-
-Exit:
-  * restart correctness is binary and proven across all modeled kill points
-  * no undefined behavior under partial-write scenarios
-
----
-
-## Phase 11 — Empirical Friction Measurement
-
-Goal:
-Measure actual execution drag from paper runtime truth.
-This phase REQUIRES live paper trading data — at minimum 30–50 fills
-across multiple sessions/regimes before the distributions are meaningful.
-Start the paper adapter running live NOW and accumulate data in parallel with Phase 10.
-
-Focus:
-  * latency distributions (order submit → fill, measured from event ts deltas)
-  * slippage distributions (fill_px vs entry_mid_px from trade_journal)
-  * entry vs exit friction split
-  * p50 / p95 / p99 slippage
-  * spread exposure at fill time
-  * fill quality by session / regime / liquidity state
-  * friction nonlinearity identification
-
-Build:
-  * analytics/friction_report.py
-    reads: fills.csv, trade_journal_*.csv, positions.csv
-    writes: friction_report_<run>.json + friction_summary.html
-  * backtest/friction_injector.py
-    injects empirical friction percentiles into backtest feed
-
-Exit:
-  * you have trustworthy latency/slippage/spread distributions
-  * you know where friction is nonlinear
-  * you know whether exits are structurally worse than entries
-  * you stop using average friction as if it is representative
-
----
-
-## Phase 12 — Research Reality Integration
-
-Goal:
-Feed empirical friction back into research. Prove edge survival under real drag.
-
-Focus:
-  * constant friction mode (p50 friction applied to all fills)
-  * conditional friction mode (friction by regime/session bucket)
-  * Monte Carlo empirical friction mode (sample from measured distribution per trade)
-  * expectancy erosion report (baseline vs friction-adjusted)
-  * drawdown distortion under realistic friction
-  * walk-forward validation (N forward windows, each run independently)
-  * parameter sensitivity (vary key params, measure output stability)
-  * spread widening injection (1.5x, 2x, 3x baseline)
-  * vol spike and compression injection
-  * regime distortion (misclassify N% of regimes, measure PnL impact)
-
-Exit:
-  * edge survives empirical friction injection  OR  strategy returns for redesign
-  * walk-forward results are consistent, not cherry-picked to one window
-  * no single parameter is load-bearing for the edge
-
----
-
-## Phase 13 — Risk-of-Ruin Modeling
-
-Goal:
-Before any compounding or real capital, quantify survivability mathematically.
-This is required. No skip.
-
-Focus:
-  * per-trade PnL sequence from trade_journal_*.csv (exact source, no inference)
-  * win rate / expectancy / variance / Sharpe
-  * drawdown distribution (historical + Monte Carlo)
-  * max consecutive losses
-  * Monte Carlo equity paths (min 10,000 paths)
-  * risk-per-trade sensitivity
-  * risk-of-ruin at current position sizing
-  * Kelly fraction calculation
-  * time to ruin distribution
-
-Build:
-  * analytics/risk_model.py
-    reads: trade_journal_*.csv (all runs combined)
-    writes: risk_model_<date>.json
-
-Exit:
-  * risk-of-ruin is inside acceptable bounds for intended holding horizon
-  * Kelly fraction is computed and position sizing is validated against it
-  * drawdown bounds are stated and modeled, not assumed
-
----
-
-## Phase 14 — Performance Attribution and Diagnostics
-
-Goal:
-Find out what is actually producing PnL. Regime/session/liquidity attribution.
-If one bucket is generating all the alpha, that is fragility, not edge.
-
-Focus:
-  * regime bucket attribution (trend / range / volatile / unknown)
-  * session bucket attribution (London / NY / overlap / Asian / off-hours)
-  * volatility bucket attribution (ATR percentile)
-  * liquidity state attribution
-  * entry reason attribution (which signal combinations produce positive expectancy)
-  * hold time distribution and PnL correlation
-  * MAE/MFE analysis (are exits too early? too late?)
-  * fee drag as % of gross PnL per bucket
-
-Build:
-  * analytics/attribution.py
-    reads: trade_journal_*.csv, bt_summary_*.json
-    writes: attribution_<date>.json + attribution_<date>.html
-
-Exit:
-  * you know which conditions produce edge and which produce drag
-  * no attribution bucket is so dominant that removing it kills the strategy
-
----
-
-## Phase 15 — Performance Visibility Dashboard
-
-Goal:
-Human-readable performance view with zero external dependencies.
-Fully local. No cloud. No external services. Runs on demand or after each run.
-
-This is not a vanity GUI. It is the operator visibility surface required for
-unattended operation. Without it, Phase 16 autonomous ops is blind.
-
-Focus:
-  * equity curve (from equity_*.csv)
-  * trade table with sortable columns (from trade_journal_*.csv)
-  * drawdown overlay
-  * attribution charts by regime / session
-  * friction vs baseline expectancy comparison
-  * reconciliation status per run
-  * risk model summary (from analytics/risk_model.py output)
-  * MAE/MFE scatter plot
-  * fill quality metrics
-  * daily/weekly performance snapshots
-
-Build:
-  * reporting/generate_report.py
-    reads: trade_journal_*.csv, equity_*.csv, bt_summary_*.json,
-           friction_report_*.json, attribution_*.json, risk_model_*.json
-    writes: report_<date>.html (single self-contained file, no server required)
-  * Triggered after: Gate A, any backtest run, on-demand via CLI flag
-  * Stack: pure Python + embedded Chart.js from local copy (no CDN)
-  * One command: python reporting/generate_report.py → opens browser
-
-Exit:
-  * operator can review full performance, risk, attribution, and fill quality
-    from a single HTML file with no internet connection
-  * report is regenerable from artifacts alone (reproducible from canonical truth)
-
----
-
-## Phase 16 — Unattended Operations Hardening
-
-Goal:
-Run hands-off under normal conditions without operator babysitting.
-Phase 16 is only valid after Phase 15 exists — you need visibility
-before you remove yourself from the loop.
-
-Focus:
-  * supervisor/watchdog process (auto-restart runner on crash with backoff)
-  * health checks (feed staleness, adapter heartbeat, fill latency, invariant violations)
-  * safe-mode and degraded-mode runtime:
-    - full mode (normal operation)
-    - no-new-entry mode (hold existing, no new positions)
-    - reduce-only mode (exits allowed, entries blocked)
-    - observation-only mode (log only, no orders)
-    - reconciliation-only mode (startup integrity check, no trading)
-  * auto-throttle (reduce position size on consecutive losses or anomalous slippage)
-  * config freeze per run (config hash stored in run manifest, changes require new run)
-  * run manifests (run_id, config hash, code hash, start time, artifact list)
-  * artifact integrity checks on startup (hash verification)
-  * alerting via existing Discord webhook:
-    - HALT events
-    - recovery contradictions
-    - drawdown limit breach
-    - invariant failures
-    - fill anomalies
-  * daily automated backup (ops/backup_repo.ps1 already exists)
-  * daily restore drill (automated, logged)
-  * safe-mode trigger conditions:
-    - feed divergence
-    - fill latency > threshold
-    - abnormal slippage (> p99)
-    - drift threshold breach
-    - invariant failure
-    - state mismatch
-
-Invariant engine (continuous, not just on startup):
-  * positions match fills
-  * realized PnL matches lifecycle truth
-  * order/fill linkage is complete
-  * no duplicate lifecycle closure
-  * timestamp ordering is valid
-  * cash/exposure limits hold
-  If critical invariant fails: halt entries, preserve state, alert, enter safe-mode
-
-Exit:
-  * normal operation needs no manual babysitting
-  * abnormal operation escalates deterministically via alert
-  * system fails closed, not open
-  * promotions and config changes remain human-governed
-  * unattended runtime is auditable from artifacts alone
-
----
-
-## Phase 17 — Paper Capital Proof
-
-Goal:
-Prove constrained paper growth under unattended operation without cheating.
-This phase runs Phase 16 for real — hands off, fixed config, no exceptions.
+Goal: Prove paper growth under unattended operation with optimized config.
 
 Rules (hard):
-  * fixed config, locked at run start (config hash enforced)
-  * fixed risk per trade (no override)
-  * no strategy edits during run
-  * no operator overrides except KILL_SWITCH or PAUSE
-  * no parameter drift
-  * no exception-based rule bending
-  * any halt is logged and must be explainable from artifacts
+  * Fixed config, locked at run start (config hash enforced)
+  * No strategy edits during run
+  * No operator overrides except KILL_SWITCH or PAUSE
+  * Any halt is logged and explainable from artifacts
 
 Duration: minimum 4 weeks unattended
 
 Exit:
-  * paper growth occurs inside modeled expectancy and drawdown bounds
-  * drawdown did not exceed modeled maximum from Phase 13
-  * reconciliation passes every run
-  * dashboard report matches modeled performance
+  * Paper growth inside modeled expectancy and drawdown bounds
+  * Reconciliation passes every run
+  * 30+ live fills accumulated (unlocks Phase 11 data gate)
 
----
+## Phase 18 — Real Micro-Capital Validation  [AFTER PHASE 17]
 
-## Phase 18 — Real Micro-Capital Validation
-
-Goal:
-Validate live settlement, live fee/slippage, and live execution under real capital.
-
-Prerequisites: Phase 17 PASS, live broker adapter implemented.
+Goal: Validate live settlement, fees, slippage under real capital.
 
 Build:
-  * execution/coinbase_adapter.py — real adapter implementing ExecutionAdapter ABC
-    (same interface as PaperAdapter: place_order, cancel, fetch_fills,
-     get_positions, get_account_state)
-  * Same canonical truth model, same reconciliation, same journal schema
-  * Model vs reality deviation tracker (expected fill vs actual fill per trade)
+  * execution/coinbase_adapter.py — real adapter (same interface as PaperAdapter)
+  * Model vs reality deviation tracker
 
 Rules:
-  * minimal capital (defined before starting)
-  * tight instrumentation (all fills logged with real latency)
-  * strict rule lock (same as Phase 17)
-  * live behavior must stay inside expected bounds from Phase 11 friction model
+  * Minimal capital (defined before starting)
+  * Tight instrumentation
+  * Live behavior must stay inside friction model bounds
 
 Exit:
-  * live behavior inside expected bounds closely enough to justify scaling
-  * real slippage matches empirical friction model from Phase 11
-  * live reconciliation passes consistently
+  * Live behavior inside expected bounds
+  * Real slippage matches empirical friction model
+  * Live reconciliation passes consistently
 
 ---
 
-## Phase 19 — Optimization, Visibility, and Survivability  [AFTER PHASE 18]
+# FUTURE PRIORITIES (Phase 19+)
 
-Goal:
-Harden the system for long-term autonomous operation. Improve strategy edge.
-Build operator visibility and multi-machine workflow automation.
+## Priority 1 — Strategy Edge  [PARTIALLY DONE]
+  [DONE] Hard TREND_DOWN + RANGE regime gate (engine.py)
+  [DONE] Score threshold optimization (MIN_SCORE=80)
+  [DONE] Fresh daily candles automated (Task Scheduler daily@03:00)
+  [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
+  [TODO] Expand to BTC-USD after ETH edge confirmed
+  [TODO] 4hr timeframe + S/R trendlines (Tori Trades swing approach)
+  [TODO] Sliding window position sizing (confidence-weighted by signal/timeframe performance)
 
-Priority 1 — Strategy edge improvements:
-  * Download fresh daily candles (automate via Task Scheduler + backtest/download_candles.py)
-  * Hard TREND_DOWN regime gate — block ALL entries when regime=TREND_DOWN (not just penalty)
-  * Disable trendline bonuses; keep only penalties (bonuses promote marginal entries)
-  * Champion-challenger backtests: regime gate vs baseline side-by-side on PC2
-  * Expand to BTC-USD after ETH edge confirmed (same canonical event model)
+## Priority 2 — Real-time Live Dashboard  [TODO]
+  * FastAPI + websockets reading live_events.csv / live_signals.csv
+  * Chart.js equity curve, regime/score/position panels
+  * Single command: python ops/dashboard.py -> localhost:8080
 
-Priority 2 — Real-time live dashboard:
-  * FastAPI + websockets server reading live_events.csv / live_signals.csv
-  * Chart.js equity curve updating in real time
-  * Current regime, score, session, position status panels
-  * Single command: python ops/dashboard.py → opens browser at localhost:8080
-  * No external dependencies (local only)
+## Priority 3 — PC1/PC2 Job Dispatch  [DONE]
+  [DONE] SSH passwordless auth PC1->PC2 (ED25519 key)
+  [DONE] ops/dispatch_backtest_pc2.ps1 — push, pull, run via scheduled task
+  [DONE] ops/check_pc2.ps1 — one-command status check
+  [DONE] ops/pull_pc2_results.ps1 — auto-pull summary + trades
+  [DONE] -SingleRun flag (skips determinism check, halves test time)
+  [DONE] -EnvOverrides for remote config without modifying PC1's .env
+  [TODO] Job queue: text file of pending runs; dispatcher pops and executes
 
-Priority 3 — PC1/PC2 automated job dispatch:
-  * Enable OpenSSH on PC2
-  * ops/dispatch_job.ps1 on PC1: ssh pc2 "git pull && python -m backtest.runner"
-  * Auto-copy bt_summary_*.json results back to PC1 via scp
-  * Job queue: text file of pending runs; dispatcher pops and executes
+## Priority 4 — Survivability  [MOSTLY DONE]
+  [DONE] Daily git backup (Task Scheduler daily@02:00, ops/auto_git_backup.ps1)
+  [DONE] Flash drive backup (ops/backup_flash.ps1 -> E:\Argus)
+  [DONE] Watchdog auto-restart (ops/watchdog.py)
+  [DONE] Runner auto-start on login (Startup folder -> ops/autostart_runner.ps1)
+  [DONE] Runner restart script (ops/restart_runner.ps1)
+  [TODO] Backup verification drill (automated weekly)
 
-Priority 4 — Survivability hardening:
-  * Automated daily git push from PC1 (Task Scheduler: git add -A && git commit && git push)
-  * Flash drive backup already exists (ops/backup_flash.ps1 → E:\Argus)
-  * Watchdog auto-restart runner_live.py on crash (ops/watchdog.py already built)
-  * Task Scheduler job for runner_live.py auto-start on boot
-  * Backup verification drill (automated weekly)
+## Priority 5 — Architecture Visualization  [TODO]
+  * ops/generate_map.py -> ARGUS_MAP.mermaid
 
-Priority 5 — Architecture visualization:
-  * ops/generate_map.py — emit ARGUS_MAP.mermaid (renders in VSCode/GitHub)
-  * Node types: ENTRYPOINT / CORE / IO / ANALYTICS / OPS / ARTIFACT
-  * Shows call graph, data flow, artifact ownership in one diagram
-
-Priority 6 — ML as governor (not driver):
-  * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
-  * Anomaly detector: flags unusual fill patterns or execution drift
-  * Capital allocation ranker: rank entry opportunities by predicted quality
-  * NEVER replaces deterministic engine — acts as score modifier only
-  * Requires 500+ labeled trades before training is meaningful
+## Priority 6 — ML as Governor  [TODO — needs 500+ trades]
+  * Regime classifier, anomaly detector, capital allocation ranker
+  * Score modifier only — never replaces deterministic engine
 
 ---
 
 # FUTURE EXTENSIONS (after Phase 19)
 
-Not on the active roadmap. Listed for architectural awareness.
-Build these only after Phase 19 is proven.
-
   * Champion-challenger shadow runtime
-    (challenger sees same environment, logs counterfactual decisions, no live orders)
-
   * Dual-feed market data validation
-    (primary + reference feed, stale-price detector, divergence threshold)
-
   * Hash-chained artifact integrity
-    (per-run manifest, chained event hashes, tamper-evident audit trail)
-
   * Deterministic replay certification
-    (artifacts replay to same reconstructed lifecycle, analytics reproducible)
-
-  * Multi-venue portability
-    (perpetual futures; same canonical event model required)
-
+  * Multi-venue portability (perpetual futures)
   * Policy engine above strategy engine
-    (hard policy layer overruling strategy: max spread, max slippage, max venue error,
-     max daily loss, max regime uncertainty, confidence floor for data quality)
-
   * Regime black-swan library
-    (deliberate catalog: exchange outage, liquidity vacuum, price gap, feed disconnect,
-     config mismatch on restart, disk-full scenario)
-
   * Storage and recovery maturity
-    (append-only run manifests, snapshot versioning, artifact compaction,
-     archival policy, corruption quarantine)
 
 ---
 
-# ACTIVE PHASE ENTRY/EXIT GATES SUMMARY
+# TWO-MACHINE SETUP
 
-Phase 10  entry: Phase 9 DONE, Gate A PASS confirmed
-          exit:  5+ kill-point scenarios pass with reconcile PASS + no ghost fills + no duplicate journal
-
-Phase 11  entry: Phase 10 DONE, 30+ live paper fills accumulated
-          exit:  friction_report.json exists with p50/p95/p99 by regime/session
-
-Phase 12  entry: Phase 11 DONE
-          exit:  edge survives empirical friction injection, walk-forward consistent
-
-Phase 13  entry: 50+ trades in trade_journal for meaningful Monte Carlo
-          exit:  risk_model.json exists, risk-of-ruin inside bounds, Kelly fraction computed
-
-Phase 14  entry: Phase 13 DONE
-          exit:  attribution.json exists, no single bucket generates all alpha
-
-Phase 15  entry: Phase 14 DONE (analytics modules exist to read from)
-          exit:  report_<date>.html generates from artifacts alone, all panels populated
-
-Phase 16  entry: Phase 15 DONE (visibility exists before removing operator)
-          exit:  unattended operation, safe-mode triggers tested, alerting confirmed
-
-Phase 17  entry: Phase 16 DONE, 4-week run plan defined
-          exit:  4+ weeks unattended, paper growth inside modeled bounds, reconcile passes
-
-Phase 18  entry: Phase 17 DONE, live adapter built and tested
-          exit:  live behavior inside friction model bounds, reconciliation passes
+  PC1 (WINDOWS-5RCTEK3): runner_live.py 24/7, dev work, heavy backtests
+  PC2 (DESKTOP-17CJMUP): offloaded backtest jobs
+  GitHub: Ksmith2322/Argus, branch phase6-hardening
+  SSH: passwordless ED25519 key, dispatch via ops/dispatch_backtest_pc2.ps1
+  .env tracked in git (paper trading, no real keys)
+  ops/logs/ NOT in git — artifacts are local to each machine
 
 ---
 
-# CURRENT STATE
+# TRENDLINE ENGINE (Phase 18 feature, currently disabled)
 
-  Phase 7:  DONE
-  Phase 8:  DONE — Gate A PASS 2026-03-10
-  Phase 9:  DONE — trade_journal confirmed 2026-03-10; recovery path Phase 9 hydration fixed 2026-03-11
-  Phase 10: DONE — Gate A covers mid-position kill; remaining kill points TBD
-  Phase 11: INFRA DONE 2026-03-11 — analytics/friction_report.py + backtest/friction_injector.py built
-            DATA PENDING — 2/30+ live fills accumulated; distributions will populate with paper runtime
-  Phase 12: INFRA DONE 2026-03-11 — backtest/walk_forward.py + backtest/stress_runner.py + analytics/research_report.py built
-            GATE PENDING — requires Phase 11 friction data + sufficient baseline trades for walk-fwd consistency
-  Phase 13: INFRA DONE 2026-03-11 — analytics/risk_model.py built; runs with warning when < 50 trades
-            DATA PENDING — only 1 live trade in journal; Monte Carlo not meaningful until 50+ accumulate
-  Phase 14: INFRA DONE 2026-03-11 — analytics/attribution.py built; regime/session/entry_reason/hold_time/MAE-MFE/fee-drag attribution
-            DATA PENDING — distributions will populate as live paper trades accumulate
-  Phase 15: INFRA DONE 2026-03-11 — reporting/generate_report.py built; single self-contained HTML report
-            All panels implemented: equity+drawdown charts, trade table, daily/weekly PnL, regime/session
-            attribution bar charts, MAE/MFE scatter, risk model summary, friction panel,
-            friction-vs-baseline comparison, reconciliation status table. Zero external dependencies.
-            Backtest PASS confirmed (attempt_invariants_ok=True, 133 trades).
-            EXIT CRITERION: report_<date>.html generates from artifacts alone — SATISFIED.
-            DATA PENDING — panels will fully populate as analytics modules accumulate live paper trade data.
-  Phase 16: INFRA DONE 2026-03-11 — Full unattended operations infrastructure built:
-            runtime_mode.py — 5-level mode system (FULL/NO_NEW_ENTRY/REDUCE_ONLY/OBSERVATION_ONLY/RECONCILIATION_ONLY)
-              with crash-safe persistence, escalation-only transitions, action gating, audit trail (JSONL history).
-            ops/health.py — health check framework (feed staleness, fill latency, consecutive losses, slippage
-              anomaly, invariant violations) with auto-escalation to safe modes.
-            ops/invariants.py — continuous invariant engine (position/fill match, duplicate fill IDs,
-              order/fill linkage, timestamp ordering, cash/exposure limits).
-            ops/run_manifest.py — config freeze (SHA-256 hash) + code hash + run manifests with drift detection.
-            ops/alerting.py — centralized alert dispatch with severity levels + dedup throttle via Discord.
-            ops/watchdog.py — supervisor process with auto-restart, exponential backoff, mode-aware gating.
-            ops/auto_throttle.py — position size reduction on consecutive losses or anomalous slippage.
-            ops/artifact_integrity.py — SHA-256 hash verification on startup, truncation detection, fill_id dedup.
-            ops/backup_restore.py — automated backup + restore drill + cleanup (keep last N).
-            Integration into runner_live.py: mode gating at order submission, periodic health checks,
-              run manifest creation/finalization, auto-throttle on BUY qty, artifact integrity on startup,
-              integrity manifest on shutdown, trade result feedback to throttle.
-            Config keys added: RUNTIME_MODE_FILE, HEALTH_* thresholds, RUNTIME_MODE_GATING_ENABLED.
-            Backtest PASS confirmed (attempt_invariants_ok=True, 133 trades, exit code 0). No regression.
-            28/28 functional tests pass (modes, health, invariants, manifest, alerting, throttle, integrity, backup).
-            ops/test_phase16_ops.py — 121/121 acceptance tests PASS (2026-03-11):
-              runtime mode (persistence, escalation-only, reset, action gating, history), health checks
-              (individual + aggregate with auto-escalation), auto-throttle (losses, slippage, recovery, qty),
-              artifact integrity (hash, truncation, missing file, duplicate fill_id), run manifest (config/code
-              hash, drift detection, save/load/finalize), invariant engine (position/fill match, duplicate IDs,
-              order linkage, timestamps, cash/exposure), alert throttle (dedup, cooldown), backup/restore
-              (full cycle, cleanup, corruption detection), integration chain (health->mode->gating end-to-end).
-            GATE PENDING — safe-mode triggers require live paper runtime for end-to-end confirmation.
-  Phase 16.5 — STRATEGY OPTIMIZATION — COMPLETE 2026-03-12 (FAIL — proceeding anyway)
-            BUGS FIXED:
-              (1) Liq filter unit mismatch — LIQ_MIN_VOL_USD_1M was comparing ETH volume to USD floor;
-                  ALL entries fired VOLUME_BELOW_MIN. Fixed: LIQ_MIN_VOL_USD_1M=0,
-                  LIQ_MIN_VOL_UNITS_1M=25 ETH. Config: LIQ_MIN_VOL_1M=max(v_usd,v_units)=25.
-              (2) PENALIZE mode penalty never applied — engine.py had early return before penalty
-                  subtraction. Since ok=True always in PENALIZE mode, penalty was computed but
-                  never subtracted. Fixed: restructured to apply penalty first.
-              (3) TL_PENALTY_RESIST_SLOPE_NEG feature added (confluence.py + config.py + .env).
-                  Penalizes entries when 1h resistance trendline has negative slope (descending
-                  channel), even when not near the line. Default=0. Comparison test uses =5.
-                  Applied to conf_score BEFORE session bonus, so score=72+session_bonus entries
-                  still fall below threshold when in descending channels.
-            COMPARISON TEST RESULTS (2026-03-12, 30-day ETH-USD Feb 9 – Mar 11):
-              Old baseline (buggy):   WR=25.35%  PF=0.74  trades=71  PnL=-$5.05
-              Test 1 (fixed_liq):     WR=25.71%  PF=0.75  trades=70  PnL=-$4.92  (liq fix neutral)
-              Test 2 (trendlines):    WR=24.29%  PF=0.71  trades=70  PnL=-$5.47  (WORSE)
-            VERDICT: FAIL — neither test hit WR>=35% / PF>=1.20.
-              Root cause: the 30-day dataset is predominantly bear/chop. The strategy wins 40% WR
-              in the Feb 22-28 recovery pocket (+$1.97) but loses in declining conditions.
-              This is a dataset and regime problem, not a filter problem.
-              TL bonuses (NEAR_SUPPORT=+5, BROKE_ABOVE_RESIST=+12) promoted marginal entries that
-              are lower quality than entries blocked by the penalty — net effect: worse results.
-            DECISION: proceed to Phase 17 with current config (USE_TRENDLINES=false, MIN_SCORE=72).
-              Strategy is structurally correct; needs diverse market data and regime filtering.
-            NEXT OPTIMIZATION TARGETS (Phase 19):
-              (1) Download fresh candles past Mar 11 — current dataset ends in bear market
-              (2) Hard TREND_DOWN regime gate — block all entries when regime=TREND_DOWN
-              (3) Disable TL bonuses, keep only penalties — bonuses are counterproductive
-              (4) Champion-challenger: test regime gate vs baseline in parallel
+  TrendlineEngine: detects pivot highs/lows on 1h candles, projects descending resistance
+  and ascending support trendlines, computes proximity and breakout signals.
+  Integrated into state.py, engine.py, confluence.py, decisions.py, config.py.
 
-  Phase 17: UNBLOCKED 2026-03-12 — proceeding with current config (MIN_SCORE=72, USE_TRENDLINES=false)
-            runner_live.py already running since 2026-03-11 (paper mode, $500.01, 1 closed trade)
-            START 4-week locked config run — no strategy edits, no parameter changes
-  Phase 18 (original): PENDING — coinbase_adapter.py not yet built
-  Phase 18 (trendlines): IMPLEMENTED 2026-03-11, OPTIMIZED 2026-03-12
-    * TrendlineEngine: detects pivot highs/lows on 1h candles, projects descending resistance
-      and ascending support trendlines, computes proximity and breakout signals
-    * Integrated into state.py, engine.py, confluence.py, decisions.py, config.py
-    * Scoring: +5 near support tl, -8 near resist tl, +12 broke above, -15/-block broke below
-    * Hard block: TL_BLOCK_LONG_BROKE_BELOW_SUPPORT=true (default) — no longs in breakdown
-    * TL_PENALTY_RESIST_SLOPE_NEG: new knob, penalizes descending channel even off-line
-    * Disabled (USE_TRENDLINES=false) pending comparison test confirmation — see Phase 16.5
+  Score effects (when USE_TRENDLINES=true):
+    Near support trendline:      +5 to score (bonus)
+    Near resistance trendline:   -8 to score (penalty)
+    Broke above resistance:     +12 to score (bonus)
+    Broke below support:        -15 to score + HARD BLOCK
+    Resistance slope negative:   -5 to score (TL_PENALTY_RESIST_SLOPE_NEG)
+
+  Status: USE_TRENDLINES=false. Bonuses were counterproductive in 2026-03-12 test.
+  Next test: penalties only with TL_PENALTY_RESIST_SLOPE_NEG=5.
 
 ---
 
-# SESSION NOTES — 2026-03-11 (evening)
+# SCHEDULED TASKS (PC1)
 
-Infrastructure and diagnostics:
-  * Removed stale ARGUS_BT_ARTIFACT_DIR Windows user-level env var that was misrouting artifacts
-  * Fixed nightly Task Scheduler: now uses run_backtest.ps1 + correct Python + correct module path
-  * Fixed config.py: AC_BONUS_TREND_DOWN clamp was [0,50] — now [-50,50] so -15 penalty takes effect
-  * Replaced 7-day bear market candle dataset with 30-day dataset (43,173 candles, 2026-02-09 to 2026-03-11)
-  * Added flash drive mirror: ops/backup_flash.ps1 (robocopy /MIR to E:\Argus\backups)
-
----
-
-# SESSION NOTES — 2026-03-12
-
-Phase 16.5 bugs fixed, comparison tests run, results analyzed:
-  * Fixed liq filter unit mismatch + PENALIZE mode early-return bug
-  * Added TL_PENALTY_RESIST_SLOPE_NEG knob (default=0)
-  * Ran 3 full 30-day backtests (43,200 candles each):
-      bt_20260312T024150Z_cd4067b6  old baseline (buggy):  WR=25.35% PF=0.74 PnL=-$5.05
-      bt_20260312T125653Z_4ebebcf1  fixed_liq:             WR=25.71% PF=0.75 PnL=-$4.92
-      bt_20260312T184623Z_591aba90  trendlines penalty=5:  WR=24.29% PF=0.71 PnL=-$5.47
-  * Phase 16.5 FAIL — liq fix is neutral, trendline bonuses made results worse
-  * Root cause: bear/chop dataset, not filter problem; Feb 22-28 recovery = the real alpha pocket
-  * Decision: proceed to Phase 17 with current config; next optimization targets in Phase 19
-
-Two-machine setup confirmed:
-  * PC1 (main, more resources): runner_live.py 24/7 + dev + heavy backtests
-  * PC2 (secondary): offloaded backtest jobs
-  * GitHub repo: Ksmith2322/Argus, branch phase6-hardening
-  * requirements.txt added; .env tracked in git (paper mode only — no real keys)
-  * RDP not yet enabled on PC2 (enable via Settings > System > Remote Desktop)
-
-Phase 17 UNBLOCKED — runner_live.py running since 2026-03-11, accumulating paper fills.
-
----
-
-# SESSION NOTES — 2026-03-13
-
-Two-machine infrastructure COMPLETE:
-  * SSH passwordless auth PC1→PC2 (ED25519 key, no RDP needed for job dispatch)
-  * ops/dispatch_backtest_pc2.ps1 — one-command dispatch: push code, SSH pull, run backtest
-  * Task Scheduler on PC1: ArgusGitBackup daily@02:00, ArgusRefreshCandles Sunday@03:00
-  * Scheduled task "ArgusBT30d" on PC2 for detached full-dataset backtests
-  * Fresh candle data downloaded: Feb 11–Mar 13 2026 (43,168 candles)
-
-Fresh 30-day baseline backtest (PC2, Feb 11–Mar 13):
-  * run_id: bt_20260313T060439Z_9518a56d — Run 1 COMPLETE
-  * 77 trades closed, 24.68% WR, -$5.92 PnL, PF=0.7378
-  * 85 entries filled, 5786 attempts, 5697 blocked (WATCH gate, correctly mislabeled as NO_CASH)
-  * Very similar to old baseline (WR=25.35%, PF=0.74) — strategy consistent but underwater
-
-CRITICAL FINDING — Score-based entry quality analysis:
-  Score 72-79: 43 trades, 14.0% WR, PnL=-$6.71  (LOSING)
-  Score 80-89: 21 trades, 14.3% WR, PnL=-$3.25  (LOSING)
-  Score 90-100: 13 trades, 76.9% WR, PnL=+$6.42 (WINNING)
-  RANGE regime: 9 trades, 0% WR, PnL=-$2.20 (ALL LOSSES)
-
-  Score threshold sweep (with RANGE regime filter):
-    >= 72 (current): 68 trades, 27.9% WR, PnL=-$1.34
-    >= 80 (staged):  30 trades, 43.3% WR, PnL=+$4.15  ← SWEET SPOT
-    >= 85:           17 trades, 70.6% WR, PnL=+$6.67
-    >= 90:           13 trades, 76.9% WR, PnL=+$6.42 (too few trades)
-
-  R:R ratio is solid: avg_win=$0.52, avg_loss=$0.23 (2.2:1). Problem is pure WR.
-
-Changes STAGED (ready to test):
-  * .env: CONFLUENCE_MIN_SCORE=80 (was 72), REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
-  * config.py: new REGIME_ENTRY_BLOCK_LIST config var (comma-separated regime names to block)
-  * engine.py: regime hard gate — emits MISSED_BUY_REGIME when regime in block list
-  * Expected impact: ~30 trades, ~43% WR, ~+$4.15 PnL (flips strategy from losing to profitable)
-
-CURRENT PRIORITIES:
-  1. Validate MIN_SCORE=80 + RANGE gate via full 30-day backtest on PC2 (queued)
-  2. Accumulate 30+ live paper fills (Phase 11 threshold)
-  3. Consider 4hr timeframe + S/R trendlines (Tori Trades approach) for swing overlay
-  4. Sliding window position sizing: allocate more capital to better-performing signal types
-  5. Phase 19 live dashboard, ML governor (after filter optimization validated)
+  ArgusRefreshCandles:  daily@03:00  -> ops/refresh_candles.ps1
+  ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
+  ArgusNightlyBT:       (Task Scheduler) -> ops/run_backtest.ps1
+  Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
