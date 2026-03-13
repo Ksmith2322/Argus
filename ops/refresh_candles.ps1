@@ -1,5 +1,5 @@
 # ops/refresh_candles.ps1
-# Downloads fresh ETH-USD 1m candles and optionally syncs to PC2.
+# Downloads fresh 1m candles for all tracked pairs and optionally syncs to PC2.
 # Usage: .\ops\refresh_candles.ps1 [-DaysBack 30] [-SyncPC2]
 param(
     [int]$DaysBack = 30,
@@ -13,27 +13,40 @@ $BRANCH = "phase6-hardening"
 Set-Location C:\Argus\repo
 . C:\Argus\.venv\Scripts\Activate.ps1
 
-Write-Host "=== Refreshing ETH-USD 1m candle data ===" -ForegroundColor Cyan
-Write-Host "Days back: $DaysBack"
+# All tracked pairs — add new ones here
+$pairs = @(
+    @{ product="ETH-USD"; file="eth_usd_1m.csv" },
+    @{ product="BTC-USD"; file="btc_usd_1m.csv" },
+    @{ product="SOL-USD"; file="sol_usd_1m.csv" }
+)
 
-$env:PRODUCT_ID = "ETH-USD"
-$env:GRANULARITY = "60"
-$env:DAYS_BACK = "$DaysBack"
-# OUT_CSV defaults to data/eth_usd_1m.csv
+Write-Host "=== Refreshing candle data ($($pairs.Count) pairs, ${DaysBack}d) ===" -ForegroundColor Cyan
 
-C:\Argus\.venv\Scripts\python.exe -m backtest.download_candles
+foreach ($p in $pairs) {
+    Write-Host ""
+    Write-Host "--- $($p.product) ---" -ForegroundColor Yellow
+    $env:PRODUCT_ID = $p.product
+    $env:GRANULARITY = "60"
+    $env:DAYS_BACK = "$DaysBack"
+    $env:OUT_CSV = "C:\Argus\repo\data\$($p.file)"
 
-Remove-Item Env:DAYS_BACK -ErrorAction SilentlyContinue
-Remove-Item Env:PRODUCT_ID -ErrorAction SilentlyContinue
-Remove-Item Env:GRANULARITY -ErrorAction SilentlyContinue
+    C:\Argus\.venv\Scripts\python.exe -m backtest.download_candles
+
+    Remove-Item Env:DAYS_BACK -ErrorAction SilentlyContinue
+    Remove-Item Env:PRODUCT_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:GRANULARITY -ErrorAction SilentlyContinue
+    Remove-Item Env:OUT_CSV -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 Write-Host "Committing updated candle data to git..." -ForegroundColor Cyan
-git add data/eth_usd_1m.csv
+$dataFiles = $pairs | ForEach-Object { "data/$($_.file)" }
+git add $dataFiles
 $status = git diff --cached --stat
 if ($status) {
     $ts = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    git commit -m "refresh candles: ${DaysBack}d ETH-USD $ts"
+    $names = ($pairs | ForEach-Object { $_.product }) -join "+"
+    git commit -m "refresh candles: ${DaysBack}d $names $ts"
     git push origin $BRANCH 2>&1
     Write-Host "Pushed to remote." -ForegroundColor Green
 } else {

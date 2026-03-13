@@ -66,10 +66,10 @@ Rules:
   Retroactive: 28 trades, 46.4% WR, PF=2.49, PnL=+$4.76, expectancy=$0.17/trade
   Exceeds exit criteria (WR>=35%, PF>=1.20) by wide margin.
 
-### Optimization Test — IN PROGRESS on PC2:
-  run_id: bt_20260313T194806Z_9a0ded3d (SingleRun mode)
+### Optimization Test — RUNNING ON PC1:
   Config: CONFLUENCE_MIN_SCORE=80, REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
-  Started: 2026-03-13 ~14:48 UTC. Expected completion: ~17:30 UTC.
+  Started: 2026-03-13 on PC1 (PC2 runs died twice — SSH disconnect).
+  Expected completion: ~4.5 hrs from start.
 
 ### Next after optimization passes:
   1. Restart PC1 live runner with new config (MIN_SCORE=80 + regime gate)

@@ -19,35 +19,46 @@ if ($status) {
 }
 git push origin $BRANCH
 
-# Build env override clauses for remote command
-$envClauses = ""
+$singleRunFlag = if ($SingleRun) { " -SingleRun" } else { "" }
+
+# Pull first (via direct SSH)
+Write-Host "Pulling latest code on PC2..."
+ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
+
+# Build launcher script lines (avoids quoting hell over SSH)
+$lines = @("Set-Location C:/Argus/repo")
 if ($Limit -gt 0) {
-    $envClauses += "`$env:BACKTEST_LIMIT='$Limit'; "
+    $lines += "`$env:BACKTEST_LIMIT='$Limit'"
 }
 foreach ($k in $EnvOverrides.Keys) {
     $v = $EnvOverrides[$k]
-    $envClauses += "`$env:${k}='${v}'; "
+    $lines += "`$env:${k}='${v}'"
 }
-if ($envClauses) {
-    Write-Host "Env overrides: $envClauses"
+$lines += "./ops/run_backtest.ps1$singleRunFlag"
+
+# Write launcher script locally, then SCP to PC2
+$localTmp = "$env:TEMP\_pc2_run.ps1"
+$lines | Set-Content -Path $localTmp -Encoding utf8
+Write-Host "Launcher script:"
+$lines | ForEach-Object { Write-Host "  $_" }
+
+Write-Host "Uploading launcher to PC2..."
+scp $localTmp "${PC2}:C:/Argus/repo/ops/_pc2_run.ps1"
+
+# Launch detached process on PC2 via Start-Process (survives SSH disconnect)
+Write-Host "Starting backtest on PC2..."
+ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Start-Process -FilePath powershell.exe -ArgumentList @('-NonInteractive','-NoProfile','-ExecutionPolicy','Bypass','-File','C:/Argus/repo/ops/_pc2_run.ps1') -WindowStyle Hidden`""
+
+# Verify it started
+Start-Sleep -Seconds 15
+$pyCount = ssh $PC2 'powershell -NonInteractive -NoProfile -Command "(Get-Process python* -ErrorAction SilentlyContinue | Measure-Object).Count"' 2>$null
+if ([int]$pyCount -gt 0) {
+    Write-Host "CONFIRMED: $pyCount Python process(es) running on PC2" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: No Python processes detected — check PC2 manually" -ForegroundColor Yellow
 }
-
-$singleRunFlag = if ($SingleRun) { " -SingleRun" } else { "" }
-$remotePs = "Set-Location C:/Argus/repo; git pull origin $BRANCH; ${envClauses}./ops/run_backtest.ps1${singleRunFlag}"
-
-# Use scheduled task for reliability (survives SSH disconnect)
-Write-Host "Creating scheduled task on PC2..."
-$taskCmd = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command `"$remotePs`""
-
-# Pull first (via direct SSH), then create+run task
-ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
-
-# Delete old task if exists, create new, run
-ssh $PC2 "schtasks /delete /tn `"ArgusBacktest`" /f" 2>$null
-ssh $PC2 "schtasks /create /tn `"ArgusBacktest`" /tr `"$taskCmd`" /sc once /st 00:00 /f"
-ssh $PC2 "schtasks /run /tn `"ArgusBacktest`""
 
 Write-Host ""
-Write-Host "--- DISPATCHED (via scheduled task) ---"
+Write-Host "--- DISPATCHED ---"
 Write-Host "Check status: .\ops\check_pc2.ps1"
 Write-Host "Pull results:  .\ops\pull_pc2_results.ps1"

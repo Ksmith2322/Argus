@@ -24,7 +24,7 @@ if (-not $RunId) {
             $j.run_id
         }
     "' 2>$null
-    $RunId = $RunId.Trim()
+    if ($RunId) { $RunId = $RunId.Trim() }
 }
 
 if (-not $RunId) {
