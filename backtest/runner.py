@@ -651,7 +651,7 @@ def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_cs
             "symbol": str(cfg.get("SYMBOL", "")),
             "timeframes": [str(cfg.get("TF_FAST", "1m")), str(cfg.get("TF_SLOW", "5m"))],
             "data_root": os.path.dirname(os.path.abspath(candles_csv)),
-            "start_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "start_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "repo_root": repo_root,
             "artifact_root": _artifact_root(),
             "artifact_dir": out_dir,

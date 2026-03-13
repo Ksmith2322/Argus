@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-12 14:35:42 CDT
+Last update: 2026-03-12 23:19:15 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       2192
+  - HOLD total:       2296
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -19,7 +19,7 @@ Missed buy counters:
 Hold reason counters:
   - HOLD_WARMUP_NO_1M_STATE: 0
   - HOLD_PAUSED: 0
-  - HOLD_STALE_DATA: 1841
+  - HOLD_STALE_DATA: 1945
   - HOLD_COOLDOWN: 17
   - HOLD_NO_SIGNAL: 37
   - HOLD_NO_TREND_OK: 257
@@ -31,4 +31,4 @@ Hold reason counters:
 
 Last event:
   reason: HOLD_STALE_DATA
-  detail: stale tick guard | px=2066.775 | bonus_trend_up=+5 | regime=TREND_UP | base_score=93 | delta=5 | adj_score=98 | watch_th=55 | trade_th=72 | trend_strength=0.00345 | vol=0.00073 | session_bonus=+2 (NY:['session:NY', 'score_bonus:5', 'reason:UTC_hour=19']) | liq:spread=NA;vol_1m=25.78696176;vol_floor>=50000;vol_base=57.92481997783333333333333333;vol_need>=28.9624;atr_norm=0.00073385645440537396709534956329434862709604203701019287109375;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=25.78696176;vol_floor>=50000;vol_base=57.92481997783333333333333333;vol_need>=28.9624;atr_norm=0.00073385645440537396709534956329434862709604203701019287109375;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20
+  detail: stale tick guard | px=0 | penalty_range=-7 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=88 | delta=-7 | adj_score=81 | watch_th=58 | trade_th=77 | trend_strength=0.00109 | vol=0.00056 | liq:spread=NA;vol_1m=12.82641906;vol_floor>=50000;vol_base=18.480620217;vol_need>=9.2403;atr_norm=0.00055660405519722508556335061058462088112719357013702392578125;violations=VOLUME_BELOW_MIN;penalty=-10 | struct=STRUCT:px<=0 | liq=spread=NA;vol_1m=12.82641906;vol_floor>=50000;vol_base=18.480620217;vol_need>=9.2403;atr_norm=0.00055660405519722508556335061058462088112719357013702392578125;violations=VOLUME_BELOW_MIN;penalty=-10
