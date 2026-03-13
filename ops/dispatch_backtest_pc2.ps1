@@ -15,15 +15,10 @@ if ($status) {
 }
 git push origin $BRANCH
 
-# Build remote command
-$pull = "cd /d C:\Argus\repo && git pull origin $BRANCH"
-if ($Limit -gt 0) {
-    $setLim = "&& set BACKTEST_LIMIT=$Limit"
-} else {
-    $setLim = ""
-}
-$bt = "&& powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\Argus\repo\ops\run_backtest.ps1"
+# Build remote powershell command (avoids cmd backslash issues)
+$limitClause = if ($Limit -gt 0) { "`$env:BACKTEST_LIMIT='$Limit'; " } else { "" }
+$remotePs = "Set-Location C:/Argus/repo; git pull origin $BRANCH; ${limitClause}./ops/run_backtest.ps1"
 
-ssh $PC2 "cmd /c ""$pull $setLim $bt"""
+ssh $PC2 "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command `"$remotePs`""
 
 Write-Host "--- DISPATCH COMPLETE ---"
