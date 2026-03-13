@@ -1,5 +1,5 @@
-# ARGUS MAP — UPDATED (Phases 7–16 complete)
-# Last updated: 2026-03-11 — analytics pipeline, ops infrastructure, reporting dashboard built
+# ARGUS MAP — UPDATED (Phases 7–16 complete, Phase 16.5 analyzed, Phase 17 active)
+# Last updated: 2026-03-12 — two-machine setup, Phase 16.5 results, Phase 19 planned
 
 This map reflects your current working reality:
 - You run backtest from `C:\Argus\repo` (canonical CWD) using the venv python
@@ -23,6 +23,16 @@ Backtest package:
 
 Ops + artifacts (canonical):
 - `C:\Argus\repo\ops\logs\`
+
+GitHub remote:
+- `https://github.com/Ksmith2322/Argus` — branch `phase6-hardening`
+- PC1 pushes; PC2 runs `git pull origin phase6-hardening` to sync
+
+Two-machine layout (confirmed 2026-03-12):
+- PC1 (main): runner_live.py 24/7 + dev work + heavy backtests
+- PC2 (secondary): offloaded backtest jobs via git pull + manual dispatch
+- .env NOT in git (gitignored) — copy manually via flash drive (E:\Argus)
+- ops/logs NOT in git — artifacts are local to each machine
 
 ---
 

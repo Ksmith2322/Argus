@@ -1,5 +1,5 @@
 FILES INDEX (one line per file; no prose)
-# Last updated: 2026-03-11 — added Phases 13-16 modules (analytics, ops infrastructure, reporting)
+# Last updated: 2026-03-12 — added requirements.txt, run_comparison_tests.ps1; Phase 16.5 complete
 
 FORMAT:
 file | TYPE | ROLE | CALLED BY | CALLS INTO | OWNS STATE | READS | WRITES | RISK TAGS
@@ -193,10 +193,13 @@ NOTE equity_logger.py: grep confirms zero imports from active code — safe to d
 control_plane.py | ORPHANED | legacy control plane stub; only references itself | none | unknown | NO | unknown | unknown | ORPHANED,cleanup-candidate
 NOTE control_plane.py: grep confirms zero imports from active code — safe to delete
 
+requirements.txt | CONFIG | minimal pip dependencies for Argus (pandas, numpy, matplotlib, requests, python-dotenv, pytz) | pip install -r | n/a | NO | none | none | packaging,pc2-setup
+
+ops/run_comparison_tests.ps1 | OPS | sequential fixed_liq + trendlines comparison backtests; resets env between runs; Run after baseline completes | manual | backtest.runner | NO | .env | none | strategy-research
+
 --- STALE SCRATCH FILES (repo root) ---
 
 bt_run_output.txt | SCRATCH | captured backtest stdout from manual run; superseded by ops/logs artifacts | none | none | NO | none | none | cleanup-candidate
-_run_scripts.txt | SCRATCH | ad-hoc command notes; superseded by CLAUDE.md and ops/*.ps1 | none | none | NO | none | none | cleanup-candidate
 
 --- MISPLACED ARTIFACT DIRECTORIES (repo root — should not exist here) ---
 
