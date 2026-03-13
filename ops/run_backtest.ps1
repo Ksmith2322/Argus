@@ -258,8 +258,8 @@ $env:LIVE_EVENTS_CSV  = Join-Path $env:ARGUS_BT_ARTIFACT_DIR "bt_sandbox_live_ev
 $env:LIVE_SIGNALS_CSV = Join-Path $env:ARGUS_BT_ARTIFACT_DIR "bt_sandbox_live_signals.csv"
 $env:ARGUS_DISABLE_LIVE_ARTIFACTS = "1"
 
-# Optional window
-if (-not $env:BACKTEST_LIMIT) { $env:BACKTEST_LIMIT = "720" }
+# Optional window (0 = full dataset)
+if (-not $env:BACKTEST_LIMIT) { $env:BACKTEST_LIMIT = "0" }
 
 # ------------------------------------------------------------
 # 4) Run #1
