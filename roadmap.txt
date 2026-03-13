@@ -27,30 +27,13 @@ Rules:
 
 ---
 
-# COMPLETED PHASES
-
-## Phase 7 — Backtest Closure and Determinism  [DONE]
-Deterministic backtest, per-run artifacts, attempt-accounting invariants, sandbox rule.
-
-## Phase 8 — Execution Truth and Restart Certainty  [DONE]
-PaperAdapter, fill persistence, startup recovery, Gate A PASS 2026-03-10.
-
-## Phase 9 — Trade Lifecycle Finalization  [DONE]
-trade_journal on every SELL->FLAT transition. Gate A confirms journal write after crash-restart.
-
-## Phase 10 — Adversarial Restart and Fault Hardening  [DONE]
-4 kill-point scenarios (A-D) all PASS 2026-03-10.
-
-## Phases 11-16 — Infrastructure  [INFRA DONE 2026-03-11]
-All analytics, risk, attribution, reporting, ops, and unattended infra modules built.
-DATA PENDING — modules will fully populate as live paper trades accumulate (need 30-50+ fills).
-  * Phase 11: friction_report.py + friction_injector.py built. Need 30+ live fills.
-  * Phase 12: walk_forward.py + stress_runner.py built. Needs Phase 11 friction data.
-  * Phase 13: risk_model.py built. Needs 50+ trades for meaningful Monte Carlo.
-  * Phase 14: attribution.py built. Needs trade data to populate.
-  * Phase 15: generate_report.py built. Single self-contained HTML report, all panels implemented.
-  * Phase 16: Full unattended ops: runtime modes, health checks, invariants, watchdog,
-              auto-throttle, artifact integrity, alerting, backup/restore. 121/121 tests PASS.
+# COMPLETED PHASES (collapsed — see git history for details)
+#   Phase 7:  Backtest determinism + sandbox rule [DONE]
+#   Phase 8:  PaperAdapter + fill persistence + startup recovery, Gate A PASS [DONE 2026-03-10]
+#   Phase 9:  Trade journal on SELL->FLAT, crash-restart proof [DONE 2026-03-10]
+#   Phase 10: Adversarial restart — 4 kill-point scenarios PASS [DONE 2026-03-10]
+#   Phase 11-16: Analytics, risk, attribution, reporting, ops infra [DONE 2026-03-11]
+#     (DATA PENDING — modules populate as live fills accumulate; need 30-50+ fills)
 
 ## Phase 16.5 — Strategy Optimization  [IN PROGRESS]
 
@@ -138,43 +121,54 @@ Exit:
 
 # FUTURE PRIORITIES (Phase 19+)
 
-## Priority 1 — Strategy Edge  [PARTIALLY DONE]
-  [DONE] Hard TREND_DOWN + RANGE regime gate (engine.py)
-  [DONE] Score threshold optimization (MIN_SCORE=80)
-  [DONE] Fresh daily candles automated (Task Scheduler daily@03:00)
+## Priority 1 — Strategy Edge
   [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
+  [TODO] Session filtering — hard-gate underperforming sessions (like RANGE regime gate)
   [TODO] Expand to BTC-USD after ETH edge confirmed
+  [TODO] Compounding rules — when/how to scale position size as equity grows
+
+## Priority 2 — Multi-Timeframe Strategy  [TODO]
   [TODO] 4hr timeframe + S/R trendlines (Tori Trades swing approach)
-  [TODO] Sliding window position sizing (confidence-weighted by signal/timeframe performance)
+    - 4hr candle aggregation in engine
+    - S/R trendline detection on 4hr chart
+    - Entry signals based on 4hr S/R bounces/breaks
+    - Existing trendline module operates on 1h; extend to 4hr
+  [TODO] Sliding window position sizing
+    - Track rolling WR/PF per signal source over last N trades
+    - Scale position size proportionally to recent performance
+    - Whichever strategy/timeframe is winning gets more capital
+  [TODO] Strategy coordination layer (1m confluence + 4hr swing coexistence)
 
-## Priority 2 — Real-time Live Dashboard  [TODO]
+## Priority 3 — Risk & Safety
+  [TODO] Drawdown circuit breaker — auto-pause if daily/weekly loss exceeds threshold
+    - Different from consecutive losses: aggregate drawdown limit
+    - e.g., pause all entries if equity drops > 3% in 24h
+  [TODO] Candle data validation — sanity check downloaded candles before backtests
+    - Detect gaps, stale data, unrealistic OHLCV values
+    - Fail-fast before wasting 3hrs on a bad dataset
+
+## Priority 4 — Real-time Live Dashboard  [TODO]
   * FastAPI + websockets reading live_events.csv / live_signals.csv
-  * Chart.js equity curve, regime/score/position panels
+  * Chart.js equity curve updating in real time
+  * Current regime, score, session, position status panels
   * Single command: python ops/dashboard.py -> localhost:8080
+  * No external dependencies (local only)
 
-## Priority 3 — PC1/PC2 Job Dispatch  [DONE]
-  [DONE] SSH passwordless auth PC1->PC2 (ED25519 key)
-  [DONE] ops/dispatch_backtest_pc2.ps1 — push, pull, run via scheduled task
-  [DONE] ops/check_pc2.ps1 — one-command status check
-  [DONE] ops/pull_pc2_results.ps1 — auto-pull summary + trades
-  [DONE] -SingleRun flag (skips determinism check, halves test time)
-  [DONE] -EnvOverrides for remote config without modifying PC1's .env
+## Priority 5 — PC1/PC2 Job Dispatch
   [TODO] Job queue: text file of pending runs; dispatcher pops and executes
+  [TODO] PC2 backtest completion alert via Discord webhook
 
-## Priority 4 — Survivability  [MOSTLY DONE]
-  [DONE] Daily git backup (Task Scheduler daily@02:00, ops/auto_git_backup.ps1)
-  [DONE] Flash drive backup (ops/backup_flash.ps1 -> E:\Argus)
-  [DONE] Watchdog auto-restart (ops/watchdog.py)
-  [DONE] Runner auto-start on login (Startup folder -> ops/autostart_runner.ps1)
-  [DONE] Runner restart script (ops/restart_runner.ps1)
+## Priority 6 — Survivability
   [TODO] Backup verification drill (automated weekly)
 
-## Priority 5 — Architecture Visualization  [TODO]
+## Priority 7 — Architecture Visualization  [TODO]
   * ops/generate_map.py -> ARGUS_MAP.mermaid
 
-## Priority 6 — ML as Governor  [TODO — needs 500+ trades]
-  * Regime classifier, anomaly detector, capital allocation ranker
-  * Score modifier only — never replaces deterministic engine
+## Priority 8 — ML as Governor  [TODO — needs 500+ trades]
+  * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
+  * Anomaly detector: flags unusual fill patterns or execution drift
+  * Capital allocation ranker: rank entry opportunities by predicted quality
+  * NEVER replaces deterministic engine — acts as score modifier only
 
 ---
 

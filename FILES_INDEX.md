@@ -1,5 +1,5 @@
 FILES INDEX (one line per file; no prose)
-# Last updated: 2026-03-12 — added requirements.txt, run_comparison_tests.ps1; Phase 16.5 complete
+# Last updated: 2026-03-13 — added ops tooling (dispatch, check, pull, restart, autostart, refresh), trendlines.py
 
 FORMAT:
 file | TYPE | ROLE | CALLED BY | CALLS INTO | OWNS STATE | READS | WRITES | RISK TAGS
@@ -25,6 +25,8 @@ decisions.py | CORE | DecisionSnapshot + EngineEvent schema + stable field mappi
 utils.py | SUPPORT | safe conversions + misc helpers | many | none | NO | none | none | misc
 
 candles.py | CORE | Candle + CandleBuilder (1m/5m/1h aggregation) | state,engine,backtest/runner,feed_coinbase,backtest/feed | none | YES | ticks,OHLCV rows | none | time,state
+
+trendlines.py | CORE | TrendlineEngine: pivot high/low detection on 1h candles, descending resistance + ascending support projection, proximity/breakout signals, score effects (+5/-8/+12/-15); disabled via USE_TRENDLINES=false | state,engine,confluence | candles | YES | cfg,1h candles | none | state,heuristics,scoring
 
 indicators.py | CORE | indicator engine (SMA/EMA/ATR/volatility, etc.) | strategy_phase2,regime,structure (via state inputs),engine | none | YES | candle closes | none | state,math
 
@@ -125,7 +127,23 @@ ops/watchdog.py | CORE (Phase 16) | supervisor process: monitors runner_live sub
 
 ops/argus_builder.py | TOOL | autonomous build agent wrapper (Claude Agent SDK); reads roadmap.txt; implements next phase; run from separate PowerShell terminal (not inside Claude Code session) | manual | claude_agent_sdk,anyio | NO | roadmap.txt,CLAUDE.md | ops/logs/builder_<ts>.log | tool,autonomous
 
-ops/run_backtest.ps1 | OPS | canonical backtest wrapper: Reset-ArgusEnv + two deterministic runs + artifact/invariant/determinism validation | you,CI | backtest.runner | NO | filesystem | ops\logs\bt_*.log; artifacts via runner | scheduler-safe,determinism,CWD-invariant
+ops/run_backtest.ps1 | OPS | canonical backtest wrapper: Reset-ArgusEnv + two deterministic runs + artifact/invariant/determinism validation; -SingleRun skips Run 2 + determinism (halves time) | you,CI,dispatch_backtest_pc2 | backtest.runner | NO | filesystem | ops\logs\bt_*.log; artifacts via runner | scheduler-safe,determinism,CWD-invariant
+
+ops/dispatch_backtest_pc2.ps1 | OPS | push code to GitHub, SSH to PC2, create+run scheduled task for backtest; -SingleRun, -EnvOverrides hashtable, -Limit | manual | git,ssh,schtasks | NO | filesystem,network | none | two-machine,dispatch
+
+ops/check_pc2.ps1 | OPS | one-command PC2 status: RUNNING + progress % if active, or latest run summary if idle | manual | ssh | NO | network | none | two-machine,monitoring
+
+ops/pull_pc2_results.ps1 | OPS | pull backtest results from PC2 via SCP (summary, trades, equity, entry attempts, event counts); saves to ops/logs/pc2/ | manual | scp | NO | network | ops/logs/pc2/*.csv,*.json | two-machine,results
+
+ops/restart_runner.ps1 | OPS | graceful stop + restart runner_live.py; CimInstance CommandLine match; 30s timeout then force kill; shows key .env config | manual | python,CimInstance | NO | filesystem | none | ops,restart-safety
+
+ops/autostart_runner.ps1 | OPS | auto-start runner on login; 30s delay, duplicate check, new window; installed via Startup folder shortcut (no admin) | Startup folder | python | NO | filesystem | ops/logs/autostart_*.log | ops,survivability
+
+ops/refresh_candles.ps1 | OPS | download latest candles; -DaysBack (default 30), -SyncPC2 (commit+push+SSH pull) | Task Scheduler daily@03:00,manual | download_candles,git,ssh | NO | network | data/eth_usd_1m.csv | data,two-machine
+
+ops/auto_git_backup.ps1 | OPS | nightly git commit + push; only commits if changes; logs to ops/logs/git_backup_*.log | Task Scheduler daily@02:00 | git | NO | filesystem | ops/logs/git_backup_*.log | backup,survivability
+
+ops/run_comparison_tests.ps1 | OPS | sequential fixed_liq + trendlines comparison backtests; resets env between runs | manual | backtest.runner | NO | .env | none | strategy-research
 
 --- ANALYTICS PACKAGE (C:\Argus\repo\analytics) ---
 

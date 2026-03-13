@@ -1,5 +1,5 @@
-# ARGUS MAP — UPDATED (Phases 7–16 complete, Phase 16.5 analyzed, Phase 17 active)
-# Last updated: 2026-03-12 — two-machine setup, Phase 16.5 results, Phase 19 planned
+# ARGUS MAP
+# Last updated: 2026-03-13 — ops tooling, two-machine automation, trendline engine
 
 This map reflects your current working reality:
 - You run backtest from `C:\Argus\repo` (canonical CWD) using the venv python
@@ -28,11 +28,14 @@ GitHub remote:
 - `https://github.com/Ksmith2322/Argus` — branch `phase6-hardening`
 - PC1 pushes; PC2 runs `git pull origin phase6-hardening` to sync
 
-Two-machine layout (confirmed 2026-03-12):
-- PC1 (main): runner_live.py 24/7 + dev work + heavy backtests
-- PC2 (secondary): offloaded backtest jobs via git pull + manual dispatch
-- .env NOT in git (gitignored) — copy manually via flash drive (E:\Argus)
-- ops/logs NOT in git — artifacts are local to each machine
+Two-machine layout (confirmed 2026-03-13):
+- PC1 (WINDOWS-5RCTEK3): runner_live.py 24/7 + dev work + heavy backtests
+- PC2 (DESKTOP-17CJMUP): offloaded backtest jobs via automated dispatch
+- SSH: passwordless ED25519 key, dispatch via `ops/dispatch_backtest_pc2.ps1`
+- .env tracked in git (paper trading, no real keys) — sync happens via git pull
+- ops/logs/ NOT in git — artifacts are local to each machine
+- Dispatch: `ops/dispatch_backtest_pc2.ps1` (-SingleRun, -EnvOverrides)
+- Status: `ops/check_pc2.ps1` | Results: `ops/pull_pc2_results.ps1`
 
 ---
 
@@ -126,6 +129,7 @@ Subsystems (market logic)
 - `ledger.py`
 - `indicators.py`
 - `candles.py`
+- `trendlines.py` (TrendlineEngine — pivot detection, S/R projection, proximity/breakout signals; disabled via USE_TRENDLINES=false)
 
 Runtime mode / ops infrastructure
 - `runtime_mode.py` → 5-level mode system (FULL/NO_NEW_ENTRY/REDUCE_ONLY/OBSERVATION_ONLY/RECONCILIATION_ONLY); crash-safe persistence; escalation-only transitions; action gating; JSONL audit trail
@@ -148,6 +152,16 @@ Backtest research tools
 
 Reporting / dashboard
 - `reporting/generate_report.py` → single self-contained HTML report (no CDN, no server); reads all analytics artifacts; panels: equity+drawdown, trade table, regime/session attribution, MAE/MFE scatter, risk model summary, friction, reconciliation status; writes ops/logs/report_<date>.html
+
+Ops tooling (two-machine dispatch + survivability)
+- `ops/dispatch_backtest_pc2.ps1` → push code, create+run scheduled task on PC2 via SSH; -SingleRun, -EnvOverrides
+- `ops/check_pc2.ps1` → one-command PC2 status (running % or latest results)
+- `ops/pull_pc2_results.ps1` → pull summary + trades + equity from PC2 to ops/logs/pc2/
+- `ops/restart_runner.ps1` → graceful stop + restart runner_live.py; shows key config before start
+- `ops/autostart_runner.ps1` → auto-start runner on login (Startup folder shortcut, no admin)
+- `ops/refresh_candles.ps1` → download latest candles; -DaysBack, -SyncPC2 (push + SSH pull)
+- `ops/auto_git_backup.ps1` → nightly git commit + push (Task Scheduler daily@02:00)
+- `ops/run_backtest.ps1` → canonical backtest wrapper; -SingleRun flag skips Run 2 + determinism
 
 Autonomous build agent
 - `ops/argus_builder.py` → Claude Agent SDK wrapper; reads roadmap.txt; autonomous phase implementation; run from a separate PowerShell (not inside Claude Code session)
