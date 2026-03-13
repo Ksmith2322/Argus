@@ -570,11 +570,47 @@ Two-machine setup confirmed:
   * RDP not yet enabled on PC2 (enable via Settings > System > Remote Desktop)
 
 Phase 17 UNBLOCKED — runner_live.py running since 2026-03-11, accumulating paper fills.
-Next: lock config, run 4 weeks unattended, accumulate 30+ fills for Phase 11 friction analysis.
+
+---
+
+# SESSION NOTES — 2026-03-13
+
+Two-machine infrastructure COMPLETE:
+  * SSH passwordless auth PC1→PC2 (ED25519 key, no RDP needed for job dispatch)
+  * ops/dispatch_backtest_pc2.ps1 — one-command dispatch: push code, SSH pull, run backtest
+  * Task Scheduler on PC1: ArgusGitBackup daily@02:00, ArgusRefreshCandles Sunday@03:00
+  * Scheduled task "ArgusBT30d" on PC2 for detached full-dataset backtests
+  * Fresh candle data downloaded: Feb 11–Mar 13 2026 (43,168 candles)
+
+Fresh 30-day baseline backtest (PC2, Feb 11–Mar 13):
+  * run_id: bt_20260313T060439Z_9518a56d — Run 1 COMPLETE
+  * 77 trades closed, 24.68% WR, -$5.92 PnL, PF=0.7378
+  * 85 entries filled, 5786 attempts, 5697 blocked (WATCH gate, correctly mislabeled as NO_CASH)
+  * Very similar to old baseline (WR=25.35%, PF=0.74) — strategy consistent but underwater
+
+CRITICAL FINDING — Score-based entry quality analysis:
+  Score 72-79: 43 trades, 14.0% WR, PnL=-$6.71  (LOSING)
+  Score 80-89: 21 trades, 14.3% WR, PnL=-$3.25  (LOSING)
+  Score 90-100: 13 trades, 76.9% WR, PnL=+$6.42 (WINNING)
+  RANGE regime: 9 trades, 0% WR, PnL=-$2.20 (ALL LOSSES)
+
+  Score threshold sweep (with RANGE regime filter):
+    >= 72 (current): 68 trades, 27.9% WR, PnL=-$1.34
+    >= 80 (staged):  30 trades, 43.3% WR, PnL=+$4.15  ← SWEET SPOT
+    >= 85:           17 trades, 70.6% WR, PnL=+$6.67
+    >= 90:           13 trades, 76.9% WR, PnL=+$6.42 (too few trades)
+
+  R:R ratio is solid: avg_win=$0.52, avg_loss=$0.23 (2.2:1). Problem is pure WR.
+
+Changes STAGED (ready to test):
+  * .env: CONFLUENCE_MIN_SCORE=80 (was 72), REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
+  * config.py: new REGIME_ENTRY_BLOCK_LIST config var (comma-separated regime names to block)
+  * engine.py: regime hard gate — emits MISSED_BUY_REGIME when regime in block list
+  * Expected impact: ~30 trades, ~43% WR, ~+$4.15 PnL (flips strategy from losing to profitable)
 
 CURRENT PRIORITIES:
-  1. Enable RDP on PC2 for remote management
-  2. Download fresh candles past Mar 11 (backtest/download_candles.py)
-  3. Accumulate 30+ live paper fills (Phase 11 threshold)
-  4. Set up Task Scheduler on PC2 for automated backtest jobs
-  5. Phase 19 planning: regime gate, live dashboard, job dispatch
+  1. Validate MIN_SCORE=80 + RANGE gate via full 30-day backtest on PC2 (queued)
+  2. Accumulate 30+ live paper fills (Phase 11 threshold)
+  3. Consider 4hr timeframe + S/R trendlines (Tori Trades approach) for swing overlay
+  4. Sliding window position sizing: allocate more capital to better-performing signal types
+  5. Phase 19 live dashboard, ML governor (after filter optimization validated)

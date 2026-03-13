@@ -1,4 +1,7 @@
 ﻿# ops/run_backtest.ps1
+param(
+    [switch]$SingleRun   # skip Run 2 + determinism check (for comparison tests)
+)
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------
@@ -282,63 +285,70 @@ $pack1 = Assert-RunPack -logsDir $logs -runId $rid1
 # Equity schema + monotonic epoch must pass
 Assert-EquityArtifact -logsDir $logs -runId $rid1
 
-# ------------------------------------------------------------
-# 5) Run #2 (same contract, fresh run_id)
-# ------------------------------------------------------------
-# Ensure we don't carry a run id forward
-Remove-Item Env:ARGUS_RUN_ID -ErrorAction SilentlyContinue
+if (-not $SingleRun) {
+    # ------------------------------------------------------------
+    # 5) Run #2 (same contract, fresh run_id)
+    # ------------------------------------------------------------
+    # Ensure we don't carry a run id forward
+    Remove-Item Env:ARGUS_RUN_ID -ErrorAction SilentlyContinue
 
-Write-Host "------------------------------------------------------------"
-Write-Host "ARGUS BACKTEST (RUN 2)"
-Write-Host "------------------------------------------------------------"
+    Write-Host "------------------------------------------------------------"
+    Write-Host "ARGUS BACKTEST (RUN 2)"
+    Write-Host "------------------------------------------------------------"
 
-python -m backtest.runner
+    python -m backtest.runner
 
-$sum2 = Get-LatestBtSummaryPath -logsDir $logs
-if (-not $sum2) { throw "FAIL: No bt_summary found after RUN 2 in $logs" }
-$rid2 = Get-RunIdFromSummaryPath -summaryPath $sum2
-$pack2 = Assert-RunPack -logsDir $logs -runId $rid2
+    $sum2 = Get-LatestBtSummaryPath -logsDir $logs
+    if (-not $sum2) { throw "FAIL: No bt_summary found after RUN 2 in $logs" }
+    $rid2 = Get-RunIdFromSummaryPath -summaryPath $sum2
+    $pack2 = Assert-RunPack -logsDir $logs -runId $rid2
 
-# Equity schema + monotonic epoch must pass
-Assert-EquityArtifact -logsDir $logs -runId $rid2
+    # Equity schema + monotonic epoch must pass
+    Assert-EquityArtifact -logsDir $logs -runId $rid2
 
-# ------------------------------------------------------------
-# 6) Determinism check (normalized summary hash must match)
-# ------------------------------------------------------------
-$n1 = Normalize-BtSummary -path $sum1
-$n2 = Normalize-BtSummary -path $sum2
-$h1 = Sha256Hex -s $n1
-$h2 = Sha256Hex -s $n2
+    # ------------------------------------------------------------
+    # 6) Determinism check (normalized summary hash must match)
+    # ------------------------------------------------------------
+    $n1 = Normalize-BtSummary -path $sum1
+    $n2 = Normalize-BtSummary -path $sum2
+    $h1 = Sha256Hex -s $n1
+    $h2 = Sha256Hex -s $n2
 
-Write-Host "------------------------------------------------------------"
-Write-Host "DETERMINISM CHECK (SUMMARY)"
-Write-Host "RUN1=$rid1"
-Write-Host "RUN2=$rid2"
-Write-Host "HASH1=$h1"
-Write-Host "HASH2=$h2"
-Write-Host "------------------------------------------------------------"
+    Write-Host "------------------------------------------------------------"
+    Write-Host "DETERMINISM CHECK (SUMMARY)"
+    Write-Host "RUN1=$rid1"
+    Write-Host "RUN2=$rid2"
+    Write-Host "HASH1=$h1"
+    Write-Host "HASH2=$h2"
+    Write-Host "------------------------------------------------------------"
 
-if ($h1 -ne $h2) {
-    throw "FAIL: summary differs after normalization (non-deterministic)"
+    if ($h1 -ne $h2) {
+        throw "FAIL: summary differs after normalization (non-deterministic)"
+    }
+
+    Write-Host "OK: deterministic summary (normalized)"
+
+    # ------------------------------------------------------------
+    # 6b) Determinism check (ARTIFACTS)
+    # ------------------------------------------------------------
+    Write-Host "------------------------------------------------------------"
+    Write-Host "DETERMINISM CHECK (ARTIFACTS)"
+    Write-Host "------------------------------------------------------------"
+    Assert-DeterministicArtifacts -logsDir $logs -rid1 $rid1 -rid2 $rid2
+    Write-Host "OK: deterministic artifacts (normalized where needed; equity raw-identical)"
+
+    # ------------------------------------------------------------
+    # 6c) Latest pointer policy (bt_summary_latest.json must point to RUN2)
+    # ------------------------------------------------------------
+    Assert-LatestPointer -logsDir $logs -expectedRunId $rid2
+    Write-Host "OK: bt_summary_latest.json points to RUN2"
+} else {
+    Write-Host "------------------------------------------------------------"
+    Write-Host "SINGLE-RUN MODE: skipping Run 2 + determinism check"
+    Write-Host "------------------------------------------------------------"
+    $rid2 = $rid1
+    $pack2 = $pack1
 }
-
-Write-Host "OK: deterministic summary (normalized)"
-
-# ------------------------------------------------------------
-# 6b) Determinism check (ARTIFACTS)
-# ------------------------------------------------------------
-Write-Host "------------------------------------------------------------"
-Write-Host "DETERMINISM CHECK (ARTIFACTS)"
-Write-Host "------------------------------------------------------------"
-Assert-DeterministicArtifacts -logsDir $logs -rid1 $rid1 -rid2 $rid2
-Write-Host "OK: deterministic artifacts (normalized where needed; equity raw-identical)"
-
-# ------------------------------------------------------------
-# 6c) Latest pointer policy (bt_summary_latest.json must point to RUN2)
-# ------------------------------------------------------------
-# line above: # 6c) Latest pointer policy (bt_summary_latest.json must point to RUN2)
-Assert-LatestPointer -logsDir $logs -expectedRunId $rid2
-Write-Host "OK: bt_summary_latest.json points to RUN2"
 
 # ------------------------------------------------------------
 # 7) Verify NO repo\logs bleed
@@ -351,7 +361,7 @@ Write-Host "OK: no repo\logs bleed detected"
 # 8) Print latest run pack (quality-of-life)
 # ------------------------------------------------------------
 Write-Host "------------------------------------------------------------"
-Write-Host "LATEST RUN PACK (RUN2)"
+Write-Host "LATEST RUN PACK"
 $pack2 | Sort Name | Select Name,Length
 Write-Host "------------------------------------------------------------"
 "LAST_RUN_ID=$rid2"

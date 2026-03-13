@@ -344,6 +344,7 @@ def load_config() -> dict:
     cfg["REGIME_TREND_SLOPE_MIN"] = _d("REGIME_TREND_SLOPE_MIN", "0.0003")
     cfg["REGIME_MA_SPREAD_MIN"] = _d("REGIME_MA_SPREAD_MIN", "0.0015")
     cfg["REGIME_MIN_GATE_SCORE"] = _i("REGIME_MIN_GATE_SCORE", "70")
+    cfg["REGIME_ENTRY_BLOCK_LIST"] = os.environ.get("REGIME_ENTRY_BLOCK_LIST", "TREND_DOWN,RANGE")
 
     cfg["REGIME_LOOKBACK"] = _clamp_int(cfg["REGIME_LOOKBACK"], 5, 50_000)
     cfg["REGIME_VOL_HIGH"] = _clamp_decimal(cfg["REGIME_VOL_HIGH"], Decimal("0"), Decimal("1"))

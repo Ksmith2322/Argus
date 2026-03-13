@@ -1405,7 +1405,25 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
 
         if entry_signal_ok:
-            if cooldown_remaining > 0:
+            _regime_block_list = [
+                s.strip().upper()
+                for s in str(cfg.get("REGIME_ENTRY_BLOCK_LIST", "")).split(",")
+                if s.strip()
+            ]
+            if snap.regime in _regime_block_list:
+                _emit_missed_buy(
+                    snap,
+                    event="MISSED_BUY_REGIME",
+                    prefix="REGIME_BLOCK",
+                    px=px,
+                    confluence_min_score=confluence_min_score,
+                    cooldown_remaining=int(cooldown_remaining),
+                    equity=equity,
+                    exposure=exposure,
+                    extra=f"regime={safe_str(snap.regime)}",
+                )
+
+            elif cooldown_remaining > 0:
                 _emit_missed_buy(
                     snap,
                     event="MISSED_BUY_COOLDOWN",
