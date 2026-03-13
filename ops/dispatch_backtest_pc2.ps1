@@ -26,7 +26,14 @@ Write-Host "Pulling latest code on PC2..."
 ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
 
 # Build launcher script lines (avoids quoting hell over SSH)
-$lines = @("Set-Location C:/Argus/repo")
+# Wrapper redirects stdout/stderr to a log file so we can diagnose crashes
+$ts = (Get-Date -Format "yyyyMMddTHHmmss")
+$logFile = "C:/Argus/repo/ops/logs/pc2_bt_${ts}.log"
+$lines = @(
+    "`$ErrorActionPreference = 'Stop'"
+    "Set-Location C:/Argus/repo"
+    ". C:/Argus/.venv/Scripts/Activate.ps1"
+)
 if ($Limit -gt 0) {
     $lines += "`$env:BACKTEST_LIMIT='$Limit'"
 }
@@ -34,20 +41,44 @@ foreach ($k in $EnvOverrides.Keys) {
     $v = $EnvOverrides[$k]
     $lines += "`$env:${k}='${v}'"
 }
-$lines += "./ops/run_backtest.ps1$singleRunFlag"
+$lines += @(
+    "try {"
+    "    ./ops/run_backtest.ps1$singleRunFlag *>&1 | Tee-Object -FilePath '$logFile'"
+    "    Add-Content -Path '$logFile' -Value 'EXIT_CODE=0'"
+    "} catch {"
+    "    Add-Content -Path '$logFile' -Value `"FATAL: `$(`$_.Exception.Message)`""
+    "    Add-Content -Path '$logFile' -Value 'EXIT_CODE=1'"
+    "}"
+)
 
 # Write launcher script locally, then SCP to PC2
 $localTmp = "$env:TEMP\_pc2_run.ps1"
 $lines | Set-Content -Path $localTmp -Encoding utf8
 Write-Host "Launcher script:"
 $lines | ForEach-Object { Write-Host "  $_" }
+Write-Host "Log file: $logFile"
 
 Write-Host "Uploading launcher to PC2..."
 scp $localTmp "${PC2}:C:/Argus/repo/ops/_pc2_run.ps1"
 
-# Launch detached process on PC2 via Start-Process (survives SSH disconnect)
+# Launch via schtasks (truly detached from SSH session — survives disconnect)
+# Write a tiny launch-wrapper that schtasks will invoke, avoiding nested-quote hell
 Write-Host "Starting backtest on PC2..."
-ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Start-Process -FilePath powershell.exe -ArgumentList @('-NonInteractive','-NoProfile','-ExecutionPolicy','Bypass','-File','C:/Argus/repo/ops/_pc2_run.ps1') -WindowStyle Hidden`""
+$launchLines = @(
+    '$taskName = "ArgusDispatchBT"'
+    '$psExe = "powershell.exe"'
+    '$psArgs = "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:/Argus/repo/ops/_pc2_run.ps1"'
+    'try {'
+    '    schtasks /Create /TN $taskName /TR "$psExe $psArgs" /SC ONCE /ST 00:00 /F | Out-Null'
+    '    schtasks /Run /TN $taskName | Out-Null'
+    '} catch {'
+    '    Start-Process -FilePath $psExe -ArgumentList $psArgs.Split(" ") -WindowStyle Hidden'
+    '}'
+)
+$launchLocal = "$env:TEMP\_pc2_launch.ps1"
+$launchLines | Set-Content -Path $launchLocal -Encoding utf8
+scp $launchLocal "${PC2}:C:/Argus/repo/ops/_pc2_launch.ps1"
+ssh $PC2 "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:/Argus/repo/ops/_pc2_launch.ps1"
 
 # Verify it started
 Start-Sleep -Seconds 15

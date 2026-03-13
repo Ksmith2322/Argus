@@ -130,6 +130,7 @@ Exit:
 ## Priority 1 — Strategy Edge
   [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
   [TODO] Session filtering — hard-gate underperforming sessions (like RANGE regime gate)
+  [DONE] Multi-asset backtest support — BACKTEST_SYMBOL env var (e.g. BTC-USD, SOL-USD)
   [TODO] Expand to BTC-USD after ETH edge confirmed
   [TODO] Compounding rules — when/how to scale position size as equity grows
 
@@ -146,12 +147,14 @@ Exit:
   [TODO] Strategy coordination layer (1m confluence + 4hr swing coexistence)
 
 ## Priority 3 — Risk & Safety
-  [TODO] Drawdown circuit breaker — auto-pause if daily/weekly loss exceeds threshold
-    - Different from consecutive losses: aggregate drawdown limit
-    - e.g., pause all entries if equity drops > 3% in 24h
-  [TODO] Candle data validation — sanity check downloaded candles before backtests
-    - Detect gaps, stale data, unrealistic OHLCV values
-    - Fail-fast before wasting 3hrs on a bad dataset
+  [DONE] Drawdown circuit breaker — DRAWDOWN_PAUSE_PCT in config/risk.py/engine.py
+    - Tracks peak equity, pauses entries when drawdown exceeds threshold
+    - Auto-recovers when equity climbs back above threshold
+    - Default: 3% (DRAWDOWN_PAUSE_PCT=0.03 in .env)
+  [DONE] Candle data validation — ops/validate_candles.py
+    - Detects gaps, stale data, unrealistic OHLCV, duplicates, wrong order
+    - Integrated into refresh_candles.ps1 (blocks commit on FAIL)
+    - Usage: python ops/validate_candles.py [file] [--strict]
 
 ## Priority 4 — Real-time Live Dashboard  [TODO]
   * FastAPI + websockets reading live_events.csv / live_signals.csv
@@ -161,6 +164,7 @@ Exit:
   * No external dependencies (local only)
 
 ## Priority 5 — PC1/PC2 Job Dispatch
+  [DONE] PC2 dispatch reliability — schtasks detachment + log capture (survives SSH disconnect)
   [TODO] Job queue: text file of pending runs; dispatcher pops and executes
   [TODO] PC2 backtest completion alert via Discord webhook
 

@@ -38,6 +38,15 @@ foreach ($p in $pairs) {
     Remove-Item Env:OUT_CSV -ErrorAction SilentlyContinue
 }
 
+# Validate downloaded candles
+Write-Host ""
+Write-Host "Validating candle data..." -ForegroundColor Cyan
+C:\Argus\.venv\Scripts\python.exe C:\Argus\repo\ops\validate_candles.py
+if ($LASTEXITCODE -eq 1) {
+    Write-Host "CANDLE VALIDATION FAILED — aborting commit" -ForegroundColor Red
+    exit 1
+}
+
 Write-Host ""
 Write-Host "Committing updated candle data to git..." -ForegroundColor Cyan
 $dataFiles = $pairs | ForEach-Object { "data/$($_.file)" }

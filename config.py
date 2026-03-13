@@ -265,6 +265,9 @@ def load_config() -> dict:
     cfg["MAX_TRADES_PER_DAY"] = _i("MAX_TRADES_PER_DAY", "10")
     cfg["COOLDOWN_AFTER_LOSS_SECONDS"] = _i("COOLDOWN_AFTER_LOSS_SECONDS", "1800")
     cfg["CLEAR_LOCKOUT_ON_DAY_RESET"] = _b("CLEAR_LOCKOUT_ON_DAY_RESET", "false")
+    # Drawdown circuit breaker: pause entries if equity drops this % from peak (0 = disabled)
+    cfg["DRAWDOWN_PAUSE_PCT"] = _d("DRAWDOWN_PAUSE_PCT", "0")
+    cfg["DRAWDOWN_PAUSE_PCT"] = _clamp_decimal(cfg["DRAWDOWN_PAUSE_PCT"], Decimal("0"), Decimal("1"))
 
     cfg["DAILY_MAX_LOSS_USD"] = _clamp_decimal(cfg["DAILY_MAX_LOSS_USD"], Decimal("0"), Decimal("1000000000"))
     cfg["MAX_TRADES_PER_DAY"] = _clamp_int(cfg["MAX_TRADES_PER_DAY"], 0, 1_000_000)

@@ -1263,6 +1263,9 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     unrl_pnl = state.ledger.unrealized_pnl_usd(px, cfg)
     realized_pnl = state.ledger.realized_pnl_usd
 
+    # Drawdown circuit breaker — update rolling equity tracker
+    state.risk.update_equity(equity, now_e, cfg)
+
     take_profit = stop_loss = trail_stop = None
     hold_s = 0
 

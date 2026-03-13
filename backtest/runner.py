@@ -1098,11 +1098,15 @@ if __name__ == "__main__":
     # enforce sandbox paths even when run as a script
     _ensure_bt_sandbox_live_paths()
 
-    default_csv = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),  # repo root
-        "data",
-        "eth_usd_1m.csv",
-    )
+    # Multi-asset: BACKTEST_SYMBOL (e.g. "BTC-USD") maps to data/<symbol>_1m.csv
+    # Falls back to BACKTEST_CSV env var, then default ETH-USD.
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+    bt_symbol = (os.environ.get("BACKTEST_SYMBOL") or "").strip().upper()
+    if bt_symbol:
+        csv_name = bt_symbol.lower().replace("-", "_") + "_1m.csv"
+        default_csv = os.path.join(data_dir, csv_name)
+    else:
+        default_csv = os.path.join(data_dir, "eth_usd_1m.csv")
 
     candles_csv = os.environ.get("BACKTEST_CSV", default_csv)
     fmt = os.environ.get("BACKTEST_FORMAT", "auto")

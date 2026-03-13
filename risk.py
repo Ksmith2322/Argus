@@ -426,6 +426,12 @@ class RiskManager:
     lockout_until_epoch: int  # 0 means not locked
     runtime: RuntimeRiskState = field(default_factory=RuntimeRiskState)
 
+    # Drawdown circuit breaker — rolling equity tracking
+    peak_equity_usd: Decimal = Decimal("0")      # high-water mark
+    current_equity_usd: Decimal = Decimal("0")    # latest known equity
+    drawdown_paused: bool = False                  # True when circuit breaker tripped
+    drawdown_paused_epoch: int = 0                 # when it tripped
+
     # --------- LINE ABOVE: runtime: RuntimeRiskState = field(default_factory=RuntimeRiskState)
     @classmethod
     def new(cls, epoch: Optional[int] = None) -> "RiskManager":
@@ -533,6 +539,36 @@ class RiskManager:
             "msg": msg,
         }
 
+    def update_equity(self, equity_usd: Decimal, now_epoch: int, cfg: Dict) -> Optional[str]:
+        """
+        Update rolling equity for drawdown circuit breaker.
+        Call this on every tick (or at least every trade close).
+        Returns a reason string if circuit breaker trips, else None.
+        """
+        self.current_equity_usd = _as_decimal(equity_usd, "0")
+        if self.current_equity_usd > self.peak_equity_usd:
+            self.peak_equity_usd = self.current_equity_usd
+
+        dd_pct = _as_decimal(cfg.get("DRAWDOWN_PAUSE_PCT", "0"), "0")
+        if dd_pct <= 0 or self.peak_equity_usd <= 0:
+            return None
+
+        current_dd = (self.peak_equity_usd - self.current_equity_usd) / self.peak_equity_usd
+        if current_dd >= dd_pct and not self.drawdown_paused:
+            self.drawdown_paused = True
+            self.drawdown_paused_epoch = _normalize_epoch_seconds(int(now_epoch))
+            return (
+                f"DRAWDOWN_CIRCUIT_BREAKER: equity={self.current_equity_usd:.2f} "
+                f"peak={self.peak_equity_usd:.2f} dd={current_dd*100:.1f}% >= {dd_pct*100:.1f}%"
+            )
+
+        # Auto-recover when equity climbs back above threshold
+        if self.drawdown_paused and current_dd < dd_pct:
+            self.drawdown_paused = False
+            self.drawdown_paused_epoch = 0
+
+        return None
+
     def can_enter(self, now_epoch: int, cfg: Dict) -> Tuple[bool, str]:
         """
         Gate NEW entries only. Exits should still be allowed.
@@ -544,6 +580,10 @@ class RiskManager:
 
         if self.runtime.failure_lock_reason:
             return False, self.runtime.failure_lock_reason
+
+        # Drawdown circuit breaker
+        if self.drawdown_paused:
+            return False, "RISK_DRAWDOWN_PAUSE"
 
         if self.lockout_until_epoch and now_epoch < int(self.lockout_until_epoch):
             return False, "RISK_LOCKOUT_COOLDOWN"
