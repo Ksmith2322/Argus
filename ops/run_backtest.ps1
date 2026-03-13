@@ -194,8 +194,8 @@ function Normalize-TextForDeterminism {
     if ($rid1) { $t = $t.Replace($rid1, "<RID>") }
     if ($rid2) { $t = $t.Replace($rid2, "<RID>") }
 
-    # Common timestamp patterns (best-effort): ISO-8601 Z stamps
-    $t = [regex]::Replace($t, "\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z", "<TSZ>")
+    # Common timestamp patterns (best-effort): ISO-8601 Z stamps and +00:00 offset
+    $t = [regex]::Replace($t, "\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})", "<TSZ>")
 
     return $t
 }
