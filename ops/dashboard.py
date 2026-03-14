@@ -264,9 +264,15 @@ async def api_backtest():
             summary_path = OPS_LOGS / f"bt_summary_{rid}.json"
             equity_path = OPS_LOGS / f"equity_{rid}.csv"
             progress = 0
+            total_bars = 0
             if equity_path.exists():
                 with open(equity_path) as f:
                     progress = sum(1 for _ in f) - 1  # subtract header
+            # Get total bars from candle data file
+            candles_csv = hdr.get("candles_csv", "")
+            if candles_csv and Path(candles_csv).exists():
+                with open(candles_csv) as f:
+                    total_bars = sum(1 for _ in f) - 1
             completed = summary_path.exists()
             summary = {}
             if completed:
@@ -279,6 +285,7 @@ async def api_backtest():
                 "git_sha": hdr.get("git_sha", ""),
                 "completed": completed,
                 "progress_bars": progress,
+                "total_bars": total_bars,
                 "pnl": summary.get("pnl_usd", ""),
                 "trades": summary.get("trades_closed", ""),
                 "win_rate": summary.get("win_rate_pct", ""),
@@ -626,8 +633,9 @@ async function loadBacktests() {
       const status = r.completed ? '<span class="badge badge-flat">DONE</span>' : '<span class="badge badge-running">RUNNING</span>';
       const pnl = r.pnl ? parseFloat(r.pnl) : 0;
       const pnlColor = pnl > 0 ? '#00e676' : pnl < 0 ? '#ff5252' : '#e0e0e0';
-      const pct = r.progress_bars ? Math.round(r.progress_bars / 43172 * 100) : 0;
-      const progressStr = r.completed ? 'Complete' : pct + '%';
+      const total = r.total_bars || r.progress_bars || 1;
+      const pct = r.progress_bars ? Math.round(r.progress_bars / total * 100) : 0;
+      const progressStr = r.completed ? 'Complete' : (r.total_bars ? pct + '% (' + r.progress_bars + '/' + r.total_bars + ')' : pct + '%');
       tr.innerHTML = '<td>' + (r.run_id || '').slice(-20) + '</td>'
         + '<td>' + status + '</td>'
         + '<td>' + progressStr + '</td>'
