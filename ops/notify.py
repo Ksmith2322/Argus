@@ -46,7 +46,10 @@ def send_discord(message: str = "", embed: dict = None, webhook_url: str = None)
         return False
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
+        url, data=data, headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Argus/1.0",
+        }
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
