@@ -112,6 +112,40 @@ def notify_trade(action: str, symbol: str, price: float, qty: float):
     send_discord(embed=embed)
 
 
+def notify_trade_close(row: dict):
+    """Send Discord embed for a closed trade with full details."""
+    pnl = float(row.get("pnl", 0) or 0)
+    color = 0x00E676 if pnl > 0 else 0xFF5252  # green/red
+    symbol = row.get("symbol", "?")
+    entry_px = row.get("entry_px", "?")
+    exit_px = row.get("exit_px", "?")
+    regime = row.get("regime_at_entry", "?")
+    exit_reason = row.get("exit_reason", "?")
+    dur_s = int(float(row.get("trade_duration_s", 0) or 0))
+    if dur_s < 60:
+        dur_str = f"{dur_s}s"
+    elif dur_s < 3600:
+        dur_str = f"{dur_s // 60}m{dur_s % 60:02d}s"
+    else:
+        dur_str = f"{dur_s // 3600}h{(dur_s % 3600) // 60:02d}m"
+
+    result = "WIN" if pnl > 0 else "LOSS"
+    embed = {
+        "title": f"Trade Closed: {symbol} ({result})",
+        "color": color,
+        "fields": [
+            {"name": "PnL", "value": f"${pnl:+.4f}", "inline": True},
+            {"name": "Entry", "value": f"${entry_px}", "inline": True},
+            {"name": "Exit", "value": f"${exit_px}", "inline": True},
+            {"name": "Duration", "value": dur_str, "inline": True},
+            {"name": "Exit Reason", "value": str(exit_reason), "inline": True},
+            {"name": "Regime", "value": str(regime), "inline": True},
+        ],
+        "footer": {"text": "Argus Live Runner"},
+    }
+    send_discord(embed=embed)
+
+
 def notify_error(error: str):
     embed = {
         "title": "Argus Error",

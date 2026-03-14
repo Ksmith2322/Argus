@@ -862,6 +862,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     _, closed_1m = state.candles_1m.on_tick(tick)
     _, closed_5m = state.candles_5m.on_tick(tick)
     _, closed_1h = state.candles_1h.on_tick(tick)
+    _, closed_4h = state.candles_4h.on_tick(tick)
 
     if closed_1m is not None:
         state.last_candle_close_1m = closed_1m.close
@@ -883,6 +884,18 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         state.last_candle_close_1h = closed_1h.close
         state.last_candle_start_1h = closed_1h.start_epoch
         state.last_st_1h = state.strat_1h.on_candle_close(closed_1h.close)
+
+    if closed_4h is not None:
+        state.last_candle_close_4h = closed_4h.close
+        state.last_candle_start_4h = closed_4h.start_epoch
+        # Keep rolling buffer of last 50 closed 4h candles (covers ~8 days)
+        buf = state.closed_candles_4h
+        if buf is None:
+            buf = []
+            state.closed_candles_4h = buf
+        buf.append(closed_4h)
+        if len(buf) > 50:
+            state.closed_candles_4h = buf[-50:]
 
     st_1m = state.last_st_1m
     candle_close_1m = getattr(state, "last_candle_close_1m", None)

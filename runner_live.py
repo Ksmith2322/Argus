@@ -1427,19 +1427,19 @@ def _maybe_write_closed_trade_journal(
     post_qty: Decimal,
     run_start_ts: int,
     startup_fill_ids: set[str],
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, dict | None]:
     """
     Write exactly one row when a SELL fill transitions the system to flat
     AND the close belongs to the current process lifecycle.
-    Returns (appended, reason).
+    Returns (appended, reason, journal_row_or_None).
     """
     # line above: fill_side = str(fill.side).upper()
     fill_side = str(fill.side).upper()
     if fill_side != "SELL":
-        return False, "not_sell"
+        return False, "not_sell", None
 
     if not (_is_effectively_open_qty(prior_qty) and _is_effectively_flat_qty(post_qty)):
-        return False, "not_open_to_flat_transition"
+        return False, "not_open_to_flat_transition", None
 
     eligible, reason = _is_fill_eligible_for_current_run_journal(
         fill=fill,
@@ -1447,24 +1447,24 @@ def _maybe_write_closed_trade_journal(
         startup_fill_ids=startup_fill_ids,
     )
     if not eligible:
-        return False, reason
+        return False, reason, None
 
     row = _build_close_journal_row_from_fill(state=state, fill=fill, snap=snap, symbol=symbol)
     if not row:
-        return False, "row_build_failed"
+        return False, "row_build_failed", None
 
     journal_key = str(row.get("journal_key", "") or "")
     if not journal_key:
-        return False, "missing_journal_key"
+        return False, "missing_journal_key", None
 
     closed_trade_keys = _get_closed_trade_keys(state)
     if journal_key in closed_trade_keys:
-        return False, "duplicate_journal_key"
+        return False, "duplicate_journal_key", None
 
     _append_trade_journal_row(log_dir=log_dir, run_id=run_id, row=row)
     closed_trade_keys.add(journal_key)
     _clear_open_trade_ctx(state)
-    return True, "appended"
+    return True, "appended", row
 
 
 def _adapter_update_market_from_tick(adapter: Any, symbol: str, tick: Any) -> None:
@@ -3408,7 +3408,7 @@ async def run_live(
                                 )
 
                                 try:
-                                    wrote_journal, journal_reason = _maybe_write_closed_trade_journal(
+                                    wrote_journal, journal_reason, journal_row = _maybe_write_closed_trade_journal(
                                         state=state,
                                         log_dir=log_dir,
                                         run_id=run_id,
@@ -3423,6 +3423,7 @@ async def run_live(
                                 except Exception as e:
                                     wrote_journal = False
                                     journal_reason = f"journal_exception:{e}"
+                                    journal_row = None
                                     try:
                                         log_event(symbol, "TRADE_JOURNAL_FAIL", journal_reason)
                                     except Exception:
@@ -3438,6 +3439,13 @@ async def run_live(
                                             f"reason={journal_reason}"
                                         ),
                                     )
+                                    # Discord notification for closed trade
+                                    if journal_row:
+                                        try:
+                                            from ops.notify import notify_trade_close
+                                            notify_trade_close(journal_row)
+                                        except Exception:
+                                            pass
                                     _maybe_abort_at_killpoint(
                                         cfg=cfg,
                                         key="KILL_AFTER_JOURNAL_WRITE",

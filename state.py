@@ -154,6 +154,7 @@ class BotState:
     candles_1m: CandleBuilder
     candles_5m: CandleBuilder
     candles_1h: CandleBuilder
+    candles_4h: CandleBuilder
 
     # -------------------------
     # Strategies per TF
@@ -246,6 +247,10 @@ class BotState:
     last_candle_close_1h: Optional[Decimal] = None
     last_candle_start_1h: Optional[int] = None
 
+    last_candle_close_4h: Optional[Decimal] = None
+    last_candle_start_4h: Optional[int] = None
+    closed_candles_4h: list = None  # rolling buffer of recent closed 4h Candle objects
+
     last_st_1m: Optional[StrategyState] = None
     last_st_5m: Optional[StrategyState] = None
     last_st_1h: Optional[StrategyState] = None
@@ -306,9 +311,12 @@ class BotState:
         tf_5m_s = int(cfg.get("CANDLE_SECONDS_5M", cfg.get("TF_5M_SECONDS", 300)))
         tf_1h_s = int(cfg.get("CANDLE_SECONDS_1H", cfg.get("TF_1H_SECONDS", 3600)))
 
+        tf_4h_s = int(cfg.get("CANDLE_SECONDS_4H", cfg.get("TF_4H_SECONDS", 14400)))
+
         candles_1m = CandleBuilder(tf_1m_s)
         candles_5m = CandleBuilder(tf_5m_s)
         candles_1h = CandleBuilder(tf_1h_s)
+        candles_4h = CandleBuilder(tf_4h_s)
 
         strat_1m = Phase2Strategy(cfg)
         strat_5m = Phase2Strategy(cfg)
@@ -393,6 +401,8 @@ class BotState:
             candles_1m=candles_1m,
             candles_5m=candles_5m,
             candles_1h=candles_1h,
+            candles_4h=candles_4h,
+            closed_candles_4h=[],
             strat_1m=strat_1m,
             strat_5m=strat_5m,
             strat_1h=strat_1h,
