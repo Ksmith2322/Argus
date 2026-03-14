@@ -100,6 +100,11 @@ def main():
 
     if not no_discord:
         try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _repo = str(_Path(__file__).resolve().parent.parent)
+            if _repo not in _sys.path:
+                _sys.path.insert(0, _repo)
             from ops.notify import send_discord
             # Discord has 2000 char limit; truncate if needed
             msg = report

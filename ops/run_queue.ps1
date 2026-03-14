@@ -87,9 +87,9 @@ function Invoke-QueueJob {
     try {
         Write-QueueLog "START: $label"
 
-        # Run backtest
-        $btArgs = @()
-        if ($singleRun) { $btArgs += "-SingleRun" }
+        # Run backtest (always single-run for queue jobs — no determinism check needed)
+        $btArgs = @("-SingleRun")
+        Write-Host "  btArgs: $btArgs  (singleRun=$singleRun)"
         & "$repoRoot\ops\run_backtest.ps1" @btArgs
 
         $jobSuccess = $true
