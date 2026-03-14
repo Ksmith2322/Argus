@@ -187,7 +187,8 @@ Exit:
   [DONE] Run comparison tool — ops/compare_runs.py (side-by-side metrics, delta from baseline)
   [DONE] Score/duration analyzer — ops/analyze_scores.py (score buckets, regime, session, duration)
   [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
-  [TODO] Job queue: text file of pending runs; dispatcher pops and executes
+  [DONE] Job queue — ops/run_queue.ps1 + backtest_queue.jsonl (sequential JSONL runner)
+  [DONE] PC2 queue dispatch — ops/dispatch_queue_pc2.ps1 (push queue + start via schtasks)
   [TODO] PC2 backtest completion alert via Discord webhook
 
 ## Priority 6 — Survivability
