@@ -207,6 +207,8 @@ Exit:
   [DONE] Discord alerts — ops/notify.py (backtest complete, trade, error) + run_queue.ps1 integration
   [DONE] Equity overlay chart — ops/plot_equity_overlay.py (Chart.js HTML, --latest N, --min-trades)
   [DONE] Trade export tool — ops/export_trades.py (table + summary, --losers-only, --winners-only, --csv)
+  [DONE] Queue watcher — ops/watch_and_launch_queue.ps1 (polls for in-flight BTs, auto-launches queue)
+  [DONE] Post-queue report — ops/post_queue_report.py (leaderboard + exit criteria check + Discord)
 
 ## Priority 6 — Survivability
   [DONE] Backup verification drill — ops/verify_backup.ps1 (git sync, key files, state freshness, candle data)

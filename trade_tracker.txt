@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-13 22:16:02 CDT
+Last update: 2026-03-13 22:26:02 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       2550
+  - HOLD total:       2552
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -21,14 +21,14 @@ Hold reason counters:
   - HOLD_PAUSED: 0
   - HOLD_STALE_DATA: 1945
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 74
+  - HOLD_NO_SIGNAL: 75
   - HOLD_NO_TREND_OK: 398
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 101
+  - HOLD_OTHER: 102
 
 Last event:
-  reason: HOLD_OTHER
-  detail: trend_ok=1 signal=1 conf=39 | px=2099.075 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=54 | delta=-15 | adj_score=39 | watch_th=58 | trade_th=85 | trend_strength=0.00110 | vol=0.00038 | liq:spread=NA;vol_1m=35.38595941;vol_floor>=25;vol_base=32.07460144071428571428571429;vol_need>=16.0373;atr_norm=0.0003751581435564202795553134794914740268723107874393463134765625;LIQ_OK | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=35.38595941;vol_floor>=25;vol_base=32.07460144071428571428571429;vol_need>=16.0373;atr_norm=0.0003751581435564202795553134794914740268723107874393463134765625;LIQ_OK
+  reason: HOLD_NO_SIGNAL
+  detail: signal=0 score=40 reasons=MA50>MA200;spread_ok(4.53bps) | px=2098.455 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=63 | delta=-15 | adj_score=48 | watch_th=58 | trade_th=85 | trend_strength=0.00045 | vol=0.00038 | liq:spread=NA;vol_1m=24.55841523;vol_floor>=25;vol_base=33.12203589533333333333333333;vol_need>=16.5610;atr_norm=0.0003834061779484365119728683790611967197037301957607269287109375;violations=VOLUME_BELOW_MIN;penalty=-10 | liq_penalty=-10 | struct=STRUCT:near_sup(d=0.000755);near_res(d=0.000086) | liq=spread=NA;vol_1m=24.55841523;vol_floor>=25;vol_base=33.12203589533333333333333333;vol_need>=16.5610;atr_norm=0.0003834061779484365119728683790611967197037301957607269287109375;violations=VOLUME_BELOW_MIN;penalty=-10

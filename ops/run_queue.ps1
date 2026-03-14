@@ -201,7 +201,9 @@ Write-Host "Queue runner finished. Jobs run: $jobsRun"
 Write-Host "Results log: $logFile"
 Write-Host "========================================" -ForegroundColor Green
 
-# Discord summary when queue finishes with jobs run
+# Post-queue leaderboard + Discord summary
 if ($jobsRun -gt 0 -and -not $DryRun) {
-    & $pyExe "$repoRoot\ops\notify.py" --test "Queue finished: $jobsRun job(s) completed. Run ``auto_compare.py`` for leaderboard." 2>$null
+    Write-Host ""
+    Write-Host "--- POST-QUEUE LEADERBOARD ---" -ForegroundColor Cyan
+    & $pyExe "$repoRoot\ops\post_queue_report.py" --min-trades 10
 }
