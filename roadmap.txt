@@ -205,6 +205,8 @@ Exit:
   [DONE] Auto-compare leaderboard — ops/auto_compare.py (ranked table, --min-trades, --top, --csv)
   [DONE] Artifact cleanup — ops/cleanup_artifacts.ps1 (keep N recent, protect in-progress runs)
   [DONE] Discord alerts — ops/notify.py (backtest complete, trade, error) + run_queue.ps1 integration
+  [DONE] Equity overlay chart — ops/plot_equity_overlay.py (Chart.js HTML, --latest N, --min-trades)
+  [DONE] Trade export tool — ops/export_trades.py (table + summary, --losers-only, --winners-only, --csv)
 
 ## Priority 6 — Survivability
   [DONE] Backup verification drill — ops/verify_backup.ps1 (git sync, key files, state freshness, candle data)
