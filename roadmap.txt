@@ -176,6 +176,39 @@ Exit:
   [TODO] Expand to BTC-USD after ETH edge confirmed
   [TODO] Adaptive score threshold — auto-adjust CONFLUENCE_MIN_SCORE based on rolling WR
   [TODO] Volume-weighted entry timing — prefer entries at volume spikes vs quiet periods
+  [TODO] Fake-out detection & mitigation
+    - Identify entries that reverse quickly after fill (e.g. price drops X% within N bars)
+    - Possible signals: wick rejection, volume divergence at entry, order book imbalance
+    - Could add a "confirmation delay" — wait N bars after signal before entering
+    - Track fake-out rate per score bucket / regime / session to find patterns
+    - Related: the 30m-3h dead zone is likely dominated by fake-outs
+  [TODO] Liquidation-aware entry gating
+    - Monitor large liquidation events by size (whale liquidations vs retail)
+    - Block entries near large liquidation cascades (momentum is unreliable)
+    - Possibly use liquidations AS signals — large liq clusters can mark reversals
+    - Needs: liquidation data feed or estimation from price/volume spikes
+  [TODO] Short selling support
+    - Currently long-only; adding shorts doubles opportunity set
+    - Engine: support SELL-to-open (short entry) + BUY-to-close (short exit)
+    - Ledger: track negative positions, short PnL = (entry - exit) * qty
+    - PaperAdapter: simulate short fills (same interface)
+    - Confluence: may need separate score thresholds for shorts vs longs
+    - Risk: separate drawdown limits for short book
+    - Phase: implement after long-only edge is proven (Phase 17+)
+  [TODO] Pyramiding / add-to-winners
+    - When position is profitable and trend continues, add to position size
+    - Rules: only add if unrealized PnL > X%, max N additions, trailing stop on full position
+    - Exit: close entire position at once (not partial — sell whole stack)
+    - Needs: multi-fill position tracking in ledger (currently single entry/exit)
+    - Risk: larger position = larger drawdown if reversal — needs tight trailing stop
+  [TODO] Mean-reversion strategy
+    - Opposite of current momentum/confluence approach
+    - Entry: price deviates X std devs from moving average → enter expecting reversion
+    - Signals: RSI oversold/overbought, Bollinger Band extremes, volume exhaustion
+    - Could run alongside momentum strategy (strategy coordination layer)
+    - Best in RANGE regime (where momentum strategy loses)
+    - Needs: separate backtest validation, own score/confluence path
+    - Phase: build as second strategy, test independently, then coordinate
 
 ## Priority 2 — Multi-Timeframe Strategy  [TODO — foundation built]
   [DONE] 4hr candle aggregation in engine (CandleBuilder + rolling buffer)
@@ -202,7 +235,9 @@ Exit:
   [TODO] Candle gap alerting — proactive Discord alert when feed gaps detected
   [TODO] Weekly performance digest — auto-generate and Discord-send weekly PnL/WR summary
 
-## Priority 5 — ML as Governor  [TODO — needs 500+ trades]
+## Priority 5 — ML as Governor  [TODO — needs 500+ trades across all assets]
+  * 500 trades = combined ETH + BTC + SOL (backtest + live)
+  * Current queue includes BTC-USD and SOL-USD runs — those trades count
   * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
   * Anomaly detector: flags unusual fill patterns or execution drift
   * Capital allocation ranker: rank entry opportunities by predicted quality
