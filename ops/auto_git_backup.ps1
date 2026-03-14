@@ -1,7 +1,7 @@
 # ops/auto_git_backup.ps1
 # Automated nightly git commit + push from PC1.
 # Schedule via Task Scheduler to run nightly at 02:00.
-# Safe to run repeatedly — only commits if there are changes.
+# Safe to run repeatedly -- only commits if there are changes.
 
 $ErrorActionPreference = "Continue"
 Set-Location C:\Argus\repo

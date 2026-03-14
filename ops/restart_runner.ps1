@@ -1,4 +1,4 @@
-# ops/restart_runner.ps1 — Safely restart runner_live.py
+# ops/restart_runner.ps1 -- Safely restart runner_live.py
 # Sends graceful stop to existing runner, waits for clean shutdown, then restarts.
 # Usage: .\ops\restart_runner.ps1 [-SkipConfirm]
 param(

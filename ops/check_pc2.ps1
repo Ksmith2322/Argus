@@ -1,4 +1,4 @@
-# ops/check_pc2.ps1 — Quick PC2 backtest status check
+# ops/check_pc2.ps1 -- Quick PC2 backtest status check
 # Usage: .\ops\check_pc2.ps1
 param()
 

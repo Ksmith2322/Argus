@@ -13,7 +13,7 @@ $BRANCH = "phase6-hardening"
 Set-Location C:\Argus\repo
 . C:\Argus\.venv\Scripts\Activate.ps1
 
-# All tracked pairs — add new ones here
+# All tracked pairs -- add new ones here
 $pairs = @(
     @{ product="ETH-USD"; file="eth_usd_1m.csv" },
     @{ product="BTC-USD"; file="btc_usd_1m.csv" },
@@ -43,7 +43,7 @@ Write-Host ""
 Write-Host "Validating candle data..." -ForegroundColor Cyan
 C:\Argus\.venv\Scripts\python.exe C:\Argus\repo\ops\validate_candles.py
 if ($LASTEXITCODE -eq 1) {
-    Write-Host "CANDLE VALIDATION FAILED — aborting commit" -ForegroundColor Red
+    Write-Host "CANDLE VALIDATION FAILED -- aborting commit" -ForegroundColor Red
     exit 1
 }
 

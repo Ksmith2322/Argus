@@ -1,4 +1,4 @@
-# ops/post_backtest_compare.ps1 — Run after a backtest completes to auto-compare against baseline
+# ops/post_backtest_compare.ps1 -- Run after a backtest completes to auto-compare against baseline
 # Usage: .\ops\post_backtest_compare.ps1 [-Baseline <run_id>]
 #
 # If no -Baseline given, compares the two most recent runs.

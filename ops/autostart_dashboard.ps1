@@ -1,4 +1,4 @@
-# ops/autostart_dashboard.ps1 — Launch Argus dashboard on login
+# ops/autostart_dashboard.ps1 -- Launch Argus dashboard on login
 # Place a shortcut to this script in the Windows Startup folder.
 $ErrorActionPreference = "Stop"
 Set-Location C:\Argus\repo

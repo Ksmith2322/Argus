@@ -1,4 +1,4 @@
-# ops/dispatch_queue_pc2.ps1 — Push queue + code to PC2 and start queue runner
+# ops/dispatch_queue_pc2.ps1 -- Push queue + code to PC2 and start queue runner
 #
 # Usage:
 #   .\ops\dispatch_queue_pc2.ps1              # push queue and start

@@ -61,7 +61,7 @@ Write-Host "Log file: $logFile"
 Write-Host "Uploading launcher to PC2..."
 scp $localTmp "${PC2}:C:/Argus/repo/ops/_pc2_run.ps1"
 
-# Launch via schtasks (truly detached from SSH session — survives disconnect)
+# Launch via schtasks (truly detached from SSH session -- survives disconnect)
 # Write a tiny launch-wrapper that schtasks will invoke, avoiding nested-quote hell
 Write-Host "Starting backtest on PC2..."
 $launchLines = @(
@@ -86,7 +86,7 @@ $pyCount = ssh $PC2 'powershell -NonInteractive -NoProfile -Command "(Get-Proces
 if ([int]$pyCount -gt 0) {
     Write-Host "CONFIRMED: $pyCount Python process(es) running on PC2" -ForegroundColor Green
 } else {
-    Write-Host "WARNING: No Python processes detected — check PC2 manually" -ForegroundColor Yellow
+    Write-Host "WARNING: No Python processes detected -- check PC2 manually" -ForegroundColor Yellow
 }
 
 Write-Host ""

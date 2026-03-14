@@ -1,4 +1,4 @@
-# ops/pull_pc2_results.ps1 — Pull latest backtest results from PC2 to PC1
+# ops/pull_pc2_results.ps1 -- Pull latest backtest results from PC2 to PC1
 # Usage: .\ops\pull_pc2_results.ps1 [-RunId <run_id>]
 # If no RunId given, pulls the latest run.
 param(

@@ -1,11 +1,11 @@
-# ops/run_queue.ps1 — Pop and run backtest jobs from backtest_queue.jsonl
+# ops/run_queue.ps1 -- Pop and run backtest jobs from backtest_queue.jsonl
 #
 # Usage:
 #   .\ops\run_queue.ps1                # run all queued jobs sequentially
 #   .\ops\run_queue.ps1 -MaxJobs 2     # run at most 2 jobs then stop
 #   .\ops\run_queue.ps1 -DryRun        # show what would run without running
 #
-# Queue format (backtest_queue.jsonl — one JSON object per line):
+# Queue format (backtest_queue.jsonl -- one JSON object per line):
 #   {"label": "human-readable name", "env": {"KEY": "VAL", ...}, "single_run": true}
 #
 # Each job:
