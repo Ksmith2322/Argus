@@ -289,6 +289,39 @@ async def api_backtest():
     return JSONResponse(runs)
 
 
+@app.get("/api/config")
+async def api_config():
+    """Read key config values from .env file."""
+    env_path = REPO / ".env"
+    if not env_path.exists():
+        return JSONResponse({})
+    keys_of_interest = [
+        "CONFLUENCE_MIN_SCORE", "CONFLUENCE_SIZE_MULT_WHEN_NOT_TRADE",
+        "REGIME_ENTRY_BLOCK_LIST", "MAX_HOLD_SECONDS", "MIN_HOLD_SECONDS",
+        "TAKE_PROFIT_PCT", "TRAIL_STOP_PCT", "STOP_LOSS_PCT",
+        "DRAWDOWN_PAUSE_PCT", "DAILY_MAX_LOSS_USD", "MAX_TRADES_PER_DAY",
+        "USE_TRENDLINES", "USE_STRUCTURE", "USE_LIQUIDITY_FILTERS",
+        "USE_SESSION_MODIFIERS", "USE_VOL_SIZING", "RISK_PER_TRADE_USD",
+        "EXECUTION_ADAPTER", "PRODUCT_ID", "START_CASH_USD",
+        "SESSION_ASIA_RISK_MULT", "SESSION_OFF_RISK_MULT",
+    ]
+    cfg = {}
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if k in keys_of_interest:
+                        cfg[k] = v.strip()
+    except Exception:
+        pass
+    return JSONResponse(cfg)
+
+
 # ---------------------------------------------------------------------------
 # SSE stream for real-time updates
 # ---------------------------------------------------------------------------
@@ -405,6 +438,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <tbody></tbody>
     </table>
   </div>
+</div>
+
+<div class="card" style="margin-top:10px;">
+  <h2>Live Config (.env)</h2>
+  <div id="config-panel" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:4px; font-size:0.78em;"></div>
 </div>
 
 <div class="card" style="margin-top:10px;">
@@ -602,9 +640,26 @@ async function loadBacktests() {
   } catch(e) { console.error('backtest fetch error', e); }
 }
 
+async function loadConfig() {
+  try {
+    const resp = await fetch('/api/config');
+    const cfg = await resp.json();
+    const panel = document.getElementById('config-panel');
+    panel.innerHTML = '';
+    const highlights = {'CONFLUENCE_MIN_SCORE':1, 'MAX_HOLD_SECONDS':1, 'REGIME_ENTRY_BLOCK_LIST':1, 'DRAWDOWN_PAUSE_PCT':1, 'USE_TRENDLINES':1};
+    Object.entries(cfg).forEach(([k,v]) => {
+      const hl = highlights[k] ? 'color:#00d4ff;font-weight:bold' : 'color:#7b8ab8';
+      const el = document.createElement('div');
+      el.innerHTML = '<span style="' + hl + '">' + k + '</span> = <span style="color:#fff">' + v + '</span>';
+      panel.appendChild(el);
+    });
+  } catch(e) { console.error('config fetch error', e); }
+}
+
 // Init
 initChart();
 loadEquity();
+loadConfig();
 loadBacktests();
 setInterval(loadEquity, 30000);
 setInterval(loadBacktests, 60000);  // refresh backtest status every 60s

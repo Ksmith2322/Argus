@@ -1,3 +1,5 @@
 {"label": "30min-timestop_score80_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "80", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
 {"label": "90min-timestop_score90_regime", "env": {"MAX_HOLD_SECONDS": "5400", "CONFLUENCE_MIN_SCORE": "90", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
 {"label": "30min-timestop_score90_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "90", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
+{"label": "30min-timestop_score85_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "85", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
+{"label": "30min-trendline-penalties_score80_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "80", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE", "USE_TRENDLINES": "true", "TL_BONUS_NEAR_SUPPORT": "0", "TL_BONUS_BROKE_ABOVE_RESIST": "0", "TL_PENALTY_NEAR_RESIST": "8", "TL_PENALTY_BROKE_BELOW_SUPPORT": "15", "TL_PENALTY_RESIST_SLOPE_NEG": "5", "TL_BLOCK_LONG_NEAR_RESIST": "false", "TL_BLOCK_LONG_BROKE_BELOW_SUPPORT": "true"}, "single_run": true}
