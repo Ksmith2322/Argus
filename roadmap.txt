@@ -62,56 +62,35 @@ Rules:
   RANGE regime: 9 trades, 0% WR, PnL=-$2.20 (ALL LOSSES)
   TREND_UP:    68 trades, 27.9% WR, PnL=-$1.34
 
-### Staged Optimization (score>=80 + block RANGE):
-  Retroactive: 28 trades, 46.4% WR, PF=2.49, PnL=+$4.76, expectancy=$0.17/trade
-  Exceeds exit criteria (WR>=35%, PF>=1.20) by wide margin.
-
-### Optimization Test — COMPLETED ON PC1 (2026-03-13):
-  Config: CONFLUENCE_MIN_SCORE=80, REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
-  run_id: bt_20260313T125723Z_05d478d3
-  58 trades, 20.69% WR, PF=0.70, PnL=-$2.97, max DD=0.99%
-  vs no-regime-block (dbd25004): 77 trades, 24.68% WR, PF=0.74, PnL=-$5.92, max DD=1.52%
-  Regime block cut losses 50% and halved max DD, but WR/PF slightly worse.
-
 ### Duration Analysis (strongest alpha signal — confirmed across both runs):
   <30m:     27 trades, 70.4% WR, PnL=+$11.75  (MASSIVE WINNER)
   30m-1.5h: 28 trades,  3.6% WR, PnL=-$7.51   (DEAD ZONE — all losers)
   1.5-3h:   36 trades,  2.8% WR, PnL=-$7.77   (DEAD ZONE)
   >3h:      44 trades, 22.7% WR, PnL=-$2.95   (slight recovery)
 
-  Implication: TIME_STOP at 90min helps, but 30min may be optimal.
-  After 90-min test completes, queue 30-min test (MAX_HOLD_SECONDS=1800).
-
-### Score Analysis (regime-blocked run, 05d478d3):
-  80-84: 27 trades, 11.1% WR, PnL=-$3.84
-  85-89: 10 trades, 20.0% WR, PnL=-$1.25
-  90+:   21 trades, 33.3% WR, PnL=+$2.15  (only profitable bucket)
-
 ### Time-Stop Exit (implemented 2026-03-13):
   MAX_HOLD_SECONDS=5400 (90 min). Closes position if held too long.
   Priority: STOP_LOSS > MIN_HOLD > TIME_STOP > TREND_INVALIDATION > TRAIL > TP.
 
-### In-flight backtests (2026-03-13):
-  PC1: bt_20260313T233056Z_2019567a — 90-min TIME_STOP + score80 + regime block (~52%)
-  PC1: bt_20260313T220804Z_fe895ebe — (different config, ~71%)
-  PC2: bt_20260313T210852Z_2584fb3c — fresh candles run (in progress)
+### Queued Optimization Tests (8 jobs, running on PC1+PC2 in parallel ~18h):
+  PC1 queue (ops/backtest_queue.jsonl):
+    1. 90min-timestop_score90_regime
+    2. 30min-timestop_score90_regime
+    3. 30min-timestop_score85_regime
+  PC2 queue (ops/backtest_queue_pc2.jsonl):
+    4. 30min-trendline-penalties_score80_regime
+    5. btc-usd_30min_score80_regime (cross-asset)
+    6. sol-usd_30min_score80_regime (cross-asset)
+    7. compound-5pct_30min_score80_regime
 
-### Queued tests (8 jobs in ops/backtest_queue.jsonl):
-  1. 30min-timestop_score80_regime
-  2. 90min-timestop_score90_regime
-  3. 30min-timestop_score90_regime
-  4. 30min-timestop_score85_regime
-  5. 30min-trendline-penalties_score80_regime
-  6. btc-usd_30min_score80_regime (cross-asset)
-  7. sol-usd_30min_score80_regime (cross-asset)
-  8. compound-5pct_30min_score80_regime
+  Queue watcher (watch_and_launch_queue.ps1) running — auto-launches when in-flight BTs finish.
+  Post-queue report (post_queue_report.py) auto-sends leaderboard to Discord on completion.
 
 ### Next steps:
-  1. In-flight backtests complete → auto-compare all runs
-  2. Run job queue: .\ops\run_queue.ps1 (8 configs, ~36 hours total)
-  3. Identify winning config from auto_compare.py leaderboard
-  4. Lock winning config, restart PC1 live runner
-  5. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
+  1. Queue finishes → review Discord leaderboard
+  2. Identify winning config from post_queue_report.py output
+  3. Lock winning config, restart PC1 live runner
+  4. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
 
@@ -154,69 +133,76 @@ Exit:
 
 ---
 
-# FUTURE PRIORITIES (Phase 19+)
+# INFRASTRUCTURE DONE (collapsed)
 
-## Priority 1 — Strategy Edge
+## Ops & Analysis Tools  [ALL DONE 2026-03-13/14]
+  [DONE] PC2 dispatch reliability — schtasks detachment + log capture
+  [DONE] Run comparison tool — ops/compare_runs.py
+  [DONE] Score/duration analyzer — ops/analyze_scores.py
+  [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
+  [DONE] Job queue — ops/run_queue.ps1 + backtest_queue.jsonl
+  [DONE] PC2 queue dispatch — ops/dispatch_queue_pc2.ps1
+  [DONE] Unified status script — ops/status_all.ps1
+  [DONE] Auto-compare leaderboard — ops/auto_compare.py
+  [DONE] Artifact cleanup — ops/cleanup_artifacts.ps1
+  [DONE] Discord alerts — ops/notify.py (backtest complete, trade close, error, runner start/crash)
+  [DONE] Equity overlay chart — ops/plot_equity_overlay.py
+  [DONE] Trade export tool — ops/export_trades.py
+  [DONE] Queue watcher — ops/watch_and_launch_queue.ps1
+  [DONE] Post-queue report — ops/post_queue_report.py
+  [DONE] Dashboard — ops/dashboard.py (FastAPI + SSE + Chart.js, localhost:8080)
+  [DONE] Architecture map — ops/generate_map.py -> ARGUS_MAP.mermaid
+  [DONE] Backup verification — ops/verify_backup.ps1
+
+## Strategy Features Built  [ALL DONE]
+  [DONE] Session filtering — SESSION_ENTRY_BLOCK_LIST
+  [DONE] Multi-asset backtest — BACKTEST_SYMBOL env var
+  [DONE] Compounding rules — COMPOUND_SIZE_PCT
+  [DONE] Drawdown circuit breaker — DRAWDOWN_PAUSE_PCT
+  [DONE] Candle data validation — ops/validate_candles.py
+  [DONE] Time-stop exit — MAX_HOLD_SECONDS
+  [DONE] 4hr candle aggregation — CandleBuilder(14400) + 50-candle rolling buffer in state/engine
+
+## Risk & Safety  [ALL DONE]
+  [DONE] Drawdown circuit breaker (DRAWDOWN_PAUSE_PCT=0.03)
+  [DONE] Candle data validation (ops/validate_candles.py)
+
+---
+
+# FUTURE PRIORITIES
+
+## Priority 1 — Strategy Edge  [AFTER PHASE 16.5]
   [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
-  [DONE] Session filtering — SESSION_ENTRY_BLOCK_LIST (like REGIME_ENTRY_BLOCK_LIST)
-  [DONE] Multi-asset backtest support — BACKTEST_SYMBOL env var (e.g. BTC-USD, SOL-USD)
   [TODO] Expand to BTC-USD after ETH edge confirmed
-  [DONE] Compounding rules — COMPOUND_SIZE_PCT (% of equity per trade, scales with growth)
-    - When >0, overrides USD_PER_TRADE with equity * pct (e.g. 0.05 = 5%)
-    - Queued test: compound-5pct_30min_score80_regime
+  [TODO] Adaptive score threshold — auto-adjust CONFLUENCE_MIN_SCORE based on rolling WR
+  [TODO] Volume-weighted entry timing — prefer entries at volume spikes vs quiet periods
 
-## Priority 2 — Multi-Timeframe Strategy  [TODO]
-  [TODO] 4hr timeframe + S/R trendlines (Tori Trades swing approach)
-    - 4hr candle aggregation in engine
-    - S/R trendline detection on 4hr chart
-    - Entry signals based on 4hr S/R bounces/breaks
-    - Existing trendline module operates on 1h; extend to 4hr
-  [TODO] Sliding window position sizing
-    - Track rolling WR/PF per signal source over last N trades
-    - Scale position size proportionally to recent performance
-    - Whichever strategy/timeframe is winning gets more capital
+## Priority 2 — Multi-Timeframe Strategy  [TODO — foundation built]
+  [DONE] 4hr candle aggregation in engine (CandleBuilder + rolling buffer)
+  [TODO] S/R trendline detection on 4hr chart (pivot highs/lows → projected lines)
+  [TODO] Entry signals based on 4hr S/R bounces/breaks
+  [TODO] Sliding window position sizing (rolling WR/PF per signal → size scaling)
   [TODO] Strategy coordination layer (1m confluence + 4hr swing coexistence)
 
-## Priority 3 — Risk & Safety
-  [DONE] Drawdown circuit breaker — DRAWDOWN_PAUSE_PCT in config/risk.py/engine.py
-    - Tracks peak equity, pauses entries when drawdown exceeds threshold
-    - Auto-recovers when equity climbs back above threshold
-    - Default: 3% (DRAWDOWN_PAUSE_PCT=0.03 in .env)
-  [DONE] Candle data validation — ops/validate_candles.py
-    - Detects gaps, stale data, unrealistic OHLCV, duplicates, wrong order
-    - Integrated into refresh_candles.ps1 (blocks commit on FAIL)
-    - Usage: python ops/validate_candles.py [file] [--strict]
+## Priority 3 — Survivability & Recovery
+  [DONE] Backup verification drill — ops/verify_backup.ps1 (weekly, Sunday@04:00)
+  [DONE] Git auto-backup — ops/auto_git_backup.ps1 (daily@02:00)
+  [TODO] USB nightly backup — ops/backup_to_usb.ps1
+    - Mirror C:\Argus\ to USB drive (robocopy /MIR or similar)
+    - Include: repo, .venv, state, ops/logs (recent N days)
+    - Exclude: __pycache__, .git/objects (already on GitHub)
+    - Scheduled: nightly via Task Scheduler (e.g. 03:00)
+    - Validate: check USB free space, verify key files copied, log result
+    - Discord alert on failure
+  [TODO] Disaster recovery runbook — document full restore from USB + GitHub
 
-## Priority 4 — Real-time Live Dashboard  [DONE 2026-03-13]
-  [DONE] FastAPI + SSE dashboard — ops/dashboard.py (localhost:8080)
-    - Equity curve (Chart.js), position status, PnL, runtime, config viewer
-    - Backtest progress panel (dynamic total bars from candle CSV)
-    - SSE push every 5s, auto-refresh equity/backtest panels
-  [DONE] Dashboard autostart — ops/autostart_dashboard.ps1 (Windows Startup shortcut)
+## Priority 4 — Observability & Monitoring
+  [TODO] Dashboard queue panel — show current queue status, running job, ETA
+  [TODO] Dashboard trade journal viewer — browse closed trades with filters
+  [TODO] Candle gap alerting — proactive Discord alert when feed gaps detected
+  [TODO] Weekly performance digest — auto-generate and Discord-send weekly PnL/WR summary
 
-## Priority 5 — PC1/PC2 Job Dispatch & Analysis Tools
-  [DONE] PC2 dispatch reliability — schtasks detachment + log capture (survives SSH disconnect)
-  [DONE] Run comparison tool — ops/compare_runs.py (side-by-side metrics, delta from baseline)
-  [DONE] Score/duration analyzer — ops/analyze_scores.py (score buckets, regime, session, duration)
-  [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
-  [DONE] Job queue — ops/run_queue.ps1 + backtest_queue.jsonl (sequential JSONL runner)
-  [DONE] PC2 queue dispatch — ops/dispatch_queue_pc2.ps1 (push queue + start via schtasks)
-  [DONE] Unified status script — ops/status_all.ps1 (live runner + PC1/PC2 + queue in one command)
-  [DONE] Auto-compare leaderboard — ops/auto_compare.py (ranked table, --min-trades, --top, --csv)
-  [DONE] Artifact cleanup — ops/cleanup_artifacts.ps1 (keep N recent, protect in-progress runs)
-  [DONE] Discord alerts — ops/notify.py (backtest complete, trade, error) + run_queue.ps1 integration
-  [DONE] Equity overlay chart — ops/plot_equity_overlay.py (Chart.js HTML, --latest N, --min-trades)
-  [DONE] Trade export tool — ops/export_trades.py (table + summary, --losers-only, --winners-only, --csv)
-  [DONE] Queue watcher — ops/watch_and_launch_queue.ps1 (polls for in-flight BTs, auto-launches queue)
-  [DONE] Post-queue report — ops/post_queue_report.py (leaderboard + exit criteria check + Discord)
-
-## Priority 6 — Survivability
-  [DONE] Backup verification drill — ops/verify_backup.ps1 (git sync, key files, state freshness, candle data)
-
-## Priority 7 — Architecture Visualization  [DONE 2026-03-13]
-  [DONE] ops/generate_map.py -> ARGUS_MAP.mermaid (64 modules, 7 layers, auto-generated)
-
-## Priority 8 — ML as Governor  [TODO — needs 500+ trades]
+## Priority 5 — ML as Governor  [TODO — needs 500+ trades]
   * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
   * Anomaly detector: flags unusual fill patterns or execution drift
   * Capital allocation ranker: rank entry opportunities by predicted quality
@@ -224,7 +210,7 @@ Exit:
 
 ---
 
-# FUTURE EXTENSIONS (after Phase 19)
+# FUTURE EXTENSIONS (after Phase 18)
 
   * Champion-challenger shadow runtime
   * Dual-feed market data validation
@@ -234,6 +220,8 @@ Exit:
   * Policy engine above strategy engine
   * Regime black-swan library
   * Storage and recovery maturity
+  * Multi-exchange arbitrage monitoring
+  * API rate limit / circuit breaker hardening
 
 ---
 
@@ -248,7 +236,7 @@ Exit:
 
 ---
 
-# TRENDLINE ENGINE (Phase 18 feature, currently disabled)
+# TRENDLINE ENGINE (currently disabled)
 
   TrendlineEngine: detects pivot highs/lows on 1h candles, projects descending resistance
   and ascending support trendlines, computes proximity and breakout signals.
@@ -262,7 +250,7 @@ Exit:
     Resistance slope negative:   -5 to score (TL_PENALTY_RESIST_SLOPE_NEG)
 
   Status: USE_TRENDLINES=false. Bonuses were counterproductive in 2026-03-12 test.
-  Next test: penalties only with TL_PENALTY_RESIST_SLOPE_NEG=5.
+  Next test: penalties only with TL_PENALTY_RESIST_SLOPE_NEG=5 (queued on PC2).
 
 ---
 
@@ -274,3 +262,4 @@ Exit:
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
   Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
   ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
+  ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1 (TODO — not yet built)
