@@ -66,23 +66,42 @@ Rules:
   Retroactive: 28 trades, 46.4% WR, PF=2.49, PnL=+$4.76, expectancy=$0.17/trade
   Exceeds exit criteria (WR>=35%, PF>=1.20) by wide margin.
 
-### Optimization Test — RUNNING ON PC1:
+### Optimization Test — COMPLETED ON PC1 (2026-03-13):
   Config: CONFLUENCE_MIN_SCORE=80, REGIME_ENTRY_BLOCK_LIST=TREND_DOWN,RANGE
-  Started: 2026-03-13 on PC1 (PC2 runs died twice — SSH disconnect).
-  Expected completion: ~4.5 hrs from start.
+  run_id: bt_20260313T125723Z_05d478d3
+  58 trades, 20.69% WR, PF=0.70, PnL=-$2.97, max DD=0.99%
+  vs no-regime-block (dbd25004): 77 trades, 24.68% WR, PF=0.74, PnL=-$5.92, max DD=1.52%
+  Regime block cut losses 50% and halved max DD, but WR/PF slightly worse.
+
+### Duration Analysis (strongest alpha signal — confirmed across both runs):
+  <30m:     27 trades, 70.4% WR, PnL=+$11.75  (MASSIVE WINNER)
+  30m-1.5h: 28 trades,  3.6% WR, PnL=-$7.51   (DEAD ZONE — all losers)
+  1.5-3h:   36 trades,  2.8% WR, PnL=-$7.77   (DEAD ZONE)
+  >3h:      44 trades, 22.7% WR, PnL=-$2.95   (slight recovery)
+
+  Implication: TIME_STOP at 90min helps, but 30min may be optimal.
+  After 90-min test completes, queue 30-min test (MAX_HOLD_SECONDS=1800).
+
+### Score Analysis (regime-blocked run, 05d478d3):
+  80-84: 27 trades, 11.1% WR, PnL=-$3.84
+  85-89: 10 trades, 20.0% WR, PnL=-$1.25
+  90+:   21 trades, 33.3% WR, PnL=+$2.15  (only profitable bucket)
 
 ### Time-Stop Exit (implemented 2026-03-13):
   MAX_HOLD_SECONDS=5400 (90 min). Closes position if held too long.
-  Data-driven: <1hr trades 41% WR (+$3.71), 1-4hr trades 3% WR (-$6.64).
   Priority: STOP_LOSS > MIN_HOLD > TIME_STOP > TREND_INVALIDATION > TRAIL > TP.
-  Backtest comparison pending (baseline run in progress, then time-stop run).
+
+### In-flight backtests (2026-03-13):
+  PC1: bt_20260313T233056Z_2019567a — 90-min TIME_STOP comparison (in progress)
+  PC2: bt_20260313T210852Z_2584fb3c — fresh candles run (in progress, ~55%)
 
 ### Next steps:
-  1. Baseline backtest completes → record results (no time-stop, score=80, regime blocks)
-  2. Run time-stop backtest → compare WR/PF/PnL against baseline
-  3. Restart PC1 live runner with winning config
-  4. BTC-USD + SOL-USD backtests (cross-asset validation)
-  5. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
+  1. Time-stop backtest completes → compare vs 05d478d3 baseline
+  2. If 90-min helps: queue 30-min time-stop test (MAX_HOLD_SECONDS=1800)
+  3. Consider raising MIN_SCORE to 90 (only profitable score bucket)
+  4. Restart PC1 live runner with winning config
+  5. BTC-USD + SOL-USD backtests (cross-asset validation)
+  6. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
 
@@ -163,8 +182,11 @@ Exit:
   * Single command: python ops/dashboard.py -> localhost:8080
   * No external dependencies (local only)
 
-## Priority 5 — PC1/PC2 Job Dispatch
+## Priority 5 — PC1/PC2 Job Dispatch & Analysis Tools
   [DONE] PC2 dispatch reliability — schtasks detachment + log capture (survives SSH disconnect)
+  [DONE] Run comparison tool — ops/compare_runs.py (side-by-side metrics, delta from baseline)
+  [DONE] Score/duration analyzer — ops/analyze_scores.py (score buckets, regime, session, duration)
+  [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
   [TODO] Job queue: text file of pending runs; dispatcher pops and executes
   [TODO] PC2 backtest completion alert via Discord webhook
 

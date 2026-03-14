@@ -1,0 +1,3 @@
+{"label": "30min-timestop_score80_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "80", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
+{"label": "90min-timestop_score90_regime", "env": {"MAX_HOLD_SECONDS": "5400", "CONFLUENCE_MIN_SCORE": "90", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
+{"label": "30min-timestop_score90_regime", "env": {"MAX_HOLD_SECONDS": "1800", "CONFLUENCE_MIN_SCORE": "90", "REGIME_ENTRY_BLOCK_LIST": "TREND_DOWN,RANGE"}, "single_run": true}
