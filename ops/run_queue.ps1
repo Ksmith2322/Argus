@@ -138,6 +138,19 @@ function Invoke-QueueJob {
     return $jobSuccess
 }
 
+# ---- Pre-queue candle refresh ----
+if (-not $DryRun) {
+    $refreshScript = "$repoRoot\ops\refresh_candles.ps1"
+    if (Test-Path $refreshScript) {
+        Write-Host "Refreshing candle data before queue start..." -ForegroundColor Cyan
+        try {
+            & $refreshScript
+        } catch {
+            Write-Host "WARNING: candle refresh failed: $_" -ForegroundColor Yellow
+        }
+    }
+}
+
 # ---- Main loop ----
 
 $jobsRun = 0

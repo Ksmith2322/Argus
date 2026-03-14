@@ -3007,6 +3007,13 @@ async def run_live(
     did_one = False
     forced_test_consumed = False
 
+    # Discord startup notification
+    try:
+        from ops.notify import send_discord
+        send_discord(f"Runner started: {symbol} | run_id={run_id} | recovery={recovery_state} | cash=${state.cash}")
+    except Exception:
+        pass
+
     try:
         while True:
             if is_kill_switch_on(cfg):
@@ -3660,6 +3667,11 @@ async def run_live(
             log_event(symbol, "RUNNER_ABORT", str(e))
         except Exception:
             pass
+        try:
+            from ops.notify import notify_error
+            notify_error(f"RUNNER ABORT: {symbol} | {e}")
+        except Exception:
+            pass
         print(f"[ABORT] {e}")
         return 99
     except KeyboardInterrupt:
@@ -3668,6 +3680,11 @@ async def run_live(
     except Exception as e:
         try:
             log_event(symbol, "RUNNER_CRASH", str(e))
+        except Exception:
+            pass
+        try:
+            from ops.notify import notify_error
+            notify_error(f"RUNNER CRASH: {symbol} | {e}")
         except Exception:
             pass
         print(f"[CRASH] {e}")

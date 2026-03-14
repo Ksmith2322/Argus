@@ -1,5 +1,5 @@
 # ARGUS ROADMAP
-# Last updated: 2026-03-13
+# Last updated: 2026-03-14
 # Goal: fully operational autonomous trading system, no outside interaction required,
 #        visual performance monitoring built-in, fail-closed behavior, human-governed
 #        promotion boundaries.
@@ -96,7 +96,7 @@ Rules:
   PC1: bt_20260313T220804Z_fe895ebe — (different config, ~71%)
   PC2: bt_20260313T210852Z_2584fb3c — fresh candles run (in progress)
 
-### Queued tests (7 jobs in ops/backtest_queue.jsonl):
+### Queued tests (8 jobs in ops/backtest_queue.jsonl):
   1. 30min-timestop_score80_regime
   2. 90min-timestop_score90_regime
   3. 30min-timestop_score90_regime
@@ -104,12 +104,13 @@ Rules:
   5. 30min-trendline-penalties_score80_regime
   6. btc-usd_30min_score80_regime (cross-asset)
   7. sol-usd_30min_score80_regime (cross-asset)
+  8. compound-5pct_30min_score80_regime
 
 ### Next steps:
   1. In-flight backtests complete → auto-compare all runs
-  2. Run job queue: .\ops\run_queue.ps1 (7 configs, ~31 hours total)
-  3. Identify winning config from auto_compare.py results
-  4. Restart PC1 live runner with winning config
+  2. Run job queue: .\ops\run_queue.ps1 (8 configs, ~36 hours total)
+  3. Identify winning config from auto_compare.py leaderboard
+  4. Lock winning config, restart PC1 live runner
   5. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
@@ -267,4 +268,5 @@ Exit:
   ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
   ArgusNightlyBT:       (Task Scheduler) -> ops/run_backtest.ps1
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
-  Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
+  Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
+  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)

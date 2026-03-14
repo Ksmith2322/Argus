@@ -1,12 +1,14 @@
 # ops/dispatch_queue_pc2.ps1 -- Push queue + code to PC2 and start queue runner
 #
 # Usage:
-#   .\ops\dispatch_queue_pc2.ps1              # push queue and start
-#   .\ops\dispatch_queue_pc2.ps1 -MaxJobs 2   # limit jobs on PC2
+#   .\ops\dispatch_queue_pc2.ps1                              # push default queue
+#   .\ops\dispatch_queue_pc2.ps1 -QueueFile ops\backtest_queue_pc2.jsonl  # custom queue
+#   .\ops\dispatch_queue_pc2.ps1 -MaxJobs 2                  # limit jobs on PC2
 #
 # Prerequisites: code pushed to git, PC2 reachable via SSH
 param(
-    [int]$MaxJobs = 0
+    [int]$MaxJobs = 0,
+    [string]$QueueFile = "ops\backtest_queue.jsonl"
 )
 
 $PC2 = "ksmith2322@yahoo.com@desktop-17cjmup"
@@ -29,8 +31,9 @@ Write-Host "Pulling latest code on PC2..."
 ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
 
 # Also SCP the queue file (in case it was modified after last commit)
-Write-Host "Uploading queue file..."
-scp "C:\Argus\repo\ops\backtest_queue.jsonl" "${PC2}:C:/Argus/repo/ops/backtest_queue.jsonl"
+$localQueue = Join-Path "C:\Argus\repo" $QueueFile
+Write-Host "Uploading queue file ($QueueFile)..."
+scp $localQueue "${PC2}:C:/Argus/repo/ops/backtest_queue.jsonl"
 
 # Build launcher script
 $ts = (Get-Date -Format "yyyyMMddTHHmmss")
