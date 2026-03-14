@@ -251,12 +251,14 @@ def load_config() -> dict:
     cfg["MAX_TOTAL_EXPOSURE"] = _d("MAX_TOTAL_EXPOSURE", "0.50")
     cfg["MIN_ORDER_USD"] = _d("MIN_ORDER_USD", "10")
     cfg["USD_PER_TRADE"] = _d("USD_PER_TRADE", "0")
+    cfg["COMPOUND_SIZE_PCT"] = _d("COMPOUND_SIZE_PCT", "0")
 
     cfg["START_CASH_USD"] = _clamp_decimal(cfg["START_CASH_USD"], Decimal("0"), Decimal("1000000000"))
     cfg["MAX_TRADE_FRACTION"] = _clamp_decimal(cfg["MAX_TRADE_FRACTION"], Decimal("0"), Decimal("1"))
     cfg["MAX_TOTAL_EXPOSURE"] = _clamp_decimal(cfg["MAX_TOTAL_EXPOSURE"], Decimal("0"), Decimal("1"))
     cfg["MIN_ORDER_USD"] = _clamp_decimal(cfg["MIN_ORDER_USD"], Decimal("0"), Decimal("1000000000"))
     cfg["USD_PER_TRADE"] = _clamp_decimal(cfg["USD_PER_TRADE"], Decimal("0"), Decimal("1000000000"))
+    cfg["COMPOUND_SIZE_PCT"] = _clamp_decimal(cfg["COMPOUND_SIZE_PCT"], Decimal("0"), Decimal("1"))
 
     # -------------------------
     # Risk rules
@@ -350,6 +352,7 @@ def load_config() -> dict:
     cfg["REGIME_MA_SPREAD_MIN"] = _d("REGIME_MA_SPREAD_MIN", "0.0015")
     cfg["REGIME_MIN_GATE_SCORE"] = _i("REGIME_MIN_GATE_SCORE", "70")
     cfg["REGIME_ENTRY_BLOCK_LIST"] = os.environ.get("REGIME_ENTRY_BLOCK_LIST", "TREND_DOWN,RANGE")
+    cfg["SESSION_ENTRY_BLOCK_LIST"] = os.environ.get("SESSION_ENTRY_BLOCK_LIST", "")
 
     cfg["REGIME_LOOKBACK"] = _clamp_int(cfg["REGIME_LOOKBACK"], 5, 50_000)
     cfg["REGIME_VOL_HIGH"] = _clamp_decimal(cfg["REGIME_VOL_HIGH"], Decimal("0"), Decimal("1"))

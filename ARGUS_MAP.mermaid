@@ -1,0 +1,149 @@
+graph TD
+    subgraph Config_and_Data["Config & Data"]
+        config["config"]
+        candles["candles"]
+        indicators["indicators"]
+        backtest_loader["loader"]
+        backtest_feed["feed"]
+        backtest_download_candles["download_candles"]
+    end
+
+    subgraph Strategy_and_Signals["Strategy & Signals"]
+        confluence["confluence"]
+        adaptive_confluence["adaptive_confluence"]
+        regime["regime"]
+        session["session"]
+        structure["structure"]
+        liquidity["liquidity"]
+        trendlines["trendlines"]
+        risk["risk"]
+        strategy_phase2["strategy_phase2"]
+        decisions["decisions"]
+    end
+
+    subgraph Engine["Engine"]
+        engine["engine"]
+        state["state"]
+    end
+
+    subgraph Execution["Execution"]
+        ledger["ledger"]
+        io_logs["io_logs"]
+        execution_adapter["adapter"]
+        execution_paper_adapter["paper_adapter"]
+        execution_intent["intent"]
+        execution_exec_io["exec_io"]
+        execution_checkpoint["checkpoint"]
+        execution_recovery["recovery"]
+    end
+
+    subgraph Lifecycle["Lifecycle"]
+        runner_live["runner_live"]
+        trade_journal["trade_journal"]
+        trade_tracker["trade_tracker"]
+        reconciliation["reconciliation"]
+        pnl_shadow["pnl_shadow"]
+        backtest_runner["runner"]
+        backtest_results["results"]
+        backtest_friction_injector["friction_injector"]
+        backtest_stress_runner["stress_runner"]
+        backtest_walk_forward["walk_forward"]
+        backtest_from_live_events["from_live_events"]
+    end
+
+    subgraph Analytics_and_Reporting["Analytics & Reporting"]
+        analytics_attribution["attribution"]
+        analytics_friction_report["friction_report"]
+        analytics_research_report["research_report"]
+        analytics_risk_model["risk_model"]
+        reporting_generate_report["generate_report"]
+    end
+
+    subgraph Ops_and_Infra["Ops & Infra"]
+        ops_health["health"]
+        ops_watchdog["watchdog"]
+        ops_alerting["alerting"]
+        ops_run_manifest["run_manifest"]
+        ops_artifact_integrity["artifact_integrity"]
+        ops_invariants["invariants"]
+        ops_auto_throttle["auto_throttle"]
+        ops_backup_restore["backup_restore"]
+        ops_dashboard["dashboard"]
+        ops_notify["notify"]
+        ops_auto_compare["auto_compare"]
+        ops_compare_runs["compare_runs"]
+        ops_analyze_scores["analyze_scores"]
+        ops_validate_candles["validate_candles"]
+        ops_argus_builder["argus_builder"]
+        runtime_mode["runtime_mode"]
+        feed_coinbase["feed_coinbase"]
+        utils["utils"]
+        notify["notify"]
+    end
+
+    subgraph Other["Other"]
+        _debug_step["_debug_step"]
+        ops_generate_map["generate_map"]
+        ops_logs_plot_equity_latest["plot_equity_latest"]
+    end
+
+    %% Dependencies
+    _debug_step --> config
+    _debug_step --> engine
+    _debug_step --> feed_coinbase
+    _debug_step --> state
+    adaptive_confluence --> confluence
+    adaptive_confluence --> regime
+    backtest_runner --> backtest_feed
+    backtest_runner --> backtest_friction_injector
+    backtest_runner --> backtest_loader
+    backtest_runner --> backtest_results
+    backtest_runner --> config
+    backtest_runner --> engine
+    backtest_runner --> feed_coinbase
+    backtest_runner --> io_logs
+    backtest_runner --> state
+    backtest_stress_runner --> backtest_friction_injector
+    backtest_stress_runner --> backtest_runner
+    backtest_stress_runner --> config
+    backtest_walk_forward --> backtest_runner
+    candles --> feed_coinbase
+    execution_exec_io --> execution_intent
+    execution_exec_io --> trade_journal
+    execution_intent --> decisions
+    execution_paper_adapter --> execution_adapter
+    ops_alerting --> notify
+    ops_health --> runtime_mode
+    ops_watchdog --> runtime_mode
+    regime --> utils
+    runner_live --> config
+    runner_live --> engine
+    runner_live --> execution_adapter
+    runner_live --> execution_recovery
+    runner_live --> feed_coinbase
+    runner_live --> io_logs
+    runner_live --> notify
+    runner_live --> ops_alerting
+    runner_live --> ops_artifact_integrity
+    runner_live --> ops_auto_throttle
+    runner_live --> ops_health
+    runner_live --> ops_run_manifest
+    runner_live --> runtime_mode
+    runner_live --> state
+    runner_live --> trade_journal
+    runner_live --> utils
+    state --> adaptive_confluence
+    state --> candles
+    state --> confluence
+    state --> execution_adapter
+    state --> execution_paper_adapter
+    state --> ledger
+    state --> liquidity
+    state --> regime
+    state --> risk
+    state --> strategy_phase2
+    state --> structure
+    state --> trade_tracker
+    state --> trendlines
+    strategy_phase2 --> indicators
+    structure --> candles

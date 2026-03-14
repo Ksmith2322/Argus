@@ -646,6 +646,7 @@ def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_cs
         hdr = {
             "run_id": run_id,
             "mode": mode,
+            "label": os.environ.get("ARGUS_JOB_LABEL", ""),
             "git_sha": _get_git_sha(repo_root),
             "config_hash": _stable_hash(cfg),
             "symbol": str(cfg.get("SYMBOL", "")),

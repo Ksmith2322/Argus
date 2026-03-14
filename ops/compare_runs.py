@@ -63,18 +63,23 @@ def find_latest(log_dir: Path, n: int) -> list:
     return [s.stem.replace("bt_summary_", "") for s in summaries[-n:]]
 
 
-def get_config_hash(log_dir: Path, run_id: str) -> str:
-    """Get config hash from run header."""
+def get_run_header(log_dir: Path, run_id: str) -> dict:
+    """Get run header fields."""
     for pattern in [f"run_header_{run_id}.json", f"run_header_bt_{run_id}.json"]:
         path = log_dir / pattern
         if path.exists():
             with open(path) as f:
-                return json.load(f).get("config_hash", "?")
+                return json.load(f)
     # Partial match
     for p in log_dir.glob(f"run_header_*{run_id}*.json"):
         with open(p) as f:
-            return json.load(f).get("config_hash", "?")
-    return "?"
+            return json.load(f)
+    return {}
+
+
+def get_config_hash(log_dir: Path, run_id: str) -> str:
+    """Get config hash from run header."""
+    return get_run_header(log_dir, run_id).get("config_hash", "?")
 
 
 def format_val(raw, converter, fmt):
@@ -128,10 +133,11 @@ def main():
         sys.exit(1)
 
     summaries = [load_summary(log_dir, rid) for rid in run_ids]
-    config_hashes = [get_config_hash(log_dir, rid) for rid in run_ids]
+    headers = [get_run_header(log_dir, rid) for rid in run_ids]
 
     # Print header
     short_ids = [rid[-12:] for rid in run_ids]  # last 12 chars for readability
+    labels = [h.get("label", "") for h in headers]
     label_w = 16
     col_w = 20
     print()
@@ -139,9 +145,14 @@ def main():
     for sid in short_ids:
         print(f"  {sid:>{col_w}}", end="")
     print()
+    if any(labels):
+        print(f"{'label':>{label_w}}", end="")
+        for lbl in labels:
+            print(f"  {(lbl or '-')[:col_w]:>{col_w}}", end="")
+        print()
     print(f"{'config_hash':>{label_w}}", end="")
-    for ch in config_hashes:
-        print(f"  {ch:>{col_w}}", end="")
+    for h in headers:
+        print(f"  {h.get('config_hash', '?'):>{col_w}}", end="")
     print()
     print("-" * (label_w + (col_w + 2) * len(run_ids)))
 

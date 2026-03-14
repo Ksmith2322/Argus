@@ -66,6 +66,10 @@ function Invoke-QueueJob {
     $singleRun = [bool]$job.single_run
     $envBackup = @{}
 
+    # Set job label for run_header
+    $envBackup["ARGUS_JOB_LABEL"] = [Environment]::GetEnvironmentVariable("ARGUS_JOB_LABEL", "Process")
+    [Environment]::SetEnvironmentVariable("ARGUS_JOB_LABEL", $label, "Process")
+
     # Set env overrides
     if ($job.env) {
         foreach ($prop in $job.env.PSObject.Properties) {
@@ -107,6 +111,7 @@ function Invoke-QueueJob {
     catch {
         Write-Host "JOB FAILED: $_" -ForegroundColor Red
         Write-QueueLog "FAIL: $label -- $_"
+        & $pyExe "$repoRoot\ops\notify.py" --error "Queue job FAILED: $label -- $_" 2>$null
     }
 
     # Restore env (always runs, replaces finally block)
@@ -124,6 +129,10 @@ function Invoke-QueueJob {
 
     if ($jobSuccess) {
         Write-QueueLog "DONE: $label | run_id=$runId | elapsed=$elapsedStr"
+        # Discord notification
+        if ($runId) {
+            & $pyExe "$repoRoot\ops\notify.py" --backtest-complete $runId 2>$null
+        }
     }
 
     return $jobSuccess
@@ -178,3 +187,8 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host "Queue runner finished. Jobs run: $jobsRun"
 Write-Host "Results log: $logFile"
 Write-Host "========================================" -ForegroundColor Green
+
+# Discord summary when queue finishes with jobs run
+if ($jobsRun -gt 0 -and -not $DryRun) {
+    & $pyExe "$repoRoot\ops\notify.py" --test "Queue finished: $jobsRun job(s) completed. Run ``auto_compare.py`` for leaderboard." 2>$null
+}

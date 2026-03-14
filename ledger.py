@@ -340,6 +340,11 @@ class VirtualLedger:
         min_order_usd = _q_money(cfg.get("MIN_ORDER_USD", "0"))
 
         usd_per_trade = _q_money(cfg.get("USD_PER_TRADE", "0"))
+        # Compounding: scale USD_PER_TRADE as % of equity instead of fixed amount
+        compound_pct = _as_decimal(cfg.get("COMPOUND_SIZE_PCT", "0"), "0")
+        if compound_pct > 0:
+            eq = self.equity_usd(px)
+            usd_per_trade = _q_money(eq * compound_pct)
         fee_bps_val = _as_decimal(cfg.get("FEE_BPS", "0"), "0")
 
         if self.cash_usd <= 0:

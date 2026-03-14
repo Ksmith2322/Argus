@@ -1430,6 +1430,23 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     extra=f"regime={safe_str(snap.regime)}",
                 )
 
+            elif snap.session and snap.session in [
+                s.strip().upper()
+                for s in str(cfg.get("SESSION_ENTRY_BLOCK_LIST", "")).split(",")
+                if s.strip()
+            ]:
+                _emit_missed_buy(
+                    snap,
+                    event="MISSED_BUY_SESSION",
+                    prefix="SESSION_BLOCK",
+                    px=px,
+                    confluence_min_score=confluence_min_score,
+                    cooldown_remaining=int(cooldown_remaining),
+                    equity=equity,
+                    exposure=exposure,
+                    extra=f"session={safe_str(snap.session)}",
+                )
+
             elif cooldown_remaining > 0:
                 _emit_missed_buy(
                     snap,

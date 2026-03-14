@@ -61,10 +61,10 @@ def print_table(rows: list[dict], csv_mode: bool = False):
     rows.sort(key=lambda r: float(r.get("profit_factor", "0") or "0"), reverse=True)
 
     if csv_mode:
-        cols = ["run_id"] + [m[0] for m in METRICS]
+        cols = ["run_id", "label"] + [m[0] for m in METRICS]
         print(",".join(cols))
         for r in rows:
-            vals = [r.get("run_id", "")]
+            vals = [r.get("run_id", ""), r.get("_label", "")]
             for key, _, _ in METRICS:
                 vals.append(str(r.get(key, "")))
             print(",".join(vals))
@@ -72,7 +72,8 @@ def print_table(rows: list[dict], csv_mode: bool = False):
 
     # Table header
     id_w = 22
-    hdr = f"{'Run ID':>{id_w}}"
+    lbl_w = 30
+    hdr = f"{'Run ID':>{id_w}}  {'Label':<{lbl_w}}"
     for _, name, fmt in METRICS:
         hdr += f"  {name:>{len(fmt.format('0'))}}"
     print(hdr)
@@ -80,7 +81,8 @@ def print_table(rows: list[dict], csv_mode: bool = False):
 
     for r in rows:
         rid = (r.get("run_id", "") or "")[-id_w:]
-        line = f"{rid:>{id_w}}"
+        label = (r.get("_label", "") or "")[:lbl_w]
+        line = f"{rid:>{id_w}}  {label:<{lbl_w}}"
         for key, _, fmt in METRICS:
             val = r.get(key, "")
             if val == "" or val is None:

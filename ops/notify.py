@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""ops/notify.py -- Discord webhook notifications for Argus.
+
+Usage:
+    python ops/notify.py --test "Hello from Argus"
+    python ops/notify.py --backtest-complete <run_id>
+    python ops/notify.py --error "Something broke"
+
+Requires DISCORD_WEBHOOK_URL env var (or in .env file). Silently skips if not set.
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _load_webhook_url() -> str:
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if url:
+        return url
+    env_path = REPO / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("DISCORD_WEBHOOK_URL=") and not line.startswith("#"):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
+    return ""
+
+
+def send_discord(message: str = "", embed: dict = None, webhook_url: str = None) -> bool:
+    url = webhook_url or _load_webhook_url()
+    if not url:
+        return False
+    payload = {}
+    if message:
+        payload["content"] = message
+    if embed:
+        payload["embeds"] = [embed]
+    if not payload:
+        return False
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+    except Exception as e:
+        print(f"[notify] Discord send failed: {e}", file=sys.stderr)
+        return False
+
+
+def notify_backtest_complete(run_id: str, summary: dict = None):
+    if summary is None:
+        summary_path = REPO / "ops" / "logs" / f"bt_summary_{run_id}.json"
+        if summary_path.exists():
+            with open(summary_path) as f:
+                summary = json.load(f)
+        else:
+            send_discord(f"Backtest `{run_id}` completed (no summary found)")
+            return
+
+    trades = summary.get("trades_closed", 0)
+    wr = summary.get("win_rate_pct", "0")
+    pf = summary.get("profit_factor", "0")
+    pnl = summary.get("pnl_usd", "0")
+    dd = summary.get("max_drawdown_pct", "0")
+    exp = summary.get("expectancy_usd", "0")
+    fills = summary.get("entry_filled", 0)
+
+    pnl_f = float(pnl) if pnl else 0
+    color = 0x00E676 if pnl_f > 0 else 0xFF5252 if pnl_f < 0 else 0xBDBDBD
+
+    embed = {
+        "title": f"Backtest Complete: {run_id[-20:]}",
+        "color": color,
+        "fields": [
+            {"name": "Trades", "value": str(trades), "inline": True},
+            {"name": "Win Rate", "value": f"{wr}%", "inline": True},
+            {"name": "PF", "value": str(pf), "inline": True},
+            {"name": "PnL", "value": f"${pnl}", "inline": True},
+            {"name": "Max DD", "value": f"{dd}%", "inline": True},
+            {"name": "E[$/t]", "value": f"${exp}", "inline": True},
+            {"name": "Fills", "value": str(fills), "inline": True},
+        ],
+        "footer": {"text": "Argus Backtest Engine"},
+    }
+    send_discord(embed=embed)
+
+
+def notify_trade(action: str, symbol: str, price: float, qty: float):
+    color = 0x00E676 if action.upper() == "BUY" else 0xFF5252
+    embed = {
+        "title": f"{action.upper()} {symbol}",
+        "color": color,
+        "fields": [
+            {"name": "Price", "value": f"${price:.2f}", "inline": True},
+            {"name": "Qty", "value": f"{qty:.8f}", "inline": True},
+            {"name": "Notional", "value": f"${price * qty:.2f}", "inline": True},
+        ],
+        "footer": {"text": "Argus Live Runner"},
+    }
+    send_discord(embed=embed)
+
+
+def notify_error(error: str):
+    embed = {
+        "title": "Argus Error",
+        "description": error[:2000],
+        "color": 0xFF0000,
+        "footer": {"text": "Argus Alert"},
+    }
+    send_discord(embed=embed)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: python ops/notify.py --test 'msg' | --backtest-complete <run_id> | --error 'msg'")
+        return
+
+    if args[0] == "--test":
+        msg = args[1] if len(args) > 1 else "Test notification from Argus"
+        ok = send_discord(msg)
+        print(f"Sent: {ok}")
+    elif args[0] == "--backtest-complete":
+        if len(args) < 2:
+            print("Usage: --backtest-complete <run_id>")
+            return
+        notify_backtest_complete(args[1])
+    elif args[0] == "--error":
+        msg = args[1] if len(args) > 1 else "Unknown error"
+        notify_error(msg)
+    else:
+        print(f"Unknown flag: {args[0]}")
+
+
+if __name__ == "__main__":
+    main()

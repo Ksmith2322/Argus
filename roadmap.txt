@@ -92,16 +92,25 @@ Rules:
   Priority: STOP_LOSS > MIN_HOLD > TIME_STOP > TREND_INVALIDATION > TRAIL > TP.
 
 ### In-flight backtests (2026-03-13):
-  PC1: bt_20260313T233056Z_2019567a — 90-min TIME_STOP comparison (in progress)
-  PC2: bt_20260313T210852Z_2584fb3c — fresh candles run (in progress, ~55%)
+  PC1: bt_20260313T233056Z_2019567a — 90-min TIME_STOP + score80 + regime block (~52%)
+  PC1: bt_20260313T220804Z_fe895ebe — (different config, ~71%)
+  PC2: bt_20260313T210852Z_2584fb3c — fresh candles run (in progress)
+
+### Queued tests (7 jobs in ops/backtest_queue.jsonl):
+  1. 30min-timestop_score80_regime
+  2. 90min-timestop_score90_regime
+  3. 30min-timestop_score90_regime
+  4. 30min-timestop_score85_regime
+  5. 30min-trendline-penalties_score80_regime
+  6. btc-usd_30min_score80_regime (cross-asset)
+  7. sol-usd_30min_score80_regime (cross-asset)
 
 ### Next steps:
-  1. Time-stop backtest completes → compare vs 05d478d3 baseline
-  2. If 90-min helps: queue 30-min time-stop test (MAX_HOLD_SECONDS=1800)
-  3. Consider raising MIN_SCORE to 90 (only profitable score bucket)
+  1. In-flight backtests complete → auto-compare all runs
+  2. Run job queue: .\ops\run_queue.ps1 (7 configs, ~31 hours total)
+  3. Identify winning config from auto_compare.py results
   4. Restart PC1 live runner with winning config
-  5. BTC-USD + SOL-USD backtests (cross-asset validation)
-  6. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
+  5. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
 
 ---
 
@@ -148,10 +157,12 @@ Exit:
 
 ## Priority 1 — Strategy Edge
   [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
-  [TODO] Session filtering — hard-gate underperforming sessions (like RANGE regime gate)
+  [DONE] Session filtering — SESSION_ENTRY_BLOCK_LIST (like REGIME_ENTRY_BLOCK_LIST)
   [DONE] Multi-asset backtest support — BACKTEST_SYMBOL env var (e.g. BTC-USD, SOL-USD)
   [TODO] Expand to BTC-USD after ETH edge confirmed
-  [TODO] Compounding rules — when/how to scale position size as equity grows
+  [DONE] Compounding rules — COMPOUND_SIZE_PCT (% of equity per trade, scales with growth)
+    - When >0, overrides USD_PER_TRADE with equity * pct (e.g. 0.05 = 5%)
+    - Queued test: compound-5pct_30min_score80_regime
 
 ## Priority 2 — Multi-Timeframe Strategy  [TODO]
   [TODO] 4hr timeframe + S/R trendlines (Tori Trades swing approach)
@@ -175,12 +186,12 @@ Exit:
     - Integrated into refresh_candles.ps1 (blocks commit on FAIL)
     - Usage: python ops/validate_candles.py [file] [--strict]
 
-## Priority 4 — Real-time Live Dashboard  [TODO]
-  * FastAPI + websockets reading live_events.csv / live_signals.csv
-  * Chart.js equity curve updating in real time
-  * Current regime, score, session, position status panels
-  * Single command: python ops/dashboard.py -> localhost:8080
-  * No external dependencies (local only)
+## Priority 4 — Real-time Live Dashboard  [DONE 2026-03-13]
+  [DONE] FastAPI + SSE dashboard — ops/dashboard.py (localhost:8080)
+    - Equity curve (Chart.js), position status, PnL, runtime, config viewer
+    - Backtest progress panel (dynamic total bars from candle CSV)
+    - SSE push every 5s, auto-refresh equity/backtest panels
+  [DONE] Dashboard autostart — ops/autostart_dashboard.ps1 (Windows Startup shortcut)
 
 ## Priority 5 — PC1/PC2 Job Dispatch & Analysis Tools
   [DONE] PC2 dispatch reliability — schtasks detachment + log capture (survives SSH disconnect)
@@ -189,13 +200,16 @@ Exit:
   [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
   [DONE] Job queue — ops/run_queue.ps1 + backtest_queue.jsonl (sequential JSONL runner)
   [DONE] PC2 queue dispatch — ops/dispatch_queue_pc2.ps1 (push queue + start via schtasks)
-  [TODO] PC2 backtest completion alert via Discord webhook
+  [DONE] Unified status script — ops/status_all.ps1 (live runner + PC1/PC2 + queue in one command)
+  [DONE] Auto-compare leaderboard — ops/auto_compare.py (ranked table, --min-trades, --top, --csv)
+  [DONE] Artifact cleanup — ops/cleanup_artifacts.ps1 (keep N recent, protect in-progress runs)
+  [DONE] Discord alerts — ops/notify.py (backtest complete, trade, error) + run_queue.ps1 integration
 
 ## Priority 6 — Survivability
-  [TODO] Backup verification drill (automated weekly)
+  [DONE] Backup verification drill — ops/verify_backup.ps1 (git sync, key files, state freshness, candle data)
 
-## Priority 7 — Architecture Visualization  [TODO]
-  * ops/generate_map.py -> ARGUS_MAP.mermaid
+## Priority 7 — Architecture Visualization  [DONE 2026-03-13]
+  [DONE] ops/generate_map.py -> ARGUS_MAP.mermaid (64 modules, 7 layers, auto-generated)
 
 ## Priority 8 — ML as Governor  [TODO — needs 500+ trades]
   * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
@@ -249,7 +263,8 @@ Exit:
 
 # SCHEDULED TASKS (PC1)
 
-  ArgusRefreshCandles:  daily@03:00  -> ops/refresh_candles.ps1
+  ArgusRefreshCandles:  Sunday@03:00 -> ops/refresh_candles.ps1 (ETH+BTC+SOL, 30d)
   ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
   ArgusNightlyBT:       (Task Scheduler) -> ops/run_backtest.ps1
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
+  Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
