@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-14 01:59:55 CDT
+Last update: 2026-03-14 21:21:34 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       2595
+  - HOLD total:       2827
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -21,14 +21,14 @@ Hold reason counters:
   - HOLD_PAUSED: 0
   - HOLD_STALE_DATA: 1945
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 83
-  - HOLD_NO_TREND_OK: 424
+  - HOLD_NO_SIGNAL: 148
+  - HOLD_NO_TREND_OK: 523
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 111
+  - HOLD_OTHER: 179
 
 Last event:
-  reason: HOLD_NO_TREND_OK
-  detail: trend_ok=0 score=40 reasons=fast>slow;spread_ok(6.76bps) | px=2078.615 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=47 | delta=-15 | adj_score=32 | watch_th=58 | trade_th=85 | trend_strength=0.00068 | vol=0.00056 | liq:spread=NA;vol_1m=1.09535896;vol_floor>=25;vol_base=23.326532313;vol_need>=11.6633;atr_norm=0.0005591383952539140562987274307715779286809265613555908203125;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | liq_penalty=-20 | struct=STRUCT:near_sup(d=0.000473);near_res(d=0.000442) | liq=spread=NA;vol_1m=1.09535896;vol_floor>=25;vol_base=23.326532313;vol_need>=11.6633;atr_norm=0.0005591383952539140562987274307715779286809265613555908203125;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20
+  reason: HOLD_NO_SIGNAL
+  detail: signal=0 score=0 reasons= | px=2095.415 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=75 | delta=-15 | adj_score=60 | watch_th=58 | trade_th=85 | trend_strength=0.00009 | vol=0.00045 | liq:spread=NA;vol_1m=6.18560588;vol_floor>=25;vol_base=14.63544963833333333333333333;vol_need>=7.3177;atr_norm=0.000449897955288374763738179495931035489775240421295166015625;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | liq_penalty=-20 | struct=STRUCT:near_sup(d=0.000282);near_res(d=0.001315);reject_res | liq=spread=NA;vol_1m=6.18560588;vol_floor>=25;vol_base=14.63544963833333333333333333;vol_need>=7.3177;atr_norm=0.000449897955288374763738179495931035489775240421295166015625;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20

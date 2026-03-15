@@ -220,13 +220,9 @@ Exit:
 ## Priority 3 — Survivability & Recovery
   [DONE] Backup verification drill — ops/verify_backup.ps1 (weekly, Sunday@04:00)
   [DONE] Git auto-backup — ops/auto_git_backup.ps1 (daily@02:00)
-  [TODO] USB nightly backup — ops/backup_to_usb.ps1
-    - Mirror C:\Argus\ to USB drive (robocopy /MIR or similar)
-    - Include: repo, .venv, state, ops/logs (recent N days)
-    - Exclude: __pycache__, .git/objects (already on GitHub)
-    - Scheduled: nightly via Task Scheduler (e.g. 03:00)
-    - Validate: check USB free space, verify key files copied, log result
-    - Discord alert on failure
+  [DONE] USB nightly backup — ops/backup_to_usb.ps1 (scheduled ArgusUSBBackup daily@03:00)
+    - robocopy /MIR to USB E:\Argus_Backup, excludes __pycache__/.git/objects/*.pyc
+    - Logs: last 7 days only. Key file verification. Discord alert on success/failure.
   [TODO] Disaster recovery runbook — document full restore from USB + GitHub
 
 ## Priority 4 — Observability & Monitoring
@@ -297,4 +293,4 @@ Exit:
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
   Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
   ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
-  ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1 (TODO — not yet built)
+  ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1 (DONE — mirrors to USB E:\Argus_Backup)

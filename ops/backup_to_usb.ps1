@@ -160,6 +160,11 @@ $elapsed = (Get-Date) - (Get-Date $ts)
 Write-BackupLog "DONE: backup to ${DriveLetter}: complete"
 
 # Discord success notification
+$discordMsg = "USB Backup OK: ${DriveLetter}: -- ${freeGB} GB free, ${copied} log files copied"
+Write-BackupLog "Sending Discord notification: $discordMsg"
 try {
-    & $pyExe "$repoRoot\ops\notify.py" --test "USB Backup OK: ${DriveLetter}: ($freeGB GB free, $copied log files)" 2>$null
-} catch {}
+    & $pyExe "$repoRoot\ops\notify.py" --test $discordMsg
+    Write-BackupLog "Discord notification sent"
+} catch {
+    Write-BackupLog "WARNING: Discord notification failed: $_"
+}
