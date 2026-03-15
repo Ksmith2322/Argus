@@ -268,6 +268,12 @@ class BotState:
     last_action_ts: int = 0
 
     # -------------------------
+    # Partial TP + Breakeven Stop
+    # -------------------------
+    partial_tp_taken: bool = False
+    breakeven_stop: Optional[Decimal] = None
+
+    # -------------------------
     # MFE / MAE
     # -------------------------
     mfe_pct: Decimal = Decimal("0")
@@ -545,6 +551,8 @@ class BotState:
             "last_action_ts": int(self.last_action_ts or 0),
             "last_fill_poll_ts": int(self.last_fill_poll_ts or 0),
             "entry_epoch": int(self.entry_epoch or 0),
+            "partial_tp_taken": bool(self.partial_tp_taken),
+            "breakeven_stop": "" if self.breakeven_stop is None else str(self.breakeven_stop),
         }
 
     def save_runtime_snapshot(self, path: Optional[str] = None) -> str:
@@ -606,6 +614,9 @@ class BotState:
 
         entry_epoch = _as_int(payload.get("entry_epoch"), 0)
         self.entry_epoch = entry_epoch if entry_epoch > 0 else None
+
+        self.partial_tp_taken = _as_bool(payload.get("partial_tp_taken"), False)
+        self.breakeven_stop = _safe_decimal_or_none(payload.get("breakeven_stop"))
 
         qty = _as_decimal(payload.get("position_qty"), "0")
         avg_entry = _safe_decimal_or_none(payload.get("avg_entry"))
@@ -691,4 +702,6 @@ class BotState:
         self.peak_price = None
         self.high_since_entry = None
         self.low_since_entry = None
+        self.partial_tp_taken = False
+        self.breakeven_stop = None
         return self.save_runtime_snapshot()

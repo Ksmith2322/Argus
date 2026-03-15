@@ -226,6 +226,15 @@ if ($jobsRun -gt 0 -and -not $DryRun) {
     Write-Host "--- POST-QUEUE LEADERBOARD ---" -ForegroundColor Cyan
     & $pyExe "$repoRoot\ops\post_queue_report.py" --min-trades 10
 
+    # Auto-generate evolution visualization
+    Write-Host ""
+    Write-Host "--- BACKTEST EVOLUTION VIZ ---" -ForegroundColor Cyan
+    try {
+        & $pyExe "$repoRoot\ops\plot_backtest_evolution.py" --latest 30
+    } catch {
+        Write-Host "WARNING: evolution viz failed: $_" -ForegroundColor Yellow
+    }
+
     # Auto-cleanup: keep 20 most recent runs to prevent disk bloat
     Write-Host ""
     Write-Host "--- ARTIFACT CLEANUP ---" -ForegroundColor Cyan

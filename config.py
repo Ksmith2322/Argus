@@ -593,6 +593,20 @@ def load_config() -> dict:
     )
     cfg["EXIT_ATR_TRAIL_MULT"] = cfg[exit_atr_key]
 
+    # Breakeven stop offset after partial TP (fraction, e.g. 0.001 = 0.1%)
+    cfg["EXIT_BREAKEVEN_OFFSET_PCT"] = _d("EXIT_BREAKEVEN_OFFSET_PCT", "0.001")
+    cfg["EXIT_BREAKEVEN_OFFSET_PCT"] = _clamp_decimal(
+        cfg["EXIT_BREAKEVEN_OFFSET_PCT"], Decimal("0"), Decimal("0.05")
+    )
+
+    # -------------------------
+    # Cross-Coin Correlation Guard
+    # -------------------------
+    cfg["USE_CROSS_COIN_GUARD"] = _b("USE_CROSS_COIN_GUARD", "false")
+    cfg["CROSS_COIN_SYMBOLS"] = _s("CROSS_COIN_SYMBOLS", "ETH-USD,BTC-USD,SOL-USD")
+    cfg["CROSS_COIN_MAX_OPEN"] = _i("CROSS_COIN_MAX_OPEN", "2")
+    cfg["CROSS_COIN_MAX_OPEN"] = _clamp_int(cfg["CROSS_COIN_MAX_OPEN"], 0, 20)
+
     # -------------------------
     # Trade tracker
     # -------------------------
