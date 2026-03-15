@@ -11,12 +11,16 @@ serves a single-page dashboard with auto-refreshing panels.
 import argparse
 import csv
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("argus.dashboard")
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -61,6 +65,7 @@ def read_runtime_state(coin: str = "ETH") -> dict:
         with open(path) as f:
             return json.load(f)
     except Exception:
+        log.warning("Failed to read runtime state: %s", path, exc_info=True)
         return {}
 
 
@@ -73,6 +78,7 @@ def read_runtime_mode() -> dict:
         with open(path) as f:
             return json.load(f)
     except Exception:
+        log.warning("Failed to read runtime mode: %s", path, exc_info=True)
         return {}
 
 
@@ -85,6 +91,7 @@ def read_run_manifest() -> dict:
         with open(manifests[-1]) as f:
             return json.load(f)
     except Exception:
+        log.warning("Failed to read manifest: %s", manifests[-1], exc_info=True)
         return {}
 
 
@@ -101,6 +108,7 @@ def read_account_tail(n: int = 5, coin: str = "ETH") -> list:
                 rows.append(row)
         return rows[-n:]
     except Exception:
+        log.warning("Failed to read account: %s", path, exc_info=True)
         return []
 
 
@@ -117,6 +125,7 @@ def read_fills_tail(n: int = 20, coin: str = "ETH") -> list:
                 rows.append(row)
         return rows[-n:]
     except Exception:
+        log.warning("Failed to read fills: %s", path, exc_info=True)
         return []
 
 
@@ -134,6 +143,7 @@ def read_trade_journal(n: int = 20, coin: str = "ETH") -> list:
                 rows.append(row)
         return rows[-n:]
     except Exception:
+        log.warning("Failed to read trade journal", exc_info=True)
         return []
 
 
@@ -154,6 +164,7 @@ def read_signals_tail(n: int = 5, coin: str = "ETH") -> list:
                 rows.append(row)
         return rows[-n:]
     except Exception:
+        log.warning("Failed to read signals: %s", path, exc_info=True)
         return []
 
 
@@ -173,6 +184,7 @@ def read_events_tail(n: int = 20, coin: str = "ETH") -> list:
                 rows.append(row)
         return rows[-n:]
     except Exception:
+        log.warning("Failed to read events: %s", path, exc_info=True)
         return []
 
 
@@ -199,6 +211,7 @@ def read_equity_series(coin: str = "ETH") -> list:
                         pass
         return points
     except Exception:
+        log.warning("Failed to read equity series", exc_info=True)
         return []
 
 
@@ -229,7 +242,7 @@ def read_decision_flow(n: int = 30, coin: str = "ETH") -> list:
                     "session": row.get("session", ""),
                 })
         except Exception:
-            pass
+            log.warning("Failed to read decision events", exc_info=True)
     # Enrich with governor data from live_signals.csv
     coin_dir_dc = OPS_LOGS / coin.lower()
     per_coin_sig = coin_dir_dc / "live_signals.csv"
@@ -258,7 +271,7 @@ def read_decision_flow(n: int = 30, coin: str = "ETH") -> list:
                 if gr["ts"] not in seen_ts:
                     decisions.append(gr)
         except Exception:
-            pass
+            log.warning("Failed to read governor signals", exc_info=True)
     decisions.sort(key=lambda x: x.get("ts", ""), reverse=True)
     return decisions[:n]
 
@@ -289,6 +302,7 @@ def read_governor_latest(coin: str = "ETH") -> dict:
             }
         return {}
     except Exception:
+        log.warning("Failed to read governor latest: %s", sig_path, exc_info=True)
         return {}
 
 
@@ -611,8 +625,19 @@ async def status_stream(request: Request, coin: str = "ETH"):
     while True:
         if await request.is_disconnected():
             break
-        data = json.dumps(build_status(coin), default=str)
-        yield {"event": "status", "data": data}
+        try:
+            data = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: json.dumps(build_status(coin), default=str)
+                ),
+                timeout=10.0,
+            )
+            yield {"event": "status", "data": data}
+        except asyncio.TimeoutError:
+            log.warning("build_status(%s) timed out after 10s", coin)
+            yield {"event": "status", "data": json.dumps({"error": "status_timeout"})}
+        except Exception:
+            log.warning("SSE build_status error for %s", coin, exc_info=True)
         await asyncio.sleep(5)
 
 

@@ -84,6 +84,9 @@ function Invoke-QueueJob {
     $jobSuccess = $false
     $runId = ""
 
+    # Clean sandbox bleed before each job (belt-and-suspenders)
+    Clear-SandboxBleed
+
     try {
         Write-QueueLog "START: $label"
 
@@ -138,8 +141,24 @@ function Invoke-QueueJob {
     return $jobSuccess
 }
 
-# ---- Pre-queue candle refresh ----
+# ---- Pre-queue sandbox cleanup ----
+# Remove stale live_*.csv from repo\logs that cause Assert-NoRepoLogsBleed failures
+function Clear-SandboxBleed {
+    $repoLogs = Join-Path $repoRoot "logs"
+    if (!(Test-Path $repoLogs)) { return }
+    $staleFiles = Get-ChildItem $repoLogs -Filter "live_*.csv" -ErrorAction SilentlyContinue
+    if ($staleFiles) {
+        Write-Host "Cleaning stale sandbox artifacts from repo\logs:" -ForegroundColor Yellow
+        foreach ($f in $staleFiles) {
+            Write-Host "  Removing: $($f.Name)" -ForegroundColor Yellow
+            Remove-Item $f.FullName -Force
+        }
+    }
+}
+
 if (-not $DryRun) {
+    Clear-SandboxBleed
+
     $refreshScript = "$repoRoot\ops\refresh_candles.ps1"
     if (Test-Path $refreshScript) {
         Write-Host "Refreshing candle data before queue start..." -ForegroundColor Cyan
@@ -206,4 +225,13 @@ if ($jobsRun -gt 0 -and -not $DryRun) {
     Write-Host ""
     Write-Host "--- POST-QUEUE LEADERBOARD ---" -ForegroundColor Cyan
     & $pyExe "$repoRoot\ops\post_queue_report.py" --min-trades 10
+
+    # Auto-cleanup: keep 20 most recent runs to prevent disk bloat
+    Write-Host ""
+    Write-Host "--- ARTIFACT CLEANUP ---" -ForegroundColor Cyan
+    try {
+        & "$repoRoot\ops\cleanup_artifacts.ps1" -Keep 20
+    } catch {
+        Write-Host "WARNING: cleanup failed: $_" -ForegroundColor Yellow
+    }
 }
