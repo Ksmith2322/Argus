@@ -11,7 +11,7 @@ param(
     [string]$QueueFile = "ops\backtest_queue.jsonl"
 )
 
-$PC2 = "ksmith2322@yahoo.com@desktop-17cjmup"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
 $BRANCH = "phase6-hardening"
 
 Write-Host "--- DISPATCH QUEUE TO PC2 ---" -ForegroundColor Cyan

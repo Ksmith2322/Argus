@@ -2,7 +2,7 @@
 # Usage: .\ops\check_pc2.ps1
 param()
 
-$PC2 = "ksmith2322@yahoo.com@desktop-17cjmup"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
 
 Write-Host "--- PC2 BACKTEST STATUS ---" -ForegroundColor Cyan
 

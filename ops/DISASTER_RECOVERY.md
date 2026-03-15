@@ -129,7 +129,7 @@ Note: If USB backup is also stale, runner can recover from `fills.csv` alone (co
 
 ## Scenario D: PC1 Dead, Failover to PC2
 
-PC1 is completely down. Run everything on PC2 (DESKTOP-17CJMUP) temporarily.
+PC1 is completely down. Run everything on PC2 (192.168.1.98) temporarily.
 
 1. On PC2, pull latest code:
    ```powershell

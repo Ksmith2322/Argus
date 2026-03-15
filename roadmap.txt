@@ -228,7 +228,7 @@ Exit:
 ## Priority 4 — Observability & Monitoring
   [DONE] Dashboard queue panel — live queue status, running job, progress bar, pending counts
   [TODO] Dashboard trade journal viewer — browse closed trades with filters
-  [TODO] Candle gap alerting — proactive Discord alert when feed gaps detected
+  [DONE] Candle gap alerting — ops/check_candle_gaps.py (Discord alert on gaps > 5min)
   [DONE] Weekly performance digest — ops/weekly_digest.py (Discord embed, --days N, --no-discord)
   [DONE] Disaster recovery runbook — ops/DISASTER_RECOVERY.md (4 scenarios: HDD fail, repo corrupt, state corrupt, PC1 failover)
 

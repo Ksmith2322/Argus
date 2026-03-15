@@ -1,0 +1,1 @@
+& "C:\Argus\.venv\Scripts\python.exe" "C:\Argus\repo\ops\weekly_digest.py"
