@@ -42,55 +42,33 @@ Rules:
   2. PENALIZE mode penalty never applied — early return bug. Fixed: penalty applied first.
   3. TL_PENALTY_RESIST_SLOPE_NEG feature added (confluence.py + config.py + .env).
 
-### Old Baseline (2026-03-12, dataset Feb 9–Mar 11, 43K candles):
-  WR=25.35%  PF=0.74  trades=71  PnL=-$5.05
-  Liq fix test: neutral. Trendline bonus test: WORSE (bonuses promote marginal entries).
-  VERDICT: FAIL — bear/chop dataset, not a filter problem.
-
 ### Fresh Baseline (2026-03-13, dataset Feb 11–Mar 13, 43K candles):
-  run_id: bt_20260313T060439Z_9518a56d (determinism confirmed, Run 1 = Run 2)
+  run_id: bt_20260313T060439Z_9518a56d (determinism confirmed)
   77 trades, 24.68% WR, PF=0.74, PnL=-$5.92, avg_win=$0.52, avg_loss=$0.23 (R:R 2.2:1)
-  Consistent with old baseline — strategy is stable but underwater.
 
-### Score Analysis (fresh baseline):
-  Score < 75:  33 trades, 15.2% WR, PnL=-$5.90  (LOSING)
-  Score 75-79: 13 trades,  7.7% WR, PnL=-$1.52  (LOSING)
-  Score 80-84: 16 trades, 18.8% WR, PnL=-$2.02  (LOSING)
-  Score 85-89:  3 trades, 33.3% WR, PnL=+$0.19  (BREAK-EVEN)
-  Score 90+:   12 trades, 75.0% WR, PnL=+$5.71  (WINNING)
+### Key Findings:
+  Score 90+: 12 trades, 75.0% WR, PnL=+$5.71 (WINNING)
+  Score <85: mostly losing. RANGE regime: 0% WR (ALL LOSSES).
+  Duration <30m: 70.4% WR, PnL=+$11.75 (MASSIVE WINNER)
+  Duration 30m-3h: 3% WR (DEAD ZONE — all losers)
+  OVERLAP session: best WR. OFF session: worst.
 
-  RANGE regime: 9 trades, 0% WR, PnL=-$2.20 (ALL LOSSES)
-  TREND_UP:    68 trades, 27.9% WR, PnL=-$1.34
+### Optimization Queue (running 2026-03-14, PC1+PC2):
+  PC1 (3 done + 2 queued):
+    [DONE] 90min-timestop_score90_regime → PF=1.06, WR=33.9%, 62 trades (BEST SO FAR)
+    [DONE] 30min-timestop_score80_regime → PF=0.76, WR=36.1%, 119 trades
+    [RUN]  30min-timestop_score85_regime
+    [QUEUE] 30min-timestop_score90_blockOFF
+    [QUEUE] 30min-timestop_score90_OVERLAPonly
+  PC2 (4 jobs dispatched):
+    [RUN]  30min-trendline-penalties_score80_regime
+    [QUEUE] btc-usd_30min_score80_regime (cross-asset)
+    [QUEUE] sol-usd_30min_score80_regime (cross-asset)
+    [QUEUE] compound-5pct_30min_score80_regime
 
-### Duration Analysis (strongest alpha signal — confirmed across both runs):
-  <30m:     27 trades, 70.4% WR, PnL=+$11.75  (MASSIVE WINNER)
-  30m-1.5h: 28 trades,  3.6% WR, PnL=-$7.51   (DEAD ZONE — all losers)
-  1.5-3h:   36 trades,  2.8% WR, PnL=-$7.77   (DEAD ZONE)
-  >3h:      44 trades, 22.7% WR, PnL=-$2.95   (slight recovery)
-
-### Time-Stop Exit (implemented 2026-03-13):
-  MAX_HOLD_SECONDS=5400 (90 min). Closes position if held too long.
-  Priority: STOP_LOSS > MIN_HOLD > TIME_STOP > TREND_INVALIDATION > TRAIL > TP.
-
-### Queued Optimization Tests (8 jobs, running on PC1+PC2 in parallel ~18h):
-  PC1 queue (ops/backtest_queue.jsonl):
-    1. 90min-timestop_score90_regime
-    2. 30min-timestop_score90_regime
-    3. 30min-timestop_score85_regime
-  PC2 queue (ops/backtest_queue_pc2.jsonl):
-    4. 30min-trendline-penalties_score80_regime
-    5. btc-usd_30min_score80_regime (cross-asset)
-    6. sol-usd_30min_score80_regime (cross-asset)
-    7. compound-5pct_30min_score80_regime
-
-  Queue watcher (watch_and_launch_queue.ps1) running — auto-launches when in-flight BTs finish.
-  Post-queue report (post_queue_report.py) auto-sends leaderboard to Discord on completion.
-
-### Next steps:
-  1. Queue finishes → review Discord leaderboard
-  2. Identify winning config from post_queue_report.py output
-  3. Lock winning config, restart PC1 live runner
-  4. Phase 16.5 EXIT when backtest confirms WR>=35% AND PF>=1.20
+### Exit criteria: WR>=35% AND PF>=1.20
+  Best so far: 90min+score90+regime → PF=1.06 (gap: PF needs +0.14, WR needs +1.1%)
+  Session filtering (blockOFF, OVERLAP-only) is the next lever to test.
 
 ---
 
@@ -133,112 +111,105 @@ Exit:
 
 ---
 
-# INFRASTRUCTURE DONE (collapsed)
+# PRIORITY 1 — Strategy Edge  [AFTER PHASE 16.5]
 
-## Ops & Analysis Tools  [ALL DONE 2026-03-13/14]
-  [DONE] PC2 dispatch reliability — schtasks detachment + log capture
-  [DONE] Run comparison tool — ops/compare_runs.py
-  [DONE] Score/duration analyzer — ops/analyze_scores.py
-  [DONE] Post-backtest auto-compare — ops/post_backtest_compare.ps1
-  [DONE] Job queue — ops/run_queue.ps1 + backtest_queue.jsonl
-  [DONE] PC2 queue dispatch — ops/dispatch_queue_pc2.ps1
-  [DONE] Unified status script — ops/status_all.ps1
-  [DONE] Auto-compare leaderboard — ops/auto_compare.py
-  [DONE] Artifact cleanup — ops/cleanup_artifacts.ps1
-  [DONE] Discord alerts — ops/notify.py (backtest complete, trade close, error, runner start/crash)
-  [DONE] Equity overlay chart — ops/plot_equity_overlay.py
-  [DONE] Trade export tool — ops/export_trades.py
-  [DONE] Queue watcher — ops/watch_and_launch_queue.ps1
-  [DONE] Post-queue report — ops/post_queue_report.py
-  [DONE] Dashboard — ops/dashboard.py (FastAPI + SSE + Chart.js, localhost:8080)
-  [DONE] Architecture map — ops/generate_map.py -> ARGUS_MAP.mermaid
-  [DONE] Backup verification — ops/verify_backup.ps1
-
-## Strategy Features Built  [ALL DONE]
-  [DONE] Session filtering — SESSION_ENTRY_BLOCK_LIST
-  [DONE] Multi-asset backtest — BACKTEST_SYMBOL env var
-  [DONE] Compounding rules — COMPOUND_SIZE_PCT
-  [DONE] Drawdown circuit breaker — DRAWDOWN_PAUSE_PCT
-  [DONE] Candle data validation — ops/validate_candles.py
-  [DONE] Time-stop exit — MAX_HOLD_SECONDS
-  [DONE] 4hr candle aggregation — CandleBuilder(14400) + 50-candle rolling buffer in state/engine
-
-## Risk & Safety  [ALL DONE]
-  [DONE] Drawdown circuit breaker (DRAWDOWN_PAUSE_PCT=0.03)
-  [DONE] Candle data validation (ops/validate_candles.py)
-
----
-
-# FUTURE PRIORITIES
-
-## Priority 1 — Strategy Edge  [AFTER PHASE 16.5]
-  [TEST] Trendline penalties only (disable bonuses, keep -8/-15 penalties + slope_neg)
+  [TEST] Trendline penalties only (queued on PC2 — disable bonuses, keep penalties)
   [TODO] Expand to BTC-USD after ETH edge confirmed
   [TODO] Adaptive score threshold — auto-adjust CONFLUENCE_MIN_SCORE based on rolling WR
   [TODO] Volume-weighted entry timing — prefer entries at volume spikes vs quiet periods
   [TODO] Fake-out detection & mitigation
-    - Identify entries that reverse quickly after fill (e.g. price drops X% within N bars)
-    - Possible signals: wick rejection, volume divergence at entry, order book imbalance
-    - Could add a "confirmation delay" — wait N bars after signal before entering
-    - Track fake-out rate per score bucket / regime / session to find patterns
+    - Identify entries that reverse quickly after fill
+    - Signals: wick rejection, volume divergence, order book imbalance
+    - Confirmation delay: wait N bars after signal before entering
+    - Track fake-out rate per score bucket / regime / session
     - Related: the 30m-3h dead zone is likely dominated by fake-outs
   [TODO] Liquidation-aware entry gating
-    - Monitor large liquidation events by size (whale liquidations vs retail)
-    - Block entries near large liquidation cascades (momentum is unreliable)
-    - Possibly use liquidations AS signals — large liq clusters can mark reversals
+    - Monitor large liquidation events by size (whale vs retail)
+    - Block entries near large liquidation cascades
+    - Use liquidations AS signals — large clusters can mark reversals
     - Needs: liquidation data feed or estimation from price/volume spikes
   [TODO] Short selling support
-    - Currently long-only; adding shorts doubles opportunity set
-    - Engine: support SELL-to-open (short entry) + BUY-to-close (short exit)
-    - Ledger: track negative positions, short PnL = (entry - exit) * qty
-    - PaperAdapter: simulate short fills (same interface)
-    - Confluence: may need separate score thresholds for shorts vs longs
-    - Risk: separate drawdown limits for short book
-    - Phase: implement after long-only edge is proven (Phase 17+)
+    - Engine: SELL-to-open + BUY-to-close
+    - Ledger: negative positions, short PnL = (entry - exit) * qty
+    - PaperAdapter: simulate short fills
+    - Separate score thresholds and drawdown limits for short book
+    - Phase: after long-only edge proven (Phase 17+)
   [TODO] Pyramiding / add-to-winners
-    - When position is profitable and trend continues, add to position size
-    - Rules: only add if unrealized PnL > X%, max N additions, trailing stop on full position
-    - Exit: close entire position at once (not partial — sell whole stack)
-    - Needs: multi-fill position tracking in ledger (currently single entry/exit)
-    - Risk: larger position = larger drawdown if reversal — needs tight trailing stop
+    - Add to position when profitable and trend continues
+    - Rules: unrealized PnL > X%, max N additions, trailing stop on full position
+    - Needs: multi-fill position tracking in ledger
   [TODO] Mean-reversion strategy
-    - Opposite of current momentum/confluence approach
-    - Entry: price deviates X std devs from moving average → enter expecting reversion
-    - Signals: RSI oversold/overbought, Bollinger Band extremes, volume exhaustion
-    - Could run alongside momentum strategy (strategy coordination layer)
-    - Best in RANGE regime (where momentum strategy loses)
-    - Needs: separate backtest validation, own score/confluence path
-    - Phase: build as second strategy, test independently, then coordinate
+    - Entry: price deviates X std devs from MA → enter expecting reversion
+    - Signals: RSI, Bollinger extremes, volume exhaustion
+    - Best in RANGE regime (where momentum loses)
+    - Build as second strategy, test independently, then coordinate
 
-## Priority 2 — Multi-Timeframe Strategy  [TODO — foundation built]
+# PRIORITY 2 — Multi-Timeframe Strategy  [TODO — foundation built]
+
   [DONE] 4hr candle aggregation in engine (CandleBuilder + rolling buffer)
   [TODO] S/R trendline detection on 4hr chart (pivot highs/lows → projected lines)
   [TODO] Entry signals based on 4hr S/R bounces/breaks
   [TODO] Sliding window position sizing (rolling WR/PF per signal → size scaling)
   [TODO] Strategy coordination layer (1m confluence + 4hr swing coexistence)
 
-## Priority 3 — Survivability & Recovery
-  [DONE] Backup verification drill — ops/verify_backup.ps1 (weekly, Sunday@04:00)
-  [DONE] Git auto-backup — ops/auto_git_backup.ps1 (daily@02:00)
-  [DONE] USB nightly backup — ops/backup_to_usb.ps1 (scheduled ArgusUSBBackup daily@03:00)
-    - robocopy /MIR to USB E:\Argus_Backup, excludes __pycache__/.git/objects/*.pyc
-    - Logs: last 7 days only. Key file verification. Discord alert on success/failure.
-  [DONE] Disaster recovery runbook — ops/DISASTER_RECOVERY.md (4 scenarios)
+# PRIORITY 3 — ML as Governor  [READY — 1,029 backtest trades available]
 
-## Priority 4 — Observability & Monitoring
-  [DONE] Dashboard queue panel — live queue status, running job, progress bar, pending counts
-  [DONE] Dashboard trade journal viewer — filterable by result/exit reason/regime, live stats
-  [DONE] Candle gap alerting — ops/check_candle_gaps.py (Discord alert on gaps > 5min)
-  [DONE] Weekly performance digest — ops/weekly_digest.py (Discord embed, --days N, --no-discord)
-  [DONE] Disaster recovery runbook — ops/DISASTER_RECOVERY.md (4 scenarios: HDD fail, repo corrupt, state corrupt, PC1 failover)
+  Trade data: 1,029 backtest trades (ETH+BTC+SOL) + 1 live trade
+  Threshold met: 500+ trades exceeded as of 2026-03-14
 
-## Priority 5 — ML as Governor  [TODO — needs 500+ trades across all assets]
-  * 500 trades = combined ETH + BTC + SOL (backtest + live)
-  * Current queue includes BTC-USD and SOL-USD runs — those trades count
-  * Regime classifier: predicts TREND/RANGE/VOLATILE from 1h features
-  * Anomaly detector: flags unusual fill patterns or execution drift
-  * Capital allocation ranker: rank entry opportunities by predicted quality
-  * NEVER replaces deterministic engine — acts as score modifier only
+  Phase 1: Feature extraction + dataset build
+    [TODO] Extract per-trade feature vectors from backtest artifacts
+      - Entry: confluence_score, regime, session, MA distances, volume ratios, spread
+      - Context: time_of_day, day_of_week, recent_volatility, trend_strength
+      - Outcome: win/loss, PnL, duration, exit_reason, MAE, MFE
+    [TODO] Build unified trade dataset (CSV or parquet) across all runs
+    [TODO] Feature correlation analysis — identify redundant/useless features
+
+  Phase 2: Regime classifier
+    [TODO] Train regime classifier: TREND_UP / TREND_DOWN / RANGE / VOLATILE
+      - Input: 1h candle features (MA slopes, ATR, volume trend, candle patterns)
+      - Output: regime label + confidence
+      - Validate against current deterministic regime detection
+    [TODO] Compare ML regime vs rule-based regime on historical data
+
+  Phase 3: Entry quality scoring
+    [TODO] Train win probability model on trade feature vectors
+      - Binary classification: win (PnL > 0) vs loss
+      - Features: score, regime, session, duration context, volume
+      - Output: P(win) as ML-adjusted score modifier
+    [TODO] Backtest with ML score modifier vs baseline
+
+  Phase 4: Anomaly detection
+    [TODO] Train anomaly detector on fill patterns and execution metrics
+      - Flags: unusual latency, price deviation from expected, volume anomalies
+      - Goal: early warning for market microstructure changes
+
+  Rules (hard — never violate):
+    * ML NEVER replaces deterministic engine — acts as score modifier only
+    * All ML decisions must be logged and traceable
+    * ML can reduce position size or block entry, never force entry
+    * Deterministic rules always have final veto
+    * Model must be retrained on fresh data periodically
+
+---
+
+# INFRASTRUCTURE (ALL DONE — collapsed)
+
+## Ops & Analysis Tools  [ALL DONE 2026-03-13/14]
+  PC2 dispatch, run comparison, score/duration analyzer, post-backtest compare,
+  job queue (PC1+PC2), unified status, auto-compare leaderboard, artifact cleanup,
+  Discord alerts (backtest/trade/error/runner), equity overlay chart, trade export,
+  queue watcher, post-queue report, dashboard (FastAPI+SSE+Chart.js), architecture map,
+  backup verification, candle gap alerting, weekly digest, DR runbook,
+  dashboard queue panel, dashboard trade journal viewer.
+
+## Strategy Features Built  [ALL DONE]
+  Session filtering, multi-asset backtest, compounding rules, drawdown circuit breaker,
+  candle data validation, time-stop exit, 4hr candle aggregation.
+
+## Survivability & Recovery  [ALL DONE]
+  Git auto-backup (daily@02:00), USB nightly backup (daily@03:00),
+  backup verification drill (weekly Sunday@04:00), disaster recovery runbook.
 
 ---
 
@@ -260,7 +231,7 @@ Exit:
 # TWO-MACHINE SETUP
 
   PC1 (WINDOWS-5RCTEK3): runner_live.py 24/7, dev work, heavy backtests
-  PC2 (DESKTOP-17CJMUP): offloaded backtest jobs
+  PC2 (DESKTOP-17CJMUP / 192.168.1.98): offloaded backtest jobs
   GitHub: Ksmith2322/Argus, branch phase6-hardening
   SSH: passwordless ED25519 key, dispatch via ops/dispatch_backtest_pc2.ps1
   .env tracked in git (paper trading, no real keys)
@@ -281,17 +252,18 @@ Exit:
     Broke below support:        -15 to score + HARD BLOCK
     Resistance slope negative:   -5 to score (TL_PENALTY_RESIST_SLOPE_NEG)
 
-  Status: USE_TRENDLINES=false. Bonuses were counterproductive in 2026-03-12 test.
-  Next test: penalties only with TL_PENALTY_RESIST_SLOPE_NEG=5 (queued on PC2).
+  Status: USE_TRENDLINES=false. Bonuses counterproductive in 2026-03-12 test.
+  Penalties-only test queued on PC2 (with TL_PENALTY_RESIST_SLOPE_NEG=5).
 
 ---
 
 # SCHEDULED TASKS (PC1)
 
-  ArgusRefreshCandles:  Sunday@03:00 -> ops/refresh_candles.ps1 (ETH+BTC+SOL, 30d)
   ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
-  ArgusNightlyBT:       (Task Scheduler) -> ops/run_backtest.ps1
+  Argus_Nightly_Backtest: daily@02:10 -> ops/run_backtest.ps1
+  ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1
+  ArgusRefreshCandles:  Sunday@03:00 -> ops/refresh_candles.ps1 (ETH+BTC+SOL, 30d)
+  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
+  ArgusWeeklyDigest:    Sunday@06:00 -> ops/weekly_digest.py (Discord performance report)
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
   Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
-  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
-  ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1 (DONE — mirrors to USB E:\Argus_Backup)
