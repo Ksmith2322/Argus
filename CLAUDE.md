@@ -112,15 +112,6 @@ Shell env hygiene: if `ARGUS_BT_ARTIFACT_DIR` is set in the shell from a prior r
 
 Config is loaded from `.env` in repo root (or path in `DOTENV_PATH`). Mode flag `ARGUS_MODE` controls backtest vs live behavior. `BACKTEST_LIMIT` controls how many candles to run (default `720`). `EXECUTION_MODE=ADAPTER` enables Phase 8 paper adapter for live; backtest ignores this.
 
-## Hazard Files — Do Not Use
-
-These are legacy entry points that reference a defunct `nova_scripts` package:
-- `main.py`
-- `run_main.py`
-- `backtest/run_backtest_LEGACY_DO_NOT_USE.py`
-
-Also avoid `logger.py` — it is a legacy duplicate IO path superseded by `io_logs.py`.
-
 ## Data
 
 Historical candle CSV: `C:\Argus\repo\data\eth_usd_1m.csv`

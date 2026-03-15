@@ -6,21 +6,25 @@
 # Usage (Task Scheduler -- every 5 minutes):
 #   schtasks /create /tn "ArgusWatchdog" /tr "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\Argus\repo\ops\watchdog.ps1" /sc minute /mo 5 /f
 #
-# What it does:
-#   1. Checks if runner_live.py is running (python process with runner_live in cmdline)
-#   2. If not running, sends Discord alert and restarts it
-#   3. If running, optionally sends heartbeat to Discord (every 6 hours)
-#   4. Logs all actions to ops/logs/watchdog.log
+# Multi-coin aware:
+#   1. Checks if runner_live.py processes are running (python with runner_live in cmdline)
+#   2. Checks per-coin state freshness (ETH, BTC, SOL) via saved_at timestamp
+#   3. If no runners found, sends Discord alert and restarts via launch_multi.ps1
+#   4. If running, optionally sends heartbeat to Discord (every 6 hours)
+#   5. Warns about stale coins (state not updated within StaleMinutes)
+#   6. Logs all actions to ops/logs/watchdog.log
 
 param(
     [switch]$DryRun,
-    [int]$HeartbeatEveryHours = 6
+    [int]$HeartbeatEveryHours = 6,
+    [int]$StaleMinutes = 5
 )
 
 $repoRoot = "C:\Argus\repo"
 $pyExe = "C:\Argus\.venv\Scripts\python.exe"
 $logFile = Join-Path $repoRoot "ops\logs\watchdog.log"
 $heartbeatFile = Join-Path $repoRoot "ops\logs\watchdog_last_heartbeat.txt"
+$coins = @("ETH", "BTC", "SOL")
 
 function Write-WatchdogLog($msg) {
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -37,18 +41,54 @@ function Send-Discord($msg) {
     }
 }
 
-function Is-RunnerAlive {
-    # Look for python processes running runner_live.py
+function Get-RunnerProcesses {
+    $runners = @()
     $procs = Get-Process -Name "python*" -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
         try {
             $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue).CommandLine
             if ($cmdline -and $cmdline -match "runner_live") {
-                return $true
+                $uptime = (Get-Date) - $p.StartTime
+                $runners += @{
+                    Pid = $p.Id
+                    Uptime = $uptime
+                    UptimeStr = "$([math]::Round($uptime.TotalHours, 1))h"
+                }
             }
         } catch {}
     }
-    return $false
+    return $runners
+}
+
+function Get-CoinStatus {
+    param([string]$coin)
+    $stateFile = Join-Path $repoRoot "state\runtime_state_${coin}_USD.json"
+    $result = @{
+        Coin = $coin
+        Found = $false
+        BotState = "UNKNOWN"
+        Cash = 0
+        Pnl = 0
+        Stale = $true
+        AgeMinutes = -1
+    }
+    if (Test-Path $stateFile) {
+        try {
+            $state = Get-Content $stateFile -Raw | ConvertFrom-Json
+            $result.Found = $true
+            $result.BotState = $state.bot_state
+            $result.Cash = [math]::Round([double]$state.cash, 2)
+            $result.Pnl = [math]::Round([double]$state.realized_pnl, 4)
+            $savedAt = [double]$state.saved_at
+            if ($savedAt -gt 0) {
+                $savedTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$savedAt).UtcDateTime
+                $age = (Get-Date).ToUniversalTime() - $savedTime
+                $result.AgeMinutes = [math]::Round($age.TotalMinutes, 1)
+                $result.Stale = ($age.TotalMinutes -gt $StaleMinutes)
+            }
+        } catch {}
+    }
+    return $result
 }
 
 function Should-SendHeartbeat {
@@ -66,61 +106,73 @@ function Should-SendHeartbeat {
 # --- Main ---
 Set-Location $repoRoot
 
-if (Is-RunnerAlive) {
-    # Runner is alive
+$runners = Get-RunnerProcesses
+$runnerCount = @($runners).Count
+
+# Collect per-coin status
+$coinStatuses = @()
+$staleCoinsList = @()
+$healthyCoins = @()
+foreach ($coin in $coins) {
+    $cs = Get-CoinStatus -coin $coin
+    $coinStatuses += $cs
+    if ($cs.Found -and (-not $cs.Stale)) {
+        $healthyCoins += $coin
+    } elseif ($cs.Found -and $cs.Stale) {
+        $staleCoinsList += $coin
+    }
+}
+
+# Build summary string
+$summaryParts = @()
+foreach ($cs in $coinStatuses) {
+    $ageTxt = "$($cs.AgeMinutes)m"
+    if ($cs.Found) {
+        $tag = if ($cs.Stale) { "STALE($ageTxt)" } else { "ok($ageTxt)" }
+        $summaryParts += "$($cs.Coin):$($cs.BotState)/$tag/`$$($cs.Cash)"
+    } else {
+        $summaryParts += "$($cs.Coin):NO_STATE"
+    }
+}
+$statusSummary = $summaryParts -join " | "
+
+if ($runnerCount -gt 0) {
+    $uptimeStr = (@($runners) | ForEach-Object { $_.UptimeStr }) -join ","
+
     if (Should-SendHeartbeat) {
-        # Read state for heartbeat info
-        $stateFile = Join-Path $repoRoot "state\runtime_state_ETH_USD.json"
-        $info = "running"
-        if (Test-Path $stateFile) {
-            try {
-                $state = Get-Content $stateFile | ConvertFrom-Json
-                $botState = $state.bot_state
-                $cash = [math]::Round([double]$state.cash, 2)
-                $pnl = [math]::Round([double]$state.realized_pnl, 4)
-                $info = "state=$botState cash=`$$cash pnl=`$$pnl"
-            } catch {}
-        }
-
-        $uptimeInfo = ""
-        try {
-            $procs = Get-Process -Name "python*" -ErrorAction SilentlyContinue
-            foreach ($p in $procs) {
-                $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue).CommandLine
-                if ($cmdline -and $cmdline -match "runner_live") {
-                    $uptime = (Get-Date) - $p.StartTime
-                    $uptimeInfo = " uptime=$([math]::Round($uptime.TotalHours, 1))h"
-                    break
-                }
-            }
-        } catch {}
-
+        $hbMsg = "Argus Heartbeat OK: ${runnerCount} runner(s) uptime=$uptimeStr | $statusSummary"
         if (-not $DryRun) {
-            Send-Discord "Argus Heartbeat OK: $info$uptimeInfo"
+            Send-Discord $hbMsg
             (Get-Date).ToUniversalTime().ToString("o") | Set-Content $heartbeatFile
         }
-        Write-WatchdogLog "HEARTBEAT: $info$uptimeInfo"
+        Write-WatchdogLog "HEARTBEAT: $hbMsg"
     } else {
-        Write-WatchdogLog "OK: runner alive, heartbeat not due yet"
+        Write-WatchdogLog "OK: ${runnerCount} runner(s), heartbeat not due | $statusSummary"
+    }
+
+    # Warn about stale coins even if runners are alive
+    if ($staleCoinsList.Count -gt 0) {
+        $staleMsg = "WARNING: stale coins: $($staleCoinsList -join ', ') (state not updated in >$StaleMinutes m)"
+        Write-WatchdogLog $staleMsg
     }
 } else {
-    # Runner is DOWN
-    Write-WatchdogLog "ALERT: runner_live.py NOT running!"
+    Write-WatchdogLog "ALERT: NO runner_live.py processes found! | $statusSummary"
 
     if (-not $DryRun) {
-        Send-Discord "ALERT: Argus runner_live.py is DOWN! Attempting auto-restart..."
+        Send-Discord "ALERT: Argus runners DOWN (0 processes)! Attempting restart..."
 
-        # Restart runner
-        Write-WatchdogLog "Restarting runner_live.py..."
+        Write-WatchdogLog "Restarting via launch_multi.ps1..."
         try {
-            Start-Process -FilePath $pyExe -ArgumentList "runner_live.py" -WorkingDirectory $repoRoot -WindowStyle Hidden
-            Start-Sleep -Seconds 10
+            & "$repoRoot\ops\launch_multi.ps1"
+            Start-Sleep -Seconds 15
 
-            if (Is-RunnerAlive) {
-                Write-WatchdogLog "RESTART OK: runner_live.py is back up"
-                Send-Discord "Argus runner_live.py restarted successfully"
+            $newRunners = Get-RunnerProcesses
+            $newCount = @($newRunners).Count
+            if ($newCount -gt 0) {
+                Write-WatchdogLog "RESTART OK: $newCount runner(s) now running"
+                Send-Discord "Argus restarted: $newCount runner(s) launched"
             } else {
-                Write-WatchdogLog "RESTART FAILED: runner still not detected after 10s"
+                Write-WatchdogLog "RESTART FAILED: still no runners after 15s"
                 Send-Discord "CRITICAL: Argus restart FAILED -- manual intervention needed"
             }
         } catch {
@@ -128,6 +180,6 @@ if (Is-RunnerAlive) {
             Send-Discord "CRITICAL: Argus restart threw error: $_"
         }
     } else {
-        Write-WatchdogLog "DRY RUN: would restart runner_live.py"
+        Write-WatchdogLog "DRY RUN: would restart via launch_multi.ps1"
     }
 }

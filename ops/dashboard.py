@@ -28,14 +28,33 @@ STATE_DIR = REPO / "state"
 
 app = FastAPI(title="Argus Dashboard")
 
+COINS = ["ETH", "BTC", "SOL"]
+
+
+def get_coin_log_dir(coin: str) -> Path:
+    """Get log directory for a specific coin."""
+    coin = coin.upper()
+    coin_dir = OPS_LOGS / coin.lower()
+    if coin == "ETH":
+        # ETH: prefer per-coin dir if it has adapter artifacts, else main dir
+        if coin_dir.exists() and (coin_dir / "account.csv").exists():
+            return coin_dir
+        return OPS_LOGS
+    return coin_dir
+
+
+def get_coin_state_path(coin: str) -> Path:
+    """Get runtime state file for a specific coin."""
+    return STATE_DIR / f"runtime_state_{coin.upper()}_USD.json"
+
 
 # ---------------------------------------------------------------------------
-# Data readers
+# Data readers  (all accept optional coin param; default = ETH / main dir)
 # ---------------------------------------------------------------------------
 
-def read_runtime_state() -> dict:
+def read_runtime_state(coin: str = "ETH") -> dict:
     """Read the latest runtime state snapshot."""
-    path = STATE_DIR / "runtime_state_ETH_USD.json"
+    path = get_coin_state_path(coin)
     if not path.exists():
         return {}
     try:
@@ -69,9 +88,9 @@ def read_run_manifest() -> dict:
         return {}
 
 
-def read_account_tail(n: int = 5) -> list:
+def read_account_tail(n: int = 5, coin: str = "ETH") -> list:
     """Read last N account rows."""
-    path = OPS_LOGS / "account.csv"
+    path = get_coin_log_dir(coin) / "account.csv"
     if not path.exists():
         return []
     try:
@@ -85,9 +104,9 @@ def read_account_tail(n: int = 5) -> list:
         return []
 
 
-def read_fills_tail(n: int = 20) -> list:
+def read_fills_tail(n: int = 20, coin: str = "ETH") -> list:
     """Read last N fills."""
-    path = OPS_LOGS / "fills.csv"
+    path = get_coin_log_dir(coin) / "fills.csv"
     if not path.exists():
         return []
     try:
@@ -101,9 +120,10 @@ def read_fills_tail(n: int = 20) -> list:
         return []
 
 
-def read_trade_journal(n: int = 20) -> list:
+def read_trade_journal(n: int = 20, coin: str = "ETH") -> list:
     """Read the latest trade journal entries."""
-    journals = sorted(OPS_LOGS.glob("trade_journal_*.csv"), key=os.path.getmtime)
+    log_dir = get_coin_log_dir(coin)
+    journals = sorted(log_dir.glob("trade_journal_*.csv"), key=os.path.getmtime)
     if not journals:
         return []
     try:
@@ -117,9 +137,13 @@ def read_trade_journal(n: int = 20) -> list:
         return []
 
 
-def read_signals_tail(n: int = 5) -> list:
+def read_signals_tail(n: int = 5, coin: str = "ETH") -> list:
     """Read last N live signal rows."""
-    path = OPS_LOGS / "live_signals.csv"
+    # Signals may be in per-coin dir even when account.csv is in main dir (ETH case)
+    coin_dir = OPS_LOGS / coin.lower()
+    per_coin_path = coin_dir / "live_signals.csv"
+    fallback_path = get_coin_log_dir(coin) / "live_signals.csv"
+    path = per_coin_path if per_coin_path.exists() else fallback_path
     if not path.exists():
         return []
     try:
@@ -133,9 +157,12 @@ def read_signals_tail(n: int = 5) -> list:
         return []
 
 
-def read_events_tail(n: int = 20) -> list:
+def read_events_tail(n: int = 20, coin: str = "ETH") -> list:
     """Read last N live event rows."""
-    path = OPS_LOGS / "live_events.csv"
+    coin_dir = OPS_LOGS / coin.lower()
+    per_coin_path = coin_dir / "live_events.csv"
+    fallback_path = get_coin_log_dir(coin) / "live_events.csv"
+    path = per_coin_path if per_coin_path.exists() else fallback_path
     if not path.exists():
         return []
     try:
@@ -149,9 +176,9 @@ def read_events_tail(n: int = 20) -> list:
         return []
 
 
-def read_equity_series() -> list:
+def read_equity_series(coin: str = "ETH") -> list:
     """Read account.csv for equity time series."""
-    path = OPS_LOGS / "account.csv"
+    path = get_coin_log_dir(coin) / "account.csv"
     if not path.exists():
         return []
     try:
@@ -175,11 +202,12 @@ def read_equity_series() -> list:
         return []
 
 
-def read_decision_flow(n: int = 30) -> list:
+def read_decision_flow(n: int = 30, coin: str = "ETH") -> list:
     """Read recent entry-related events with governor scores."""
+    log_dir = get_coin_log_dir(coin)
     decisions = []
     # From live_events.csv — entry attempts, blocks, fills
-    path = OPS_LOGS / "live_events.csv"
+    path = log_dir / "live_events.csv"
     if path.exists():
         try:
             rows = []
@@ -203,7 +231,9 @@ def read_decision_flow(n: int = 30) -> list:
         except Exception:
             pass
     # Enrich with governor data from live_signals.csv
-    sig_path = OPS_LOGS / "live_signals.csv"
+    coin_dir_dc = OPS_LOGS / coin.lower()
+    per_coin_sig = coin_dir_dc / "live_signals.csv"
+    sig_path = per_coin_sig if per_coin_sig.exists() else (log_dir / "live_signals.csv")
     if sig_path.exists():
         try:
             gov_rows = []
@@ -233,9 +263,12 @@ def read_decision_flow(n: int = 30) -> list:
     return decisions[:n]
 
 
-def read_governor_latest() -> dict:
+def read_governor_latest(coin: str = "ETH") -> dict:
     """Read latest governor score from live_signals.csv."""
-    sig_path = OPS_LOGS / "live_signals.csv"
+    coin_dir = OPS_LOGS / coin.lower()
+    per_coin_path = coin_dir / "live_signals.csv"
+    fallback_path = get_coin_log_dir(coin) / "live_signals.csv"
+    sig_path = per_coin_path if per_coin_path.exists() else fallback_path
     if not sig_path.exists():
         return {}
     try:
@@ -323,16 +356,16 @@ def read_queue_status() -> dict:
     return result
 
 
-def build_status() -> dict:
+def build_status(coin: str = "ETH") -> dict:
     """Aggregate all status info into a single dict."""
-    state = read_runtime_state()
+    state = read_runtime_state(coin)
     manifest = read_run_manifest()
     mode = read_runtime_mode()
-    account = read_account_tail(1)
-    fills = read_fills_tail(20)
-    journal = read_trade_journal(10)
-    signals = read_signals_tail(3)
-    events = read_events_tail(20)
+    account = read_account_tail(1, coin)
+    fills = read_fills_tail(20, coin)
+    journal = read_trade_journal(10, coin)
+    signals = read_signals_tail(3, coin)
+    events = read_events_tail(20, coin)
 
     # Compute uptime
     start_ts = manifest.get("start_ts", 0)
@@ -367,8 +400,9 @@ def build_status() -> dict:
         "journal": journal[-5:],
         "signals": signals,
         "events": events[-10:],
+        "coin": coin.upper(),
         "queue": read_queue_status(),
-        "governor": read_governor_latest(),
+        "governor": read_governor_latest(coin),
     }
 
 
@@ -376,9 +410,39 @@ def build_status() -> dict:
 # API routes
 # ---------------------------------------------------------------------------
 
+def _coin_param(request: Request) -> str:
+    """Extract coin from query string, default ETH."""
+    c = request.query_params.get("coin", "ETH").upper()
+    return c if c in COINS else "ETH"
+
+
 @app.get("/api/status")
-async def api_status():
-    return JSONResponse(build_status())
+async def api_status(request: Request):
+    return JSONResponse(build_status(_coin_param(request)))
+
+
+@app.get("/api/multi")
+async def api_multi():
+    """Summary for all coins — used by multi-coin overview."""
+    result = {}
+    for coin in COINS:
+        state = read_runtime_state(coin)
+        acct = read_account_tail(1, coin)
+        latest_acct = acct[-1] if acct else {}
+        result[coin] = {
+            "bot_state": state.get("bot_state", "UNKNOWN"),
+            "symbol": f"{coin}-USD",
+            "cash": state.get("cash", "0"),
+            "equity": latest_acct.get("equity", state.get("cash", "0")),
+            "realized_pnl": state.get("realized_pnl", "0"),
+            "position_qty": state.get("position_qty", "0"),
+            "saved_at": state.get("saved_at", 0),
+            "saved_at_iso": datetime.fromtimestamp(
+                state.get("saved_at", 0), tz=timezone.utc
+            ).isoformat() if state.get("saved_at") else "",
+            "governor": read_governor_latest(coin),
+        }
+    return JSONResponse(result)
 
 
 @app.get("/api/queue")
@@ -387,33 +451,33 @@ async def api_queue():
 
 
 @app.get("/api/equity")
-async def api_equity():
-    return JSONResponse(read_equity_series())
+async def api_equity(request: Request):
+    return JSONResponse(read_equity_series(_coin_param(request)))
 
 
 @app.get("/api/events")
-async def api_events():
-    return JSONResponse(read_events_tail(50))
+async def api_events(request: Request):
+    return JSONResponse(read_events_tail(50, _coin_param(request)))
 
 
 @app.get("/api/fills")
-async def api_fills():
-    return JSONResponse(read_fills_tail(50))
+async def api_fills(request: Request):
+    return JSONResponse(read_fills_tail(50, _coin_param(request)))
 
 
 @app.get("/api/journal")
-async def api_journal():
-    return JSONResponse(read_trade_journal(200))
+async def api_journal(request: Request):
+    return JSONResponse(read_trade_journal(200, _coin_param(request)))
 
 
 @app.get("/api/decisions")
-async def api_decisions():
-    return JSONResponse(read_decision_flow(50))
+async def api_decisions(request: Request):
+    return JSONResponse(read_decision_flow(50, _coin_param(request)))
 
 
 @app.get("/api/governor")
-async def api_governor():
-    return JSONResponse(read_governor_latest())
+async def api_governor(request: Request):
+    return JSONResponse(read_governor_latest(_coin_param(request)))
 
 
 @app.get("/api/backtest")
@@ -461,6 +525,47 @@ async def api_backtest():
     return JSONResponse(runs)
 
 
+@app.get("/api/leaderboard")
+async def api_leaderboard():
+    """Ranked backtest results from all bt_summary files, paired with run_header labels."""
+    rows = []
+    for sp in OPS_LOGS.glob("bt_summary_bt_*.json"):
+        if "latest" in sp.name:
+            continue
+        try:
+            with open(sp) as f:
+                s = json.load(f)
+            rid = s.get("run_id", sp.stem.replace("bt_summary_", ""))
+            # pair with run_header for label
+            hp = OPS_LOGS / f"run_header_{rid}.json"
+            label = "—"
+            if hp.exists():
+                with open(hp) as f:
+                    label = json.load(f).get("label", "—")
+            trades = s.get("total_trades", s.get("entry_filled", 0))
+            if isinstance(trades, str):
+                trades = int(trades) if trades else 0
+            rows.append({
+                "run_id": rid,
+                "label": label,
+                "trades": trades,
+                "win_rate": s.get("win_rate_pct", "0"),
+                "profit_factor": s.get("profit_factor", "0"),
+                "pnl": s.get("realized_pnl_usd", s.get("pnl_usd", "0")),
+                "expectancy": s.get("expectancy_usd", "0"),
+                "max_dd": s.get("max_drawdown_pct", "0"),
+                "avg_win": s.get("avg_win_usd", "0"),
+                "avg_loss": s.get("avg_loss_usd", "0"),
+                "start_epoch": s.get("start_epoch", 0),
+                "end_epoch": s.get("end_epoch", 0),
+            })
+        except Exception:
+            continue
+    # Sort by profit factor descending, then by trades descending
+    rows.sort(key=lambda r: (float(r["profit_factor"] or 0), r["trades"]), reverse=True)
+    return JSONResponse(rows)
+
+
 @app.get("/api/config")
 async def api_config():
     """Read key config values from .env file."""
@@ -501,19 +606,20 @@ async def api_config():
 # SSE stream for real-time updates
 # ---------------------------------------------------------------------------
 
-async def status_stream(request: Request):
+async def status_stream(request: Request, coin: str = "ETH"):
     """Push status updates every 5 seconds."""
     while True:
         if await request.is_disconnected():
             break
-        data = json.dumps(build_status(), default=str)
+        data = json.dumps(build_status(coin), default=str)
         yield {"event": "status", "data": data}
         await asyncio.sleep(5)
 
 
 @app.get("/api/stream")
 async def stream(request: Request):
-    return EventSourceResponse(status_stream(request))
+    coin = _coin_param(request)
+    return EventSourceResponse(status_stream(request, coin))
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +650,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .state-OPEN { color: #00e676; }
   .state-BUYING { color: #ffc107; }
   .state-SELLING { color: #ff9800; }
-  .chart-container { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+  .chart-container { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; margin-bottom: 12px; max-height: 280px; position: relative; }
   table { width: 100%; border-collapse: collapse; font-size: 0.78em; }
   th { color: #7b8ab8; text-align: left; padding: 4px 6px; border-bottom: 1px solid #1e2a42; }
   td { padding: 4px 6px; border-bottom: 1px solid #0d1321; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
@@ -554,6 +660,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-running { background: #1b2a3a; color: #00d4ff; }
   .badge-error { background: #3a1b1b; color: #ff5252; }
   .footer { color: #3a4a6b; font-size: 0.7em; margin-top: 8px; text-align: center; }
+  .coin-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .coin-tab { padding: 6px 16px; border-radius: 4px; border: 1px solid #1e2a42; background: #141b2d; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.85em; font-weight: bold; transition: all 0.2s; }
+  .coin-tab:hover { border-color: #00d4ff; color: #00d4ff; }
+  .coin-tab.active { background: #1e2a42; color: #00d4ff; border-color: #00d4ff; }
+  .multi-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+  .coin-summary { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; cursor: pointer; transition: border-color 0.2s; }
+  .coin-summary:hover { border-color: #00d4ff; }
+  .coin-summary .coin-name { font-size: 1.1em; font-weight: bold; color: #00d4ff; margin-bottom: 6px; }
+  .coin-summary .coin-state { font-size: 0.85em; margin-bottom: 4px; }
+  .coin-summary .coin-pnl { font-size: 1.3em; font-weight: bold; }
+  .coin-summary .coin-detail { font-size: 0.72em; color: #7b8ab8; margin-top: 2px; }
   #connection-status { position: fixed; top: 8px; right: 12px; font-size: 0.75em; }
   .connected { color: #00e676; }
   .disconnected { color: #ff5252; }
@@ -574,6 +691,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div style="display:flex; justify-content:space-between; align-items:center;">
   <h1>ARGUS DASHBOARD</h1>
   <span id="connection-status" class="disconnected">CONNECTING...</span>
+</div>
+
+<div class="coin-tabs">
+  <button class="coin-tab active" data-coin="ETH" onclick="switchCoin('ETH')">ETH</button>
+  <button class="coin-tab" data-coin="BTC" onclick="switchCoin('BTC')">BTC</button>
+  <button class="coin-tab" data-coin="SOL" onclick="switchCoin('SOL')">SOL</button>
+</div>
+
+<div class="multi-overview" id="multi-overview">
+  <div class="coin-summary" onclick="switchCoin('ETH')" id="summary-ETH">
+    <div class="coin-name">ETH-USD</div>
+    <div class="coin-state">State: <span id="ms-state-ETH" class="state-FLAT">—</span></div>
+    <div class="coin-pnl" id="ms-pnl-ETH">$0.00</div>
+    <div class="coin-detail">Equity: <span id="ms-eq-ETH">—</span> | Qty: <span id="ms-qty-ETH">0</span></div>
+    <div class="coin-detail">Updated: <span id="ms-ts-ETH">—</span></div>
+  </div>
+  <div class="coin-summary" onclick="switchCoin('BTC')" id="summary-BTC">
+    <div class="coin-name">BTC-USD</div>
+    <div class="coin-state">State: <span id="ms-state-BTC" class="state-FLAT">—</span></div>
+    <div class="coin-pnl" id="ms-pnl-BTC">$0.00</div>
+    <div class="coin-detail">Equity: <span id="ms-eq-BTC">—</span> | Qty: <span id="ms-qty-BTC">0</span></div>
+    <div class="coin-detail">Updated: <span id="ms-ts-BTC">—</span></div>
+  </div>
+  <div class="coin-summary" onclick="switchCoin('SOL')" id="summary-SOL">
+    <div class="coin-name">SOL-USD</div>
+    <div class="coin-state">State: <span id="ms-state-SOL" class="state-FLAT">—</span></div>
+    <div class="coin-pnl" id="ms-pnl-SOL">$0.00</div>
+    <div class="coin-detail">Equity: <span id="ms-eq-SOL">—</span> | Qty: <span id="ms-qty-SOL">0</span></div>
+    <div class="coin-detail">Updated: <span id="ms-ts-SOL">—</span></div>
+  </div>
 </div>
 
 <div class="grid">
@@ -696,12 +843,74 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="card" style="margin-top:10px;">
+  <h2>Backtest Leaderboard</h2>
+  <div style="display:flex; gap:8px; margin-bottom:8px; font-size:0.78em;">
+    <span id="lb-count" style="color:#7b8ab8;">Loading...</span>
+    <button onclick="loadLeaderboard()" style="margin-left:auto; background:#1e2a42; color:#7b8ab8; border:1px solid #2a3a5c; border-radius:3px; padding:2px 10px; cursor:pointer; font-size:0.9em;">Refresh</button>
+  </div>
+  <div style="max-height:350px; overflow-y:auto;">
+  <table id="leaderboard-table">
+    <thead><tr>
+      <th>#</th><th>Label</th><th>Trades</th><th>WR%</th><th>PF</th>
+      <th>PnL</th><th>Exp</th><th>DD%</th><th>Avg W</th><th>Avg L</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</div>
+
 <div class="footer">
   Last update: <span id="last-update">—</span> | Run: <span id="run-id">—</span> | Saved: <span id="saved-at">—</span>
 </div>
 
 <script>
 let equityChart = null;
+let currentCoin = 'ETH';
+let sseConnection = null;
+
+function switchCoin(coin) {
+  currentCoin = coin.toUpperCase();
+  // Update tab active state
+  document.querySelectorAll('.coin-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.coin === currentCoin);
+  });
+  // Highlight selected summary card
+  document.querySelectorAll('.coin-summary').forEach(c => {
+    c.style.borderColor = c.id === 'summary-' + currentCoin ? '#00d4ff' : '#1e2a42';
+  });
+  // Reconnect SSE for new coin
+  if (sseConnection) { sseConnection.close(); }
+  connectSSE();
+  // Reload coin-specific data
+  loadEquity();
+  loadBacktests();
+  loadJournal();
+  loadDecisions();
+  window._journalLoaded = false;
+}
+
+async function loadMultiOverview() {
+  try {
+    const resp = await fetch('/api/multi');
+    const data = await resp.json();
+    ['ETH', 'BTC', 'SOL'].forEach(coin => {
+      const c = data[coin];
+      if (!c) return;
+      const stEl = document.getElementById('ms-state-' + coin);
+      if (stEl) { stEl.textContent = c.bot_state || 'UNKNOWN'; stEl.className = 'state-' + (c.bot_state || 'FLAT'); }
+      const pnlVal = parseFloat(c.realized_pnl) || 0;
+      const pnlEl = document.getElementById('ms-pnl-' + coin);
+      if (pnlEl) { pnlEl.textContent = '$' + pnlVal.toFixed(4); pnlEl.style.color = pnlVal > 0 ? '#00e676' : pnlVal < 0 ? '#ff5252' : '#e0e0e0'; }
+      const eqEl = document.getElementById('ms-eq-' + coin);
+      if (eqEl) eqEl.textContent = '$' + (parseFloat(c.equity) || 0).toFixed(2);
+      const qtyEl = document.getElementById('ms-qty-' + coin);
+      if (qtyEl) qtyEl.textContent = c.position_qty || '0';
+      const tsEl = document.getElementById('ms-ts-' + coin);
+      if (tsEl) tsEl.textContent = c.saved_at_iso ? c.saved_at_iso.slice(11, 19) + 'Z' : '—';
+    });
+  } catch(e) { console.error('multi fetch error', e); }
+}
 
 function initChart() {
   const ctx = document.getElementById('equity-chart').getContext('2d');
@@ -861,7 +1070,7 @@ function updateDashboard(data) {
 
 async function loadEquity() {
   try {
-    const resp = await fetch('/api/equity');
+    const resp = await fetch('/api/equity?coin=' + currentCoin);
     const data = await resp.json();
     if (equityChart && data.length > 0) {
       equityChart.data.datasets[0].data = data;
@@ -872,7 +1081,8 @@ async function loadEquity() {
 
 function connectSSE() {
   const status = document.getElementById('connection-status');
-  const es = new EventSource('/api/stream');
+  const es = new EventSource('/api/stream?coin=' + currentCoin);
+  sseConnection = es;
 
   es.addEventListener('status', (e) => {
     try {
@@ -881,7 +1091,7 @@ function connectSSE() {
     } catch(err) { console.error('parse error', err); }
   });
 
-  es.onopen = () => { status.textContent = 'LIVE'; status.className = 'connected'; };
+  es.onopen = () => { status.textContent = 'LIVE (' + currentCoin + ')'; status.className = 'connected'; };
   es.onerror = () => {
     status.textContent = 'RECONNECTING...'; status.className = 'disconnected';
     es.close();
@@ -891,7 +1101,7 @@ function connectSSE() {
 
 async function loadBacktests() {
   try {
-    const resp = await fetch('/api/backtest');
+    const resp = await fetch('/api/backtest?coin=' + currentCoin);
     const runs = await resp.json();
     const body = document.querySelector('#bt-table tbody');
     body.innerHTML = '';
@@ -934,7 +1144,7 @@ async function loadConfig() {
 // --- Decision Flow ---
 async function loadDecisions() {
   try {
-    const resp = await fetch('/api/decisions');
+    const resp = await fetch('/api/decisions?coin=' + currentCoin);
     const decisions = await resp.json();
     const container = document.getElementById('decision-flow');
     if (!decisions.length) {
@@ -1035,7 +1245,7 @@ function populateJournalFilters(trades) {
 
 async function loadJournal() {
   try {
-    const resp = await fetch('/api/journal');
+    const resp = await fetch('/api/journal?coin=' + currentCoin);
     _allJournal = await resp.json();
     window._journalLoaded = true;
     populateJournalFilters(_allJournal);
@@ -1048,6 +1258,40 @@ document.getElementById('jf-result').addEventListener('change', () => renderJour
 document.getElementById('jf-exit').addEventListener('change', () => renderJournal(_allJournal));
 document.getElementById('jf-regime').addEventListener('change', () => renderJournal(_allJournal));
 
+// --- Leaderboard ---
+async function loadLeaderboard() {
+  try {
+    const res = await fetch('/api/leaderboard');
+    const rows = await res.json();
+    const tbody = document.querySelector('#leaderboard-table tbody');
+    tbody.innerHTML = '';
+    const countEl = document.getElementById('lb-count');
+    const withTrades = rows.filter(r => r.trades > 0);
+    countEl.textContent = withTrades.length + ' runs with trades / ' + rows.length + ' total';
+    withTrades.forEach((r, i) => {
+      const pf = parseFloat(r.profit_factor) || 0;
+      const pnl = parseFloat(r.pnl) || 0;
+      const startPnl = 500;  // base capital
+      const netPnl = pnl - startPnl;
+      const pfColor = pf >= 1.2 ? '#00e676' : pf >= 1.0 ? '#ffc107' : '#ff5252';
+      const pnlColor = netPnl >= 0 ? '#00e676' : '#ff5252';
+      const tr = document.createElement('tr');
+      if (i === 0) tr.style.background = 'rgba(0,230,118,0.08)';
+      tr.innerHTML = '<td>' + (i+1) + '</td>'
+        + '<td title="' + r.run_id + '" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">' + r.label + '</td>'
+        + '<td>' + r.trades + '</td>'
+        + '<td>' + parseFloat(r.win_rate).toFixed(1) + '</td>'
+        + '<td style="color:' + pfColor + ';font-weight:bold;">' + pf.toFixed(2) + '</td>'
+        + '<td style="color:' + pnlColor + ';">$' + netPnl.toFixed(2) + '</td>'
+        + '<td>$' + parseFloat(r.expectancy).toFixed(3) + '</td>'
+        + '<td>' + parseFloat(r.max_dd).toFixed(2) + '%</td>'
+        + '<td style="color:#00e676;">$' + parseFloat(r.avg_win).toFixed(3) + '</td>'
+        + '<td style="color:#ff5252;">$' + parseFloat(r.avg_loss).toFixed(3) + '</td>';
+      tbody.appendChild(tr);
+    });
+  } catch(e) { console.error('leaderboard error', e); }
+}
+
 // Init
 initChart();
 loadEquity();
@@ -1055,10 +1299,14 @@ loadConfig();
 loadBacktests();
 loadJournal();
 loadDecisions();
+loadMultiOverview();
+loadLeaderboard();
 setInterval(loadEquity, 30000);
 setInterval(loadBacktests, 60000);
 setInterval(loadJournal, 120000);
-setInterval(loadDecisions, 15000);  // refresh decision flow every 15s
+setInterval(loadDecisions, 15000);
+setInterval(loadMultiOverview, 10000);
+setInterval(loadLeaderboard, 120000);  // refresh leaderboard every 2 min
 connectSSE();
 </script>
 </body>
