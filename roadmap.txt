@@ -223,13 +223,14 @@ Exit:
   [DONE] USB nightly backup — ops/backup_to_usb.ps1 (scheduled ArgusUSBBackup daily@03:00)
     - robocopy /MIR to USB E:\Argus_Backup, excludes __pycache__/.git/objects/*.pyc
     - Logs: last 7 days only. Key file verification. Discord alert on success/failure.
-  [TODO] Disaster recovery runbook — document full restore from USB + GitHub
+  [DONE] Disaster recovery runbook — ops/DISASTER_RECOVERY.md (4 scenarios)
 
 ## Priority 4 — Observability & Monitoring
-  [TODO] Dashboard queue panel — show current queue status, running job, ETA
+  [DONE] Dashboard queue panel — live queue status, running job, progress bar, pending counts
   [TODO] Dashboard trade journal viewer — browse closed trades with filters
   [TODO] Candle gap alerting — proactive Discord alert when feed gaps detected
-  [TODO] Weekly performance digest — auto-generate and Discord-send weekly PnL/WR summary
+  [DONE] Weekly performance digest — ops/weekly_digest.py (Discord embed, --days N, --no-discord)
+  [DONE] Disaster recovery runbook — ops/DISASTER_RECOVERY.md (4 scenarios: HDD fail, repo corrupt, state corrupt, PC1 failover)
 
 ## Priority 5 — ML as Governor  [TODO — needs 500+ trades across all assets]
   * 500 trades = combined ETH + BTC + SOL (backtest + live)

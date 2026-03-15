@@ -175,6 +175,70 @@ def read_equity_series() -> list:
         return []
 
 
+def read_queue_status() -> dict:
+    """Read queue files and detect running/pending/completed jobs."""
+    result = {"pending_pc1": 0, "pending_pc2": 0, "pending_labels": [],
+              "running_job": None, "completed_today": 0}
+    # Pending PC1
+    q1 = REPO / "ops" / "backtest_queue.jsonl"
+    if q1.exists():
+        try:
+            lines = [l.strip() for l in open(q1).readlines() if l.strip()]
+            result["pending_pc1"] = len(lines)
+            for l in lines:
+                try:
+                    result["pending_labels"].append(json.loads(l).get("label", "?"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Pending PC2
+    q2 = REPO / "ops" / "backtest_queue_pc2.jsonl"
+    if q2.exists():
+        try:
+            lines = [l.strip() for l in open(q2).readlines() if l.strip()]
+            result["pending_pc2"] = len(lines)
+        except Exception:
+            pass
+    # Running job: most recent run_header with no matching bt_summary
+    try:
+        headers = sorted(OPS_LOGS.glob("run_header_bt_*.json"), key=os.path.getmtime, reverse=True)
+        for h in headers[:5]:
+            hdr = json.load(open(h))
+            rid = hdr.get("run_id", "")
+            if not (OPS_LOGS / f"bt_summary_{rid}.json").exists():
+                progress = 0
+                total_bars = 0
+                eq_path = OPS_LOGS / f"equity_{rid}.csv"
+                if eq_path.exists():
+                    with open(eq_path) as f:
+                        progress = sum(1 for _ in f) - 1
+                candles_csv = hdr.get("candles_csv", "")
+                if candles_csv and Path(candles_csv).exists():
+                    with open(candles_csv) as f:
+                        total_bars = sum(1 for _ in f) - 1
+                result["running_job"] = {
+                    "run_id": rid, "label": hdr.get("label", ""),
+                    "progress": progress, "total_bars": total_bars,
+                    "pct": round(progress / total_bars * 100) if total_bars else 0
+                }
+                break
+    except Exception:
+        pass
+    # Completed today
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        for p in sorted(OPS_LOGS.glob("bt_summary_bt_*.json"), key=os.path.getmtime, reverse=True)[:20]:
+            mtime = datetime.fromtimestamp(os.path.getmtime(p), tz=timezone.utc)
+            if mtime.strftime("%Y-%m-%d") == today_str:
+                result["completed_today"] += 1
+            else:
+                break
+    except Exception:
+        pass
+    return result
+
+
 def build_status() -> dict:
     """Aggregate all status info into a single dict."""
     state = read_runtime_state()
@@ -219,6 +283,7 @@ def build_status() -> dict:
         "journal": journal[-5:],
         "signals": signals,
         "events": events[-10:],
+        "queue": read_queue_status(),
     }
 
 
@@ -229,6 +294,11 @@ def build_status() -> dict:
 @app.get("/api/status")
 async def api_status():
     return JSONResponse(build_status())
+
+
+@app.get("/api/queue")
+async def api_queue():
+    return JSONResponse(read_queue_status())
 
 
 @app.get("/api/equity")
@@ -425,6 +495,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="label">Status: <span id="manifest-status">UNKNOWN</span></div>
     <div class="label">Config: <span id="config-hash">—</span></div>
   </div>
+  <div class="card">
+    <h2>Queue Status</h2>
+    <div id="queue-running" class="metric" style="font-size:1.0em; color:#00d4ff;">Idle</div>
+    <div id="queue-progress" style="margin:6px 0;">
+      <div style="background:#1e2a42; border-radius:3px; height:14px; overflow:hidden;">
+        <div id="queue-progress-bar" style="background:#00d4ff; height:100%; width:0%; transition:width 0.5s;"></div>
+      </div>
+      <div class="label" id="queue-progress-text" style="margin-top:2px;">—</div>
+    </div>
+    <div class="label">Pending PC1: <span id="queue-pending-pc1">0</span> | PC2: <span id="queue-pending-pc2">0</span></div>
+    <div class="label">Completed today: <span id="queue-completed">0</span></div>
+    <div id="queue-labels" class="label" style="margin-top:4px;"></div>
+  </div>
 </div>
 
 <div class="chart-container">
@@ -592,6 +675,35 @@ function updateDashboard(data) {
       + '<td>' + durStr + '</td>';
     journalBody.appendChild(tr);
   });
+
+  // Queue panel
+  if (data.queue) {
+    const q = data.queue;
+    const runEl = document.getElementById('queue-running');
+    const barEl = document.getElementById('queue-progress-bar');
+    const textEl = document.getElementById('queue-progress-text');
+    if (q.running_job) {
+      const rj = q.running_job;
+      runEl.textContent = rj.label || rj.run_id.slice(-16);
+      runEl.style.color = '#00d4ff';
+      barEl.style.width = rj.pct + '%';
+      textEl.textContent = rj.total_bars ? (rj.pct + '% (' + rj.progress + '/' + rj.total_bars + ' bars)') : (rj.progress + ' bars');
+    } else {
+      runEl.textContent = 'Idle';
+      runEl.style.color = '#7b8ab8';
+      barEl.style.width = '0%';
+      textEl.textContent = 'No job running';
+    }
+    document.getElementById('queue-pending-pc1').textContent = q.pending_pc1 || 0;
+    document.getElementById('queue-pending-pc2').textContent = q.pending_pc2 || 0;
+    document.getElementById('queue-completed').textContent = q.completed_today || 0;
+    const labelsEl = document.getElementById('queue-labels');
+    if (q.pending_labels && q.pending_labels.length > 0) {
+      labelsEl.innerHTML = 'Next: ' + q.pending_labels.map(l => '<span class="badge badge-running" style="margin:1px;">' + l + '</span>').join(' ');
+    } else {
+      labelsEl.innerHTML = '';
+    }
+  }
 }
 
 async function loadEquity() {
