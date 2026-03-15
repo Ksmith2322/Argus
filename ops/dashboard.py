@@ -731,12 +731,100 @@ def _build_scatter_data(summaries: list, max_runs: int = 8) -> list:
     return all_trades
 
 
+def _build_projection(summaries: list) -> dict:
+    """Compute year-end balance projection from backtest performance."""
+    # Read starting cash from .env
+    start_cash = 500.0
+    env_path = REPO / ".env"
+    if env_path.exists():
+        try:
+            for line in open(env_path):
+                if line.strip().startswith("START_CASH_USD"):
+                    start_cash = float(line.split("=", 1)[1].strip())
+                    break
+        except Exception:
+            pass
+
+    if not summaries:
+        return {"start_cash": start_cash, "scenarios": []}
+
+    # Gather performance metrics from all runs
+    runs_with_pnl = []
+    for s in summaries:
+        pnl = float(s.get("total_pnl_usd", 0) or 0)
+        trades = int(s.get("total_closed", s.get("trades_closed", 0)) or 0)
+        # Try to get backtest duration in days
+        dataset_bars = int(s.get("dataset_bars", s.get("bars_processed", 0)) or 0)
+        bt_days = max(1, dataset_bars / 1440)  # 1-min bars -> days
+        if trades > 0:
+            runs_with_pnl.append({
+                "pnl": pnl,
+                "trades": trades,
+                "days": bt_days,
+                "pf": float(s.get("profit_factor", 0) or 0),
+                "label": s.get("label", s.get("job_label", s.get("run_id", ""))),
+            })
+
+    if not runs_with_pnl:
+        return {"start_cash": start_cash, "scenarios": []}
+
+    # Sort by PF to get best, median, worst
+    runs_with_pnl.sort(key=lambda r: r["pf"])
+
+    now = datetime.now(timezone.utc)
+    days_left_in_year = max(1, (datetime(now.year, 12, 31, tzinfo=timezone.utc) - now).days)
+
+    scenarios = []
+    for tag, run in [
+        ("worst", runs_with_pnl[0]),
+        ("median", runs_with_pnl[len(runs_with_pnl) // 2]),
+        ("best", runs_with_pnl[-1]),
+    ]:
+        daily_pnl = run["pnl"] / run["days"]
+        projected_gain = daily_pnl * days_left_in_year
+        year_end_balance = start_cash + projected_gain
+        pct_gain = (projected_gain / start_cash) * 100 if start_cash > 0 else 0
+
+        scenarios.append({
+            "tag": tag,
+            "label": str(run["label"])[:30],
+            "pf": round(run["pf"], 3),
+            "daily_pnl": round(daily_pnl, 4),
+            "bt_days": round(run["days"], 1),
+            "projected_gain": round(projected_gain, 2),
+            "year_end_balance": round(year_end_balance, 2),
+            "pct_gain": round(pct_gain, 1),
+            "days_left": days_left_in_year,
+        })
+
+    # Monthly projection curve for best scenario
+    best = scenarios[-1]
+    monthly_curve = []
+    for m in range(13):  # 0=now through 12=Dec
+        month_num = now.month + m
+        if month_num > 12:
+            month_num -= 12
+        days_into_projection = m * 30.44
+        balance = start_cash + best["daily_pnl"] * days_into_projection
+        monthly_curve.append({
+            "month": month_num,
+            "balance": round(balance, 2),
+        })
+
+    return {
+        "start_cash": start_cash,
+        "scenarios": scenarios,
+        "monthly_curve": monthly_curve,
+    }
+
+
 @app.get("/api/evolution")
 async def api_evolution():
     summaries = _load_bt_summaries(50)
     return JSONResponse({
         "evo": _build_evo_points(summaries),
         "scatter": _build_scatter_data(summaries),
+        "projection": _build_projection(summaries),
     })
 
 
@@ -1008,6 +1096,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div id="evo-page" class="page-content">
   <div class="evo-stats" id="evo-stats-bar"></div>
 
+  <div id="projection-section" style="margin-bottom:16px;">
+    <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">YEAR-END PROJECTION</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+      <div id="projection-cards" style="display:flex; flex-direction:column; gap:8px;"></div>
+      <div class="evo-chart-wrap" style="margin-bottom:0;">
+        <canvas id="projection-chart" style="height:220px;"></canvas>
+      </div>
+    </div>
+  </div>
+
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">PROFIT FACTOR & WIN RATE OVER TIME</h2>
   <div class="evo-chart-wrap">
     <canvas id="evo-pf-wr"></canvas>
@@ -1098,10 +1196,194 @@ function loadEvolution() {
 
     // 3D scatter
     render3DScatter(SCATTER);
+
+    // Year-end projection
+    renderProjection(data.projection || {});
   }).catch(e => {
     console.error('Evolution load error', e);
     document.getElementById('evo-stats-bar').innerHTML = '<div class="evo-stat"><div class="val" style="color:#ff5252">Load Error</div></div>';
   });
+}
+
+function renderProjection(proj) {
+  const cards = document.getElementById('projection-cards');
+  if (!proj.scenarios || !proj.scenarios.length) {
+    cards.innerHTML = '<div class="evo-stat" style="width:100%"><div class="val" style="color:#7b8ab8">No projection data</div></div>';
+    return;
+  }
+
+  const startCash = proj.start_cash || 500;
+  const tagColors = {worst:'#ff5252', median:'#ffb74d', best:'#00e676'};
+  const tagLabels = {worst:'Conservative', median:'Median', best:'Optimistic'};
+
+  // Also compute live-adjusted projection if we have live PnL
+  let liveNote = '';
+  const realizedEl = document.getElementById('realized-pnl');
+  if (realizedEl) {
+    const livePnl = parseFloat(realizedEl.textContent.replace(/[^0-9.-]/g, ''));
+    if (!isNaN(livePnl) && livePnl !== 0) {
+      liveNote = '<div style="margin-top:8px; padding:8px; background:#0d1321; border:1px solid #1e2a42; border-radius:4px; font-size:0.78em;">' +
+        '<span style="color:#00d4ff;">LIVE P&L:</span> <span style="color:' + (livePnl >= 0 ? '#00e676' : '#ff5252') + '; font-weight:bold;">$' + livePnl.toFixed(2) + '</span>' +
+        ' — Current balance: <b>$' + (startCash + livePnl).toFixed(2) + '</b></div>';
+    }
+  }
+
+  let html = '';
+  proj.scenarios.forEach(sc => {
+    const color = tagColors[sc.tag] || '#7b8ab8';
+    const label = tagLabels[sc.tag] || sc.tag;
+    const arrow = sc.pct_gain >= 0 ? '&#9650;' : '&#9660;';
+    html += '<div style="background:#141b2d; border:1px solid #1e2a42; border-left:3px solid '+color+'; border-radius:6px; padding:10px 14px;">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+      '<div><span style="color:'+color+'; font-weight:bold; font-size:0.9em;">'+label+'</span>' +
+      '<span style="color:#7b8ab8; font-size:0.7em; margin-left:8px;">PF='+sc.pf+' | '+sc.bt_days+'d backtest</span></div>' +
+      '<div style="font-size:0.72em; color:#7b8ab8;">'+sc.days_left+' days left</div></div>' +
+      '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">' +
+      '<div style="font-size:1.5em; font-weight:bold; color:'+color+';">$'+sc.year_end_balance.toFixed(2)+'</div>' +
+      '<div style="font-size:1.0em; color:'+color+';">'+arrow+' '+sc.pct_gain.toFixed(1)+'%</div></div>' +
+      '<div style="font-size:0.7em; color:#7b8ab8; margin-top:2px;">$'+sc.daily_pnl.toFixed(4)+'/day &rarr; $'+sc.projected_gain.toFixed(2)+' gain from $'+startCash.toFixed(0)+'</div>' +
+      '</div>';
+  });
+  html += liveNote;
+  cards.innerHTML = html;
+
+  // Monthly projection curve
+  const curve = proj.monthly_curve || [];
+  if (!curve.length) return;
+  const canvas = document.getElementById('projection-chart');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const PAD = {l:55, r:15, t:15, b:35};
+  const pW = W-PAD.l-PAD.r, pH = H-PAD.t-PAD.b;
+
+  const bals = curve.map(c => c.balance);
+  const yMin = Math.min(0, ...bals) * 0.9;
+  const yMax = Math.max(...bals) * 1.1;
+  const yRange = yMax - yMin || 1;
+  const xScale = i => PAD.l + (i/(curve.length-1)) * pW;
+  const yScale = v => PAD.t + pH - ((v-yMin)/yRange)*pH;
+
+  // Grid
+  ctx.strokeStyle = '#1e2a42'; ctx.lineWidth = 0.5;
+  for (let i=0;i<=4;i++) { const y=PAD.t+(i/4)*pH; ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(W-PAD.r,y); ctx.stroke(); }
+
+  // Starting cash reference
+  ctx.strokeStyle = '#7b8ab844'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(PAD.l, yScale(startCash)); ctx.lineTo(W-PAD.r, yScale(startCash)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#7b8ab8'; ctx.font = '9px Courier New'; ctx.textAlign = 'right';
+  ctx.fillText('$'+startCash, PAD.l-4, yScale(startCash)+3);
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, PAD.t, 0, PAD.t+pH);
+  const endBal = bals[bals.length-1];
+  if (endBal >= startCash) {
+    grad.addColorStop(0, 'rgba(0,230,118,0.25)'); grad.addColorStop(1, 'rgba(0,230,118,0.02)');
+  } else {
+    grad.addColorStop(0, 'rgba(255,82,82,0.05)'); grad.addColorStop(1, 'rgba(255,82,82,0.25)');
+  }
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.moveTo(xScale(0), yScale(0));
+  curve.forEach((c,i) => ctx.lineTo(xScale(i), yScale(c.balance)));
+  ctx.lineTo(xScale(curve.length-1), PAD.t+pH); ctx.lineTo(xScale(0), PAD.t+pH); ctx.closePath(); ctx.fill();
+
+  // Line
+  ctx.strokeStyle = endBal >= startCash ? '#00e676' : '#ff5252'; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  curve.forEach((c,i) => { i===0 ? ctx.moveTo(xScale(i),yScale(c.balance)) : ctx.lineTo(xScale(i),yScale(c.balance)); });
+  ctx.stroke();
+
+  // Points + labels
+  const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  ctx.textAlign = 'center'; ctx.font = '9px Courier New';
+  curve.forEach((c,i) => {
+    ctx.fillStyle = endBal >= startCash ? '#00e676' : '#ff5252';
+    ctx.beginPath(); ctx.arc(xScale(i), yScale(c.balance), 3, 0, Math.PI*2); ctx.fill();
+    if (i === 0 || i === curve.length-1 || i % 3 === 0) {
+      ctx.fillStyle = '#7b8ab8';
+      ctx.fillText(months[c.month] || c.month, xScale(i), H-PAD.b+14);
+    }
+  });
+
+  // End balance label
+  ctx.fillStyle = endBal >= startCash ? '#00e676' : '#ff5252'; ctx.font = 'bold 11px Courier New'; ctx.textAlign = 'left';
+  ctx.fillText('$'+endBal.toFixed(0), xScale(curve.length-1)+6, yScale(endBal)+4);
+
+  // Y axis
+  ctx.fillStyle = '#7b8ab8'; ctx.font = '9px Courier New'; ctx.textAlign = 'right';
+  for (let i=0;i<=4;i++) { const v=yMin+(yRange*i/4); ctx.fillText('$'+v.toFixed(0), PAD.l-4, PAD.t+pH-(i/4)*pH+3); }
+}
+
+// Real-time projection ticker — updates from SSE live PnL
+let lastProjectionData = null;
+function updateLiveProjection(livePnl, liveEquity) {
+  if (!lastProjectionData && evoLoaded) {
+    // Cache projection data on first SSE update after evo load
+    fetch('/api/evolution').then(r => r.json()).then(d => {
+      lastProjectionData = d.projection;
+      _applyLiveProjectionUpdate(livePnl, liveEquity);
+    }).catch(() => {});
+    return;
+  }
+  if (!lastProjectionData) return;
+  _applyLiveProjectionUpdate(livePnl, liveEquity);
+}
+
+function _applyLiveProjectionUpdate(livePnl, liveEquity) {
+  const proj = lastProjectionData;
+  if (!proj || !proj.scenarios || !proj.scenarios.length) return;
+  const liveEl = document.getElementById('live-projection-ticker');
+  if (!liveEl) {
+    // Create the live ticker element if it doesn't exist
+    const section = document.getElementById('projection-cards');
+    if (!section) return;
+    const div = document.createElement('div');
+    div.id = 'live-projection-ticker';
+    div.style.cssText = 'margin-top:8px; padding:10px 14px; background:#0d1321; border:1px solid #00d4ff44; border-radius:6px; animation: pulse 2s infinite;';
+    section.appendChild(div);
+    // Add pulse animation
+    if (!document.getElementById('pulse-style')) {
+      const style = document.createElement('style');
+      style.id = 'pulse-style';
+      style.textContent = '@keyframes pulse { 0%,100%{border-color:#00d4ff44} 50%{border-color:#00d4ff} }';
+      document.head.appendChild(style);
+    }
+  }
+  const ticker = document.getElementById('live-projection-ticker');
+  if (!ticker) return;
+
+  const startCash = proj.start_cash || 500;
+  const currentBalance = liveEquity > 0 ? liveEquity : startCash + livePnl;
+  const gainPct = ((currentBalance - startCash) / startCash * 100);
+  const color = livePnl >= 0 ? '#00e676' : '#ff5252';
+  const arrow = livePnl >= 0 ? '&#9650;' : '&#9660;';
+
+  // Annualize from live performance
+  // Use the elapsed days of paper trading (started ~2026-03-11)
+  const startDate = new Date('2026-03-11T00:00:00Z');
+  const now = new Date();
+  const elapsedDays = Math.max(1, (now - startDate) / 86400000);
+  const dailyRate = livePnl / elapsedDays;
+  const daysLeft = proj.scenarios[0] ? proj.scenarios[0].days_left : 290;
+  const projectedYearEnd = currentBalance + dailyRate * daysLeft;
+  const projYearEndPct = ((projectedYearEnd - startCash) / startCash * 100);
+
+  ticker.innerHTML =
+    '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+    '<div style="font-size:0.75em; color:#00d4ff; font-weight:bold; letter-spacing:1px;">LIVE PERFORMANCE</div>' +
+    '<div style="font-size:0.68em; color:#7b8ab8;">Updated ' + new Date().toISOString().slice(11,19) + 'Z</div></div>' +
+    '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">' +
+    '<div><span style="color:#7b8ab8; font-size:0.78em;">Current Balance:</span> ' +
+    '<span style="font-size:1.3em; font-weight:bold; color:'+color+';">$'+currentBalance.toFixed(2)+'</span>' +
+    '<span style="font-size:0.85em; color:'+color+'; margin-left:6px;">'+arrow+' '+gainPct.toFixed(2)+'%</span></div>' +
+    '<div><span style="color:#7b8ab8; font-size:0.78em;">Year-End Proj:</span> ' +
+    '<span style="font-size:1.1em; font-weight:bold; color:'+(projectedYearEnd>=startCash?'#00e676':'#ff5252')+';">$'+projectedYearEnd.toFixed(2)+'</span>' +
+    '<span style="font-size:0.78em; color:'+(projYearEndPct>=0?'#00e676':'#ff5252')+'; margin-left:4px;">('+projYearEndPct.toFixed(1)+'%)</span></div></div>' +
+    '<div style="font-size:0.68em; color:#7b8ab8; margin-top:4px;">$'+dailyRate.toFixed(4)+'/day over '+elapsedDays.toFixed(0)+' days | Live P&L: <span style="color:'+color+'">$'+livePnl.toFixed(4)+'</span></div>';
 }
 
 function drawEvoCanvas(canvasId, tipId, EVO, series, yConfigs) {
@@ -1310,6 +1592,9 @@ function updateDashboard(data) {
 
   document.getElementById('total-fills').textContent = data.total_fills || 0;
   document.getElementById('total-journal').textContent = data.total_journal_entries || 0;
+
+  // Real-time projection update on evolution page
+  updateLiveProjection(parseFloat(data.realized_pnl) || 0, parseFloat(data.equity) || 0);
 
   // Runtime
   document.getElementById('uptime').textContent = (data.uptime_hours || 0) + 'h';
