@@ -349,6 +349,13 @@ class DecisionSnapshot:
     mae_pct: Decimal = Decimal("0")
 
     # -------------------------
+    # ML Governor
+    # -------------------------
+    governor_win_prob: Optional[float] = None
+    governor_recommendation: str = ""
+    governor_score_modifier: int = 0
+
+    # -------------------------
     # Decision
     # -------------------------
     action: str = "HOLD"

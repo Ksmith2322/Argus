@@ -175,6 +175,90 @@ def read_equity_series() -> list:
         return []
 
 
+def read_decision_flow(n: int = 30) -> list:
+    """Read recent entry-related events with governor scores."""
+    decisions = []
+    # From live_events.csv — entry attempts, blocks, fills
+    path = OPS_LOGS / "live_events.csv"
+    if path.exists():
+        try:
+            rows = []
+            with open(path) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    event = row.get("event", "")
+                    if any(k in event for k in ["BUY", "MISSED_BUY", "ENTRY", "GOVERNOR"]):
+                        rows.append(row)
+            for row in rows[-n:]:
+                decisions.append({
+                    "ts": row.get("ts", ""),
+                    "event": row.get("event", ""),
+                    "action": row.get("action", ""),
+                    "detail": (row.get("detail", "") or "")[:120],
+                    "confluence_score": row.get("confluence_score", ""),
+                    "confluence_gate": row.get("confluence_gate", ""),
+                    "regime": row.get("regime", ""),
+                    "session": row.get("session", ""),
+                })
+        except Exception:
+            pass
+    # Enrich with governor data from live_signals.csv
+    sig_path = OPS_LOGS / "live_signals.csv"
+    if sig_path.exists():
+        try:
+            gov_rows = []
+            with open(sig_path) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    prob = row.get("governor_win_prob", "")
+                    action = row.get("action", "")
+                    if prob and action not in ("HOLD", ""):
+                        gov_rows.append({
+                            "ts": row.get("ts", ""),
+                            "action": action,
+                            "governor_win_prob": prob,
+                            "governor_recommendation": row.get("governor_recommendation", ""),
+                            "governor_score_modifier": row.get("governor_score_modifier", ""),
+                            "confluence_score": row.get("confluence_score", ""),
+                            "regime": row.get("regime", ""),
+                            "session": row.get("session", ""),
+                        })
+            seen_ts = {d["ts"] for d in decisions}
+            for gr in gov_rows[-n:]:
+                if gr["ts"] not in seen_ts:
+                    decisions.append(gr)
+        except Exception:
+            pass
+    decisions.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    return decisions[:n]
+
+
+def read_governor_latest() -> dict:
+    """Read latest governor score from live_signals.csv."""
+    sig_path = OPS_LOGS / "live_signals.csv"
+    if not sig_path.exists():
+        return {}
+    try:
+        last = {}
+        with open(sig_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                last = row
+        prob = last.get("governor_win_prob", "")
+        if prob:
+            return {
+                "win_prob": float(prob),
+                "recommendation": last.get("governor_recommendation", ""),
+                "score_modifier": last.get("governor_score_modifier", ""),
+                "confluence_score": last.get("confluence_score", ""),
+                "regime": last.get("regime", ""),
+                "session": last.get("session", ""),
+            }
+        return {}
+    except Exception:
+        return {}
+
+
 def read_queue_status() -> dict:
     """Read queue files and detect running/pending/completed jobs."""
     result = {"pending_pc1": 0, "pending_pc2": 0, "pending_labels": [],
@@ -284,6 +368,7 @@ def build_status() -> dict:
         "signals": signals,
         "events": events[-10:],
         "queue": read_queue_status(),
+        "governor": read_governor_latest(),
     }
 
 
@@ -319,6 +404,16 @@ async def api_fills():
 @app.get("/api/journal")
 async def api_journal():
     return JSONResponse(read_trade_journal(200))
+
+
+@app.get("/api/decisions")
+async def api_decisions():
+    return JSONResponse(read_decision_flow(50))
+
+
+@app.get("/api/governor")
+async def api_governor():
+    return JSONResponse(read_governor_latest())
 
 
 @app.get("/api/backtest")
@@ -383,6 +478,7 @@ async def api_config():
         "USD_PER_TRADE", "COMPOUND_SIZE_PCT",
         "SESSION_ENTRY_BLOCK_LIST",
         "SESSION_ASIA_RISK_MULT", "SESSION_OFF_RISK_MULT",
+        "USE_ML_GOVERNOR", "ML_GOVERNOR_MODE", "ML_GOVERNOR_THRESHOLD",
     ]
     cfg = {}
     try:
@@ -461,6 +557,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #connection-status { position: fixed; top: 8px; right: 12px; font-size: 0.75em; }
   .connected { color: #00e676; }
   .disconnected { color: #ff5252; }
+  .gov-gauge { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .gov-bar-bg { flex: 1; background: #1e2a42; border-radius: 4px; height: 18px; overflow: hidden; position: relative; }
+  .gov-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s, background 0.5s; }
+  .gov-bar-label { position: absolute; right: 6px; top: 1px; font-size: 0.7em; color: #fff; font-weight: bold; }
+  .decision-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid #0d1321; font-size: 0.75em; }
+  .decision-row:last-child { border-bottom: none; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot-allow { background: #00e676; }
+  .dot-block { background: #ff5252; }
+  .dot-caution { background: #ffc107; }
+  .dot-unknown { background: #7b8ab8; }
 </style>
 </head>
 <body>
@@ -508,11 +615,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="label">Completed today: <span id="queue-completed">0</span></div>
     <div id="queue-labels" class="label" style="margin-top:4px;"></div>
   </div>
+  <div class="card">
+    <h2>ML Governor</h2>
+    <div id="gov-status" class="metric" style="font-size:1.0em; color:#7b8ab8;">DISABLED</div>
+    <div class="gov-gauge">
+      <div class="gov-bar-bg">
+        <div id="gov-bar" class="gov-bar-fill" style="width:0%; background:#7b8ab8;"></div>
+        <span id="gov-bar-pct" class="gov-bar-label">—</span>
+      </div>
+    </div>
+    <div class="label" style="margin-top:4px;">Recommendation: <span id="gov-rec" style="font-weight:bold;">—</span></div>
+    <div class="label">Score mod: <span id="gov-mod">0</span> | Confluence: <span id="gov-conf">—</span></div>
+    <div class="label">Regime: <span id="gov-regime">—</span> | Session: <span id="gov-session">—</span></div>
+  </div>
 </div>
 
 <div class="chart-container">
   <h2 style="color:#7b8ab8; font-size:0.85em; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Equity Curve</h2>
   <canvas id="equity-chart" height="200"></canvas>
+</div>
+
+<div class="card" style="margin-bottom:12px;">
+  <h2>Decision Flow</h2>
+  <div id="decision-flow" style="max-height:250px; overflow-y:auto; padding:4px;">
+    <div style="color:#7b8ab8; font-size:0.8em;">Waiting for entry signals...</div>
+  </div>
 </div>
 
 <div class="grid" style="grid-template-columns: 1fr 1fr;">
@@ -677,6 +804,31 @@ function updateDashboard(data) {
     renderJournal(data.journal || []);
   }
 
+  // Governor panel
+  if (data.governor && data.governor.win_prob !== undefined) {
+    const g = data.governor;
+    const prob = g.win_prob;
+    const pct = Math.round(prob * 100);
+    const rec = g.recommendation || '—';
+    const barColor = prob >= 0.45 ? '#00e676' : prob >= 0.30 ? '#ffc107' : '#ff5252';
+    const recColor = rec === 'ALLOW' ? '#00e676' : rec === 'BLOCK' ? '#ff5252' : rec === 'CAUTION' ? '#ffc107' : '#7b8ab8';
+
+    document.getElementById('gov-status').textContent = pct + '% WIN PROB';
+    document.getElementById('gov-status').style.color = barColor;
+    document.getElementById('gov-bar').style.width = pct + '%';
+    document.getElementById('gov-bar').style.background = barColor;
+    document.getElementById('gov-bar-pct').textContent = pct + '%';
+    document.getElementById('gov-rec').textContent = rec;
+    document.getElementById('gov-rec').style.color = recColor;
+    document.getElementById('gov-mod').textContent = g.score_modifier || '0';
+    document.getElementById('gov-conf').textContent = g.confluence_score || '—';
+    document.getElementById('gov-regime').textContent = g.regime || '—';
+    document.getElementById('gov-session').textContent = g.session || '—';
+  } else {
+    document.getElementById('gov-status').textContent = 'LOG_ONLY';
+    document.getElementById('gov-status').style.color = '#7b8ab8';
+  }
+
   // Queue panel
   if (data.queue) {
     const q = data.queue;
@@ -769,7 +921,7 @@ async function loadConfig() {
     const cfg = await resp.json();
     const panel = document.getElementById('config-panel');
     panel.innerHTML = '';
-    const highlights = {'CONFLUENCE_MIN_SCORE':1, 'MAX_HOLD_SECONDS':1, 'REGIME_ENTRY_BLOCK_LIST':1, 'DRAWDOWN_PAUSE_PCT':1, 'USE_TRENDLINES':1};
+    const highlights = {'CONFLUENCE_MIN_SCORE':1, 'MAX_HOLD_SECONDS':1, 'REGIME_ENTRY_BLOCK_LIST':1, 'DRAWDOWN_PAUSE_PCT':1, 'USE_TRENDLINES':1, 'USE_ML_GOVERNOR':1, 'ML_GOVERNOR_MODE':1};
     Object.entries(cfg).forEach(([k,v]) => {
       const hl = highlights[k] ? 'color:#00d4ff;font-weight:bold' : 'color:#7b8ab8';
       const el = document.createElement('div');
@@ -777,6 +929,49 @@ async function loadConfig() {
       panel.appendChild(el);
     });
   } catch(e) { console.error('config fetch error', e); }
+}
+
+// --- Decision Flow ---
+async function loadDecisions() {
+  try {
+    const resp = await fetch('/api/decisions');
+    const decisions = await resp.json();
+    const container = document.getElementById('decision-flow');
+    if (!decisions.length) {
+      container.innerHTML = '<div style="color:#7b8ab8; font-size:0.8em;">No entry signals yet...</div>';
+      return;
+    }
+    container.innerHTML = '';
+    decisions.forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'decision-row';
+      const event = d.event || d.action || '';
+      const isBuy = event.includes('BUY') && !event.includes('MISSED');
+      const isBlock = event.includes('MISSED') || event.includes('BLOCK');
+      const dotClass = isBuy ? 'dot-allow' : isBlock ? 'dot-block' : 'dot-unknown';
+
+      const prob = d.governor_win_prob ? (parseFloat(d.governor_win_prob) * 100).toFixed(0) + '%' : '';
+      const probColor = d.governor_win_prob ? (parseFloat(d.governor_win_prob) >= 0.45 ? '#00e676' : parseFloat(d.governor_win_prob) >= 0.30 ? '#ffc107' : '#ff5252') : '#7b8ab8';
+      const govTag = prob ? '<span style="color:' + probColor + '; font-weight:bold; margin-left:4px;">[' + prob + ']</span>' : '';
+      const recTag = d.governor_recommendation ? '<span style="color:#7b8ab8; margin-left:2px;">' + d.governor_recommendation + '</span>' : '';
+
+      const ts = (d.ts || '').slice(11, 19) || '??:??:??';
+      const confStr = d.confluence_score ? 'CS=' + d.confluence_score : '';
+      const regimeStr = d.regime ? d.regime : '';
+      const sessionStr = d.session ? d.session : '';
+      const meta = [confStr, regimeStr, sessionStr].filter(Boolean).join(' | ');
+
+      const eventColor = isBuy ? '#00e676' : isBlock ? '#ff5252' : '#ffc107';
+      const shortEvent = event.replace('MISSED_BUY_', 'MISS:').replace('WOULD_BUY', 'ENTRY');
+
+      row.innerHTML = '<div class="dot ' + dotClass + '"></div>'
+        + '<span style="color:#7b8ab8; min-width:55px;">' + ts + '</span>'
+        + '<span style="color:' + eventColor + '; min-width:90px; font-weight:bold;">' + shortEvent + '</span>'
+        + govTag + recTag
+        + '<span style="color:#7b8ab8; margin-left:auto; font-size:0.9em;">' + meta + '</span>';
+      container.appendChild(row);
+    });
+  } catch(e) { console.error('decisions fetch error', e); }
 }
 
 // --- Journal Viewer ---
@@ -859,9 +1054,11 @@ loadEquity();
 loadConfig();
 loadBacktests();
 loadJournal();
+loadDecisions();
 setInterval(loadEquity, 30000);
 setInterval(loadBacktests, 60000);
-setInterval(loadJournal, 120000);  // refresh journal every 2 min
+setInterval(loadJournal, 120000);
+setInterval(loadDecisions, 15000);  // refresh decision flow every 15s
 connectSSE();
 </script>
 </body>

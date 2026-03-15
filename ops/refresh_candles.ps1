@@ -2,8 +2,9 @@
 # Downloads fresh 1m candles for all tracked pairs and optionally syncs to PC2.
 # Usage: .\ops\refresh_candles.ps1 [-DaysBack 30] [-SyncPC2]
 param(
-    [int]$DaysBack = 30,
-    [switch]$SyncPC2
+    [int]$DaysBack = 45,
+    [switch]$SyncPC2,
+    [switch]$RunBacktest
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,6 +68,14 @@ if ($SyncPC2) {
     Write-Host "--- SYNCING TO PC2 ---" -ForegroundColor Cyan
     ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
     Write-Host "PC2 synced." -ForegroundColor Green
+}
+
+# Optionally chain into nightly backtest
+if ($RunBacktest) {
+    Write-Host ""
+    Write-Host "--- CHAINING INTO BACKTEST ---" -ForegroundColor Cyan
+    & "$PSScriptRoot\run_backtest.ps1" -SingleRun
+    Write-Host "Backtest complete." -ForegroundColor Green
 }
 
 Write-Host ""

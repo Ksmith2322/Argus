@@ -259,6 +259,11 @@ def _signals_header() -> List[str]:
         "argus_profile",
         "argus_forced_regime",
         "argus_forced_liq_block",
+
+        # ML Governor
+        "governor_win_prob",
+        "governor_recommendation",
+        "governor_score_modifier",
     ]
 
 

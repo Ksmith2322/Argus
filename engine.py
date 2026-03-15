@@ -25,6 +25,9 @@ from liquidity import LiquidityResult  # noqa: F401
 # Phase 5C
 from session import classify_session, apply_session_to_score
 
+# ML Governor (Phase ML-1)
+import ml_governor
+
 
 def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
     if min_dist is None:
@@ -1564,64 +1567,89 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 )
                                 risk_blocked_reason = str(why or "")
                             else:
-                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                                snap.vol_used = vol_used
-                                snap.vol_sizing_qty = qty_vol
-                                snap.execution_qty = qty
-                                snap.vol_reason = qty_reason
-                                snap.sizing_note = sizing_note
+                                # ML Governor evaluation (stamps snapshot, optionally gates)
+                                gov = ml_governor.evaluate(snap, cfg)
+                                snap.governor_win_prob = gov.win_prob
+                                snap.governor_recommendation = gov.recommendation
+                                snap.governor_score_modifier = gov.score_modifier
 
-                                if _adapter_mode_enabled(cfg, state):
-                                    snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
-                                    snap.entry_intent_id = snap.intent_id
-                                    snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
-                                    snap.execution_status = "PENDING_SUBMIT"
-                                    snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
-
-                                    _add_event(
+                                gov_mode = str(cfg.get("ML_GOVERNOR_MODE", "LOG_ONLY")).upper()
+                                if gov_mode == "GATE" and gov.recommendation == "BLOCK" and gov.model_loaded:
+                                    _emit_missed_buy(
                                         snap,
-                                        ev_name,
-                                        (
-                                            f"ENTRY_INTENT | px={px} qty={qty} "
-                                            f"client_order_id={snap.client_order_id} | "
-                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                        ),
-                                        notify_title="BUY",
-                                        notify_body=(
-                                            f"{symbol} BUY intent\n"
-                                            f"px={px}\nqty={qty}\n"
-                                            f"client_order_id={snap.client_order_id}"
-                                        ),
-                                        client_order_id=snap.client_order_id,
+                                        event="MISSED_BUY_GOVERNOR",
+                                        prefix="ML_GOVERNOR_BLOCK",
+                                        px=px,
+                                        confluence_min_score=confluence_min_score,
+                                        cooldown_remaining=int(cooldown_remaining),
+                                        equity=equity,
+                                        exposure=exposure,
+                                        extra=f"win_prob={gov.win_prob:.3f} threshold={cfg.get('ML_GOVERNOR_THRESHOLD', '0.30')}",
                                     )
-
-                                    action = "BUY"
-                                    action_reason = "ENTRY_INTENT"
                                 else:
-                                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                                    state.risk.record_entry(now_e, cfg)
+                                    if gov_mode == "SCORE_MODIFY" and gov.model_loaded and gov.score_modifier != 0:
+                                        old_score = snap.confluence_score
+                                        if old_score is not None:
+                                            snap.confluence_score = max(0, min(100, old_score + gov.score_modifier))
 
-                                    state.entry_epoch = now_e
-                                    state.peak_price = px
-                                    state.trend_below_count = 0
-                                    state.mfe_pct = Decimal("0")
-                                    state.mae_pct = Decimal("0")
-                                    state.high_since_entry = px
-                                    state.low_since_entry = px
+                                    ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                                    snap.vol_used = vol_used
+                                    snap.vol_sizing_qty = qty_vol
+                                    snap.execution_qty = qty
+                                    snap.vol_reason = qty_reason
+                                    snap.sizing_note = sizing_note
 
-                                    _add_event(
-                                        snap,
-                                        ev_name,
-                                        (
-                                            f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                        ),
-                                        notify_title="BUY",
-                                        notify_body=f"{symbol} BUY px={px} qty={qty}",
-                                    )
+                                    if _adapter_mode_enabled(cfg, state):
+                                        snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                        snap.entry_intent_id = snap.intent_id
+                                        snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                        snap.execution_status = "PENDING_SUBMIT"
+                                        snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
 
-                                    action = ev_name
-                                    action_reason = "ENTRY_FILLED"
+                                        _add_event(
+                                            snap,
+                                            ev_name,
+                                            (
+                                                f"ENTRY_INTENT | px={px} qty={qty} "
+                                                f"client_order_id={snap.client_order_id} | "
+                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                            ),
+                                            notify_title="BUY",
+                                            notify_body=(
+                                                f"{symbol} BUY intent\n"
+                                                f"px={px}\nqty={qty}\n"
+                                                f"client_order_id={snap.client_order_id}"
+                                            ),
+                                            client_order_id=snap.client_order_id,
+                                        )
+
+                                        action = "BUY"
+                                        action_reason = "ENTRY_INTENT"
+                                    else:
+                                        fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                        state.risk.record_entry(now_e, cfg)
+
+                                        state.entry_epoch = now_e
+                                        state.peak_price = px
+                                        state.trend_below_count = 0
+                                        state.mfe_pct = Decimal("0")
+                                        state.mae_pct = Decimal("0")
+                                        state.high_since_entry = px
+                                        state.low_since_entry = px
+
+                                        _add_event(
+                                            snap,
+                                            ev_name,
+                                            (
+                                                f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                            ),
+                                            notify_title="BUY",
+                                            notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                        )
+
+                                        action = ev_name
+                                        action_reason = "ENTRY_FILLED"
 
             else:
                 if require_confluence and (not conf_ok):

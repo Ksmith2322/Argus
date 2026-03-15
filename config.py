@@ -457,6 +457,13 @@ def load_config() -> dict:
     cfg["TL_PENALTY_RESIST_SLOPE_NEG"] = _clamp_int(_i("TL_PENALTY_RESIST_SLOPE_NEG", "0"), 0, 30)
 
     # -------------------------
+    # ML Governor
+    # -------------------------
+    cfg["USE_ML_GOVERNOR"] = _b("USE_ML_GOVERNOR", "false")
+    cfg["ML_GOVERNOR_MODE"] = os.environ.get("ML_GOVERNOR_MODE", "LOG_ONLY").upper()  # LOG_ONLY | SCORE_MODIFY | GATE
+    cfg["ML_GOVERNOR_THRESHOLD"] = str(_d("ML_GOVERNOR_THRESHOLD", "0.30"))
+
+    # -------------------------
     # Phase 5B — Liquidity Filters
     # -------------------------
     cfg["USE_LIQUIDITY_FILTERS"] = _b("USE_LIQUIDITY_FILTERS", "false")

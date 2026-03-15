@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-14 21:21:34 CDT
+Last update: 2026-03-15 01:58:46 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       2827
+  - HOLD total:       2882
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -19,16 +19,16 @@ Missed buy counters:
 Hold reason counters:
   - HOLD_WARMUP_NO_1M_STATE: 0
   - HOLD_PAUSED: 0
-  - HOLD_STALE_DATA: 1945
+  - HOLD_STALE_DATA: 1982
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 148
-  - HOLD_NO_TREND_OK: 523
+  - HOLD_NO_SIGNAL: 157
+  - HOLD_NO_TREND_OK: 524
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 179
+  - HOLD_OTHER: 187
 
 Last event:
-  reason: HOLD_NO_SIGNAL
-  detail: signal=0 score=0 reasons= | px=2095.415 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=75 | delta=-15 | adj_score=60 | watch_th=58 | trade_th=85 | trend_strength=0.00009 | vol=0.00045 | liq:spread=NA;vol_1m=6.18560588;vol_floor>=25;vol_base=14.63544963833333333333333333;vol_need>=7.3177;atr_norm=0.000449897955288374763738179495931035489775240421295166015625;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | liq_penalty=-20 | struct=STRUCT:near_sup(d=0.000282);near_res(d=0.001315);reject_res | liq=spread=NA;vol_1m=6.18560588;vol_floor>=25;vol_base=14.63544963833333333333333333;vol_need>=7.3177;atr_norm=0.000449897955288374763738179495931035489775240421295166015625;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20
+  reason: HOLD_STALE_DATA
+  detail: stale tick guard | px=2107.915 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=99 | delta=-15 | adj_score=84 | watch_th=58 | trade_th=85 | trend_strength=0.00083 | vol=0.00037 | liq:spread=NA;vol_1m=39.19132342;vol_floor>=25;vol_base=18.6648174155;vol_need>=9.3324;atr_norm=0.000371248597561009592571412696315746870823204517364501953125;LIQ_OK | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=39.19132342;vol_floor>=25;vol_base=18.6648174155;vol_need>=9.3324;atr_norm=0.000371248597561009592571412696315746870823204517364501953125;LIQ_OK
