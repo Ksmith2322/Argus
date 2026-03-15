@@ -648,6 +648,99 @@ async def stream(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Evolution API — serves backtest summary timeline + trade scatter data
+# ---------------------------------------------------------------------------
+
+def _load_bt_summaries(latest: int = 50) -> list:
+    files = sorted(
+        OPS_LOGS.glob("bt_summary_bt_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    files = [f for f in files if "latest" not in f.name]
+    if latest > 0:
+        files = files[-latest:]
+    out = []
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["_mtime"] = f.stat().st_mtime
+            out.append(data)
+        except Exception:
+            pass
+    return out
+
+
+def _build_evo_points(summaries: list) -> list:
+    points = []
+    for s in summaries:
+        run_id = s.get("run_id", "")
+        label = s.get("label", s.get("job_label", run_id))
+        ts = s.get("_mtime", 0)
+        if run_id:
+            try:
+                date_part = run_id.split("_")[1] if "_" in run_id else ""
+                if date_part and "T" in date_part:
+                    dt = datetime.strptime(date_part, "%Y%m%dT%H%M%SZ")
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    ts = dt.timestamp()
+            except Exception:
+                pass
+        points.append({
+            "ts": ts * 1000,
+            "label": str(label)[:40],
+            "run_id": str(run_id)[:30],
+            "pf": round(float(s.get("profit_factor", 0) or 0), 3),
+            "wr": round(float(s.get("win_rate_pct", 0) or 0), 1),
+            "pnl": round(float(s.get("total_pnl_usd", 0) or 0), 2),
+            "trades": int(s.get("total_closed", s.get("trades_closed", 0)) or 0),
+            "expectancy": round(float(s.get("expectancy_usd", 0) or 0), 4),
+        })
+    return sorted(points, key=lambda p: p["ts"])
+
+
+def _build_scatter_data(summaries: list, max_runs: int = 8) -> list:
+    recent = summaries[-max_runs:] if len(summaries) > max_runs else summaries
+    all_trades = []
+    for s in recent:
+        run_id = s.get("run_id", "")
+        if not run_id:
+            continue
+        trades_file = OPS_LOGS / f"trades_{run_id}.csv"
+        if not trades_file.exists():
+            continue
+        try:
+            with open(trades_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    entry_epoch = float(row.get("entry_epoch", row.get("epoch", 0)) or 0)
+                    entry_px = float(row.get("entry_px", row.get("fill_px", 0)) or 0)
+                    pnl = float(row.get("realized_pnl", row.get("pnl", 0)) or 0)
+                    hold_s = float(row.get("hold_seconds", row.get("duration_s", 0)) or 0)
+                    if entry_epoch > 0 and entry_px > 0:
+                        all_trades.append({
+                            "x": entry_epoch * 1000,
+                            "y": round(entry_px, 2),
+                            "z": round(pnl, 4),
+                            "hold": round(hold_s, 0),
+                            "run": run_id[:20],
+                            "win": 1 if pnl > 0 else 0,
+                        })
+        except Exception:
+            pass
+    return all_trades
+
+
+@app.get("/api/evolution")
+async def api_evolution():
+    summaries = _load_bt_summaries(50)
+    return JSONResponse({
+        "evo": _build_evo_points(summaries),
+        "scatter": _build_scatter_data(summaries),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Dashboard HTML (single page, self-contained)
 # ---------------------------------------------------------------------------
 
@@ -685,6 +778,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-running { background: #1b2a3a; color: #00d4ff; }
   .badge-error { background: #3a1b1b; color: #ff5252; }
   .footer { color: #3a4a6b; font-size: 0.7em; margin-top: 8px; text-align: center; }
+  .page-nav { display: flex; gap: 0; margin-bottom: 14px; border-bottom: 2px solid #1e2a42; }
+  .page-nav-btn { padding: 10px 24px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.95em; font-weight: bold; letter-spacing: 1px; transition: all 0.2s; margin-bottom: -2px; }
+  .page-nav-btn:hover { color: #00d4ff; }
+  .page-nav-btn.active { color: #00d4ff; border-bottom-color: #00d4ff; }
+  .page-content { display: none; }
+  .page-content.active { display: block; }
+  #evo-page .evo-stats { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 12px 0; }
+  #evo-page .evo-stat { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 8px 16px; text-align: center; }
+  #evo-page .evo-stat .val { font-size: 1.3em; font-weight: bold; }
+  #evo-page .evo-stat .lbl { font-size: 0.7em; color: #7b8ab8; }
+  #evo-page .evo-chart-wrap { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; margin-bottom: 14px; position: relative; }
+  #evo-page canvas { width: 100%; height: 300px; display: block; }
+  #evo-page .evo-legend { display: flex; gap: 16px; justify-content: center; font-size: 0.75em; padding: 6px; }
+  #evo-page .evo-legend .edot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; vertical-align: middle; }
+  #scatter3d { width: 100%; height: 500px; cursor: grab; }
+  #evo-page .evo-tip { position: absolute; background: #1a1a2e; border: 1px solid #00d4ff; border-radius: 4px; padding: 6px 10px; font-size: 0.72em; pointer-events: none; display: none; z-index: 100; max-width: 320px; line-height: 1.4; }
   .coin-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
   .coin-tab { padding: 6px 16px; border-radius: 4px; border: 1px solid #1e2a42; background: #141b2d; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.85em; font-weight: bold; transition: all 0.2s; }
   .coin-tab:hover { border-color: #00d4ff; color: #00d4ff; }
@@ -718,6 +827,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span id="connection-status" class="disconnected">CONNECTING...</span>
 </div>
 
+<div class="page-nav">
+  <button class="page-nav-btn active" onclick="switchPage('live')">LIVE</button>
+  <button class="page-nav-btn" onclick="switchPage('evolution')">BACKTEST EVOLUTION</button>
+</div>
+
+<div id="live-page" class="page-content active">
 <div class="coin-tabs">
   <button class="coin-tab active" data-coin="ETH" onclick="switchCoin('ETH')">ETH</button>
   <button class="coin-tab" data-coin="BTC" onclick="switchCoin('BTC')">BTC</button>
@@ -888,11 +1003,215 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="footer">
   Last update: <span id="last-update">—</span> | Run: <span id="run-id">—</span> | Saved: <span id="saved-at">—</span>
 </div>
+</div><!-- end live-page -->
 
+<div id="evo-page" class="page-content">
+  <div class="evo-stats" id="evo-stats-bar"></div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">PROFIT FACTOR & WIN RATE OVER TIME</h2>
+  <div class="evo-chart-wrap">
+    <canvas id="evo-pf-wr"></canvas>
+    <div class="evo-tip" id="evo-tip-pf"></div>
+    <div class="evo-legend">
+      <span><span class="edot" style="background:#00d4ff"></span> Profit Factor</span>
+      <span><span class="edot" style="background:#00e676"></span> Win Rate %</span>
+      <span style="color:#ffb74d">--- PF=1.0 breakeven</span>
+    </div>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">PNL & EXPECTANCY OVER TIME</h2>
+  <div class="evo-chart-wrap">
+    <canvas id="evo-pnl"></canvas>
+    <div class="evo-tip" id="evo-tip-pnl"></div>
+    <div class="evo-legend">
+      <span><span class="edot" style="background:#ffb74d"></span> Total PnL ($)</span>
+      <span><span class="edot" style="background:#ba68c8"></span> Expectancy ($/trade)</span>
+    </div>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">3D TRADE SCATTER — PRICE x TIME x PNL</h2>
+  <div class="evo-chart-wrap">
+    <div id="scatter3d"></div>
+    <div class="evo-legend">
+      <span><span class="edot" style="background:#00e676"></span> Win</span>
+      <span><span class="edot" style="background:#ff5252"></span> Loss</span>
+      <span style="color:#7b8ab8">Drag to rotate | Scroll to zoom</span>
+    </div>
+  </div>
+</div><!-- end evo-page -->
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
 <script>
 let equityChart = null;
 let currentCoin = 'ETH';
 let sseConnection = null;
+let evoLoaded = false;
+
+function switchPage(page) {
+  document.querySelectorAll('.page-nav-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
+  if (page === 'evolution') {
+    document.querySelectorAll('.page-nav-btn')[1].classList.add('active');
+    document.getElementById('evo-page').classList.add('active');
+    if (!evoLoaded) { loadEvolution(); }
+  } else {
+    document.querySelectorAll('.page-nav-btn')[0].classList.add('active');
+    document.getElementById('live-page').classList.add('active');
+  }
+}
+
+function loadEvolution() {
+  fetch('/api/evolution').then(r => r.json()).then(data => {
+    evoLoaded = true;
+    const EVO = data.evo || [];
+    const SCATTER = data.scatter || [];
+
+    // Stats bar
+    const bar = document.getElementById('evo-stats-bar');
+    if (!EVO.length) { bar.innerHTML = '<div class="evo-stat"><div class="val" style="color:#7b8ab8">No data</div></div>'; return; }
+    const latest = EVO[EVO.length - 1];
+    const bestPf = Math.max(...EVO.map(d => d.pf));
+    const bestWr = Math.max(...EVO.map(d => d.wr));
+    const stats = [
+      ['Runs', EVO.length, ''],
+      ['Latest PF', latest.pf.toFixed(2), latest.pf >= 1 ? 'positive' : 'negative'],
+      ['Best PF', bestPf.toFixed(2), bestPf >= 1 ? 'positive' : 'negative'],
+      ['Latest WR', latest.wr.toFixed(1) + '%', latest.wr >= 35 ? 'positive' : 'negative'],
+      ['Best WR', bestWr.toFixed(1) + '%', ''],
+      ['Latest PnL', '$' + latest.pnl.toFixed(2), latest.pnl >= 0 ? 'positive' : 'negative'],
+      ['Total Trades', EVO.reduce((s,d) => s + d.trades, 0), ''],
+    ];
+    bar.innerHTML = stats.map(([l,v,c]) =>
+      '<div class="evo-stat"><div class="val ' + c + '">' + v + '</div><div class="lbl">' + l + '</div></div>'
+    ).join('');
+
+    // Draw charts
+    drawEvoCanvas('evo-pf-wr', 'evo-tip-pf', EVO,
+      [{key:'pf', color:'#00d4ff', label:'Profit Factor'}, {key:'wr', color:'#00e676', label:'Win Rate %'}],
+      [{min:0, max:Math.max(2, ...EVO.map(d=>d.pf), 1.5), ref:1.0}, {min:0, max:100}]
+    );
+    drawEvoCanvas('evo-pnl', 'evo-tip-pnl', EVO,
+      [{key:'pnl', color:'#ffb74d', label:'PnL ($)'}, {key:'expectancy', color:'#ba68c8', label:'Exp ($/trade)'}],
+      [{ref:0}, {ref:0}]
+    );
+
+    // 3D scatter
+    render3DScatter(SCATTER);
+  }).catch(e => {
+    console.error('Evolution load error', e);
+    document.getElementById('evo-stats-bar').innerHTML = '<div class="evo-stat"><div class="val" style="color:#ff5252">Load Error</div></div>';
+  });
+}
+
+function drawEvoCanvas(canvasId, tipId, EVO, series, yConfigs) {
+  const canvas = document.getElementById(canvasId);
+  const tip = document.getElementById(tipId);
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const PAD = {l:55, r:55, t:15, b:40};
+  const pW = W - PAD.l - PAD.r, pH = H - PAD.t - PAD.b;
+  if (!EVO.length) { ctx.fillStyle='#7b8ab8'; ctx.font='13px Courier New'; ctx.fillText('No data', W/2-25, H/2); return; }
+  const xScale = i => PAD.l + (i / Math.max(1, EVO.length-1)) * pW;
+
+  // Grid
+  ctx.strokeStyle = '#1e2a42'; ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 5; i++) { const y = PAD.t + (i/5)*pH; ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(W-PAD.r,y); ctx.stroke(); }
+
+  series.forEach((s, si) => {
+    const yc = yConfigs[si];
+    const vals = EVO.map(d => d[s.key]);
+    const yMin = yc.min !== undefined ? yc.min : Math.min(...vals);
+    const yMax = yc.max !== undefined ? yc.max : Math.max(...vals);
+    const yRange = yMax - yMin || 1;
+    const yS = v => PAD.t + pH - ((v - yMin) / yRange) * pH;
+
+    if (yc.ref !== undefined) {
+      ctx.strokeStyle = '#ffb74d44'; ctx.lineWidth = 1; ctx.setLineDash([6,4]);
+      ctx.beginPath(); ctx.moveTo(PAD.l, yS(yc.ref)); ctx.lineTo(W-PAD.r, yS(yc.ref)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.beginPath();
+    EVO.forEach((d,i) => { const x = xScale(i), y = yS(d[s.key]); i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); });
+    ctx.stroke();
+    EVO.forEach((d,i) => { ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(xScale(i), yS(d[s.key]), 3.5, 0, Math.PI*2); ctx.fill(); });
+    ctx.fillStyle = s.color; ctx.font = '9px Courier New'; ctx.save();
+    ctx.translate(si===0?10:W-10, PAD.t+pH/2); ctx.rotate(-Math.PI/2); ctx.textAlign='center'; ctx.fillText(s.label,0,0); ctx.restore();
+  });
+
+  ctx.fillStyle = '#7b8ab8'; ctx.font = '9px Courier New'; ctx.textAlign = 'center';
+  const step = Math.max(1, Math.floor(EVO.length/10));
+  EVO.forEach((d,i) => { if (i%step===0||i===EVO.length-1) { ctx.fillText(d.ts>0?new Date(d.ts).toLocaleDateString('en-US',{month:'short',day:'numeric'}):'#'+i, xScale(i), H-PAD.b+14); }});
+
+  canvas.onmousemove = e => {
+    const br = canvas.getBoundingClientRect(), mx = e.clientX - br.left;
+    const idx = Math.round(((mx - PAD.l) / pW) * (EVO.length-1));
+    if (idx >= 0 && idx < EVO.length) {
+      const d = EVO[idx];
+      tip.innerHTML = '<b>'+d.label+'</b><br>PF: '+d.pf+' | WR: '+d.wr+'% | PnL: $'+d.pnl+'<br>Trades: '+d.trades+' | Exp: $'+d.expectancy;
+      tip.style.display = 'block'; tip.style.left = Math.min(mx+10, W-280)+'px'; tip.style.top = '20px';
+    }
+  };
+  canvas.onmouseleave = () => { tip.style.display = 'none'; };
+}
+
+function render3DScatter(SCATTER) {
+  const container = document.getElementById('scatter3d');
+  if (!SCATTER.length) { container.innerHTML = '<div style="padding:40px;text-align:center;color:#7b8ab8">No trade data for 3D scatter</div>'; return; }
+  if (typeof THREE === 'undefined') { container.innerHTML = '<div style="padding:40px;text-align:center;color:#7b8ab8">Three.js loading...</div>'; return; }
+
+  const W = container.clientWidth, H = container.clientHeight;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0e1a);
+  const camera = new THREE.PerspectiveCamera(55, W/H, 0.1, 5000);
+  camera.position.set(250, 200, 350);
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(W, H); renderer.setPixelRatio(window.devicePixelRatio);
+  container.innerHTML = '';
+  container.appendChild(renderer.domElement);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.dampingFactor = 0.08; controls.autoRotate = true; controls.autoRotateSpeed = 0.5;
+
+  const xs = SCATTER.map(d=>d.x), ys = SCATTER.map(d=>d.y), zs = SCATTER.map(d=>d.z);
+  const xMin=Math.min(...xs), xMax=Math.max(...xs), yMin=Math.min(...ys), yMax=Math.max(...ys), zMin=Math.min(...zs), zMax=Math.max(...zs);
+  const xR=xMax-xMin||1, yR=yMax-yMin||1, zR=zMax-zMin||1, SZ=200;
+  const norm = (v,mn,rng) => ((v-mn)/rng - 0.5)*SZ;
+
+  scene.add(new THREE.GridHelper(SZ, 20, 0x222244, 0x111122));
+
+  function mkLabel(text, pos, color) {
+    const c2 = document.createElement('canvas'); c2.width=256; c2.height=64;
+    const x2 = c2.getContext('2d'); x2.font='bold 28px Courier New'; x2.fillStyle=color; x2.fillText(text,4,40);
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c2), transparent:true}));
+    sp.position.copy(pos); sp.scale.set(40,10,1); scene.add(sp);
+  }
+  mkLabel('TIME >>>',new THREE.Vector3(SZ/2+20,-SZ/2,0),'#00d4ff');
+  mkLabel('PRICE',new THREE.Vector3(0,SZ/2+10,0),'#00e676');
+  mkLabel('PnL >>>',new THREE.Vector3(0,-SZ/2,SZ/2+20),'#ffb74d');
+
+  const winGeo=new THREE.SphereGeometry(2.5,12,8), loseGeo=new THREE.SphereGeometry(2.5,12,8);
+  const winMat=new THREE.MeshBasicMaterial({color:0x00e676,transparent:true,opacity:0.85});
+  const loseMat=new THREE.MeshBasicMaterial({color:0xff5252,transparent:true,opacity:0.85});
+
+  SCATTER.forEach(d => {
+    const px=norm(d.x,xMin,xR), py=norm(d.y,yMin,yR), pz=norm(d.z,zMin,zR);
+    const mesh = new THREE.Mesh(d.win?winGeo:loseGeo, d.win?winMat:loseMat);
+    mesh.position.set(px,py,pz); scene.add(mesh);
+    const lg = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(px,-SZ/2,pz), new THREE.Vector3(px,py,pz)]);
+    scene.add(new THREE.Line(lg, new THREE.LineBasicMaterial({color:d.win?0x00e676:0xff5252, transparent:true, opacity:0.15})));
+  });
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const pl = new THREE.PointLight(0x00d4ff, 0.8, 1000); pl.position.set(100,200,100); scene.add(pl);
+
+  (function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); })();
+  window.addEventListener('resize', () => { const w=container.clientWidth, h=container.clientHeight; camera.aspect=w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h); });
+}
 
 function switchCoin(coin) {
   currentCoin = coin.toUpperCase();
