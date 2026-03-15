@@ -318,7 +318,7 @@ async def api_fills():
 
 @app.get("/api/journal")
 async def api_journal():
-    return JSONResponse(read_trade_journal(50))
+    return JSONResponse(read_trade_journal(200))
 
 
 @app.get("/api/backtest")
@@ -547,10 +547,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="card" style="margin-top:10px;">
   <h2>Trade Journal</h2>
+  <div id="journal-filters" style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; font-size:0.78em;">
+    <select id="jf-result" style="background:#1e2a42; color:#e0e0e0; border:1px solid #2a3a5c; border-radius:3px; padding:2px 6px;">
+      <option value="all">All Trades</option>
+      <option value="win">Wins Only</option>
+      <option value="loss">Losses Only</option>
+    </select>
+    <select id="jf-exit" style="background:#1e2a42; color:#e0e0e0; border:1px solid #2a3a5c; border-radius:3px; padding:2px 6px;">
+      <option value="all">All Exits</option>
+    </select>
+    <select id="jf-regime" style="background:#1e2a42; color:#e0e0e0; border:1px solid #2a3a5c; border-radius:3px; padding:2px 6px;">
+      <option value="all">All Regimes</option>
+    </select>
+    <span id="jf-stats" style="color:#7b8ab8; margin-left:auto; line-height:24px;"></span>
+  </div>
+  <div style="max-height:400px; overflow-y:auto;">
   <table id="journal-table">
-    <thead><tr><th>Entry</th><th>Exit</th><th>Side</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>PnL</th><th>Duration</th></tr></thead>
+    <thead><tr><th>Entry</th><th>Exit</th><th>Side</th><th>Qty</th><th>Entry Px</th><th>Exit Px</th><th>PnL</th><th>Duration</th><th>Exit Reason</th><th>Regime</th></tr></thead>
     <tbody></tbody>
   </table>
+  </div>
 </div>
 
 <div class="footer">
@@ -656,25 +672,10 @@ function updateDashboard(data) {
     eventsBody.appendChild(tr);
   });
 
-  // Journal table
-  const journalBody = document.querySelector('#journal-table tbody');
-  journalBody.innerHTML = '';
-  (data.journal || []).reverse().forEach(j => {
-    const tr = document.createElement('tr');
-    const pnlVal = parseFloat(j.realized_pnl || j.pnl || 0);
-    const pnlColor = pnlVal > 0 ? '#00e676' : pnlVal < 0 ? '#ff5252' : '#e0e0e0';
-    const dur = parseInt(j.duration_s || 0);
-    const durStr = dur > 3600 ? (dur/3600).toFixed(1) + 'h' : dur > 60 ? Math.round(dur/60) + 'm' : dur + 's';
-    tr.innerHTML = '<td>' + (j.entry_ts || j.entry_time || '').slice(11, 19) + '</td>'
-      + '<td>' + (j.exit_ts || j.exit_time || '').slice(11, 19) + '</td>'
-      + '<td>' + (j.side || 'LONG') + '</td>'
-      + '<td>' + (j.qty || '') + '</td>'
-      + '<td>$' + (parseFloat(j.entry_px || j.entry_price || 0)).toFixed(2) + '</td>'
-      + '<td>$' + (parseFloat(j.exit_px || j.exit_price || 0)).toFixed(2) + '</td>'
-      + '<td style="color:' + pnlColor + '">$' + pnlVal.toFixed(4) + '</td>'
-      + '<td>' + durStr + '</td>';
-    journalBody.appendChild(tr);
-  });
+  // Journal table — only update from SSE if we haven't loaded full journal yet
+  if (!window._journalLoaded) {
+    renderJournal(data.journal || []);
+  }
 
   // Queue panel
   if (data.queue) {
@@ -778,13 +779,89 @@ async function loadConfig() {
   } catch(e) { console.error('config fetch error', e); }
 }
 
+// --- Journal Viewer ---
+let _allJournal = [];
+
+function renderJournal(trades) {
+  const body = document.querySelector('#journal-table tbody');
+  body.innerHTML = '';
+  const resultFilter = document.getElementById('jf-result').value;
+  const exitFilter = document.getElementById('jf-exit').value;
+  const regimeFilter = document.getElementById('jf-regime').value;
+
+  let filtered = trades.slice().reverse();
+  if (resultFilter === 'win') filtered = filtered.filter(j => parseFloat(j.realized_pnl || j.pnl || 0) > 0);
+  if (resultFilter === 'loss') filtered = filtered.filter(j => parseFloat(j.realized_pnl || j.pnl || 0) <= 0);
+  if (exitFilter !== 'all') filtered = filtered.filter(j => (j.exit_reason || '') === exitFilter);
+  if (regimeFilter !== 'all') filtered = filtered.filter(j => (j.regime_at_entry || j.regime || '') === regimeFilter);
+
+  let totalPnl = 0, wins = 0;
+  filtered.forEach(j => {
+    const pnlVal = parseFloat(j.realized_pnl || j.pnl || 0);
+    totalPnl += pnlVal;
+    if (pnlVal > 0) wins++;
+    const pnlColor = pnlVal > 0 ? '#00e676' : pnlVal < 0 ? '#ff5252' : '#e0e0e0';
+    const dur = parseInt(j.duration_s || 0);
+    const durStr = dur > 3600 ? (dur/3600).toFixed(1) + 'h' : dur > 60 ? Math.round(dur/60) + 'm' : dur + 's';
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + (j.entry_ts || j.entry_time || '').slice(11, 19) + '</td>'
+      + '<td>' + (j.exit_ts || j.exit_time || '').slice(11, 19) + '</td>'
+      + '<td>' + (j.side || 'LONG') + '</td>'
+      + '<td>' + (j.qty || '') + '</td>'
+      + '<td>$' + (parseFloat(j.entry_px || j.entry_price || 0)).toFixed(2) + '</td>'
+      + '<td>$' + (parseFloat(j.exit_px || j.exit_price || 0)).toFixed(2) + '</td>'
+      + '<td style="color:' + pnlColor + '">$' + pnlVal.toFixed(4) + '</td>'
+      + '<td>' + durStr + '</td>'
+      + '<td>' + (j.exit_reason || '') + '</td>'
+      + '<td>' + (j.regime_at_entry || j.regime || '') + '</td>';
+    body.appendChild(tr);
+  });
+
+  const wr = filtered.length > 0 ? (wins / filtered.length * 100).toFixed(1) : '0.0';
+  const pnlColor = totalPnl > 0 ? '#00e676' : totalPnl < 0 ? '#ff5252' : '#e0e0e0';
+  document.getElementById('jf-stats').innerHTML = filtered.length + ' trades | WR: ' + wr + '% | PnL: <span style="color:' + pnlColor + '">$' + totalPnl.toFixed(4) + '</span>';
+}
+
+function populateJournalFilters(trades) {
+  const exits = new Set();
+  const regimes = new Set();
+  trades.forEach(j => {
+    if (j.exit_reason) exits.add(j.exit_reason);
+    const r = j.regime_at_entry || j.regime || '';
+    if (r) regimes.add(r);
+  });
+  const exitSel = document.getElementById('jf-exit');
+  exitSel.innerHTML = '<option value="all">All Exits</option>';
+  [...exits].sort().forEach(e => { exitSel.innerHTML += '<option value="' + e + '">' + e + '</option>'; });
+  const regSel = document.getElementById('jf-regime');
+  regSel.innerHTML = '<option value="all">All Regimes</option>';
+  [...regimes].sort().forEach(r => { regSel.innerHTML += '<option value="' + r + '">' + r + '</option>'; });
+}
+
+async function loadJournal() {
+  try {
+    const resp = await fetch('/api/journal');
+    _allJournal = await resp.json();
+    window._journalLoaded = true;
+    populateJournalFilters(_allJournal);
+    renderJournal(_allJournal);
+  } catch(e) { console.error('journal fetch error', e); }
+}
+
+// Filter event listeners
+document.getElementById('jf-result').addEventListener('change', () => renderJournal(_allJournal));
+document.getElementById('jf-exit').addEventListener('change', () => renderJournal(_allJournal));
+document.getElementById('jf-regime').addEventListener('change', () => renderJournal(_allJournal));
+
 // Init
 initChart();
 loadEquity();
 loadConfig();
 loadBacktests();
+loadJournal();
 setInterval(loadEquity, 30000);
-setInterval(loadBacktests, 60000);  // refresh backtest status every 60s
+setInterval(loadBacktests, 60000);
+setInterval(loadJournal, 120000);  // refresh journal every 2 min
 connectSSE();
 </script>
 </body>
