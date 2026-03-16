@@ -42,6 +42,7 @@ from typing import Dict, List, Optional
 DEFAULT_KEYS = [
     # --- Missed buys (existing) ---
     "MISSED_BUY_NO_CASH",
+    "MISSED_BUY_WATCH_GATED",
     "MISSED_BUY_EXPOSURE_CAP",
     "MISSED_BUY_MIN_ORDER",
     "MISSED_BUY_RISK_LOCKOUT",

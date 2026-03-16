@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Tuple, Any, List, Dict
+import hashlib
 import random
-import uuid
 
 from confluence import TFState
 from decisions import DecisionSnapshot, EngineEvent
@@ -103,14 +103,20 @@ def _engine_mode_enabled(cfg: dict, state: Any = None) -> bool:
     return _execution_mode(cfg, state) == "ENGINE"
 
 
+def _deterministic_suffix(symbol: str, side: str, epoch_s: int) -> str:
+    """Deterministic 10-char hex from inputs — same inputs always produce same ID."""
+    h = hashlib.sha256(f"{symbol}:{side}:{int(epoch_s)}".encode()).hexdigest()
+    return h[:10]
+
+
 def _new_intent_id(symbol: str, side: str, epoch_s: int) -> str:
-    return f"{symbol}:{side}:{int(epoch_s)}:{uuid.uuid4().hex[:10]}"
+    return f"{symbol}:{side}:{int(epoch_s)}:{_deterministic_suffix(symbol, side, epoch_s)}"
 
 
 def _new_client_order_id(symbol: str, side: str, epoch_s: int) -> str:
     symbol_part = str(symbol).replace("-", "").replace("/", "").upper()
     side_part = str(side).upper()
-    return f"argus-{symbol_part}-{side_part}-{int(epoch_s)}-{uuid.uuid4().hex[:10]}"
+    return f"argus-{symbol_part}-{side_part}-{int(epoch_s)}-{_deterministic_suffix(symbol, side, epoch_s)}"
 
 
 def _compute_buy_qty_and_reason(ledger, px: Decimal, cfg: dict) -> Tuple[Decimal, str]:
@@ -1394,14 +1400,27 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     action = "SELL"
                     action_reason = "PARTIAL_TP_1R_INTENT"
 
-        # Use breakeven stop if partial TP was taken
+        # Standalone breakeven stop: activate when price reaches trigger % above entry
+        be_trigger_pct = _as_decimal(cfg.get("EXIT_BREAKEVEN_TRIGGER_PCT", "0"), "0")
+        if (
+            be_trigger_pct > 0
+            and state.breakeven_stop is None
+            and not state.partial_tp_taken
+            and state.ledger.avg_entry_px is not None
+            and state.high_since_entry is not None
+        ):
+            be_trigger_px = state.ledger.avg_entry_px * (Decimal("1") + be_trigger_pct)
+            if state.high_since_entry >= be_trigger_px:
+                state.breakeven_stop = state.ledger.avg_entry_px * (Decimal("1") + be_offset_pct)
+
+        # Use breakeven stop if partial TP was taken OR standalone trigger activated
         effective_stop = stop_loss
-        if state.partial_tp_taken and state.breakeven_stop is not None:
+        if state.breakeven_stop is not None:
             effective_stop = state.breakeven_stop
 
         if effective_stop is not None and px <= effective_stop and action == "HOLD":
             action = would_sell_action
-            if state.partial_tp_taken:
+            if state.breakeven_stop is not None:
                 action_reason = f"BREAKEVEN_STOP (px={px} <= be={effective_stop})"
             else:
                 action_reason = "STOP_LOSS"
@@ -1484,6 +1503,9 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 )
 
                 action = ev_name
+                # Preserve MFE/MAE for snapshot BEFORE resetting state
+                _final_mfe = state.mfe_pct
+                _final_mae = state.mae_pct
                 state.cooldown_until_epoch = now_e + int(cfg["COOLDOWN_SECONDS"])
                 state.trend_below_count = 0
                 state.peak_price = None
@@ -1494,6 +1516,9 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 state.low_since_entry = None
                 state.partial_tp_taken = False
                 state.breakeven_stop = None
+                # Stash final MFE/MAE so snapshot (built later) captures pre-reset values
+                state._sell_mfe_pct = _final_mfe
+                state._sell_mae_pct = _final_mae
 
     if (not state.ledger.in_pos()) and emit_actions:
         entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
@@ -1584,14 +1609,18 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             cfg=cfg,
                         )
 
+                        watch_gated = False
                         if require_confluence and conf_gate != "TRADE" and qty > 0:
                             try:
+                                pre_mult_qty = qty
                                 qty = qty * conf_size_mult
+                                if qty <= 0 < pre_mult_qty:
+                                    watch_gated = True
                             except Exception:
                                 pass
 
                         if qty <= 0:
-                            ev = _missed_buy_event_from_qty_reason(qty_reason)
+                            ev = "MISSED_BUY_WATCH_GATED" if watch_gated else _missed_buy_event_from_qty_reason(qty_reason)
                             _emit_missed_buy(
                                 snap,
                                 event=ev,
@@ -1601,7 +1630,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 cooldown_remaining=int(cooldown_remaining),
                                 equity=equity,
                                 exposure=exposure,
-                                extra=f"qty_reason={safe_str(qty_reason)}",
+                                extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated else ''}",
                             )
                         else:
                             if hasattr(state.risk, "can_enter_with_context"):
@@ -1758,14 +1787,18 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                         qty_cap=_as_decimal(qty_cap, "0"),
                         cfg=cfg,
                     )
+                    watch_gated2 = False
                     if require_confluence and conf_gate != "TRADE" and qty > 0:
                         try:
+                            pre_mult_qty2 = qty
                             qty = qty * conf_size_mult
+                            if qty <= 0 < pre_mult_qty2:
+                                watch_gated2 = True
                         except Exception:
                             pass
 
                     if qty <= 0:
-                        ev = _missed_buy_event_from_qty_reason(qty_reason)
+                        ev = "MISSED_BUY_WATCH_GATED" if watch_gated2 else _missed_buy_event_from_qty_reason(qty_reason)
                         _emit_missed_buy(
                             snap,
                             event=ev,
@@ -1775,7 +1808,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             cooldown_remaining=int(cooldown_remaining),
                             equity=equity,
                             exposure=exposure,
-                            extra=f"qty_reason={safe_str(qty_reason)}",
+                            extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated2 else ''}",
                         )
                     else:
                         if hasattr(state.risk, "can_enter_with_context"):
@@ -1965,8 +1998,14 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     snap.dist_trail = dist_trail
     snap.min_dist = min_dist
 
-    snap.mfe_pct = state.mfe_pct
-    snap.mae_pct = state.mae_pct
+    # Use stashed pre-reset MFE/MAE if this is a SELL tick (state was already reset)
+    _stashed_mfe = getattr(state, "_sell_mfe_pct", None)
+    _stashed_mae = getattr(state, "_sell_mae_pct", None)
+    snap.mfe_pct = _stashed_mfe if _stashed_mfe is not None else state.mfe_pct
+    snap.mae_pct = _stashed_mae if _stashed_mae is not None else state.mae_pct
+    # Clear stash so next HOLD tick uses live values
+    state._sell_mfe_pct = None
+    state._sell_mae_pct = None
 
     snap.action = action
     snap.action_reason = action_reason

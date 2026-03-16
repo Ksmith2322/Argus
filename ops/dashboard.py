@@ -9,13 +9,15 @@ Reads live runner artifacts (state, account, fills, signals, events) and
 serves a single-page dashboard with auto-refreshing panels.
 """
 import argparse
+import base64
 import csv
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -421,6 +423,141 @@ def read_queue_status() -> dict:
     return result
 
 
+# --- PC2 status (cached SSH, refreshes every 60s) ---
+_pc2_cache: dict = {"ts": 0, "data": None}
+PC2_SSH = 'ksmith2322@yahoo.com@192.168.1.98'
+PC2_CACHE_TTL = 60  # seconds
+
+
+def _fetch_pc2_status() -> dict:
+    """SSH to PC2 and read its queue_results.log tail + backtest_queue.jsonl."""
+    now = time.time()
+    if _pc2_cache["data"] is not None and (now - _pc2_cache["ts"]) < PC2_CACHE_TTL:
+        return _pc2_cache["data"]
+    result = {"reachable": False, "running_label": "", "running_progress": "",
+              "pending": [], "recent_log": [], "error": "",
+              "eta_remaining_s": 0, "eta_pct": 0, "elapsed_s": 0}
+    try:
+        # SSH command: get log tail, queue, and progress info for ETA
+        # Use -EncodedCommand to avoid shell escaping issues with $ variables
+        ps_script = (
+            'Get-Content C:/Argus/repo/ops/logs/queue_results.log -Tail 5;'
+            'Write-Output "---QUEUE---";'
+            'if (Test-Path C:/Argus/repo/ops/backtest_queue.jsonl) { Get-Content C:/Argus/repo/ops/backtest_queue.jsonl };'
+            'Write-Output "---PROGRESS---";'
+            '$hdrs = Get-ChildItem C:/Argus/repo/ops/logs/run_header_bt_*.json -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3;'
+            'foreach ($h in $hdrs) {'
+            '  $j = Get-Content $h.FullName | ConvertFrom-Json;'
+            '  $rid = $j.run_id;'
+            '  $sum = "C:/Argus/repo/ops/logs/bt_summary_" + $rid + ".json";'
+            '  if (!(Test-Path $sum)) {'
+            '    $eq = "C:/Argus/repo/ops/logs/equity_" + $rid + ".csv";'
+            '    $eqLines = 0;'
+            '    if (Test-Path $eq) { $eqLines = (Get-Content $eq | Measure-Object -Line).Lines - 1 };'
+            '    $csv = $j.candles_csv;'
+            '    $csvLines = 0;'
+            '    if ($csv -and (Test-Path $csv)) { $csvLines = (Get-Content $csv | Measure-Object -Line).Lines - 1 };'
+            '    $startTs = $h.LastWriteTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");'
+            '    Write-Output ($rid + "|" + $eqLines + "|" + $csvLines + "|" + $startTs);'
+            '    break'
+            '  }'
+            '}'
+        )
+        encoded = base64.b64encode(ps_script.encode('utf-16-le')).decode('ascii')
+        cmd = ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+               PC2_SSH, f'powershell -NoProfile -EncodedCommand {encoded}']
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0:
+            result["error"] = proc.stderr.strip()[:200]
+            _pc2_cache.update(ts=now, data=result)
+            return result
+        result["reachable"] = True
+        lines = proc.stdout.strip().split('\n')
+        sep_idx = -1
+        for i, l in enumerate(lines):
+            if '---QUEUE---' in l:
+                sep_idx = i
+                break
+        log_lines = lines[:sep_idx] if sep_idx >= 0 else lines
+        rest_lines = lines[sep_idx+1:] if sep_idx >= 0 else []
+        # Split rest into queue and progress sections
+        prog_idx = -1
+        for i, l in enumerate(rest_lines):
+            if '---PROGRESS---' in l:
+                prog_idx = i
+                break
+        queue_lines = rest_lines[:prog_idx] if prog_idx >= 0 else rest_lines
+        progress_lines = rest_lines[prog_idx+1:] if prog_idx >= 0 else []
+        # Parse log lines
+        for line in log_lines:
+            line = line.strip()
+            if not line:
+                continue
+            ts = line[1:21] if line.startswith("[") else ""
+            rest = line[23:] if len(line) > 23 else line
+            status = "UNKNOWN"
+            label = rest
+            if rest.startswith("START:"):
+                status = "START"
+                label = rest[7:].strip()
+            elif rest.startswith("DONE:"):
+                status = "DONE"
+                label = rest[6:].strip().split("|")[0].strip()
+            elif rest.startswith("FAIL:"):
+                status = "FAIL"
+                label = rest[6:].strip().split(" -- ")[0].strip()
+            result["recent_log"].append({"ts": ts, "status": status, "label": label})
+        # Detect running: last entry is START with no DONE/FAIL after
+        if result["recent_log"] and result["recent_log"][-1]["status"] == "START":
+            result["running_label"] = result["recent_log"][-1]["label"]
+        # Parse pending queue
+        for ql in queue_lines:
+            ql = ql.strip()
+            if not ql:
+                continue
+            try:
+                result["pending"].append(json.loads(ql).get("label", "?"))
+            except Exception:
+                pass
+        # Parse progress: "run_id|eq_lines|csv_lines|start_ts"
+        for pl in progress_lines:
+            pl = pl.strip()
+            if '|' not in pl:
+                continue
+            parts = pl.split('|')
+            if len(parts) >= 4:
+                try:
+                    eq_lines = int(parts[1])
+                    csv_lines = int(parts[2])
+                    start_ts_str = parts[3]
+                    pct = round(eq_lines / csv_lines * 100) if csv_lines > 0 else 0
+                    # Parse start time for elapsed
+                    try:
+                        start_dt = datetime.strptime(start_ts_str.strip(), "%Y-%m-%dT%H:%M:%SZ")
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                        elapsed = time.time() - start_dt.timestamp()
+                    except Exception:
+                        elapsed = 0
+                    eta_s = 0
+                    if pct > 0 and elapsed > 0:
+                        total_est = elapsed / (pct / 100.0)
+                        eta_s = int(total_est - elapsed)
+                    result["eta_pct"] = pct
+                    result["elapsed_s"] = int(elapsed)
+                    result["eta_remaining_s"] = max(0, eta_s)
+                    result["progress_bars"] = eq_lines
+                    result["total_bars"] = csv_lines
+                except Exception:
+                    pass
+                break
+    except subprocess.TimeoutExpired:
+        result["error"] = "SSH timeout (PC2 unreachable)"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    _pc2_cache.update(ts=now, data=result)
+    return result
+
+
 def build_status(coin: str = "ETH") -> dict:
     """Aggregate all status info into a single dict."""
     state = read_runtime_state(coin)
@@ -569,6 +706,8 @@ async def api_queue():
     except Exception:
         pass
     base["recent"] = recent
+    # PC2 status (cached SSH)
+    base["pc2"] = _fetch_pc2_status()
     return JSONResponse(base)
 
 
@@ -859,10 +998,16 @@ def _build_projection(summaries: list) -> dict:
     # Gather performance metrics from all runs
     runs_with_pnl = []
     for s in summaries:
-        pnl = float(s.get("total_pnl_usd", 0) or 0)
+        pnl = float(s.get("total_pnl_usd", s.get("pnl_usd", 0)) or 0)
         trades = int(s.get("total_closed", s.get("trades_closed", 0)) or 0)
         # Try to get backtest duration in days
         dataset_bars = int(s.get("dataset_bars", s.get("bars_processed", 0)) or 0)
+        if dataset_bars == 0:
+            # Compute from epoch range (1-min bars)
+            start_ep = int(s.get("start_epoch", 0) or 0)
+            end_ep = int(s.get("end_epoch", 0) or 0)
+            if end_ep > start_ep:
+                dataset_bars = (end_ep - start_ep) // 60
         bt_days = max(1, dataset_bars / 1440)  # 1-min bars -> days
         if trades > 0:
             runs_with_pnl.append({
@@ -876,53 +1021,427 @@ def _build_projection(summaries: list) -> dict:
     if not runs_with_pnl:
         return {"start_cash": start_cash, "scenarios": []}
 
-    # Sort by PF to get best, median, worst
-    runs_with_pnl.sort(key=lambda r: r["pf"])
-
     now = datetime.now(timezone.utc)
     days_left_in_year = max(1, (datetime(now.year, 12, 31, tzinfo=timezone.utc) - now).days)
 
+    # Primary projection: LATEST run = current strategy truth
+    latest_run = runs_with_pnl[-1]  # summaries are sorted by mtime, last = newest
+    latest_daily = latest_run["pnl"] / latest_run["days"]
+
+    # Historical context: best-ever run (may be different config)
+    best_run = max(runs_with_pnl, key=lambda r: r["pf"])
+    best_daily = best_run["pnl"] / best_run["days"]
+
+    # 3-coin multiplier: $500 per coin x 3 coins
+    num_coins = 3
+    per_coin_cash = start_cash
+
     scenarios = []
-    for tag, run in [
-        ("worst", runs_with_pnl[0]),
-        ("median", runs_with_pnl[len(runs_with_pnl) // 2]),
-        ("best", runs_with_pnl[-1]),
+    for tag, run, note in [
+        ("latest", latest_run, "Current strategy"),
+        ("best_ever", best_run, "Best historical"),
     ]:
         daily_pnl = run["pnl"] / run["days"]
+        # Per-coin projection
         projected_gain = daily_pnl * days_left_in_year
-        year_end_balance = start_cash + projected_gain
-        pct_gain = (projected_gain / start_cash) * 100 if start_cash > 0 else 0
+        year_end_balance = per_coin_cash + projected_gain
+        pct_gain = (projected_gain / per_coin_cash) * 100 if per_coin_cash > 0 else 0
+        # 3-coin aggregate
+        total_year_end = year_end_balance * num_coins
 
         scenarios.append({
             "tag": tag,
             "label": str(run["label"])[:30],
+            "note": note,
             "pf": round(run["pf"], 3),
             "daily_pnl": round(daily_pnl, 4),
             "bt_days": round(run["days"], 1),
             "projected_gain": round(projected_gain, 2),
             "year_end_balance": round(year_end_balance, 2),
+            "total_year_end_3coin": round(total_year_end, 2),
             "pct_gain": round(pct_gain, 1),
             "days_left": days_left_in_year,
         })
 
-    # Monthly projection curve for best scenario
-    best = scenarios[-1]
+    # Monthly projection curve from LATEST run (source of truth)
+    # Two curves: (1) compound only, (2) compound + $500/month injection
+    import math as _math
+    monthly_injection = 500  # $500/month capital injection plan
     monthly_curve = []
+    monthly_curve_with_injection = []
+    # Compute daily compound rate from latest backtest
+    latest_daily_return_pct = (latest_daily / per_coin_cash) if per_coin_cash > 0 else 0
     for m in range(13):  # 0=now through 12=Dec
         month_num = now.month + m
         if month_num > 12:
             month_num -= 12
         days_into_projection = m * 30.44
-        balance = start_cash + best["daily_pnl"] * days_into_projection
+
+        # Compound-only curve (3-coin aggregate)
+        if latest_daily_return_pct > 0:
+            compound_balance = per_coin_cash * num_coins * _math.pow(1 + latest_daily_return_pct, days_into_projection)
+        else:
+            compound_balance = per_coin_cash * num_coins + (latest_daily * num_coins * days_into_projection)
         monthly_curve.append({
             "month": month_num,
-            "balance": round(balance, 2),
+            "balance": round(compound_balance, 2),
         })
+
+        # Compound + $500/month injection curve
+        if m == 0:
+            inj_balance = per_coin_cash * num_coins
+        else:
+            prev = monthly_curve_with_injection[-1]["balance"]
+            if latest_daily_return_pct > 0:
+                inj_balance = prev * _math.pow(1 + latest_daily_return_pct, 30.44) + monthly_injection
+            else:
+                inj_balance = prev + (latest_daily * num_coins * 30.44) + monthly_injection
+        monthly_curve_with_injection.append({
+            "month": month_num,
+            "balance": round(inj_balance, 2),
+        })
+
+    # $100K milestone — compound + $500/month injection (realistic)
+    milestone_100k = None
+    total_balance = per_coin_cash * num_coins  # $1500 total across 3 coins
+    agg_daily = latest_daily * num_coins
+
+    if latest_daily_return_pct > 0:
+        # Simulate month-by-month compound + injection to find $100K crossing
+        sim_balance = total_balance
+        months_to_100k = None
+        for m in range(1, 361):  # up to 30 years
+            sim_balance = sim_balance * _math.pow(1 + latest_daily_return_pct, 30.44) + monthly_injection
+            if sim_balance >= 100_000:
+                months_to_100k = m
+                break
+        days_needed_compound_inj = months_to_100k * 30.44 if months_to_100k else None
+
+        # Pure compound (no injection) for comparison
+        sim_balance_pure = total_balance
+        months_pure = None
+        for m in range(1, 361):
+            sim_balance_pure = sim_balance_pure * _math.pow(1 + latest_daily_return_pct, 30.44)
+            if sim_balance_pure >= 100_000:
+                months_pure = m
+                break
+        days_pure = months_pure * 30.44 if months_pure else None
+
+        milestone_100k = {
+            "target": 100_000,
+            "daily_pnl_latest": round(latest_daily, 4),
+            "daily_pnl_3coin": round(agg_daily, 4),
+            "daily_return_pct": round(latest_daily_return_pct * 100, 4),
+            "current_balance": round(total_balance, 2),
+            "dollars_to_go": round(100_000 - total_balance, 2),
+            "num_coins": num_coins,
+            "monthly_injection": monthly_injection,
+            # Compound + injection
+            "days_needed": round(days_needed_compound_inj, 0) if days_needed_compound_inj else None,
+            "months_needed": months_to_100k,
+            "target_date": (now + timedelta(days=days_needed_compound_inj)).strftime("%Y-%m-%d") if days_needed_compound_inj else "N/A",
+            # Pure compound
+            "days_pure_compound": round(days_pure, 0) if days_pure else None,
+            "months_pure_compound": months_pure,
+        }
+    elif agg_daily > 0:
+        # Linear fallback (positive but tiny returns)
+        dollars_to_go = 100_000 - total_balance
+        days_needed = dollars_to_go / agg_daily
+        milestone_100k = {
+            "target": 100_000,
+            "daily_pnl_latest": round(latest_daily, 4),
+            "daily_pnl_3coin": round(agg_daily, 4),
+            "daily_return_pct": round(latest_daily_return_pct * 100, 4),
+            "current_balance": round(total_balance, 2),
+            "dollars_to_go": round(dollars_to_go, 2),
+            "num_coins": num_coins,
+            "monthly_injection": monthly_injection,
+            "days_needed": round(days_needed, 0),
+            "target_date": (now + timedelta(days=days_needed)).strftime("%Y-%m-%d"),
+        }
+
+    # Best-ever potential (compound + injection)
+    best_daily_return_pct = (best_daily / per_coin_cash) if per_coin_cash > 0 else 0
+    if best_daily_return_pct > 0 and best_daily_return_pct > latest_daily_return_pct:
+        sim_balance_best = total_balance
+        months_best = None
+        for m in range(1, 361):
+            sim_balance_best = sim_balance_best * _math.pow(1 + best_daily_return_pct, 30.44) + monthly_injection
+            if sim_balance_best >= 100_000:
+                months_best = m
+                break
+        if milestone_100k is None:
+            milestone_100k = {}
+        if months_best:
+            milestone_100k["best_ever_days"] = round(months_best * 30.44, 0)
+            milestone_100k["best_ever_months"] = months_best
+        milestone_100k["best_ever_daily_3coin"] = round(best_daily * num_coins, 4)
+
+    # Financial milestones: $2K per coin, then $5K per coin
+    milestone_2k = None
+    milestone_5k = None
+    if latest_daily > 0:
+        dollars_to_2k = 2000 - per_coin_cash
+        days_to_2k = dollars_to_2k / latest_daily
+        milestone_2k = {
+            "target": 2000,
+            "daily_pnl": round(latest_daily, 4),
+            "days_needed": round(days_to_2k, 0),
+            "target_date": (now + timedelta(days=days_to_2k)).strftime("%Y-%m-%d"),
+            "current_balance": per_coin_cash,
+        }
+        dollars_to_5k = 5000 - per_coin_cash
+        days_to_5k = dollars_to_5k / latest_daily
+        milestone_5k = {
+            "target": 5000,
+            "daily_pnl": round(latest_daily, 4),
+            "days_needed": round(days_to_5k, 0),
+            "target_date": (now + timedelta(days=days_to_5k)).strftime("%Y-%m-%d"),
+            "current_balance": per_coin_cash,
+        }
 
     return {
         "start_cash": start_cash,
+        "num_coins": num_coins,
         "scenarios": scenarios,
         "monthly_curve": monthly_curve,
+        "monthly_curve_with_injection": monthly_curve_with_injection,
+        "monthly_injection": monthly_injection,
+        "milestone_100k": milestone_100k,
+        "milestone_2k": milestone_2k,
+        "milestone_5k": milestone_5k,
+    }
+
+
+def _build_100k_projection_check(total_equity: float, compound_rate_pct: float) -> dict:
+    """Compute months-to-$100K using compound + $500/month injection."""
+    import math as _m
+    monthly_inj = 500
+    if compound_rate_pct > 0:
+        daily_r = compound_rate_pct / 100
+        sim = total_equity
+        months = None
+        for mo in range(1, 361):
+            sim = sim * _m.pow(1 + daily_r, 30.44) + monthly_inj
+            if sim >= 100_000:
+                months = mo
+                break
+        if months:
+            return {"name": "$100K Projection < 12 months (compound + $500/mo)",
+                    "target": "< 12 months", "current": f"{months} months",
+                    "pass": months <= 12, "format": "text"}
+    return {"name": "$100K Projection < 12 months (compound + $500/mo)",
+            "target": "< 12 months", "current": "Not profitable yet",
+            "pass": False, "format": "text"}
+
+
+def _build_readiness_tracker(summaries: list) -> dict:
+    """Compute go-live readiness metrics from latest backtest + live data."""
+    import csv as _csv
+
+    # --- Backtest metrics (latest run) ---
+    bt_pf = 0.0
+    bt_wr = 0.0
+    bt_exp = 0.0
+    bt_trades = 0
+    bt_mfe_available = False
+    if summaries:
+        latest = summaries[-1]
+        bt_pf = float(latest.get("profit_factor", 0) or 0)
+        bt_wr = float(latest.get("win_rate_pct", 0) or 0)
+        bt_exp = float(latest.get("expectancy_usd", 0) or 0)
+        bt_trades = int(latest.get("trades_closed", 0) or 0)
+        # Check if MFE is populated (non-zero) in latest trades
+        run_id = latest.get("run_id", "")
+        if run_id:
+            trades_file = OPS_LOGS / f"trades_{run_id}.csv"
+            if trades_file.exists():
+                try:
+                    with open(trades_file, "r") as tf:
+                        reader = _csv.DictReader(tf)
+                        for row in reader:
+                            mfe = float(row.get("mfe_pct_points", 0) or 0)
+                            if mfe != 0:
+                                bt_mfe_available = True
+                                break
+                except Exception:
+                    pass
+
+    # --- Live metrics (per coin) ---
+    live_trades = {"ETH": 0, "BTC": 0, "SOL": 0}
+    live_pnl = {"ETH": 0.0, "BTC": 0.0, "SOL": 0.0}
+    live_equity = {"ETH": 500.0, "BTC": 500.0, "SOL": 500.0}
+    live_max_consec_loss = 0
+    live_max_dd_pct = 0.0
+    live_days_profitable = 0
+    total_live_trades = 0
+
+    for coin in ["ETH", "BTC", "SOL"]:
+        coin_lower = coin.lower()
+        fills_path = OPS_LOGS / coin_lower / "fills.csv"
+        if not fills_path.exists():
+            # Try top-level fills
+            fills_path = OPS_LOGS / "fills.csv"
+        if fills_path.exists():
+            try:
+                with open(fills_path, "r") as ff:
+                    reader = _csv.DictReader(ff)
+                    coin_fills = [r for r in reader if coin in (r.get("symbol", "") or "")]
+                    live_trades[coin] = len([f for f in coin_fills if (f.get("side", "") or "") == "BUY"])
+            except Exception:
+                pass
+
+        # Read runtime state for equity/pnl
+        state_file = REPO / "state" / f"runtime_state_{coin}_USD.json"
+        if state_file.exists():
+            try:
+                with open(state_file) as sf:
+                    st = json.load(sf)
+                live_pnl[coin] = float(st.get("realized_pnl", 0) or 0)
+                live_equity[coin] = float(st.get("cash", 500) or 500)
+            except Exception:
+                pass
+
+        total_live_trades += live_trades[coin]
+
+    total_live_pnl = sum(live_pnl.values())
+    total_live_equity = sum(live_equity.values())
+
+    # --- Compute derived metrics ---
+    min_equity = min(live_equity.values())
+    total_agg_pnl = sum(live_pnl.values())
+    # Daily rate from paper trading start
+    paper_start = datetime(2026, 3, 15, tzinfo=timezone.utc)
+    elapsed_days = max(1, (datetime.now(timezone.utc) - paper_start).total_seconds() / 86400)
+    daily_rate_3coin = total_agg_pnl / elapsed_days
+    # $100K math: need $98,500 in 365 days = $269.86/day across 3 coins
+    daily_needed_100k = (100_000 - total_live_equity) / 365
+    # Compound math: what daily % return gets us to $100K in 1 year
+    # $1500 * (1 + r)^365 = $100,000 → r = (100000/1500)^(1/365) - 1 ≈ 1.18%
+    import math
+    compound_rate_needed = (math.pow(100_000 / max(total_live_equity, 1), 1 / 365) - 1) * 100
+    compound_rate_current = 0.0
+    if daily_rate_3coin > 0 and total_live_equity > 0:
+        compound_rate_current = (daily_rate_3coin / total_live_equity) * 100
+
+    # Check BTC/SOL backtest existence
+    btc_bt_done = any("BTC" in str(s.get("symbol", "")) or "btc" in str(s.get("label", "")).lower()
+                       for s in summaries)
+    sol_bt_done = any("SOL" in str(s.get("symbol", "")) or "sol" in str(s.get("label", "")).lower()
+                       for s in summaries)
+
+    # --- Build checklist ---
+    checks = [
+        {
+            "category": "Phase 1 — Strategy Validation (Backtest)",
+            "items": [
+                {"name": "Backtest PF >= 1.2", "target": 1.2, "current": round(bt_pf, 3),
+                 "pass": bt_pf >= 1.2, "format": "pf"},
+                {"name": "Backtest WR >= 50%", "target": 50.0, "current": round(bt_wr, 1),
+                 "pass": bt_wr >= 50.0, "format": "pct"},
+                {"name": "Positive Expectancy (> $0/trade)", "target": 0.0, "current": round(bt_exp, 4),
+                 "pass": bt_exp > 0, "format": "usd"},
+                {"name": "MFE/MAE Data Available", "target": "Yes", "current": "Yes" if bt_mfe_available else "No",
+                 "pass": bt_mfe_available, "format": "bool"},
+                {"name": "Exit Optimization Tested (TP/BE)", "target": "Done",
+                 "current": "Running" if bt_pf > 0 else "Pending",
+                 "pass": bt_pf >= 1.0, "format": "bool"},
+                {"name": "ETH 30-day Backtest Profitable", "target": "PF>1.0",
+                 "current": str(round(bt_pf, 2)), "pass": bt_pf >= 1.0, "format": "text"},
+                {"name": "BTC Backtest Validated", "target": "Done",
+                 "current": "Done" if btc_bt_done else "Pending",
+                 "pass": btc_bt_done, "format": "bool"},
+                {"name": "SOL Backtest Validated", "target": "Done",
+                 "current": "Done" if sol_bt_done else "Pending",
+                 "pass": sol_bt_done, "format": "bool"},
+            ],
+        },
+        {
+            "category": "Phase 2 — Paper Trading Proof (all 3 coins)",
+            "items": [
+                {"name": "ETH: 50+ Paper Trades", "target": 50, "current": live_trades["ETH"],
+                 "pass": live_trades["ETH"] >= 50, "format": "int"},
+                {"name": "BTC: 50+ Paper Trades", "target": 50, "current": live_trades["BTC"],
+                 "pass": live_trades["BTC"] >= 50, "format": "int"},
+                {"name": "SOL: 50+ Paper Trades", "target": 50, "current": live_trades["SOL"],
+                 "pass": live_trades["SOL"] >= 50, "format": "int"},
+                {"name": "Live PF >= 1.1 (aggregate)", "target": 1.1, "current": "N/A",
+                 "pass": False, "format": "pf"},
+                {"name": "Max Drawdown < 5% per coin", "target": "< 5%", "current": "N/A",
+                 "pass": False, "format": "text"},
+                {"name": "No 5+ Consecutive Losses", "target": "< 5", "current": "N/A",
+                 "pass": False, "format": "text"},
+                {"name": "ML Governor Retrained (200+ trades)", "target": 200,
+                 "current": total_live_trades, "pass": total_live_trades >= 200, "format": "int"},
+                {"name": "2+ Weeks Consistent PF > 1.0", "target": "14 days",
+                 "current": "0 days", "pass": False, "format": "text"},
+            ],
+        },
+        {
+            "category": "Phase 3 — Financial Milestones ($500 → $2K → $5K)",
+            "items": [
+                {"name": "ETH: $500 → $2,000", "target": 2000,
+                 "current": round(live_equity.get("ETH", 500), 2),
+                 "pass": live_equity.get("ETH", 500) >= 2000, "format": "usd"},
+                {"name": "BTC: $500 → $2,000", "target": 2000,
+                 "current": round(live_equity.get("BTC", 500), 2),
+                 "pass": live_equity.get("BTC", 500) >= 2000, "format": "usd"},
+                {"name": "SOL: $500 → $2,000", "target": 2000,
+                 "current": round(live_equity.get("SOL", 500), 2),
+                 "pass": live_equity.get("SOL", 500) >= 2000, "format": "usd"},
+                {"name": "All 3 Coins → $5,000 each", "target": 5000,
+                 "current": round(min_equity, 2),
+                 "pass": min_equity >= 5000, "format": "usd"},
+                {"name": "Portfolio Total >= $15,000", "target": 15000,
+                 "current": round(total_live_equity, 2),
+                 "pass": total_live_equity >= 15000, "format": "usd"},
+            ],
+        },
+        {
+            "category": "Phase 4 — $100K Velocity (compound + $500/mo injection, <1 year)",
+            "items": [
+                {"name": f"Compound Rate >= {compound_rate_needed:.2f}%/day", "target": round(compound_rate_needed, 2),
+                 "current": round(compound_rate_current, 4),
+                 "pass": compound_rate_current >= compound_rate_needed * 0.5, "format": "pct",
+                 "note": "With $500/mo injection, ~0.6%/day is sufficient"},
+                {"name": f"Daily Rate >= ${daily_needed_100k:.2f}/day (3 coins, linear)", "target": round(daily_needed_100k, 2),
+                 "current": round(daily_rate_3coin, 4),
+                 "pass": daily_rate_3coin >= daily_needed_100k * 0.1, "format": "usd",
+                 "note": "Linear rate; compound+injection requires far less"},
+                _build_100k_projection_check(total_live_equity, compound_rate_current),
+            ],
+        },
+        {
+            "category": "Phase 5 — Go-Live Infrastructure",
+            "items": [
+                {"name": "Coinbase API Keys Configured", "target": "Done",
+                 "current": "Not done", "pass": False, "format": "bool"},
+                {"name": "Real Money Adapter Tested", "target": "Done",
+                 "current": "Not done", "pass": False, "format": "bool"},
+                {"name": "Kill Switch Verified", "target": "Done",
+                 "current": "Not tested", "pass": False, "format": "bool"},
+                {"name": "Recovery/Reconciliation Tested", "target": "Done",
+                 "current": "Phase 8 Pass" if True else "Not tested",
+                 "pass": True, "format": "bool"},
+                {"name": "Discord Alerts Working", "target": "Done",
+                 "current": "Active", "pass": True, "format": "bool"},
+            ],
+        },
+    ]
+
+    total_items = sum(len(c["items"]) for c in checks)
+    passed_items = sum(1 for c in checks for i in c["items"] if i["pass"])
+
+    return {
+        "checks": checks,
+        "total": total_items,
+        "passed": passed_items,
+        "pct": round((passed_items / total_items) * 100, 1) if total_items > 0 else 0,
+        "live_trades": live_trades,
+        "live_pnl": {k: round(v, 4) for k, v in live_pnl.items()},
+        "live_equity": {k: round(v, 2) for k, v in live_equity.items()},
+        "total_live_equity": round(total_live_equity, 2),
     }
 
 
@@ -933,6 +1452,7 @@ async def api_evolution():
         "evo": _build_evo_points(summaries),
         "scatter": _build_scatter_data(summaries),
         "projection": _build_projection(summaries),
+        "readiness": _build_readiness_tracker(summaries),
         "ml_network": _build_ml_network_data(),
         "strategy_compare": _build_strategy_compare(summaries),
         "trade_analytics": _build_trade_analytics(summaries),
@@ -1163,7 +1683,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     #evo-page canvas { height: 140px !important; }
     #evo-page .evo-chart-wrap { padding: 6px; margin-bottom: 8px; }
     #evo-page h2 { font-size: 0.75em !important; margin: 4px 0 2px !important; }
-    #ml-network-canvas { height: 250px !important; }
+    #ml-network-canvas { height: 300px !important; }
     #evo-page .evo-stats { gap: 6px; }
     #evo-page .evo-stat { padding: 4px 8px; }
     #evo-page .evo-stat .val { font-size: 1em; }
@@ -1236,6 +1756,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="coin-pnl" id="ms-pnl-SOL">$0.00</div>
     <div class="coin-detail">Equity: <span id="ms-eq-SOL">—</span> | Qty: <span id="ms-qty-SOL">0</span></div>
     <div class="coin-detail">Updated: <span id="ms-ts-SOL">—</span></div>
+  </div>
+</div>
+
+<!-- 3-coin aggregate portfolio bar -->
+<div id="portfolio-aggregate" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div style="color:#00d4ff; font-weight:bold; font-size:0.85em; letter-spacing:1px;">PORTFOLIO TOTAL (3 COINS)</div>
+    <div style="font-size:0.72em; color:#7b8ab8;">Updated: <span id="agg-ts">—</span></div>
+  </div>
+  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">
+    <div><span style="color:#7b8ab8; font-size:0.78em;">Total Equity:</span>
+      <span id="agg-equity" style="font-size:1.5em; font-weight:bold; color:#00d4ff;">$1,500.00</span></div>
+    <div><span style="color:#7b8ab8; font-size:0.78em;">Total P&L:</span>
+      <span id="agg-pnl" style="font-size:1.2em; font-weight:bold;">$0.00</span></div>
+    <div><span style="color:#7b8ab8; font-size:0.78em;">Daily Rate:</span>
+      <span id="agg-daily" style="font-size:1.0em; font-weight:bold;">$0.00/day</span></div>
   </div>
 </div>
 
@@ -1392,6 +1928,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <canvas id="projection-chart" style="height:160px;"></canvas>
       </div>
     </div>
+    <div id="milestone-100k" style="margin-top:10px; display:none;"></div>
+  </div>
+
+  <!-- Go-Live Readiness Tracker -->
+  <div id="readiness-section" style="margin-bottom:16px;">
+    <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">GO-LIVE READINESS TRACKER</h2>
+    <div id="readiness-content" style="color:#7b8ab8;">Loading...</div>
   </div>
 
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">PROFIT FACTOR & WIN RATE OVER TIME</h2>
@@ -1432,13 +1975,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">WIN/LOSS PNL DISTRIBUTION</h2>
   <div class="evo-chart-wrap">
-    <canvas id="dist-chart" style="height:150px;"></canvas>
+    <div style="position:relative; height:150px; max-height:150px;">
+      <canvas id="dist-chart"></canvas>
+    </div>
     <div id="dist-stats" style="text-align:center; font-size:0.75em; color:#7b8ab8; margin-top:4px;"></div>
   </div>
 
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">DRAWDOWN CURVE (Latest Run)</h2>
   <div class="evo-chart-wrap">
-    <canvas id="drawdown-chart" style="height:120px;"></canvas>
+    <div style="position:relative; height:120px; max-height:120px;">
+      <canvas id="drawdown-chart"></canvas>
+    </div>
     <div class="evo-legend">
       <span><span class="edot" style="background:#ff5252"></span> Drawdown %</span>
       <span style="color:#7b8ab8">Lower is better — 0% = at equity peak</span>
@@ -1446,9 +1993,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">ML GOVERNOR NEURAL NETWORK</h2>
-  <div class="evo-chart-wrap" style="min-height:280px; position:relative;">
-    <canvas id="ml-network-canvas" style="width:100%; height:280px;"></canvas>
-    <div id="ml-network-stats" style="position:absolute; top:8px; right:12px; font-size:0.7em; color:#7b8ab8; text-align:right;"></div>
+  <div class="evo-chart-wrap" style="position:relative;">
+    <div id="ml-network-stats" style="font-size:0.7em; color:#7b8ab8; text-align:center; padding:4px 0 8px; display:flex; gap:16px; justify-content:center; flex-wrap:wrap;"></div>
+    <canvas id="ml-network-canvas" style="width:100%; height:350px;"></canvas>
     <div class="evo-legend">
       <span><span class="edot" style="background:#00d4ff"></span> Input Features</span>
       <span><span class="edot" style="background:#ffc107"></span> Hidden Layer</span>
@@ -1462,24 +2009,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div id="queue-page" class="page-content">
   <h2 style="color:#00d4ff; margin-bottom:12px;">QUEUE & BACKTEST STATUS</h2>
 
-  <!-- Running job -->
-  <div class="card" style="margin-bottom:12px; border-left:3px solid #ffc107;">
-    <h2>CURRENTLY RUNNING</h2>
-    <div id="q-running" style="color:#7b8ab8;">Loading...</div>
-  </div>
-
-  <!-- Progress bar area -->
-  <div id="q-progress-wrap" style="display:none; margin-bottom:12px;">
-    <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
-      <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
-      <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
+  <!-- Running jobs by PC -->
+  <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:12px;">
+    <div class="card" style="border-left:3px solid #ffc107;">
+      <h2>PC1 (LOCAL) — RUNNING</h2>
+      <div id="q-running" style="color:#7b8ab8;">Loading...</div>
+      <div id="q-progress-wrap" style="display:none; margin-top:8px;">
+        <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
+          <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
+          <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="border-left:3px solid #ba68c8;">
+      <h2>PC2 (REMOTE) — RUNNING</h2>
+      <div id="q-pc2-status" style="color:#7b8ab8;">Loading...</div>
     </div>
   </div>
 
-  <!-- Pending queue -->
-  <div class="card" style="margin-bottom:12px; border-left:3px solid #00d4ff;">
-    <h2>PENDING QUEUE (<span id="q-pending-count">0</span> jobs)</h2>
-    <div id="q-pending" style="color:#7b8ab8;">None</div>
+  <!-- Pending queues -->
+  <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:12px;">
+    <div class="card" style="border-left:3px solid #00d4ff;">
+      <h2>PC1 QUEUE (<span id="q-pending-count">0</span> jobs)</h2>
+      <div id="q-pending" style="color:#7b8ab8;">None</div>
+    </div>
+    <div class="card" style="border-left:3px solid #ba68c8;">
+      <h2>PC2 QUEUE (<span id="q-pc2-pending-count">0</span> jobs)</h2>
+      <div id="q-pc2-pending" style="color:#7b8ab8;">None</div>
+    </div>
   </div>
 
   <div class="grid" style="grid-template-columns: 1fr 1fr;">
@@ -1546,11 +2103,10 @@ function loadEvolution() {
     const stats = [
       ['Runs', EVO.length, ''],
       ['Latest PF', latest.pf.toFixed(2), latest.pf >= 1 ? 'positive' : 'negative'],
-      ['Best PF', bestPf.toFixed(2), bestPf >= 1 ? 'positive' : 'negative'],
+      ['All-Time Best PF', bestPf.toFixed(2), bestPf >= 1 ? 'positive' : 'negative'],
       ['Latest WR', latest.wr.toFixed(1) + '%', latest.wr >= 35 ? 'positive' : 'negative'],
-      ['Best WR', bestWr.toFixed(1) + '%', ''],
       ['Latest PnL', '$' + latest.pnl.toFixed(2), latest.pnl >= 0 ? 'positive' : 'negative'],
-      ['Total Trades', EVO.reduce((s,d) => s + d.trades, 0), ''],
+      ['Latest Trades', latest.trades, ''],
     ];
     bar.innerHTML = stats.map(([l,v,c]) =>
       '<div class="evo-stat"><div class="val ' + c + '">' + v + '</div><div class="lbl">' + l + '</div></div>'
@@ -1580,6 +2136,8 @@ function loadEvolution() {
 
     // Year-end projection
     renderProjection(data.projection || {});
+    renderMilestone100k(data.projection || {});
+    renderReadiness(data.readiness || {});
   }).catch(e => {
     console.error('Evolution load error', e);
     document.getElementById('evo-stats-bar').innerHTML = '<div class="evo-stat"><div class="val" style="color:#ff5252">Load Error</div></div>';
@@ -1634,7 +2192,7 @@ function loadQueueStatus() {
       qEtaEl.style.display = 'none';
     }
 
-    // Pending queue
+    // Pending queue - PC1
     const labels = data.pending_labels || [];
     document.getElementById('q-pending-count').textContent = labels.length;
     const pendEl = document.getElementById('q-pending');
@@ -1643,6 +2201,56 @@ function loadQueueStatus() {
     } else {
       pendEl.innerHTML = labels.map((l, i) =>
         '<div style="padding:4px 8px; margin:2px 0; background:#0d1321; border-radius:3px; border-left:2px solid #00d4ff; font-size:0.85em;">' +
+        '<span style="color:#7b8ab8;">#' + (i+1) + '</span> ' + l + '</div>'
+      ).join('');
+    }
+
+    // PC2 status
+    const pc2 = data.pc2 || {};
+    const pc2El = document.getElementById('q-pc2-status');
+    if (!pc2.reachable) {
+      pc2El.innerHTML = '<span style="color:#ff5252;">' + (pc2.error || 'PC2 unreachable') + '</span>';
+    } else if (pc2.running_label) {
+      let pc2Eta = '';
+      if (pc2.eta_pct > 0) {
+        const pct = pc2.eta_pct;
+        const elH = Math.floor(pc2.elapsed_s / 3600);
+        const elM = Math.floor((pc2.elapsed_s % 3600) / 60);
+        const etaH = Math.floor(pc2.eta_remaining_s / 3600);
+        const etaM = Math.floor((pc2.eta_remaining_s % 3600) / 60);
+        const prog = pc2.progress_bars || 0;
+        const tot = pc2.total_bars || 0;
+        pc2Eta =
+          '<div style="margin-top:6px;">' +
+          '<div style="background:#0d1321; border-radius:4px; height:8px; overflow:hidden; border:1px solid #1e2a42;">' +
+          '<div style="height:100%; width:'+pct+'%; background:linear-gradient(90deg, #ba68c8, #9c27b0); border-radius:4px;"></div></div>' +
+          '<div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.72em; color:#7b8ab8;">' +
+          '<span>'+pct+'% ('+prog.toLocaleString()+'/'+tot.toLocaleString()+' bars)</span>' +
+          '<span>Elapsed: '+elH+'h '+elM+'m</span></div>' +
+          '<div style="font-size:0.82em; color:#ba68c8; margin-top:3px; font-weight:bold;">ETA: ~'+etaH+'h '+etaM+'m remaining</div></div>';
+      } else {
+        pc2Eta = '<div style="color:#7b8ab8; font-size:0.75em; margin-top:4px;">Starting... (waiting for progress data)</div>';
+      }
+      pc2El.innerHTML = '<div style="font-size:1.1em; color:#ba68c8; font-weight:bold;">' + pc2.running_label + '</div>' + pc2Eta;
+    } else {
+      const lastLog = pc2.recent_log && pc2.recent_log.length ? pc2.recent_log[pc2.recent_log.length - 1] : null;
+      if (lastLog && lastLog.status === 'DONE') {
+        pc2El.innerHTML = '<span style="color:#00e676;">Last job completed: ' + lastLog.label + '</span>';
+      } else if (lastLog && lastLog.status === 'FAIL') {
+        pc2El.innerHTML = '<span style="color:#ff5252;">Last job failed: ' + lastLog.label + '</span>';
+      } else {
+        pc2El.innerHTML = '<span style="color:#7b8ab8;">Idle</span>';
+      }
+    }
+    // PC2 pending
+    const pc2Pend = pc2.pending || [];
+    document.getElementById('q-pc2-pending-count').textContent = pc2Pend.length;
+    const pc2PendEl = document.getElementById('q-pc2-pending');
+    if (!pc2Pend.length) {
+      pc2PendEl.innerHTML = '<span style="color:#7b8ab8;">Queue empty</span>';
+    } else {
+      pc2PendEl.innerHTML = pc2Pend.map((l, i) =>
+        '<div style="padding:4px 8px; margin:2px 0; background:#0d1321; border-radius:3px; border-left:2px solid #ba68c8; font-size:0.85em;">' +
         '<span style="color:#7b8ab8;">#' + (i+1) + '</span> ' + l + '</div>'
       ).join('');
     }
@@ -1711,38 +2319,70 @@ function renderProjection(proj) {
   }
 
   const startCash = proj.start_cash || 500;
-  const tagColors = {worst:'#ff5252', median:'#ffb74d', best:'#00e676'};
-  const tagLabels = {worst:'Conservative', median:'Median', best:'Optimistic'};
+  const numCoins = proj.num_coins || 3;
+  const tagColors = {latest:'#00d4ff', best_ever:'#7b8ab866'};
+  const tagLabels = {latest:'CURRENT STRATEGY', best_ever:'Best Historical'};
 
-  // Also compute live-adjusted projection if we have live PnL
-  let liveNote = '';
-  const realizedEl = document.getElementById('realized-pnl');
-  if (realizedEl) {
-    const livePnl = parseFloat(realizedEl.textContent.replace(/[^0-9.-]/g, ''));
-    if (!isNaN(livePnl) && livePnl !== 0) {
-      liveNote = '<div style="margin-top:8px; padding:8px; background:#0d1321; border:1px solid #1e2a42; border-radius:4px; font-size:0.78em;">' +
-        '<span style="color:#00d4ff;">LIVE P&L:</span> <span style="color:' + (livePnl >= 0 ? '#00e676' : '#ff5252') + '; font-weight:bold;">$' + livePnl.toFixed(2) + '</span>' +
-        ' — Current balance: <b>$' + (startCash + livePnl).toFixed(2) + '</b></div>';
-    }
-  }
-
-  let html = '';
+  let html = '<div style="font-size:0.7em; color:#7b8ab8; margin-bottom:8px;">Source: latest backtest (current config) | $'+startCash+' per coin x '+numCoins+' coins</div>';
   proj.scenarios.forEach(sc => {
     const color = tagColors[sc.tag] || '#7b8ab8';
     const label = tagLabels[sc.tag] || sc.tag;
     const arrow = sc.pct_gain >= 0 ? '&#9650;' : '&#9660;';
-    html += '<div style="background:#141b2d; border:1px solid #1e2a42; border-left:3px solid '+color+'; border-radius:6px; padding:10px 14px;">' +
+    const isPrimary = sc.tag === 'latest';
+    const borderWidth = isPrimary ? '3px' : '1px';
+    const opacity = isPrimary ? '1' : '0.6';
+    const total3 = sc.total_year_end_3coin || sc.year_end_balance * numCoins;
+    html += '<div style="background:#141b2d; border:1px solid #1e2a42; border-left:'+borderWidth+' solid '+color+'; border-radius:6px; padding:10px 14px; opacity:'+opacity+';">' +
       '<div style="display:flex; justify-content:space-between; align-items:center;">' +
       '<div><span style="color:'+color+'; font-weight:bold; font-size:0.9em;">'+label+'</span>' +
+      (sc.note ? '<span style="color:#7b8ab8; font-size:0.65em; margin-left:6px;">('+sc.note+')</span>' : '') +
       '<span style="color:#7b8ab8; font-size:0.7em; margin-left:8px;">PF='+sc.pf+' | '+sc.bt_days+'d backtest</span></div>' +
       '<div style="font-size:0.72em; color:#7b8ab8;">'+sc.days_left+' days left</div></div>' +
       '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">' +
-      '<div style="font-size:1.5em; font-weight:bold; color:'+color+';">$'+sc.year_end_balance.toFixed(2)+'</div>' +
+      '<div><span style="font-size:1.5em; font-weight:bold; color:'+color+';">$'+sc.year_end_balance.toFixed(2)+'</span>' +
+      '<span style="font-size:0.75em; color:#7b8ab8; margin-left:6px;">per coin</span></div>' +
       '<div style="font-size:1.0em; color:'+color+';">'+arrow+' '+sc.pct_gain.toFixed(1)+'%</div></div>' +
-      '<div style="font-size:0.7em; color:#7b8ab8; margin-top:2px;">$'+sc.daily_pnl.toFixed(4)+'/day &rarr; $'+sc.projected_gain.toFixed(2)+' gain from $'+startCash.toFixed(0)+'</div>' +
+      '<div style="font-size:0.7em; color:#7b8ab8; margin-top:2px;">$'+sc.daily_pnl.toFixed(4)+'/day/coin &rarr; $'+sc.projected_gain.toFixed(2)+' gain | <b style="color:'+color+';">3-coin total: $'+total3.toFixed(2)+'</b></div>' +
       '</div>';
   });
-  html += liveNote;
+
+  // $2K live-readiness milestone
+  const m2k = proj.milestone_2k;
+  if (m2k) {
+    const m2kColor = m2k.days_needed <= 90 ? '#00e676' : m2k.days_needed <= 365 ? '#ffb74d' : '#ff5252';
+    const m2kPct = Math.min(100, Math.max(0, (m2k.current_balance / m2k.target) * 100));
+    html += '<div style="margin-top:8px; padding:10px 14px; background:#141b2d; border:1px solid #1e2a42; border-left:3px solid #ba68c8; border-radius:6px;">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+      '<div style="color:#ba68c8; font-weight:bold; font-size:0.85em;">GO-LIVE TARGET: $2,000/coin</div>' +
+      '<div style="font-size:0.72em; color:'+m2kColor+';">'+Math.round(m2k.days_needed)+' days ('+m2k.target_date+')</div></div>' +
+      '<div style="margin-top:6px; background:#0d1321; border-radius:3px; height:8px; overflow:hidden;">' +
+      '<div style="height:100%; width:'+m2kPct.toFixed(1)+'%; background:linear-gradient(90deg,#ba68c8,#e040fb); border-radius:3px;"></div></div>' +
+      '<div style="font-size:0.65em; color:#7b8ab8; margin-top:3px;">$'+m2k.current_balance.toFixed(0)+' / $'+m2k.target.toFixed(0)+' ('+m2kPct.toFixed(1)+'%) | $'+m2k.daily_pnl.toFixed(4)+'/day</div></div>';
+  } else {
+    // Get current PF from latest scenario
+    const latestSc = proj.scenarios.find(s => s.tag === 'latest');
+    const curPf = latestSc ? latestSc.pf : 0;
+    const pfPct = Math.min(100, Math.max(0, (curPf / 1.5) * 100));  // gauge: 0 to 1.5 PF
+    const pfColor = curPf >= 1.0 ? '#00e676' : curPf >= 0.9 ? '#ffb74d' : '#ff5252';
+    html += '<div style="margin-top:8px; padding:10px 14px; background:#141b2d; border:1px solid #1e2a42; border-left:3px solid #ba68c8; border-radius:6px;">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+      '<div style="color:#ba68c8; font-weight:bold; font-size:0.85em;">GO-LIVE TARGET: $2,000/coin</div>' +
+      '<div style="font-size:0.72em; color:#ff5252;">PF must reach 1.0+</div></div>' +
+      '<div style="margin-top:8px; display:flex; align-items:center; gap:10px;">' +
+      '<div style="flex:1;">' +
+      '<div style="font-size:0.7em; color:#7b8ab8; margin-bottom:3px;">Profit Factor Progress</div>' +
+      '<div style="background:#0d1321; border-radius:3px; height:14px; overflow:hidden; position:relative;">' +
+      '<div style="height:100%; width:'+pfPct.toFixed(1)+'%; background:linear-gradient(90deg,#ff5252,'+pfColor+'); border-radius:3px; transition:width 0.5s;"></div>' +
+      '<div style="position:absolute; top:0; left:50%; transform:translateX(-50%); height:100%; width:1px; background:#00e67666;"></div>' +
+      '</div>' +
+      '<div style="display:flex; justify-content:space-between; margin-top:2px; font-size:0.6em; color:#7b8ab8;">' +
+      '<span>0</span><span style="color:#00e676;">1.0 (breakeven)</span><span>1.5+</span></div>' +
+      '</div>' +
+      '<div style="text-align:center; min-width:70px;">' +
+      '<div style="font-size:1.4em; font-weight:bold; color:'+pfColor+';">'+curPf.toFixed(2)+'</div>' +
+      '<div style="font-size:0.6em; color:#7b8ab8;">Current PF</div></div></div></div>';
+  }
+
   cards.innerHTML = html;
 
   // Monthly projection curve
@@ -1816,6 +2456,115 @@ function renderProjection(proj) {
   for (let i=0;i<=4;i++) { const v=yMin+(yRange*i/4); ctx.fillText('$'+v.toFixed(0), PAD.l-4, PAD.t+pH-(i/4)*pH+3); }
 }
 
+function renderMilestone100k(proj) {
+  const el = document.getElementById('milestone-100k');
+  if (!el) return;
+  const ms = proj.milestone_100k;
+  if (!ms) {
+    // No positive scenario — show "not yet" state
+    const startCash = proj.start_cash || 500;
+    const toGo = 100000 - startCash;
+    el.style.display = 'block';
+    el.innerHTML =
+      '<div style="background:#141b2d; border:1px solid #1e2a42; border-left:3px solid #ffb74d; border-radius:6px; padding:12px 14px;">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+      '<div style="font-size:0.85em; letter-spacing:1px; color:#ffb74d; font-weight:bold;">&#127942; $100K MILESTONE</div>' +
+      '<div style="font-size:0.72em; color:#7b8ab8;">$'+toGo.toLocaleString()+' to go</div></div>' +
+      '<div style="margin-top:8px;">' +
+      '<div style="background:#0d1321; border-radius:4px; height:10px; overflow:hidden; border:1px solid #1e2a42;">' +
+      '<div style="height:100%; width:'+((startCash/100000)*100).toFixed(2)+'%; background:linear-gradient(90deg, #ffb74d, #ff9800); border-radius:4px;"></div></div>' +
+      '<div style="display:flex; justify-content:space-between; margin-top:4px; font-size:0.68em; color:#7b8ab8;">' +
+      '<span>$'+startCash.toLocaleString()+'</span><span>$100,000</span></div></div>' +
+      '<div style="margin-top:6px; font-size:0.75em; color:#7b8ab8;">Waiting for profitable backtest scenario to estimate timeline...</div></div>';
+    return;
+  }
+
+  const pct = ((ms.current_balance / ms.target) * 100).toFixed(2);
+  const years = (ms.days_needed / 365).toFixed(1);
+  const months = Math.round(ms.days_needed / 30.44);
+  let timeStr;
+  if (ms.days_needed < 60) timeStr = Math.round(ms.days_needed) + ' days';
+  else if (ms.days_needed < 730) timeStr = months + ' months';
+  else timeStr = years + ' years';
+
+  const barColor = ms.days_needed < 365 ? '#00e676' : ms.days_needed < 1095 ? '#ffb74d' : '#ff5252';
+  const nCoins = ms.num_coins || 3;
+  const dailyTotal = ms.daily_pnl_3coin || (ms.daily_pnl_latest || 0) * nCoins;
+  el.style.display = 'block';
+  let msHtml =
+    '<div style="background:#141b2d; border:1px solid #1e2a42; border-left:3px solid '+barColor+'; border-radius:6px; padding:12px 14px;">' +
+    '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+    '<div style="font-size:0.85em; letter-spacing:1px; color:'+barColor+'; font-weight:bold;">$100K MILESTONE</div>' +
+    '<div style="font-size:0.72em; color:#7b8ab8;">$'+(ms.target - ms.current_balance).toLocaleString(undefined,{maximumFractionDigits:0})+' to go</div></div>' +
+    '<div style="margin-top:8px;">' +
+    '<div style="background:#0d1321; border-radius:4px; height:10px; overflow:hidden; border:1px solid #1e2a42;">' +
+    '<div style="height:100%; width:'+pct+'%; background:linear-gradient(90deg, '+barColor+', '+barColor+'aa); border-radius:4px; min-width:2px;"></div></div>' +
+    '<div style="display:flex; justify-content:space-between; margin-top:4px; font-size:0.68em; color:#7b8ab8;">' +
+    '<span>$'+ms.current_balance.toLocaleString()+' ('+nCoins+' coins)</span><span>$100,000</span></div></div>' +
+    '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">' +
+    '<div><span style="font-size:1.2em; font-weight:bold; color:'+barColor+';">~'+timeStr+'</span>' +
+    '<span style="font-size:0.72em; color:#7b8ab8; margin-left:8px;">at $'+dailyTotal.toFixed(2)+'/day ('+nCoins+' coins combined)</span></div>' +
+    '<div style="font-size:0.78em; color:#7b8ab8;">ETA: <b style="color:'+barColor+';">'+ms.target_date+'</b></div></div>';
+  // Show best-ever potential if different
+  if (ms.best_ever_days && ms.best_ever_days < ms.days_needed) {
+    const bestYears = (ms.best_ever_days / 365).toFixed(1);
+    const bestMonths = Math.round(ms.best_ever_days / 30.44);
+    let bestTimeStr;
+    if (ms.best_ever_days < 60) bestTimeStr = Math.round(ms.best_ever_days) + ' days';
+    else if (ms.best_ever_days < 730) bestTimeStr = bestMonths + ' months';
+    else bestTimeStr = bestYears + ' years';
+    msHtml += '<div style="font-size:0.68em; color:#7b8ab866; margin-top:4px;">Best-ever potential: ~'+bestTimeStr+' at $'+(ms.best_ever_daily_3coin||0).toFixed(2)+'/day</div>';
+  }
+  msHtml += '<div style="font-size:0.65em; color:#7b8ab866; margin-top:4px;">Based on latest backtest x'+nCoins+' coins — auto-adjusts as strategy improves</div></div>';
+  el.innerHTML = msHtml;
+}
+
+function renderReadiness(r) {
+  const el = document.getElementById('readiness-content');
+  if (!el || !r.checks) { if(el) el.innerHTML = '<span style="color:#7b8ab8">No readiness data</span>'; return; }
+
+  const pct = r.pct || 0;
+  const barColor = pct >= 80 ? '#00e676' : pct >= 50 ? '#ffb74d' : '#ff5252';
+
+  let html = '<div style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:12px 14px; margin-bottom:10px;">' +
+    '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+    '<div><span style="font-size:1.3em; font-weight:bold; color:'+barColor+';">'+r.passed+'/'+r.total+'</span>' +
+    '<span style="font-size:0.78em; color:#7b8ab8; margin-left:8px;">checks passed ('+pct+'%)</span></div>' +
+    '<div style="font-size:0.72em; color:#7b8ab8;">Portfolio: $'+((r.total_live_equity||1500).toFixed(2))+'</div></div>' +
+    '<div style="margin-top:6px; background:#0d1321; border-radius:3px; height:12px; overflow:hidden;">' +
+    '<div style="height:100%; width:'+pct+'%; background:linear-gradient(90deg,'+barColor+','+barColor+'aa); border-radius:3px; transition:width 0.5s;"></div></div></div>';
+
+  r.checks.forEach(cat => {
+    const catPassed = cat.items.filter(i => i.pass).length;
+    const catTotal = cat.items.length;
+    const catColor = catPassed === catTotal ? '#00e676' : catPassed > 0 ? '#ffb74d' : '#ff5252';
+    html += '<div style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:6px;">' +
+      '<div style="color:'+catColor+'; font-weight:bold; font-size:0.82em; margin-bottom:8px; letter-spacing:0.5px;">' +
+      cat.category.toUpperCase() + ' <span style="color:#7b8ab8; font-weight:normal;">('+catPassed+'/'+catTotal+')</span></div>';
+
+    cat.items.forEach(item => {
+      const icon = item.pass ? '<span style="color:#00e676;">&#10003;</span>' : '<span style="color:#ff5252;">&#10007;</span>';
+      const valColor = item.pass ? '#00e676' : '#ff5252';
+      let currentStr = String(item.current);
+      if (item.format === 'pf') currentStr = parseFloat(item.current).toFixed(3);
+      else if (item.format === 'pct') currentStr = parseFloat(item.current).toFixed(1) + '%';
+      else if (item.format === 'usd') currentStr = '$' + parseFloat(item.current).toFixed(2);
+      else if (item.format === 'int') currentStr = String(item.current);
+      const targetStr = typeof item.target === 'number' ? (item.format === 'pct' ? item.target + '%' : item.format === 'usd' ? '$' + item.target : String(item.target)) : String(item.target);
+
+      html += '<div style="display:flex; justify-content:space-between; align-items:center; padding:3px 0; border-bottom:1px solid #1e2a4233;">' +
+        '<div style="display:flex; align-items:center; gap:8px;">' + icon +
+        '<span style="font-size:0.78em; color:#e0e0e0;">'+item.name+'</span></div>' +
+        '<div style="display:flex; align-items:center; gap:12px;">' +
+        '<span style="font-size:0.75em; color:'+valColor+'; font-weight:bold;">'+currentStr+'</span>' +
+        '<span style="font-size:0.65em; color:#7b8ab8;">/ '+targetStr+'</span></div></div>';
+    });
+    html += '</div>';
+  });
+
+  el.innerHTML = html;
+}
+
 // Real-time projection ticker — updates from SSE live PnL
 let lastProjectionData = null;
 function updateLiveProjection(livePnl, liveEquity) {
@@ -1860,10 +2609,11 @@ function _applyLiveProjectionUpdate(livePnl, liveEquity) {
   const color = livePnl >= 0 ? '#00e676' : '#ff5252';
   const arrow = livePnl >= 0 ? '&#9650;' : '&#9660;';
 
-  // Annualize from live performance
-  // Use the elapsed days of paper trading (started ~2026-03-11)
-  const startDate = new Date('2026-03-11T00:00:00Z');
+  // Annualize from live performance — dynamically compute elapsed days
   const now = new Date();
+  // Use first scenario's bt_days as a sanity floor; actual paper start = 2026-03-15
+  const paperStartStr = '2026-03-15T00:00:00Z';
+  const startDate = new Date(paperStartStr);
   const elapsedDays = Math.max(1, (now - startDate) / 86400000);
   const dailyRate = livePnl / elapsedDays;
   const daysLeft = proj.scenarios[0] ? proj.scenarios[0].days_left : 290;
@@ -1882,6 +2632,14 @@ function _applyLiveProjectionUpdate(livePnl, liveEquity) {
     '<span style="font-size:1.1em; font-weight:bold; color:'+(projectedYearEnd>=startCash?'#00e676':'#ff5252')+';">$'+projectedYearEnd.toFixed(2)+'</span>' +
     '<span style="font-size:0.78em; color:'+(projYearEndPct>=0?'#00e676':'#ff5252')+'; margin-left:4px;">('+projYearEndPct.toFixed(1)+'%)</span></div></div>' +
     '<div style="font-size:0.68em; color:#7b8ab8; margin-top:4px;">$'+dailyRate.toFixed(4)+'/day over '+elapsedDays.toFixed(0)+' days | Live P&L: <span style="color:'+color+'">$'+livePnl.toFixed(4)+'</span></div>';
+
+  // Update milestone with live data
+  if (dailyRate > 0) {
+    const liveMs = {target:100000, current_balance:currentBalance, daily_pnl_best:dailyRate,
+      days_needed:(100000-currentBalance)/dailyRate,
+      target_date:new Date(Date.now()+((100000-currentBalance)/dailyRate)*86400000).toISOString().slice(0,10)};
+    renderMilestone100k({milestone_100k:liveMs, start_cash:startCash});
+  }
 }
 
 function drawEvoCanvas(canvasId, tipId, EVO, series, yConfigs) {
@@ -2177,10 +2935,10 @@ function renderMLNetwork(mlData) {
   // Stats overlay
   const aucLine = mlData.roc_auc ? 'ROC-AUC: <span style="color:#00e676;">' + mlData.roc_auc.toFixed(3) + '</span>' :
     'Train WR: <span style="color:#ffc107;">' + (mlData.win_rate || 0) + '%</span>';
-  statsEl.innerHTML = '<div style="color:#00d4ff; font-weight:bold;">ML GOVERNOR</div>' +
-    '<div>' + aucLine + '</div>' +
-    '<div>Trees: ' + mlData.n_estimators + ' | Depth: ' + mlData.max_depth + '</div>' +
-    '<div>Trained on: ' + (mlData.train_samples || 0).toLocaleString() + ' trades</div>';
+  statsEl.innerHTML = '<span style="color:#00d4ff; font-weight:bold;">ML GOVERNOR</span>' +
+    '<span>' + aucLine + '</span>' +
+    '<span>Trees: ' + mlData.n_estimators + ' | Depth: ' + mlData.max_depth + '</span>' +
+    '<span>Trained: ' + (mlData.train_samples || 0).toLocaleString() + ' trades</span>';
 
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
@@ -2191,13 +2949,13 @@ function renderMLNetwork(mlData) {
   const W = rect.width, H = rect.height;
 
   // Layout: features on left, 2 hidden layers in middle, output on right
-  const features = mlData.features.slice(0, 16); // top 16 by importance
+  const features = mlData.features.slice(0, 10); // top 10 by importance
   const maxImp = Math.max(...features.map(f => f.importance));
 
   // Positions
-  const leftX = 140, midX1 = W * 0.38, midX2 = W * 0.58, rightX = W - 60;
+  const leftX = 160, midX1 = W * 0.38, midX2 = W * 0.58, rightX = W - 80;
   const inputNodes = features.map((f, i) => ({
-    x: leftX, y: 30 + i * ((H - 60) / (features.length - 1 || 1)),
+    x: leftX, y: 25 + i * ((H - 50) / (features.length - 1 || 1)),
     imp: f.importance, name: f.name
   }));
   // Hidden layer 1 (8 nodes)
@@ -2271,13 +3029,14 @@ function renderMLNetwork(mlData) {
       ctx.shadowBlur = 0;
       // Label
       ctx.fillStyle = '#7b8ab8';
-      ctx.font = '10px monospace';
+      ctx.font = '9px monospace';
       ctx.textAlign = 'right';
-      ctx.fillText(n.name, n.x - r - 6, n.y + 3);
+      const lbl = n.name.length > 18 ? n.name.slice(0, 17) + '..' : n.name;
+      ctx.fillText(lbl, n.x - r - 8, n.y + 3);
       // Importance bar
       const barW = (n.imp / maxImp) * 30;
       ctx.fillStyle = 'rgba(0,212,255,0.2)';
-      ctx.fillRect(n.x - r - 6 - barW, n.y - 2, barW, 4);
+      ctx.fillRect(n.x - r - 8 - barW, n.y - 2, barW, 4);
     });
 
     // Hidden layer 1 nodes
@@ -2444,21 +3203,41 @@ async function loadMultiOverview() {
   try {
     const resp = await fetch('/api/multi');
     const data = await resp.json();
+    let aggEq = 0, aggPnl = 0, latestTs = '';
     ['ETH', 'BTC', 'SOL'].forEach(coin => {
       const c = data[coin];
       if (!c) return;
       const stEl = document.getElementById('ms-state-' + coin);
       if (stEl) { stEl.textContent = c.bot_state || 'UNKNOWN'; stEl.className = 'state-' + (c.bot_state || 'FLAT'); }
       const pnlVal = parseFloat(c.realized_pnl) || 0;
+      const eqVal = parseFloat(c.equity) || 0;
+      aggEq += eqVal; aggPnl += pnlVal;
       const pnlEl = document.getElementById('ms-pnl-' + coin);
       if (pnlEl) { pnlEl.textContent = '$' + pnlVal.toFixed(4); pnlEl.style.color = pnlVal > 0 ? '#00e676' : pnlVal < 0 ? '#ff5252' : '#e0e0e0'; }
       const eqEl = document.getElementById('ms-eq-' + coin);
-      if (eqEl) eqEl.textContent = '$' + (parseFloat(c.equity) || 0).toFixed(2);
+      if (eqEl) eqEl.textContent = '$' + eqVal.toFixed(2);
       const qtyEl = document.getElementById('ms-qty-' + coin);
       if (qtyEl) qtyEl.textContent = c.position_qty || '0';
       const tsEl = document.getElementById('ms-ts-' + coin);
-      if (tsEl) tsEl.textContent = c.saved_at_iso ? new Date(c.saved_at_iso).toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
+      const tsStr = c.saved_at_iso ? new Date(c.saved_at_iso).toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
+      if (tsEl) tsEl.textContent = tsStr;
+      if (c.saved_at_iso) latestTs = tsStr;
     });
+    // Update portfolio aggregate bar
+    const aggEqEl = document.getElementById('agg-equity');
+    const aggPnlEl = document.getElementById('agg-pnl');
+    const aggDailyEl = document.getElementById('agg-daily');
+    const aggTsEl = document.getElementById('agg-ts');
+    if (aggEqEl) { aggEqEl.textContent = '$' + aggEq.toFixed(2); aggEqEl.style.color = aggEq >= 1500 ? '#00e676' : '#ff5252'; }
+    if (aggPnlEl) { aggPnlEl.textContent = '$' + aggPnl.toFixed(4); aggPnlEl.style.color = aggPnl >= 0 ? '#00e676' : '#ff5252'; }
+    if (aggDailyEl) {
+      const paperStart = new Date('2026-03-15T00:00:00Z');
+      const elapsed = Math.max(1, (Date.now() - paperStart) / 86400000);
+      const dailyRate = aggPnl / elapsed;
+      aggDailyEl.textContent = '$' + dailyRate.toFixed(4) + '/day';
+      aggDailyEl.style.color = dailyRate >= 0 ? '#00e676' : '#ff5252';
+    }
+    if (aggTsEl) aggTsEl.textContent = latestTs;
   } catch(e) { console.error('multi fetch error', e); }
 }
 

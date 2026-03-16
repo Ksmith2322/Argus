@@ -281,6 +281,7 @@ def load_config() -> dict:
     cfg["QUIET_MODE"] = _b("QUIET_MODE", "false")
     cfg["SUMMARY_EVERY_SECONDS"] = _i("SUMMARY_EVERY_SECONDS", "900")
     cfg["TRACK_MFE_MAE"] = _b("TRACK_MFE_MAE", "true")
+    cfg["VERIFY_TF_SNAPSHOTS"] = _b("VERIFY_TF_SNAPSHOTS", "true")
     cfg["TEST_EASY_ENTRIES"] = _b("TEST_EASY_ENTRIES", "false")
     cfg["TEST_EASY_EXITS"] = _b("TEST_EASY_EXITS", "false")
 
@@ -597,6 +598,14 @@ def load_config() -> dict:
     cfg["EXIT_BREAKEVEN_OFFSET_PCT"] = _d("EXIT_BREAKEVEN_OFFSET_PCT", "0.001")
     cfg["EXIT_BREAKEVEN_OFFSET_PCT"] = _clamp_decimal(
         cfg["EXIT_BREAKEVEN_OFFSET_PCT"], Decimal("0"), Decimal("0.05")
+    )
+
+    # Standalone breakeven stop: move stop to entry+offset once price reaches this % above entry
+    # e.g. 0.003 = activate breakeven stop after price moves +0.3% above entry
+    # Set to 0 to disable standalone breakeven (partial-TP breakeven still works independently)
+    cfg["EXIT_BREAKEVEN_TRIGGER_PCT"] = _d("EXIT_BREAKEVEN_TRIGGER_PCT", "0")
+    cfg["EXIT_BREAKEVEN_TRIGGER_PCT"] = _clamp_decimal(
+        cfg["EXIT_BREAKEVEN_TRIGGER_PCT"], Decimal("0"), Decimal("0.05")
     )
 
     # -------------------------

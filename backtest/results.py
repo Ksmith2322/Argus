@@ -265,6 +265,8 @@ class BacktestResults:
                 self.entry_block_risk += 1
             elif ("MIN_ORDER" in upper) or ("EXPOSURE" in upper) or ("NO_CASH" in upper) or ("SIZE" in upper):
                 self.entry_block_size += 1
+            elif "WATCH_GATED" in upper:
+                self.entry_block_confluence += 1
             else:
                 self.entry_block_other += 1
 
