@@ -374,11 +374,36 @@ def read_queue_status() -> dict:
                 if candles_csv and Path(candles_csv).exists():
                     with open(candles_csv) as f:
                         total_bars = sum(1 for _ in f) - 1
+                pct = round(progress / total_bars * 100) if total_bars else 0
+                # ETA: extrapolate from run_header mtime (job start) + progress
+                start_epoch = os.path.getmtime(h)
+                elapsed_s = time.time() - start_epoch
+                eta_current_s = 0
+                eta_current_iso = ""
+                if pct > 0:
+                    total_est_s = elapsed_s / (pct / 100.0)
+                    eta_current_s = int(total_est_s - elapsed_s)
+                    eta_ts = datetime.fromtimestamp(time.time() + eta_current_s, tz=timezone.utc)
+                    eta_current_iso = eta_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
                 result["running_job"] = {
                     "run_id": rid, "label": hdr.get("label", ""),
                     "progress": progress, "total_bars": total_bars,
-                    "pct": round(progress / total_bars * 100) if total_bars else 0
+                    "pct": pct,
+                    "elapsed_s": int(elapsed_s),
+                    "eta_remaining_s": eta_current_s,
+                    "eta_completion": eta_current_iso,
                 }
+                # Queue-wide ETA: current remaining + estimated time per pending job
+                pending_count = result["pending_pc1"]
+                if pct > 0 and total_bars > 0:
+                    est_per_job_s = total_est_s  # assume similar job size
+                    queue_remaining_s = eta_current_s + int(pending_count * est_per_job_s)
+                    queue_done_ts = datetime.fromtimestamp(time.time() + queue_remaining_s, tz=timezone.utc)
+                    result["queue_eta"] = {
+                        "remaining_s": queue_remaining_s,
+                        "completion": queue_done_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "est_per_job_s": int(est_per_job_s),
+                    }
                 break
     except Exception:
         pass
@@ -498,8 +523,8 @@ async def api_queue():
                 if not line:
                     continue
                 # Parse: [2026-03-15T18:14:23Z] START: label
-                ts = line[1:25] if line.startswith("[") else ""
-                rest = line[27:] if len(line) > 27 else line
+                ts = line[1:21] if line.startswith("[") else ""
+                rest = line[23:] if len(line) > 23 else line
                 status = "UNKNOWN"
                 label = rest
                 reason = ""
@@ -908,7 +933,171 @@ async def api_evolution():
         "evo": _build_evo_points(summaries),
         "scatter": _build_scatter_data(summaries),
         "projection": _build_projection(summaries),
+        "ml_network": _build_ml_network_data(),
+        "strategy_compare": _build_strategy_compare(summaries),
+        "trade_analytics": _build_trade_analytics(summaries),
     })
+
+
+def _build_ml_network_data() -> dict:
+    """Extract ML governor network structure + feature importances for visualization."""
+    model_path = REPO / "data" / "ml_governor.pkl"
+    if not model_path.exists():
+        return {}
+    try:
+        import pickle
+        with open(model_path, "rb") as f:
+            artifact = pickle.load(f)
+        model = artifact["model"]
+        feature_names = artifact.get("feature_names", [])
+        stats = artifact.get("training_stats", {})
+        # Feature importances
+        imp = model.feature_importances_.tolist() if hasattr(model, "feature_importances_") else []
+        features = []
+        for i, name in enumerate(feature_names):
+            features.append({
+                "name": name.replace("sig_", ""),
+                "importance": round(imp[i], 4) if i < len(imp) else 0,
+            })
+        features.sort(key=lambda x: x["importance"], reverse=True)
+        # Model structure info
+        n_estimators = getattr(model, "n_estimators", 0)
+        max_depth = getattr(model, "max_depth", 0)
+        return {
+            "features": features,
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "roc_auc": stats.get("roc_auc", 0),
+            "win_rate": round(stats.get("win_rate", 0) * 100, 1),
+            "train_samples": stats.get("n_trades", stats.get("train_samples", 0)),
+        }
+    except Exception:
+        return {}
+
+
+def _build_strategy_compare(summaries: list) -> list:
+    """Group backtest summaries by strategy config label for comparison."""
+    by_label = {}
+    for s in summaries:
+        run_id = s.get("run_id", "")
+        # Get label from run_header (labels live there, not in summary)
+        label = s.get("label", s.get("job_label", ""))
+        if not label or label == run_id:
+            hdr_path = OPS_LOGS / f"run_header_{run_id}.json"
+            try:
+                if hdr_path.exists():
+                    label = json.load(open(hdr_path)).get("label", "")
+            except Exception as e:
+                log.warning("strategy_compare hdr read error: %s", e)
+        if not label or label == run_id:
+            continue
+        by_label[label] = {
+            "label": str(label)[:50],
+            "pf": round(float(s.get("profit_factor", 0) or 0), 3),
+            "wr": round(float(s.get("win_rate_pct", 0) or 0), 1),
+            "pnl": round(float(s.get("total_pnl_usd", s.get("pnl_usd", 0)) or 0), 2),
+            "trades": int(s.get("total_closed", s.get("trades_closed", 0)) or 0),
+            "expectancy": round(float(s.get("expectancy_usd", 0) or 0), 4),
+            "max_dd_pct": round(float(s.get("max_drawdown_pct", 0) or 0), 2),
+        }
+    log.info("strategy_compare: %d summaries -> %d labeled configs", len(summaries), len(by_label))
+    return sorted(by_label.values(), key=lambda x: x["pf"], reverse=True)
+
+
+def _build_trade_analytics(summaries: list, max_runs: int = 15) -> dict:
+    """Build time-of-day heatmap and PnL distribution from recent trades."""
+    recent = summaries[-max_runs:] if len(summaries) > max_runs else summaries
+    all_trades = []
+    for s in recent:
+        run_id = s.get("run_id", "")
+        if not run_id:
+            continue
+        tf = OPS_LOGS / f"trades_{run_id}.csv"
+        if not tf.exists():
+            continue
+        try:
+            with open(tf, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    entry_epoch = float(row.get("entry_epoch", 0) or 0)
+                    pnl = float(row.get("realized_usd", row.get("realized_pnl", 0)) or 0)
+                    dur_s = float(row.get("duration_s", row.get("hold_seconds", 0)) or 0)
+                    if entry_epoch > 0:
+                        all_trades.append({"epoch": entry_epoch, "pnl": pnl, "dur_s": dur_s})
+        except Exception:
+            pass
+
+    if not all_trades:
+        return {"heatmap": [], "distribution": [], "total_trades": 0}
+
+    from datetime import datetime as _dt, timezone as _tz
+    # Time-of-day heatmap: hour (UTC) x day-of-week -> avg pnl + count
+    heatmap = {}  # (hour, dow) -> {"pnl_sum": float, "count": int, "wins": int}
+    for t in all_trades:
+        dt = _dt.fromtimestamp(t["epoch"], tz=_tz.utc)
+        h = dt.hour
+        dow = dt.weekday()  # 0=Mon
+        key = (h, dow)
+        if key not in heatmap:
+            heatmap[key] = {"pnl_sum": 0, "count": 0, "wins": 0}
+        heatmap[key]["pnl_sum"] += t["pnl"]
+        heatmap[key]["count"] += 1
+        if t["pnl"] > 0:
+            heatmap[key]["wins"] += 1
+
+    heatmap_out = []
+    for (h, dow), v in sorted(heatmap.items()):
+        heatmap_out.append({
+            "hour": h, "dow": dow,
+            "count": v["count"],
+            "avg_pnl": round(v["pnl_sum"] / v["count"], 4) if v["count"] else 0,
+            "total_pnl": round(v["pnl_sum"], 4),
+            "wr": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
+        })
+
+    # PnL distribution: bucket trades by pnl ranges
+    pnls = [t["pnl"] for t in all_trades]
+    dist = []
+    # Create buckets from min to max
+    mn, mx = min(pnls), max(pnls)
+    bucket_size = max(0.05, (mx - mn) / 30) if mx > mn else 0.05
+    b = mn
+    while b <= mx + bucket_size:
+        count = sum(1 for p in pnls if b <= p < b + bucket_size)
+        if count:
+            dist.append({"bin": round(b, 3), "count": count, "is_win": b >= 0})
+        b += bucket_size
+
+    # Drawdown curve from the latest run's equity file
+    drawdown_curve = []
+    if recent:
+        latest_rid = recent[-1].get("run_id", "")
+        eq_path = OPS_LOGS / f"equity_{latest_rid}.csv"
+        if eq_path.exists():
+            try:
+                eqs = []
+                with open(eq_path, "r", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        eqs.append(float(row.get("equity_usd", 0) or 0))
+                if eqs:
+                    peak = eqs[0]
+                    # Sample every N points to keep payload reasonable
+                    step = max(1, len(eqs) // 500)
+                    for i in range(0, len(eqs), step):
+                        v = eqs[i]
+                        peak = max(peak, v)
+                        dd_pct = ((peak - v) / peak * 100) if peak > 0 else 0
+                        drawdown_curve.append(round(dd_pct, 3))
+            except Exception:
+                pass
+
+    return {
+        "heatmap": heatmap_out,
+        "distribution": dist,
+        "drawdown": drawdown_curve,
+        "total_trades": len(all_trades),
+        "avg_pnl": round(sum(pnls) / len(pnls), 4),
+        "median_pnl": round(sorted(pnls)[len(pnls) // 2], 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -965,12 +1154,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #evo-page .evo-stat { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 8px 16px; text-align: center; }
   #evo-page .evo-stat .val { font-size: 1.3em; font-weight: bold; }
   #evo-page .evo-stat .lbl { font-size: 0.7em; color: #7b8ab8; }
-  #evo-page .evo-chart-wrap { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; margin-bottom: 14px; position: relative; }
-  #evo-page canvas { width: 100%; height: 300px; display: block; }
-  #evo-page .evo-legend { display: flex; gap: 16px; justify-content: center; font-size: 0.75em; padding: 6px; }
-  #evo-page .evo-legend .edot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; vertical-align: middle; }
-  #scatter3d { width: 100%; height: 500px; cursor: grab; }
+  #evo-page .evo-chart-wrap { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 8px; margin-bottom: 10px; position: relative; }
+  #evo-page canvas { width: 100%; height: 180px; display: block; }
+  #evo-page .evo-legend { display: flex; gap: 12px; justify-content: center; font-size: 0.7em; padding: 4px; flex-wrap: wrap; }
+  #evo-page .evo-legend .edot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; vertical-align: middle; }
   #evo-page .evo-tip { position: absolute; background: #1a1a2e; border: 1px solid #00d4ff; border-radius: 4px; padding: 6px 10px; font-size: 0.72em; pointer-events: none; display: none; z-index: 100; max-width: 320px; line-height: 1.4; }
+  @media (max-width: 768px) {
+    #evo-page canvas { height: 140px !important; }
+    #evo-page .evo-chart-wrap { padding: 6px; margin-bottom: 8px; }
+    #evo-page h2 { font-size: 0.75em !important; margin: 4px 0 2px !important; }
+    #ml-network-canvas { height: 250px !important; }
+    #evo-page .evo-stats { gap: 6px; }
+    #evo-page .evo-stat { padding: 4px 8px; }
+    #evo-page .evo-stat .val { font-size: 1em; }
+    #projection-section { display: none; }
+  }
   .coin-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
   .coin-tab { padding: 6px 16px; border-radius: 4px; border: 1px solid #1e2a42; background: #141b2d; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.85em; font-weight: bold; transition: all 0.2s; }
   .coin-tab:hover { border-color: #00d4ff; color: #00d4ff; }
@@ -1191,7 +1389,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
       <div id="projection-cards" style="display:flex; flex-direction:column; gap:8px;"></div>
       <div class="evo-chart-wrap" style="margin-bottom:0;">
-        <canvas id="projection-chart" style="height:220px;"></canvas>
+        <canvas id="projection-chart" style="height:160px;"></canvas>
       </div>
     </div>
   </div>
@@ -1217,13 +1415,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">3D TRADE SCATTER — PRICE x TIME x PNL</h2>
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">STRATEGY COMPARISON</h2>
   <div class="evo-chart-wrap">
-    <div id="scatter3d"></div>
+    <canvas id="strategy-compare-chart" style="height:180px;"></canvas>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">TIME-OF-DAY PERFORMANCE HEATMAP</h2>
+  <div class="evo-chart-wrap" style="overflow-x:auto;">
+    <canvas id="heatmap-canvas" style="width:100%; height:160px;"></canvas>
     <div class="evo-legend">
-      <span><span class="edot" style="background:#00e676"></span> Win</span>
-      <span><span class="edot" style="background:#ff5252"></span> Loss</span>
-      <span style="color:#7b8ab8">Drag to rotate | Scroll to zoom</span>
+      <span><span class="edot" style="background:#00e676"></span> Profitable hours</span>
+      <span><span class="edot" style="background:#ff5252"></span> Losing hours</span>
+      <span style="color:#7b8ab8">Times shown in CT (Austin)</span>
+    </div>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">WIN/LOSS PNL DISTRIBUTION</h2>
+  <div class="evo-chart-wrap">
+    <canvas id="dist-chart" style="height:150px;"></canvas>
+    <div id="dist-stats" style="text-align:center; font-size:0.75em; color:#7b8ab8; margin-top:4px;"></div>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">DRAWDOWN CURVE (Latest Run)</h2>
+  <div class="evo-chart-wrap">
+    <canvas id="drawdown-chart" style="height:120px;"></canvas>
+    <div class="evo-legend">
+      <span><span class="edot" style="background:#ff5252"></span> Drawdown %</span>
+      <span style="color:#7b8ab8">Lower is better — 0% = at equity peak</span>
+    </div>
+  </div>
+
+  <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">ML GOVERNOR NEURAL NETWORK</h2>
+  <div class="evo-chart-wrap" style="min-height:280px; position:relative;">
+    <canvas id="ml-network-canvas" style="width:100%; height:280px;"></canvas>
+    <div id="ml-network-stats" style="position:absolute; top:8px; right:12px; font-size:0.7em; color:#7b8ab8; text-align:right;"></div>
+    <div class="evo-legend">
+      <span><span class="edot" style="background:#00d4ff"></span> Input Features</span>
+      <span><span class="edot" style="background:#ffc107"></span> Hidden Layer</span>
+      <span><span class="edot" style="background:#00e676"></span> TRADE</span>
+      <span><span class="edot" style="background:#ff5252"></span> BLOCK</span>
+      <span style="color:#7b8ab8">Line thickness = feature importance</span>
     </div>
   </div>
 </div><!-- end evo-page -->
@@ -1335,8 +1566,17 @@ function loadEvolution() {
       [{ref:0}, {ref:0}]
     );
 
-    // 3D scatter
-    try { render3DScatter(SCATTER); } catch(e) { console.error('3D scatter error', e); }
+    // Strategy comparison chart
+    try { renderStrategyCompare(data.strategy_compare || []); } catch(e) { console.error('Strategy compare error', e); }
+
+    // Trade analytics: heatmap + distribution
+    const ta = data.trade_analytics || {};
+    try { renderHeatmap(ta.heatmap || []); } catch(e) { console.error('Heatmap error', e); }
+    try { renderDistribution(ta.distribution || [], ta); } catch(e) { console.error('Distribution error', e); }
+    try { renderDrawdown(ta.drawdown || []); } catch(e) { console.error('Drawdown error', e); }
+
+    // ML Network visualization
+    try { renderMLNetwork(data.ml_network || {}); } catch(e) { console.error('ML network error', e); }
 
     // Year-end projection
     renderProjection(data.projection || {});
@@ -1354,14 +1594,44 @@ function loadQueueStatus() {
     const progWrap = document.getElementById('q-progress-wrap');
     if (data.running_job) {
       const j = data.running_job;
+      // Format elapsed and ETA
+      const fmtDur = (s) => { const h=Math.floor(s/3600); const m=Math.floor((s%3600)/60); return h>0 ? h+'h '+m+'m' : m+'m'; };
+      let etaLine = '';
+      if (j.eta_remaining_s > 0) {
+        const etaLocal = new Date(j.eta_completion).toLocaleString('en-US', {timeZone:'America/Chicago', hour:'numeric', minute:'2-digit', hour12:true});
+        etaLine = ' | ETA: <span style="color:#00e676; font-weight:bold;">' + etaLocal + ' CT</span> (' + fmtDur(j.eta_remaining_s) + ' remaining)';
+      }
       runEl.innerHTML = '<div style="font-size:1.1em; color:#ffc107; font-weight:bold;">' + (j.label || j.run_id) + '</div>' +
-        '<div style="color:#7b8ab8; font-size:0.8em; margin-top:4px;">Run ID: ' + j.run_id + ' | ' + j.progress.toLocaleString() + ' / ' + j.total_bars.toLocaleString() + ' bars</div>';
+        '<div style="color:#7b8ab8; font-size:0.8em; margin-top:4px;">Run ID: ' + j.run_id + ' | ' + j.progress.toLocaleString() + ' / ' + j.total_bars.toLocaleString() + ' bars | Elapsed: ' + fmtDur(j.elapsed_s) + etaLine + '</div>';
       progWrap.style.display = 'block';
       document.getElementById('q-progress-bar').style.width = j.pct + '%';
       document.getElementById('q-progress-label').textContent = j.pct + '% complete';
     } else {
       runEl.innerHTML = '<span style="color:#7b8ab8;">No backtest currently running</span>';
       progWrap.style.display = 'none';
+    }
+
+    // Queue-wide ETA
+    let qEtaEl = document.getElementById('q-queue-eta');
+    if (!qEtaEl) {
+      qEtaEl = document.createElement('div');
+      qEtaEl.id = 'q-queue-eta';
+      qEtaEl.style.cssText = 'margin:12px 0; padding:10px; background:#0d1321; border:1px solid #1e2a42; border-radius:6px;';
+      progWrap.parentNode.insertBefore(qEtaEl, progWrap.nextSibling);
+    }
+    if (data.queue_eta) {
+      const fmtDur = (s) => { const h=Math.floor(s/3600); const m=Math.floor((s%3600)/60); return h>0 ? h+'h '+m+'m' : m+'m'; };
+      const allDoneLocal = new Date(data.queue_eta.completion).toLocaleString('en-US', {timeZone:'America/Chicago', hour:'numeric', minute:'2-digit', hour12:true, month:'short', day:'numeric'});
+      const perJob = fmtDur(data.queue_eta.est_per_job_s);
+      const pending = (data.pending_labels || []).length;
+      qEtaEl.innerHTML = '<div style="font-size:0.9em;">' +
+        '<span style="color:#00d4ff; font-weight:bold;">QUEUE COMPLETION</span>' +
+        '<span style="color:#00e676; font-weight:bold; margin-left:12px;">' + allDoneLocal + ' CT</span>' +
+        '<span style="color:#7b8ab8; margin-left:12px;">(' + fmtDur(data.queue_eta.remaining_s) + ' total remaining | ~' + perJob + '/job | ' + (pending + 1) + ' jobs left)</span>' +
+        '</div>';
+      qEtaEl.style.display = 'block';
+    } else {
+      qEtaEl.style.display = 'none';
     }
 
     // Pending queue
@@ -1410,7 +1680,7 @@ function loadQueueStatus() {
         const icon = e.status === 'DONE' ? 'OK' : e.status === 'FAIL' ? 'FAIL' : e.status === 'START' ? 'RUN' : '?';
         let line = '<div style="padding:3px 6px; margin:1px 0; border-left:2px solid ' + sc + ';">' +
           '<span style="color:' + sc + '; font-weight:bold; width:35px; display:inline-block;">' + icon + '</span> ' +
-          '<span style="color:#7b8ab8; font-size:0.9em;">' + (e.ts ? e.ts.slice(5,16).replace('T',' ') : '') + '</span> ' +
+          '<span style="color:#7b8ab8; font-size:0.9em;">' + (e.ts ? new Date(e.ts).toLocaleString('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') : '') + '</span> ' +
           e.label;
         if (e.reason) {
           line += '<div style="color:#ff5252; font-size:0.85em; margin-left:40px; margin-top:2px;">' + e.reason + '</div>';
@@ -1603,7 +1873,7 @@ function _applyLiveProjectionUpdate(livePnl, liveEquity) {
   ticker.innerHTML =
     '<div style="display:flex; justify-content:space-between; align-items:center;">' +
     '<div style="font-size:0.75em; color:#00d4ff; font-weight:bold; letter-spacing:1px;">LIVE PERFORMANCE</div>' +
-    '<div style="font-size:0.68em; color:#7b8ab8;">Updated ' + new Date().toISOString().slice(11,19) + 'Z</div></div>' +
+    '<div style="font-size:0.68em; color:#7b8ab8;">Updated ' + new Date().toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) + ' CT</div></div>' +
     '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">' +
     '<div><span style="color:#7b8ab8; font-size:0.78em;">Current Balance:</span> ' +
     '<span style="font-size:1.3em; font-weight:bold; color:'+color+';">$'+currentBalance.toFixed(2)+'</span>' +
@@ -1668,6 +1938,432 @@ function drawEvoCanvas(canvasId, tipId, EVO, series, yConfigs) {
     }
   };
   canvas.onmouseleave = () => { tip.style.display = 'none'; };
+}
+
+let drawdownChart = null;
+function renderDrawdown(dd) {
+  const canvas = document.getElementById('drawdown-chart');
+  if (!dd.length) { canvas.parentElement.innerHTML = '<div style="padding:20px; text-align:center; color:#7b8ab8;">No drawdown data</div>'; return; }
+  if (drawdownChart) { drawdownChart.destroy(); }
+
+  const maxDD = Math.max(...dd);
+  drawdownChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: dd.map((_, i) => i),
+      datasets: [{
+        data: dd.map(v => -v),  // Negative so drawdown goes DOWN
+        borderColor: '#ff5252',
+        backgroundColor: 'rgba(255,82,82,0.15)',
+        fill: true,
+        pointRadius: 0,
+        borderWidth: 1.2,
+        tension: 0.1,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: (ctx) => 'Drawdown: ' + Math.abs(ctx.raw).toFixed(2) + '%' }
+        },
+        title: {
+          display: true,
+          text: 'Max Drawdown: ' + maxDD.toFixed(2) + '%',
+          color: '#ff5252', font: { size: 11 }, align: 'end'
+        }
+      },
+      scales: {
+        x: { display: false },
+        y: { ticks: { color: '#7b8ab8', callback: (v) => Math.abs(v).toFixed(1) + '%' },
+             grid: { color: '#1e2a42' },
+             title: { display: true, text: 'Drawdown %', color: '#7b8ab8' } }
+      }
+    }
+  });
+}
+
+function renderHeatmap(data) {
+  const canvas = document.getElementById('heatmap-canvas');
+  if (!data.length) { canvas.parentElement.querySelector('.evo-legend').insertAdjacentHTML('beforebegin', '<div style="padding:20px; text-align:center; color:#7b8ab8;">No heatmap data</div>'); return; }
+
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+
+  // UTC to CT offset (-5 CST / -6 CDT -- approximate CDT for March)
+  const CT_OFFSET = -5;
+
+  const days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  const cellW = (W - 60) / 24;
+  const cellH = (H - 35) / 7;
+  const ox = 40, oy = 25;
+
+  // Find max absolute PnL for color scaling
+  const maxAbs = Math.max(...data.map(d => Math.abs(d.avg_pnl)), 0.01);
+
+  // Draw cells
+  data.forEach(d => {
+    const ctHour = ((d.hour + CT_OFFSET) % 24 + 24) % 24;
+    const x = ox + ctHour * cellW;
+    const y = oy + d.dow * cellH;
+    const intensity = Math.min(Math.abs(d.avg_pnl) / maxAbs, 1);
+    if (d.avg_pnl >= 0) {
+      ctx.fillStyle = 'rgba(0,230,118,' + (0.15 + intensity * 0.75) + ')';
+    } else {
+      ctx.fillStyle = 'rgba(255,82,82,' + (0.15 + intensity * 0.75) + ')';
+    }
+    ctx.fillRect(x + 1, y + 1, cellW - 2, cellH - 2);
+
+    // Count label
+    if (d.count >= 2) {
+      ctx.fillStyle = '#fff';
+      ctx.font = '9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(d.count + 't', x + cellW / 2, y + cellH / 2 + 3);
+    }
+  });
+
+  // Hour labels
+  ctx.fillStyle = '#7b8ab8'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+  for (let h = 0; h < 24; h += 2) {
+    const label = h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p';
+    ctx.fillText(label, ox + h * cellW + cellW / 2, oy - 6);
+  }
+  // Day labels
+  ctx.textAlign = 'right';
+  days.forEach((d, i) => { ctx.fillText(d, ox - 4, oy + i * cellH + cellH / 2 + 3); });
+
+  // Title
+  ctx.fillStyle = '#3a4a6b'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('Hour of Day (CT)', W / 2, H - 2);
+}
+
+let distChart = null;
+function renderDistribution(bins, stats) {
+  const canvas = document.getElementById('dist-chart');
+  const statsEl = document.getElementById('dist-stats');
+  if (!bins.length) { canvas.parentElement.innerHTML = '<div style="padding:20px; text-align:center; color:#7b8ab8;">No distribution data</div>'; return; }
+
+  if (distChart) { distChart.destroy(); }
+
+  statsEl.innerHTML = 'Total trades: <b>' + (stats.total_trades || 0) + '</b> | ' +
+    'Avg PnL: <span style="color:' + ((stats.avg_pnl||0) >= 0 ? '#00e676' : '#ff5252') + ';">$' + (stats.avg_pnl || 0).toFixed(4) + '</span> | ' +
+    'Median PnL: <span style="color:' + ((stats.median_pnl||0) >= 0 ? '#00e676' : '#ff5252') + ';">$' + (stats.median_pnl || 0).toFixed(4) + '</span>';
+
+  distChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: bins.map(b => '$' + b.bin.toFixed(2)),
+      datasets: [{
+        data: bins.map(b => b.count),
+        backgroundColor: bins.map(b => b.is_win ? 'rgba(0,230,118,0.6)' : 'rgba(255,82,82,0.6)'),
+        borderColor: bins.map(b => b.is_win ? '#00e676' : '#ff5252'),
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => ctx.raw + ' trades in this PnL range'
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#7b8ab8', font: { size: 8 }, maxRotation: 45, autoSkip: true, maxTicksLimit: 15 }, grid: { color: '#1e2a42' },
+             title: { display: true, text: 'PnL per trade ($)', color: '#7b8ab8' } },
+        y: { ticks: { color: '#7b8ab8' }, grid: { color: '#1e2a42' },
+             title: { display: true, text: 'Frequency', color: '#7b8ab8' } }
+      }
+    },
+    plugins: [{
+      id: 'zeroLine',
+      afterDraw: (chart) => {
+        // Draw vertical line at $0
+        const xScale = chart.scales.x;
+        const labels = bins.map(b => b.bin);
+        const zeroIdx = labels.findIndex(b => b >= 0);
+        if (zeroIdx >= 0) {
+          const x = xScale.getPixelForValue(zeroIdx);
+          const ctx = chart.ctx;
+          ctx.save(); ctx.strokeStyle = '#ffc107'; ctx.lineWidth = 1.5;
+          ctx.setLineDash([4,3]); ctx.beginPath();
+          ctx.moveTo(x, chart.chartArea.top); ctx.lineTo(x, chart.chartArea.bottom);
+          ctx.stroke(); ctx.restore();
+        }
+      }
+    }]
+  });
+}
+
+let strategyChart = null;
+function renderStrategyCompare(configs) {
+  const canvas = document.getElementById('strategy-compare-chart');
+  if (!configs.length) { canvas.parentElement.innerHTML = '<div style="padding:30px; text-align:center; color:#7b8ab8;">No labeled backtest configs to compare</div>'; return; }
+
+  if (strategyChart) { strategyChart.destroy(); }
+
+  // Short labels
+  const labels = configs.map(c => c.label.replace('screen_','').replace('compound','cmpd').replace('_regime',''));
+  const pfData = configs.map(c => c.pf);
+  const wrData = configs.map(c => c.wr);
+  const tradesData = configs.map(c => c.trades);
+
+  strategyChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'Profit Factor', data: pfData, backgroundColor: pfData.map(v => v >= 1.0 ? 'rgba(0,212,255,0.7)' : 'rgba(255,82,82,0.5)'),
+          borderColor: '#00d4ff', borderWidth: 1, yAxisID: 'y', order: 2 },
+        { label: 'Win Rate %', data: wrData, type: 'line', borderColor: '#00e676', backgroundColor: 'rgba(0,230,118,0.1)',
+          pointBackgroundColor: wrData.map(v => v >= 40 ? '#00e676' : '#ffc107'), pointRadius: 5, tension: 0.3, yAxisID: 'y1', order: 1 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#7b8ab8', font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const c = configs[ctx.dataIndex];
+              return 'Trades: ' + c.trades + ' | PnL: $' + c.pnl.toFixed(2) + ' | Exp: $' + c.expectancy.toFixed(4);
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#7b8ab8', font: { size: 9 }, maxRotation: 45 }, grid: { color: '#1e2a42' } },
+        y: { position: 'left', title: { display: true, text: 'Profit Factor', color: '#00d4ff' },
+             ticks: { color: '#00d4ff' }, grid: { color: '#1e2a42' },
+             suggestedMin: 0, suggestedMax: 2 },
+        y1: { position: 'right', title: { display: true, text: 'Win Rate %', color: '#00e676' },
+              ticks: { color: '#00e676' }, grid: { display: false },
+              suggestedMin: 0, suggestedMax: 60 },
+      }
+    },
+    plugins: [{
+      id: 'breakeven',
+      afterDraw: (chart) => {
+        const yScale = chart.scales.y;
+        const y = yScale.getPixelForValue(1.0);
+        const ctx = chart.ctx;
+        ctx.save(); ctx.strokeStyle = '#ffb74d'; ctx.lineWidth = 1.5;
+        ctx.setLineDash([6,4]); ctx.beginPath();
+        ctx.moveTo(chart.chartArea.left, y); ctx.lineTo(chart.chartArea.right, y);
+        ctx.stroke(); ctx.restore();
+      }
+    }]
+  });
+}
+
+function renderMLNetwork(mlData) {
+  const canvas = document.getElementById('ml-network-canvas');
+  const statsEl = document.getElementById('ml-network-stats');
+  if (!mlData.features || !mlData.features.length) {
+    canvas.parentElement.innerHTML = '<div style="padding:40px; text-align:center; color:#7b8ab8;">ML Governor model not loaded</div>';
+    return;
+  }
+
+  // Stats overlay
+  const aucLine = mlData.roc_auc ? 'ROC-AUC: <span style="color:#00e676;">' + mlData.roc_auc.toFixed(3) + '</span>' :
+    'Train WR: <span style="color:#ffc107;">' + (mlData.win_rate || 0) + '%</span>';
+  statsEl.innerHTML = '<div style="color:#00d4ff; font-weight:bold;">ML GOVERNOR</div>' +
+    '<div>' + aucLine + '</div>' +
+    '<div>Trees: ' + mlData.n_estimators + ' | Depth: ' + mlData.max_depth + '</div>' +
+    '<div>Trained on: ' + (mlData.train_samples || 0).toLocaleString() + ' trades</div>';
+
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+
+  // Layout: features on left, 2 hidden layers in middle, output on right
+  const features = mlData.features.slice(0, 16); // top 16 by importance
+  const maxImp = Math.max(...features.map(f => f.importance));
+
+  // Positions
+  const leftX = 140, midX1 = W * 0.38, midX2 = W * 0.58, rightX = W - 60;
+  const inputNodes = features.map((f, i) => ({
+    x: leftX, y: 30 + i * ((H - 60) / (features.length - 1 || 1)),
+    imp: f.importance, name: f.name
+  }));
+  // Hidden layer 1 (8 nodes)
+  const h1Count = 8;
+  const h1Nodes = Array.from({length: h1Count}, (_, i) => ({
+    x: midX1, y: 40 + i * ((H - 80) / (h1Count - 1))
+  }));
+  // Hidden layer 2 (4 nodes)
+  const h2Count = 4;
+  const h2Nodes = Array.from({length: h2Count}, (_, i) => ({
+    x: midX2, y: H * 0.2 + i * ((H * 0.6) / (h2Count - 1))
+  }));
+  // Output: TRADE / BLOCK
+  const outputNodes = [
+    { x: rightX, y: H * 0.35, label: 'TRADE', color: '#00e676' },
+    { x: rightX, y: H * 0.65, label: 'BLOCK', color: '#ff5252' },
+  ];
+
+  // Animation state
+  let pulsePhase = 0;
+  const pulses = [];
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Background glow
+    const grd = ctx.createRadialGradient(W/2, H/2, 50, W/2, H/2, W/2);
+    grd.addColorStop(0, 'rgba(0,212,255,0.03)');
+    grd.addColorStop(1, 'rgba(10,14,26,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw connections: input -> h1
+    inputNodes.forEach(inp => {
+      const alpha = 0.05 + (inp.imp / maxImp) * 0.3;
+      const width = 0.3 + (inp.imp / maxImp) * 2.5;
+      h1Nodes.forEach(h => {
+        ctx.strokeStyle = 'rgba(0,212,255,' + alpha + ')';
+        ctx.lineWidth = width;
+        ctx.beginPath(); ctx.moveTo(inp.x, inp.y); ctx.lineTo(h.x, h.y); ctx.stroke();
+      });
+    });
+
+    // h1 -> h2
+    h1Nodes.forEach(h1 => {
+      h2Nodes.forEach(h2 => {
+        ctx.strokeStyle = 'rgba(255,193,7,0.12)';
+        ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.moveTo(h1.x, h1.y); ctx.lineTo(h2.x, h2.y); ctx.stroke();
+      });
+    });
+
+    // h2 -> output
+    h2Nodes.forEach(h2 => {
+      outputNodes.forEach(out => {
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(h2.x, h2.y); ctx.lineTo(out.x, out.y); ctx.stroke();
+      });
+    });
+
+    // Draw input nodes + labels
+    inputNodes.forEach(n => {
+      const r = 3 + (n.imp / maxImp) * 6;
+      const bright = 0.4 + (n.imp / maxImp) * 0.6;
+      ctx.fillStyle = 'rgba(0,212,255,' + bright + ')';
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill();
+      // Glow
+      ctx.shadowColor = '#00d4ff'; ctx.shadowBlur = n.imp / maxImp * 12;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+      // Label
+      ctx.fillStyle = '#7b8ab8';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(n.name, n.x - r - 6, n.y + 3);
+      // Importance bar
+      const barW = (n.imp / maxImp) * 30;
+      ctx.fillStyle = 'rgba(0,212,255,0.2)';
+      ctx.fillRect(n.x - r - 6 - barW, n.y - 2, barW, 4);
+    });
+
+    // Hidden layer 1 nodes
+    h1Nodes.forEach((n, i) => {
+      const pulse = 0.5 + 0.3 * Math.sin(pulsePhase + i * 0.8);
+      ctx.fillStyle = 'rgba(255,193,7,' + pulse + ')';
+      ctx.beginPath(); ctx.arc(n.x, n.y, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowColor = '#ffc107'; ctx.shadowBlur = 8 * pulse;
+      ctx.beginPath(); ctx.arc(n.x, n.y, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+
+    // Hidden layer 2 nodes
+    h2Nodes.forEach((n, i) => {
+      const pulse = 0.5 + 0.3 * Math.sin(pulsePhase + i * 1.2 + 1);
+      ctx.fillStyle = 'rgba(186,104,200,' + pulse + ')';
+      ctx.beginPath(); ctx.arc(n.x, n.y, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowColor = '#ba68c8'; ctx.shadowBlur = 10 * pulse;
+      ctx.beginPath(); ctx.arc(n.x, n.y, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+
+    // Output nodes
+    outputNodes.forEach(n => {
+      ctx.fillStyle = n.color;
+      ctx.beginPath(); ctx.arc(n.x, n.y, 10, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowColor = n.color; ctx.shadowBlur = 15;
+      ctx.beginPath(); ctx.arc(n.x, n.y, 10, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'left';
+      ctx.fillText(n.label, n.x + 16, n.y + 4);
+    });
+
+    // Layer labels
+    ctx.fillStyle = '#3a4a6b'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('INPUT FEATURES', leftX, H - 5);
+    ctx.fillText('HIDDEN 1', midX1, H - 5);
+    ctx.fillText('HIDDEN 2', midX2, H - 5);
+    ctx.fillText('OUTPUT', rightX, H - 5);
+
+    // Animated pulses traveling through network
+    if (Math.random() < 0.03) {
+      const srcIdx = Math.floor(Math.random() * inputNodes.length);
+      pulses.push({ x: inputNodes[srcIdx].x, y: inputNodes[srcIdx].y, targetLayer: 1, progress: 0,
+        imp: inputNodes[srcIdx].imp, srcIdx: srcIdx });
+    }
+
+    for (let i = pulses.length - 1; i >= 0; i--) {
+      const p = pulses[i];
+      p.progress += 0.02;
+      let sx, sy, ex, ey;
+      if (p.targetLayer === 1) {
+        sx = inputNodes[p.srcIdx]?.x || leftX; sy = inputNodes[p.srcIdx]?.y || H/2;
+        const tIdx = Math.floor(Math.random() * h1Count);
+        ex = h1Nodes[tIdx].x; ey = h1Nodes[tIdx].y;
+      } else if (p.targetLayer === 2) {
+        sx = midX1; sy = p.y;
+        const tIdx = Math.floor(Math.random() * h2Count);
+        ex = h2Nodes[tIdx].x; ey = h2Nodes[tIdx].y;
+      } else {
+        sx = midX2; sy = p.y;
+        const tIdx = Math.random() < 0.5 ? 0 : 1;
+        ex = outputNodes[tIdx].x; ey = outputNodes[tIdx].y;
+      }
+      const px = sx + (ex - sx) * p.progress;
+      const py = sy + (ey - sy) * p.progress;
+      const bright = 0.6 + (p.imp / maxImp) * 0.4;
+      ctx.fillStyle = p.targetLayer === 1 ? 'rgba(0,212,255,' + bright + ')' :
+                      p.targetLayer === 2 ? 'rgba(255,193,7,' + bright + ')' : 'rgba(0,230,118,' + bright + ')';
+      ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.arc(px, py, 2.5, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+
+      if (p.progress >= 1) {
+        if (p.targetLayer < 3) {
+          p.targetLayer++; p.progress = 0; p.x = ex; p.y = ey;
+        } else {
+          pulses.splice(i, 1);
+        }
+      }
+    }
+
+    pulsePhase += 0.03;
+    requestAnimationFrame(draw);
+  }
+  draw();
 }
 
 function render3DScatter(SCATTER) {
@@ -1761,7 +2457,7 @@ async function loadMultiOverview() {
       const qtyEl = document.getElementById('ms-qty-' + coin);
       if (qtyEl) qtyEl.textContent = c.position_qty || '0';
       const tsEl = document.getElementById('ms-ts-' + coin);
-      if (tsEl) tsEl.textContent = c.saved_at_iso ? c.saved_at_iso.slice(11, 19) + 'Z' : '—';
+      if (tsEl) tsEl.textContent = c.saved_at_iso ? new Date(c.saved_at_iso).toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
     });
   } catch(e) { console.error('multi fetch error', e); }
 }
@@ -1792,7 +2488,7 @@ function epochToTime(ts) {
   const ms = parseInt(ts);
   if (!ms) return '—';
   const d = new Date(ms > 1e12 ? ms : ms * 1000);
-  return d.toISOString().slice(11, 19) + 'Z';
+  return d.toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true});
 }
 
 function updateDashboard(data) {
@@ -1833,7 +2529,7 @@ function updateDashboard(data) {
   // Footer
   document.getElementById('run-id').textContent = data.run_id || '—';
   document.getElementById('saved-at').textContent = data.saved_at_iso || '—';
-  document.getElementById('last-update').textContent = new Date().toISOString().slice(11, 19) + 'Z';
+  document.getElementById('last-update').textContent = new Date().toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true}) + ' CT';
 
   // Fills table
   const fillsBody = document.querySelector('#fills-table tbody');
@@ -1857,7 +2553,8 @@ function updateDashboard(data) {
     const tr = document.createElement('tr');
     const action = e.action || '';
     const actionColor = action === 'WOULD_BUY' ? '#00e676' : action === 'HOLD' ? '#7b8ab8' : '#ffc107';
-    tr.innerHTML = '<td>' + (e.ts || '').slice(11, 19) + '</td>'
+    const evtTime = e.ts ? new Date(e.ts+'Z').toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '';
+    tr.innerHTML = '<td>' + evtTime + '</td>'
       + '<td>' + (e.event || '') + '</td>'
       + '<td style="color:' + actionColor + '">' + action + '</td>'
       + '<td>' + (e.confluence_score || '') + '</td>'
@@ -2022,7 +2719,7 @@ async function loadDecisions() {
       const govTag = prob ? '<span style="color:' + probColor + '; font-weight:bold; margin-left:4px;">[' + prob + ']</span>' : '';
       const recTag = d.governor_recommendation ? '<span style="color:#7b8ab8; margin-left:2px;">' + d.governor_recommendation + '</span>' : '';
 
-      const ts = (d.ts || '').slice(11, 19) || '??:??:??';
+      const ts = d.ts ? new Date(d.ts+'Z').toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '??:??';
       const confStr = d.confluence_score ? 'CS=' + d.confluence_score : '';
       const regimeStr = d.regime ? d.regime : '';
       const sessionStr = d.session ? d.session : '';
@@ -2066,8 +2763,11 @@ function renderJournal(trades) {
     const dur = parseInt(j.duration_s || 0);
     const durStr = dur > 3600 ? (dur/3600).toFixed(1) + 'h' : dur > 60 ? Math.round(dur/60) + 'm' : dur + 's';
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td>' + (j.entry_ts || j.entry_time || '').slice(11, 19) + '</td>'
-      + '<td>' + (j.exit_ts || j.exit_time || '').slice(11, 19) + '</td>'
+    const ets = j.entry_ts || j.entry_time || '';
+    const xts = j.exit_ts || j.exit_time || '';
+    const fmtJTs = (t) => t ? new Date(t+'Z').toLocaleString('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') : '';
+    tr.innerHTML = '<td>' + fmtJTs(ets) + '</td>'
+      + '<td>' + fmtJTs(xts) + '</td>'
       + '<td>' + (j.side || 'LONG') + '</td>'
       + '<td>' + (j.qty || '') + '</td>'
       + '<td>$' + (parseFloat(j.entry_px || j.entry_price || 0)).toFixed(2) + '</td>'
