@@ -797,6 +797,11 @@ def run_backtest(
     start_epoch = int(candles[0].epoch)
     end_epoch = int(candles[-1].epoch)
 
+    # Seed RiskManager from first candle epoch (not wall-clock) for determinism.
+    # Without this, RISK_DAY_RESET embeds today's date, causing drift across midnight.
+    from risk import RiskManager as _RM
+    state.risk = _RM.new(epoch=start_epoch)
+
     start_equity = _p_decimal(cfg.get("START_CASH_USD", "0"), "0")
     equity_curve: List[Tuple[int, Decimal]] = []
     trades: List[Trade] = []

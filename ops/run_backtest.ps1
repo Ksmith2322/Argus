@@ -200,6 +200,13 @@ function Normalize-TextForDeterminism {
     # Common timestamp patterns (best-effort): ISO-8601 Z stamps and +00:00 offset
     $t = [regex]::Replace($t, "\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})", "<TSZ>")
 
+    # Bare dates (YYYY-MM-DD) not already part of a timestamp — catches RISK_DAY_RESET wall-clock leak
+    $t = [regex]::Replace($t, "\b\d{4}-\d{2}-\d{2}\b", "<DATE>")
+
+    # git_sha and config_hash can change if a commit lands between Run 1 and Run 2
+    $t = [regex]::Replace($t, '"git_sha":\s*"[0-9a-f]+"', '"git_sha":"<GIT>"')
+    $t = [regex]::Replace($t, '"config_hash":\s*"[0-9a-f]+"', '"config_hash":"<CFG>"')
+
     return $t
 }
 
