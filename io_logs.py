@@ -25,8 +25,8 @@ def logs_dir() -> str:
     if bt_dir and mode in ("bt", "backtest"):
         return bt_dir
 
-    # 3) default: repo-local logs folder
-    return os.path.join(os.path.dirname(__file__), "logs")
+    # 3) default: canonical artifact directory (ops/logs)
+    return os.path.join(os.path.dirname(__file__), "ops", "logs")
 
 
 def signals_csv_path() -> str:

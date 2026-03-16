@@ -63,7 +63,7 @@ function Invoke-QueueJob {
     )
     # line above: param(
 
-    $singleRun = [bool]$job.single_run
+    # single_run field kept in queue schema for documentation; -SingleRun always passed
     $envBackup = @{}
 
     # Set job label for run_header
@@ -91,9 +91,8 @@ function Invoke-QueueJob {
         Write-QueueLog "START: $label"
 
         # Run backtest (always single-run for queue jobs — no determinism check needed)
-        $btArgs = @("-SingleRun")
-        Write-Host "  btArgs: $btArgs  (singleRun=$singleRun)"
-        & "$repoRoot\ops\run_backtest.ps1" @btArgs
+        Write-Host "  Running run_backtest.ps1 -SingleRun"
+        & "$repoRoot\ops\run_backtest.ps1" -SingleRun
 
         $jobSuccess = $true
 

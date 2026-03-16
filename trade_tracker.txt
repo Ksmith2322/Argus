@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-15 01:58:46 CDT
+Last update: 2026-03-15 22:26:16 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       2882
+  - HOLD total:       3127
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -19,16 +19,16 @@ Missed buy counters:
 Hold reason counters:
   - HOLD_WARMUP_NO_1M_STATE: 0
   - HOLD_PAUSED: 0
-  - HOLD_STALE_DATA: 1982
+  - HOLD_STALE_DATA: 2070
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 157
-  - HOLD_NO_TREND_OK: 524
+  - HOLD_NO_SIGNAL: 202
+  - HOLD_NO_TREND_OK: 587
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 187
+  - HOLD_OTHER: 236
 
 Last event:
   reason: HOLD_STALE_DATA
-  detail: stale tick guard | px=2107.915 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=99 | delta=-15 | adj_score=84 | watch_th=58 | trade_th=85 | trend_strength=0.00083 | vol=0.00037 | liq:spread=NA;vol_1m=39.19132342;vol_floor>=25;vol_base=18.6648174155;vol_need>=9.3324;atr_norm=0.000371248597561009592571412696315746870823204517364501953125;LIQ_OK | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=39.19132342;vol_floor>=25;vol_base=18.6648174155;vol_need>=9.3324;atr_norm=0.000371248597561009592571412696315746870823204517364501953125;LIQ_OK
+  detail: stale tick guard | px=2201.655 | bonus_trend_up=+5 | regime=TREND_UP | base_score=100 | delta=5 | adj_score=100 | watch_th=55 | trade_th=80 | trend_strength=0.00582 | vol=0.00099 | liq:spread=NA;vol_1m=518.39802219;vol_floor>=25;vol_base=148.2202069858333333333333333;vol_need>=74.1101;atr_norm=0.00098627254644598314099745994809609328513033688068389892578125;LIQ_OK | struct=STRUCT:no_resistance_above_px | liq=spread=NA;vol_1m=518.39802219;vol_floor>=25;vol_base=148.2202069858333333333333333;vol_need>=74.1101;atr_norm=0.00098627254644598314099745994809609328513033688068389892578125;LIQ_OK

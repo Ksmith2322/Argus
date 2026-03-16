@@ -23,7 +23,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("argus.dashboard")
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 REPO = Path(__file__).resolve().parent.parent
@@ -31,6 +32,31 @@ OPS_LOGS = REPO / "ops" / "logs"
 STATE_DIR = REPO / "state"
 
 app = FastAPI(title="Argus Dashboard")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+# PWA routes — must be at root, not under /static/
+@app.get("/manifest.json")
+async def pwa_manifest():
+    return FileResponse(STATIC_DIR / "manifest.json", media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+async def pwa_sw():
+    return FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/"})
+
+
+@app.get("/icon-192.png")
+async def pwa_icon_192():
+    return FileResponse(STATIC_DIR / "icon-192.png", media_type="image/png")
+
+
+@app.get("/icon-512.png")
+async def pwa_icon_512():
+    return FileResponse(STATIC_DIR / "icon-512.png", media_type="image/png")
+
 
 COINS = ["ETH", "BTC", "SOL"]
 
@@ -461,7 +487,64 @@ async def api_multi():
 
 @app.get("/api/queue")
 async def api_queue():
-    return JSONResponse(read_queue_status())
+    base = read_queue_status()
+    # Add results log (last 30 entries)
+    log_path = REPO / "ops" / "logs" / "queue_results.log"
+    log_entries = []
+    if log_path.exists():
+        try:
+            for line in open(log_path).readlines()[-30:]:
+                line = line.strip()
+                if not line:
+                    continue
+                # Parse: [2026-03-15T18:14:23Z] START: label
+                ts = line[1:25] if line.startswith("[") else ""
+                rest = line[27:] if len(line) > 27 else line
+                status = "UNKNOWN"
+                label = rest
+                reason = ""
+                if rest.startswith("START:"):
+                    status = "START"
+                    label = rest[7:].strip()
+                elif rest.startswith("DONE:"):
+                    status = "DONE"
+                    label = rest[6:].strip().split("|")[0].strip()
+                elif rest.startswith("FAIL:"):
+                    status = "FAIL"
+                    parts = rest[6:].strip().split(" -- ", 1)
+                    label = parts[0].strip()
+                    reason = parts[1].strip() if len(parts) > 1 else ""
+                log_entries.append({"ts": ts, "status": status, "label": label, "reason": reason})
+        except Exception:
+            pass
+    base["log"] = log_entries
+    # Add recent completed summaries (last 15)
+    recent = []
+    try:
+        sums = sorted(OPS_LOGS.glob("bt_summary_bt_*.json"), key=os.path.getmtime, reverse=True)[:15]
+        for sp in sums:
+            d = json.load(open(sp))
+            rid = d.get("run_id", "")
+            # Try to get label from run_header
+            lbl = ""
+            hdr_path = OPS_LOGS / f"run_header_{rid}.json"
+            if hdr_path.exists():
+                try:
+                    lbl = json.load(open(hdr_path)).get("label", "")
+                except Exception:
+                    pass
+            recent.append({
+                "run_id": rid, "label": lbl,
+                "pf": float(d.get("profit_factor", 0)),
+                "wr": float(d.get("win_rate_pct", 0)),
+                "pnl": str(d.get("pnl_usd", "0")),
+                "trades": int(d.get("trades_closed", 0)),
+                "ts": datetime.fromtimestamp(os.path.getmtime(sp), tz=timezone.utc).isoformat(),
+            })
+    except Exception:
+        pass
+    base["recent"] = recent
+    return JSONResponse(base)
 
 
 @app.get("/api/equity")
@@ -837,6 +920,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#00d4ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Argus">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <title>Argus Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
@@ -918,6 +1007,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="page-nav">
   <button class="page-nav-btn active" onclick="switchPage('live')">LIVE</button>
   <button class="page-nav-btn" onclick="switchPage('evolution')">BACKTEST EVOLUTION</button>
+  <button class="page-nav-btn" onclick="switchPage('queue')">QUEUE STATUS</button>
 </div>
 
 <div id="live-page" class="page-content active">
@@ -1138,8 +1228,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div><!-- end evo-page -->
 
-<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<div id="queue-page" class="page-content">
+  <h2 style="color:#00d4ff; margin-bottom:12px;">QUEUE & BACKTEST STATUS</h2>
+
+  <!-- Running job -->
+  <div class="card" style="margin-bottom:12px; border-left:3px solid #ffc107;">
+    <h2>CURRENTLY RUNNING</h2>
+    <div id="q-running" style="color:#7b8ab8;">Loading...</div>
+  </div>
+
+  <!-- Progress bar area -->
+  <div id="q-progress-wrap" style="display:none; margin-bottom:12px;">
+    <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
+      <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
+      <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
+    </div>
+  </div>
+
+  <!-- Pending queue -->
+  <div class="card" style="margin-bottom:12px; border-left:3px solid #00d4ff;">
+    <h2>PENDING QUEUE (<span id="q-pending-count">0</span> jobs)</h2>
+    <div id="q-pending" style="color:#7b8ab8;">None</div>
+  </div>
+
+  <div class="grid" style="grid-template-columns: 1fr 1fr;">
+    <!-- Recent results -->
+    <div class="card" style="border-left:3px solid #00e676;">
+      <h2>RECENT RESULTS (last 15)</h2>
+      <div style="overflow-y:auto; max-height:400px;">
+        <table id="q-results-table">
+          <thead><tr style="color:#7b8ab8; font-size:0.75em;">
+            <th style="text-align:left;">Label</th><th>Trades</th><th>PF</th><th>WR%</th><th>PnL</th>
+          </tr></thead>
+          <tbody id="q-results"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Log / failures -->
+    <div class="card" style="border-left:3px solid #ff5252;">
+      <h2>QUEUE LOG (last 30 entries)</h2>
+      <div style="overflow-y:auto; max-height:400px;">
+        <div id="q-log" style="font-size:0.75em; font-family:monospace;"></div>
+      </div>
+    </div>
+  </div>
+</div><!-- end queue-page -->
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script>
 let equityChart = null;
 let currentCoin = 'ETH';
@@ -1153,6 +1290,10 @@ function switchPage(page) {
     document.querySelectorAll('.page-nav-btn')[1].classList.add('active');
     document.getElementById('evo-page').classList.add('active');
     if (!evoLoaded) { loadEvolution(); }
+  } else if (page === 'queue') {
+    document.querySelectorAll('.page-nav-btn')[2].classList.add('active');
+    document.getElementById('queue-page').classList.add('active');
+    loadQueueStatus();
   } else {
     document.querySelectorAll('.page-nav-btn')[0].classList.add('active');
     document.getElementById('live-page').classList.add('active');
@@ -1195,13 +1336,100 @@ function loadEvolution() {
     );
 
     // 3D scatter
-    render3DScatter(SCATTER);
+    try { render3DScatter(SCATTER); } catch(e) { console.error('3D scatter error', e); }
 
     // Year-end projection
     renderProjection(data.projection || {});
   }).catch(e => {
     console.error('Evolution load error', e);
     document.getElementById('evo-stats-bar').innerHTML = '<div class="evo-stat"><div class="val" style="color:#ff5252">Load Error</div></div>';
+  });
+}
+
+let queueInterval = null;
+function loadQueueStatus() {
+  fetch('/api/queue').then(r => r.json()).then(data => {
+    // Running job
+    const runEl = document.getElementById('q-running');
+    const progWrap = document.getElementById('q-progress-wrap');
+    if (data.running_job) {
+      const j = data.running_job;
+      runEl.innerHTML = '<div style="font-size:1.1em; color:#ffc107; font-weight:bold;">' + (j.label || j.run_id) + '</div>' +
+        '<div style="color:#7b8ab8; font-size:0.8em; margin-top:4px;">Run ID: ' + j.run_id + ' | ' + j.progress.toLocaleString() + ' / ' + j.total_bars.toLocaleString() + ' bars</div>';
+      progWrap.style.display = 'block';
+      document.getElementById('q-progress-bar').style.width = j.pct + '%';
+      document.getElementById('q-progress-label').textContent = j.pct + '% complete';
+    } else {
+      runEl.innerHTML = '<span style="color:#7b8ab8;">No backtest currently running</span>';
+      progWrap.style.display = 'none';
+    }
+
+    // Pending queue
+    const labels = data.pending_labels || [];
+    document.getElementById('q-pending-count').textContent = labels.length;
+    const pendEl = document.getElementById('q-pending');
+    if (!labels.length) {
+      pendEl.innerHTML = '<span style="color:#7b8ab8;">Queue empty</span>';
+    } else {
+      pendEl.innerHTML = labels.map((l, i) =>
+        '<div style="padding:4px 8px; margin:2px 0; background:#0d1321; border-radius:3px; border-left:2px solid #00d4ff; font-size:0.85em;">' +
+        '<span style="color:#7b8ab8;">#' + (i+1) + '</span> ' + l + '</div>'
+      ).join('');
+    }
+
+    // Recent results table
+    const recent = data.recent || [];
+    const tbody = document.getElementById('q-results');
+    if (!recent.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#7b8ab8; text-align:center;">No results</td></tr>';
+    } else {
+      tbody.innerHTML = recent.map(r => {
+        const pfColor = r.pf >= 1.2 ? '#00e676' : r.pf >= 1.0 ? '#ffc107' : '#ff5252';
+        const wrColor = r.wr >= 40 ? '#00e676' : r.wr >= 30 ? '#ffc107' : '#ff5252';
+        const pnlVal = parseFloat(r.pnl) || 0;
+        const pnlColor = pnlVal >= 0 ? '#00e676' : '#ff5252';
+        return '<tr style="border-bottom:1px solid #1e2a42;">' +
+          '<td style="text-align:left; padding:4px 2px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + r.run_id + '">' +
+            (r.label || r.run_id.slice(-12)) + '</td>' +
+          '<td style="text-align:center; padding:4px;">' + r.trades + '</td>' +
+          '<td style="text-align:center; padding:4px; color:' + pfColor + '; font-weight:bold;">' + r.pf.toFixed(2) + '</td>' +
+          '<td style="text-align:center; padding:4px; color:' + wrColor + ';">' + r.wr.toFixed(1) + '%</td>' +
+          '<td style="text-align:center; padding:4px; color:' + pnlColor + ';">$' + pnlVal.toFixed(2) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    // Queue log
+    const log = data.log || [];
+    const logEl = document.getElementById('q-log');
+    if (!log.length) {
+      logEl.innerHTML = '<span style="color:#7b8ab8;">No log entries</span>';
+    } else {
+      logEl.innerHTML = log.slice().reverse().map(e => {
+        const sc = e.status === 'DONE' ? '#00e676' : e.status === 'FAIL' ? '#ff5252' : e.status === 'START' ? '#ffc107' : '#7b8ab8';
+        const icon = e.status === 'DONE' ? 'OK' : e.status === 'FAIL' ? 'FAIL' : e.status === 'START' ? 'RUN' : '?';
+        let line = '<div style="padding:3px 6px; margin:1px 0; border-left:2px solid ' + sc + ';">' +
+          '<span style="color:' + sc + '; font-weight:bold; width:35px; display:inline-block;">' + icon + '</span> ' +
+          '<span style="color:#7b8ab8; font-size:0.9em;">' + (e.ts ? e.ts.slice(5,16).replace('T',' ') : '') + '</span> ' +
+          e.label;
+        if (e.reason) {
+          line += '<div style="color:#ff5252; font-size:0.85em; margin-left:40px; margin-top:2px;">' + e.reason + '</div>';
+        }
+        return line + '</div>';
+      }).join('');
+    }
+
+    // Auto-refresh every 30s while on queue page
+    if (!queueInterval) {
+      queueInterval = setInterval(() => {
+        if (document.getElementById('queue-page').classList.contains('active')) {
+          loadQueueStatus();
+        }
+      }, 30000);
+    }
+  }).catch(e => {
+    console.error('Queue load error', e);
+    document.getElementById('q-running').innerHTML = '<span style="color:#ff5252;">Load Error</span>';
   });
 }
 
@@ -1937,6 +2165,13 @@ setInterval(loadDecisions, 15000);
 setInterval(loadMultiOverview, 10000);
 setInterval(loadLeaderboard, 120000);  // refresh leaderboard every 2 min
 connectSSE();
+
+// PWA Service Worker registration
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    console.log('SW registered, scope:', reg.scope);
+  }).catch(err => console.warn('SW registration failed:', err));
+}
 </script>
 </body>
 </html>"""
@@ -1958,8 +2193,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Argus Dashboard")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
 
     print(f"Argus Dashboard: http://{args.host}:{args.port}")
+    print(f"  Local:     http://localhost:{args.port}")
+    print(f"  Tailscale: open Tailscale app to find your PC's Tailscale IP, then visit http://<tailscale-ip>:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
