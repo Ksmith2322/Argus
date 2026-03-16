@@ -1,1 +1,2 @@
-﻿
+{"label": "btc_compound10pct_gov-gate35_30min_blockOFF", "env": {"BACKTEST_CSV": "C:\\Argus\\repo\\data\\btc_usd_1m.csv", "PRODUCT_ID": "BTC-USD", "COMPOUND_SIZE_PCT": "0.10", "ML_GOVERNOR_MODE": "GATE", "ML_GOVERNOR_THRESHOLD": "0.35", "MAX_HOLD_SECONDS": "1800", "SESSION_BLOCK_ENTRY": "false"}, "single_run": true}
+{"label": "sol_compound10pct_gov-gate35_30min_blockOFF", "env": {"BACKTEST_CSV": "C:\\Argus\\repo\\data\\sol_usd_1m.csv", "PRODUCT_ID": "SOL-USD", "COMPOUND_SIZE_PCT": "0.10", "ML_GOVERNOR_MODE": "GATE", "ML_GOVERNOR_THRESHOLD": "0.35", "MAX_HOLD_SECONDS": "1800", "SESSION_BLOCK_ENTRY": "false"}, "single_run": true}
