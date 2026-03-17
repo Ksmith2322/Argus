@@ -2983,6 +2983,17 @@ async def run_live(
         f"kill_before_journal={int(_killpoint_enabled(cfg, 'KILL_BEFORE_JOURNAL_WRITE'))} "
         f"kill_after_journal={int(_killpoint_enabled(cfg, 'KILL_AFTER_JOURNAL_WRITE'))}"
     )
+    _coin_env = os.getenv("ARGUS_COIN_ENV", "")
+    print(
+        f"  [CONFIG] score={cfg.get('CONFLUENCE_MIN_SCORE')} "
+        f"gov={cfg.get('ML_GOVERNOR_THRESHOLD')} ({cfg.get('ML_GOVERNOR_MODE','?')}) "
+        f"tp={cfg.get('TAKE_PROFIT_PCT')} sl={cfg.get('STOP_LOSS_PCT')} "
+        f"trail={cfg.get('TRAIL_STOP_PCT')} be={cfg.get('EXIT_BREAKEVEN_TRIGGER_PCT')} "
+        f"hold={cfg.get('MAX_HOLD_SECONDS')}s compound={cfg.get('COMPOUND_SIZE_PCT')} "
+        f"trendlines={cfg.get('USE_TRENDLINES')} structure={cfg.get('USE_STRUCTURE')} "
+        f"cooldown={cfg.get('COOLDOWN_SECONDS')}s "
+        f"overlay={_coin_env or 'none'}"
+    )
 
     # --- Phase 16: run manifest & mode init ---
     _rm_file = cfg.get("RUNTIME_MODE_FILE", "") or None
