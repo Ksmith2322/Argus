@@ -1038,7 +1038,9 @@ def run_backtest(
                     open_trade = None
 
             # ---- run-scoped signals ----
-            if write_logs and not bt_lite_mode and (bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
+            # Always write signal on BUY/SELL actions (needed for ML feature extraction)
+            _is_action_tick = getattr(snap, "action", "HOLD") not in ("HOLD", "")
+            if write_logs and not bt_lite_mode and (_is_action_tick or bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
                 try:
                     # legacy compatibility (writes to sandbox LIVE_SIGNALS_CSV)
                     log_signal_snapshot(snap, symbol=symbol, price=getattr(snap, "px", None))
