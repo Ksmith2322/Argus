@@ -125,37 +125,13 @@ def read_run_manifest() -> dict:
 
 
 def read_account_tail(n: int = 5, coin: str = "ETH") -> list:
-    """Read last N account rows."""
-    path = get_coin_log_dir(coin) / "account.csv"
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read account: %s", path, exc_info=True)
-        return []
+    """Read last N account rows (tail-seek optimized)."""
+    return _tail_csv(get_coin_log_dir(coin) / "account.csv", n)
 
 
 def read_fills_tail(n: int = 20, coin: str = "ETH") -> list:
-    """Read last N fills."""
-    path = get_coin_log_dir(coin) / "fills.csv"
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read fills: %s", path, exc_info=True)
-        return []
+    """Read last N fills (tail-seek optimized)."""
+    return _tail_csv(get_coin_log_dir(coin) / "fills.csv", n)
 
 
 def read_trade_journal(n: int = 20, coin: str = "ETH") -> list:
@@ -1501,12 +1477,17 @@ async def api_evolution():
     })
 
 
+_ml_cache = {"mtime": 0, "data": {}}
+
 def _build_ml_network_data() -> dict:
     """Extract ML governor network structure + feature importances for visualization."""
     model_path = REPO / "data" / "ml_governor.pkl"
     if not model_path.exists():
         return {}
     try:
+        mtime = model_path.stat().st_mtime
+        if mtime == _ml_cache["mtime"] and _ml_cache["data"]:
+            return _ml_cache["data"]
         import pickle
         with open(model_path, "rb") as f:
             artifact = pickle.load(f)
@@ -1525,7 +1506,7 @@ def _build_ml_network_data() -> dict:
         # Model structure info
         n_estimators = getattr(model, "n_estimators", 0)
         max_depth = getattr(model, "max_depth", 0)
-        return {
+        result = {
             "features": features,
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -1533,6 +1514,9 @@ def _build_ml_network_data() -> dict:
             "win_rate": round(stats.get("win_rate", 0) * 100, 1),
             "train_samples": stats.get("n_trades", stats.get("train_samples", 0)),
         }
+        _ml_cache["mtime"] = mtime
+        _ml_cache["data"] = result
+        return result
     except Exception:
         return {}
 
