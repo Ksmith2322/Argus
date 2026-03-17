@@ -1524,6 +1524,15 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         entry_signal_ok = bool(st_1m.trend_ok and st_1m.signal == 1)
 
         if entry_signal_ok:
+            # --- ML Governor: evaluate EARLY so every entry signal gets a prediction ---
+            # This stamps snap.governor_* for ALL potential entries (even those blocked
+            # by regime/liq/risk gates), enabling data collection in LOG_ONLY and
+            # accurate scoring in GATE mode.  The GATE block still happens downstream.
+            _gov_result = ml_governor.evaluate(snap, cfg)
+            snap.governor_win_prob = _gov_result.win_prob
+            snap.governor_recommendation = _gov_result.recommendation
+            snap.governor_score_modifier = _gov_result.score_modifier
+
             _regime_block_list = [
                 s.strip().upper()
                 for s in str(cfg.get("REGIME_ENTRY_BLOCK_LIST", "")).split(",")
@@ -1667,12 +1676,8 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 )
                                 risk_blocked_reason = str(why or "")
                             else:
-                                # ML Governor evaluation (stamps snapshot, optionally gates)
-                                gov = ml_governor.evaluate(snap, cfg)
-                                snap.governor_win_prob = gov.win_prob
-                                snap.governor_recommendation = gov.recommendation
-                                snap.governor_score_modifier = gov.score_modifier
-
+                                # ML Governor GATE check (evaluation already done above)
+                                gov = _gov_result  # reuse early evaluation
                                 gov_mode = str(cfg.get("ML_GOVERNOR_MODE", "LOG_ONLY")).upper()
                                 if gov_mode == "GATE" and gov.recommendation == "BLOCK" and gov.model_loaded:
                                     _emit_missed_buy(

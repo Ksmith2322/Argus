@@ -10,6 +10,7 @@ serves a single-page dashboard with auto-refreshing panels.
 """
 import argparse
 import base64
+import collections
 import csv
 import json
 import logging
@@ -124,37 +125,13 @@ def read_run_manifest() -> dict:
 
 
 def read_account_tail(n: int = 5, coin: str = "ETH") -> list:
-    """Read last N account rows."""
-    path = get_coin_log_dir(coin) / "account.csv"
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read account: %s", path, exc_info=True)
-        return []
+    """Read last N account rows (tail-seek optimized)."""
+    return _tail_csv(get_coin_log_dir(coin) / "account.csv", n)
 
 
 def read_fills_tail(n: int = 20, coin: str = "ETH") -> list:
-    """Read last N fills."""
-    path = get_coin_log_dir(coin) / "fills.csv"
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read fills: %s", path, exc_info=True)
-        return []
+    """Read last N fills (tail-seek optimized)."""
+    return _tail_csv(get_coin_log_dir(coin) / "fills.csv", n)
 
 
 def read_trade_journal(n: int = 20, coin: str = "ETH") -> list:
@@ -175,25 +152,51 @@ def read_trade_journal(n: int = 20, coin: str = "ETH") -> list:
         return []
 
 
+def _tail_csv(path: Path, n: int) -> list:
+    """Efficiently read last N rows of a CSV file using seek-from-end."""
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return []
+        # Read header + last chunk (estimate ~500 bytes/row, read extra)
+        chunk_size = min(size, max(n * 800, 8192))
+        with open(path, "rb") as f:
+            # Read header line
+            header = f.readline().decode("utf-8", errors="replace").strip()
+            if size <= chunk_size:
+                # Small file — read all
+                f.seek(0)
+                reader = csv.DictReader(
+                    line.decode("utf-8", errors="replace") for line in f
+                )
+                rows = collections.deque(reader, maxlen=n)
+                return list(rows)
+            # Large file — seek to tail
+            f.seek(max(0, size - chunk_size))
+            f.readline()  # skip partial line
+            tail_lines = f.readlines()
+        if not tail_lines:
+            return []
+        # Parse with header
+        text_lines = [header + "\n"] + [
+            l.decode("utf-8", errors="replace") for l in tail_lines
+        ]
+        reader = csv.DictReader(text_lines)
+        return list(collections.deque(reader, maxlen=n))
+    except Exception:
+        log.warning("Failed to tail-read CSV: %s", path, exc_info=True)
+        return []
+
+
 def read_signals_tail(n: int = 5, coin: str = "ETH") -> list:
     """Read last N live signal rows."""
-    # Signals may be in per-coin dir even when account.csv is in main dir (ETH case)
     coin_dir = OPS_LOGS / coin.lower()
     per_coin_path = coin_dir / "live_signals.csv"
     fallback_path = get_coin_log_dir(coin) / "live_signals.csv"
     path = per_coin_path if per_coin_path.exists() else fallback_path
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read signals: %s", path, exc_info=True)
-        return []
+    return _tail_csv(path, n)
 
 
 def read_events_tail(n: int = 20, coin: str = "ETH") -> list:
@@ -202,18 +205,7 @@ def read_events_tail(n: int = 20, coin: str = "ETH") -> list:
     per_coin_path = coin_dir / "live_events.csv"
     fallback_path = get_coin_log_dir(coin) / "live_events.csv"
     path = per_coin_path if per_coin_path.exists() else fallback_path
-    if not path.exists():
-        return []
-    try:
-        rows = []
-        with open(path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(row)
-        return rows[-n:]
-    except Exception:
-        log.warning("Failed to read events: %s", path, exc_info=True)
-        return []
+    return _tail_csv(path, n)
 
 
 def read_equity_series(coin: str = "ETH") -> list:
@@ -334,7 +326,7 @@ def read_governor_latest(coin: str = "ETH") -> dict:
         return {}
 
 
-def read_queue_status() -> dict:
+def read_queue_status(skip_pc2: bool = False) -> dict:
     """Read queue files and detect running/pending/completed jobs."""
     result = {"pending_pc1": 0, "pending_pc2": 0, "pending_labels": [],
               "running_job": None, "completed_today": 0}
@@ -342,7 +334,8 @@ def read_queue_status() -> dict:
     q1 = REPO / "ops" / "backtest_queue.jsonl"
     if q1.exists():
         try:
-            lines = [l.strip() for l in open(q1).readlines() if l.strip()]
+            with open(q1) as _qf:
+                lines = [l.strip() for l in _qf.readlines() if l.strip()]
             result["pending_pc1"] = len(lines)
             for l in lines:
                 try:
@@ -355,7 +348,8 @@ def read_queue_status() -> dict:
     q2 = REPO / "ops" / "backtest_queue_pc2.jsonl"
     if q2.exists():
         try:
-            lines = [l.strip() for l in open(q2).readlines() if l.strip()]
+            with open(q2) as _qf:
+                lines = [l.strip() for l in _qf.readlines() if l.strip()]
             result["pending_pc2"] = len(lines)
         except Exception:
             pass
@@ -363,14 +357,20 @@ def read_queue_status() -> dict:
     try:
         headers = sorted(OPS_LOGS.glob("run_header_bt_*.json"), key=os.path.getmtime, reverse=True)
         for h in headers[:5]:
-            hdr = json.load(open(h))
+            with open(h) as _hf:
+                hdr = json.load(_hf)
             rid = hdr.get("run_id", "")
             if not (OPS_LOGS / f"bt_summary_{rid}.json").exists():
                 progress = 0
                 total_bars = 0
+                # Try equity CSV first; fall back to events CSV for BT_LITE_MODE
                 eq_path = OPS_LOGS / f"equity_{rid}.csv"
+                ev_path = OPS_LOGS / f"bt_events_{rid}.csv"
                 if eq_path.exists():
                     with open(eq_path) as f:
+                        progress = sum(1 for _ in f) - 1
+                elif ev_path.exists():
+                    with open(ev_path) as f:
                         progress = sum(1 for _ in f) - 1
                 candles_csv = hdr.get("candles_csv", "")
                 if candles_csv and Path(candles_csv).exists():
@@ -603,7 +603,7 @@ def build_status(coin: str = "ETH") -> dict:
         "signals": signals,
         "events": events[-10:],
         "coin": coin.upper(),
-        "queue": read_queue_status(),
+        "queue": read_queue_status(skip_pc2=True),
         "governor": read_governor_latest(coin),
     }
 
@@ -687,13 +687,15 @@ async def api_queue():
         try:
             sums = sorted(logs_dir.glob("bt_summary_bt_*.json"), key=os.path.getmtime, reverse=True)[:20]
             for sp in sums:
-                d = json.load(open(sp))
+                with open(sp) as _sf:
+                    d = json.load(_sf)
                 rid = d.get("run_id", "")
                 lbl = ""
                 hdr_path = logs_dir / f"run_header_{rid}.json"
                 if hdr_path.exists():
                     try:
-                        lbl = json.load(open(hdr_path)).get("label", "")
+                        with open(hdr_path) as _hf:
+                            lbl = json.load(_hf).get("label", "")
                     except Exception:
                         pass
                 mfe = float(d.get("avg_mfe_pct_points", 0) or 0)
@@ -1475,12 +1477,17 @@ async def api_evolution():
     })
 
 
+_ml_cache = {"mtime": 0, "data": {}}
+
 def _build_ml_network_data() -> dict:
     """Extract ML governor network structure + feature importances for visualization."""
     model_path = REPO / "data" / "ml_governor.pkl"
     if not model_path.exists():
         return {}
     try:
+        mtime = model_path.stat().st_mtime
+        if mtime == _ml_cache["mtime"] and _ml_cache["data"]:
+            return _ml_cache["data"]
         import pickle
         with open(model_path, "rb") as f:
             artifact = pickle.load(f)
@@ -1499,7 +1506,7 @@ def _build_ml_network_data() -> dict:
         # Model structure info
         n_estimators = getattr(model, "n_estimators", 0)
         max_depth = getattr(model, "max_depth", 0)
-        return {
+        result = {
             "features": features,
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -1507,6 +1514,9 @@ def _build_ml_network_data() -> dict:
             "win_rate": round(stats.get("win_rate", 0) * 100, 1),
             "train_samples": stats.get("n_trades", stats.get("train_samples", 0)),
         }
+        _ml_cache["mtime"] = mtime
+        _ml_cache["data"] = result
+        return result
     except Exception:
         return {}
 
@@ -1522,7 +1532,8 @@ def _build_strategy_compare(summaries: list) -> list:
             hdr_path = OPS_LOGS / f"run_header_{run_id}.json"
             try:
                 if hdr_path.exists():
-                    label = json.load(open(hdr_path)).get("label", "")
+                    with open(hdr_path) as _hf:
+                        label = json.load(_hf).get("label", "")
             except Exception as e:
                 log.warning("strategy_compare hdr read error: %s", e)
         if not label or label == run_id:

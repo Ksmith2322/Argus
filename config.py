@@ -69,6 +69,11 @@ def load_config() -> dict:
     else:
         load_dotenv()
 
+    # Per-coin overlay: ARGUS_COIN_ENV=.env.btc layers coin-specific overrides on top
+    coin_env = os.getenv("ARGUS_COIN_ENV", "").strip()
+    if coin_env and os.path.isfile(coin_env):
+        load_dotenv(dotenv_path=coin_env, override=True)
+
     cfg: dict = {}
 
     # -------------------------
