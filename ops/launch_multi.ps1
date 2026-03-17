@@ -15,7 +15,7 @@
 # Per-coin .env overlay (if exists) layers coin-specific params on top.
 
 param(
-    [string[]]$Coins = @("ETH", "BTC", "SOL"),
+    [string[]]$Coins = @("ETH", "BTC"),
     [switch]$DryRun
 )
 

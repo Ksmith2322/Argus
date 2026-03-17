@@ -1,13 +1,14 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-16 08:24:01 CDT
+Last update: 2026-03-17 00:40:35 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       3247
+  - HOLD total:       3444
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
+  - MISSED_BUY_WATCH_GATED: 0
   - MISSED_BUY_EXPOSURE_CAP: 0
   - MISSED_BUY_MIN_ORDER: 0
   - MISSED_BUY_RISK_LOCKOUT: 0
@@ -21,14 +22,14 @@ Hold reason counters:
   - HOLD_PAUSED: 0
   - HOLD_STALE_DATA: 2162
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 210
-  - HOLD_NO_TREND_OK: 587
+  - HOLD_NO_SIGNAL: 250
+  - HOLD_NO_TREND_OK: 674
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_OTHER: 256
+  - HOLD_OTHER: 326
 
 Last event:
-  reason: HOLD_NO_SIGNAL
-  detail: signal=0 score=40 reasons=MA50>MA200;spread_ok(6.91bps) | px=2279.86 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=8 | delta=-15 | adj_score=0 | watch_th=58 | trade_th=85 | trend_strength=0.00069 | vol=0.00105 | session_bonus=+8 (OVERLAP:['session:OVERLAP', 'overlap:1', 'score_bonus:8', 'reason:UTC_hour=13 overlap']) | liq:spread=NA;vol_1m=61.52035351;vol_floor>=25;vol_base=61.52035351;vol_need>=30.7602;atr_norm=0.00104905037770147853935787107815258423215709626674652099609375;LIQ_OK | struct=STRUCT:no_support_levels;no_resistance_levels | liq=spread=NA;vol_1m=61.52035351;vol_floor>=25;vol_base=61.52035351;vol_need>=30.7602;atr_norm=0.00104905037770147853935787107815258423215709626674652099609375;LIQ_OK
+  reason: HOLD_NO_TREND_OK
+  detail: trend_ok=0 score=20 reasons=spread_ok(19.12bps) | px=74159.245 | bonus_trend_down=+-15 | regime=TREND_DOWN | base_score=66 | delta=-15 | adj_score=51 | watch_th=55 | trade_th=80 | trend_strength=0.00191 | vol=0.00070 | liq:spread=NA;vol_1m=8.33261753;vol_floor>=25;vol_base=3.344632954666666666666666667;vol_need>=1.6723;atr_norm=0.0007036388658208218;violations=VOLUME_BELOW_MIN;penalty=-10 | liq_penalty=-10 | struct= | liq=spread=NA;vol_1m=8.33261753;vol_floor>=25;vol_base=3.344632954666666666666666667;vol_need>=1.6723;atr_norm=0.0007036388658208218;violations=VOLUME_BELOW_MIN;penalty=-10
