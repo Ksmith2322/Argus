@@ -680,31 +680,47 @@ async def api_queue():
         except Exception:
             pass
     base["log"] = log_entries
-    # Add recent completed summaries (last 15)
+    # Add recent completed summaries (last 25) from BOTH PC1 and PC2
     recent = []
-    try:
-        sums = sorted(OPS_LOGS.glob("bt_summary_bt_*.json"), key=os.path.getmtime, reverse=True)[:15]
-        for sp in sums:
-            d = json.load(open(sp))
-            rid = d.get("run_id", "")
-            # Try to get label from run_header
-            lbl = ""
-            hdr_path = OPS_LOGS / f"run_header_{rid}.json"
-            if hdr_path.exists():
-                try:
-                    lbl = json.load(open(hdr_path)).get("label", "")
-                except Exception:
-                    pass
-            recent.append({
-                "run_id": rid, "label": lbl,
-                "pf": float(d.get("profit_factor", 0)),
-                "wr": float(d.get("win_rate_pct", 0)),
-                "pnl": str(d.get("pnl_usd", "0")),
-                "trades": int(d.get("trades_closed", 0)),
-                "ts": datetime.fromtimestamp(os.path.getmtime(sp), tz=timezone.utc).isoformat(),
-            })
-    except Exception:
-        pass
+    def _read_summaries(logs_dir, source_tag):
+        items = []
+        try:
+            sums = sorted(logs_dir.glob("bt_summary_bt_*.json"), key=os.path.getmtime, reverse=True)[:20]
+            for sp in sums:
+                d = json.load(open(sp))
+                rid = d.get("run_id", "")
+                lbl = ""
+                hdr_path = logs_dir / f"run_header_{rid}.json"
+                if hdr_path.exists():
+                    try:
+                        lbl = json.load(open(hdr_path)).get("label", "")
+                    except Exception:
+                        pass
+                mfe = float(d.get("avg_mfe_pct_points", 0) or 0)
+                mae = float(d.get("avg_mae_pct_points", 0) or 0)
+                items.append({
+                    "run_id": rid, "label": lbl, "source": source_tag,
+                    "pf": float(d.get("profit_factor", 0)),
+                    "wr": float(d.get("win_rate_pct", 0)),
+                    "pnl": str(d.get("pnl_usd", "0")),
+                    "trades": int(d.get("trades_closed", 0)),
+                    "expectancy": str(d.get("expectancy_usd", "0")),
+                    "max_dd_pct": float(d.get("max_drawdown_pct", 0) or 0),
+                    "avg_mfe": mfe, "avg_mae": mae,
+                    "symbol": d.get("symbol", "ETH-USD"),
+                    "elapsed_days": round(max(1, (int(d.get("end_epoch", 0) or 0) - int(d.get("start_epoch", 0) or 0)) / 86400), 1),
+                    "ts": datetime.fromtimestamp(os.path.getmtime(sp), tz=timezone.utc).isoformat(),
+                })
+        except Exception:
+            pass
+        return items
+    recent = _read_summaries(OPS_LOGS, "PC1")
+    pc2_logs = OPS_LOGS / "pc2"
+    if pc2_logs.exists():
+        recent.extend(_read_summaries(pc2_logs, "PC2"))
+    # Sort all by timestamp descending, limit to 25
+    recent.sort(key=lambda x: x["ts"], reverse=True)
+    recent = recent[:25]
     base["recent"] = recent
     # PC2 status (cached SSH)
     base["pc2"] = _fetch_pc2_status()
@@ -2007,58 +2023,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div><!-- end evo-page -->
 
 <div id="queue-page" class="page-content">
-  <h2 style="color:#00d4ff; margin-bottom:12px;">QUEUE & BACKTEST STATUS</h2>
+  <h2 style="color:#00d4ff; margin-bottom:12px;">BACKTEST COMMAND CENTER</h2>
 
-  <!-- Running jobs by PC -->
-  <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:12px;">
-    <div class="card" style="border-left:3px solid #ffc107;">
-      <h2>PC1 (LOCAL) — RUNNING</h2>
-      <div id="q-running" style="color:#7b8ab8;">Loading...</div>
-      <div id="q-progress-wrap" style="display:none; margin-top:8px;">
-        <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
-          <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
-          <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
+  <!-- SECTION 1: Active Jobs -->
+  <div class="card" style="border-left:3px solid #ffc107; margin-bottom:12px;">
+    <h2>ACTIVE JOBS</h2>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
+      <div>
+        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC1 (LOCAL)</div>
+        <div id="q-running" style="color:#7b8ab8;">Loading...</div>
+        <div id="q-progress-wrap" style="display:none; margin-top:8px;">
+          <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
+            <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
+            <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="card" style="border-left:3px solid #ba68c8;">
-      <h2>PC2 (REMOTE) — RUNNING</h2>
-      <div id="q-pc2-status" style="color:#7b8ab8;">Loading...</div>
+      <div>
+        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC2 (REMOTE)</div>
+        <div id="q-pc2-status" style="color:#7b8ab8;">Loading...</div>
+      </div>
     </div>
   </div>
 
-  <!-- Pending queues -->
-  <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:12px;">
-    <div class="card" style="border-left:3px solid #00d4ff;">
-      <h2>PC1 QUEUE (<span id="q-pending-count">0</span> jobs)</h2>
-      <div id="q-pending" style="color:#7b8ab8;">None</div>
-    </div>
-    <div class="card" style="border-left:3px solid #ba68c8;">
-      <h2>PC2 QUEUE (<span id="q-pc2-pending-count">0</span> jobs)</h2>
-      <div id="q-pc2-pending" style="color:#7b8ab8;">None</div>
+  <!-- SECTION 2: Pending Queues -->
+  <div class="card" style="border-left:3px solid #00d4ff; margin-bottom:12px;">
+    <h2>UP NEXT</h2>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
+      <div>
+        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC1 Queue (<span id="q-pending-count">0</span> jobs)</div>
+        <div id="q-pending" style="color:#7b8ab8;">None</div>
+      </div>
+      <div>
+        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC2 Queue (<span id="q-pc2-pending-count">0</span> jobs)</div>
+        <div id="q-pc2-pending" style="color:#7b8ab8;">None</div>
+      </div>
     </div>
   </div>
 
-  <div class="grid" style="grid-template-columns: 1fr 1fr;">
-    <!-- Recent results -->
-    <div class="card" style="border-left:3px solid #00e676;">
-      <h2>RECENT RESULTS (last 15)</h2>
-      <div style="overflow-y:auto; max-height:400px;">
-        <table id="q-results-table">
-          <thead><tr style="color:#7b8ab8; font-size:0.75em;">
-            <th style="text-align:left;">Label</th><th>Trades</th><th>PF</th><th>WR%</th><th>PnL</th>
-          </tr></thead>
-          <tbody id="q-results"></tbody>
-        </table>
-      </div>
+  <!-- SECTION 3: All Completed Results (unified table) -->
+  <div class="card" style="border-left:3px solid #00e676; margin-bottom:12px;">
+    <h2>COMPLETED RESULTS (All PCs)</h2>
+    <div style="overflow-x:auto; max-height:500px; overflow-y:auto;">
+      <table id="q-results-table" style="width:100%; border-collapse:collapse; font-size:0.8em;">
+        <thead><tr style="color:#7b8ab8; font-size:0.85em; border-bottom:1px solid #1e2a42; position:sticky; top:0; background:#0a0e1a;">
+          <th style="text-align:left; padding:6px 8px;">Label</th>
+          <th style="padding:6px 4px;">PC</th>
+          <th style="padding:6px 4px;">Coin</th>
+          <th style="padding:6px 4px;">Days</th>
+          <th style="padding:6px 4px;">Trades</th>
+          <th style="padding:6px 4px;">PF</th>
+          <th style="padding:6px 4px;">WR%</th>
+          <th style="padding:6px 4px;">PnL</th>
+          <th style="padding:6px 4px;">Exp</th>
+          <th style="padding:6px 4px;">DD%</th>
+          <th style="padding:6px 4px;">MFE%</th>
+          <th style="padding:6px 4px;">MAE%</th>
+        </tr></thead>
+        <tbody id="q-results"></tbody>
+      </table>
     </div>
+  </div>
 
-    <!-- Log / failures -->
-    <div class="card" style="border-left:3px solid #ff5252;">
-      <h2>QUEUE LOG (last 30 entries)</h2>
-      <div style="overflow-y:auto; max-height:400px;">
-        <div id="q-log" style="font-size:0.75em; font-family:monospace;"></div>
-      </div>
+  <!-- SECTION 4: Queue Log -->
+  <div class="card" style="border-left:3px solid #ff5252;">
+    <h2>QUEUE LOG</h2>
+    <div style="overflow-y:auto; max-height:250px;">
+      <div id="q-log" style="font-size:0.75em; font-family:monospace;"></div>
     </div>
   </div>
 </div><!-- end queue-page -->
@@ -2255,24 +2286,38 @@ function loadQueueStatus() {
       ).join('');
     }
 
-    // Recent results table
+    // Unified results table (all PCs)
     const recent = data.recent || [];
     const tbody = document.getElementById('q-results');
     if (!recent.length) {
-      tbody.innerHTML = '<tr><td colspan="5" style="color:#7b8ab8; text-align:center;">No results</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="12" style="color:#7b8ab8; text-align:center;">No results</td></tr>';
     } else {
-      tbody.innerHTML = recent.map(r => {
+      tbody.innerHTML = recent.filter(r => r.trades > 0).map(r => {
         const pfColor = r.pf >= 1.2 ? '#00e676' : r.pf >= 1.0 ? '#ffc107' : '#ff5252';
-        const wrColor = r.wr >= 40 ? '#00e676' : r.wr >= 30 ? '#ffc107' : '#ff5252';
+        const wrColor = r.wr >= 50 ? '#00e676' : r.wr >= 35 ? '#ffc107' : '#ff5252';
         const pnlVal = parseFloat(r.pnl) || 0;
         const pnlColor = pnlVal >= 0 ? '#00e676' : '#ff5252';
+        const expVal = parseFloat(r.expectancy) || 0;
+        const expColor = expVal >= 0 ? '#00e676' : '#ff5252';
+        const pcColor = r.source === 'PC2' ? '#ba68c8' : '#00d4ff';
+        const mfeStr = r.avg_mfe ? r.avg_mfe.toFixed(3) + '%' : '-';
+        const maeStr = r.avg_mae ? r.avg_mae.toFixed(3) + '%' : '-';
+        const ddColor = r.max_dd_pct > 3 ? '#ff5252' : r.max_dd_pct > 1 ? '#ffc107' : '#00e676';
+        const coin = (r.symbol || 'ETH-USD').replace('-USD','');
         return '<tr style="border-bottom:1px solid #1e2a42;">' +
-          '<td style="text-align:left; padding:4px 2px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + r.run_id + '">' +
+          '<td style="text-align:left; padding:5px 8px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + r.run_id + '">' +
             (r.label || r.run_id.slice(-12)) + '</td>' +
-          '<td style="text-align:center; padding:4px;">' + r.trades + '</td>' +
-          '<td style="text-align:center; padding:4px; color:' + pfColor + '; font-weight:bold;">' + r.pf.toFixed(2) + '</td>' +
-          '<td style="text-align:center; padding:4px; color:' + wrColor + ';">' + r.wr.toFixed(1) + '%</td>' +
-          '<td style="text-align:center; padding:4px; color:' + pnlColor + ';">$' + pnlVal.toFixed(2) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + pcColor + '; font-size:0.8em;">' + r.source + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; font-size:0.8em;">' + coin + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:#7b8ab8;">' + r.elapsed_days + '</td>' +
+          '<td style="text-align:center; padding:5px 4px;">' + r.trades + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + pfColor + '; font-weight:bold;">' + r.pf.toFixed(2) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + wrColor + ';">' + r.wr.toFixed(1) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + pnlColor + ';">$' + pnlVal.toFixed(2) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + expColor + '; font-size:0.85em;">$' + expVal.toFixed(3) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:' + ddColor + ';">' + r.max_dd_pct.toFixed(2) + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:#00e676;">' + mfeStr + '</td>' +
+          '<td style="text-align:center; padding:5px 4px; color:#ff5252;">' + maeStr + '</td>' +
           '</tr>';
       }).join('');
     }
