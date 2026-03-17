@@ -238,7 +238,7 @@ if ($jobsRun -gt 0 -and -not $DryRun) {
     Write-Host ""
     Write-Host "--- ARTIFACT CLEANUP ---" -ForegroundColor Cyan
     try {
-        & "$repoRoot\ops\cleanup_artifacts.ps1" -Keep 20
+        & "$repoRoot\ops\cleanup_artifacts.ps1" -Keep 9999
     } catch {
         Write-Host "WARNING: cleanup failed: $_" -ForegroundColor Yellow
     }
