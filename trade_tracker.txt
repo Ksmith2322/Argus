@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-17 00:40:35 CDT
+Last update: 2026-03-17 01:55:57 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       3444
+  - HOLD total:       3459
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -23,7 +23,7 @@ Hold reason counters:
   - HOLD_STALE_DATA: 2162
   - HOLD_COOLDOWN: 17
   - HOLD_NO_SIGNAL: 250
-  - HOLD_NO_TREND_OK: 674
+  - HOLD_NO_TREND_OK: 689
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
@@ -32,4 +32,4 @@ Hold reason counters:
 
 Last event:
   reason: HOLD_NO_TREND_OK
-  detail: trend_ok=0 score=20 reasons=spread_ok(19.12bps) | px=74159.245 | bonus_trend_down=+-15 | regime=TREND_DOWN | base_score=66 | delta=-15 | adj_score=51 | watch_th=55 | trade_th=80 | trend_strength=0.00191 | vol=0.00070 | liq:spread=NA;vol_1m=8.33261753;vol_floor>=25;vol_base=3.344632954666666666666666667;vol_need>=1.6723;atr_norm=0.0007036388658208218;violations=VOLUME_BELOW_MIN;penalty=-10 | liq_penalty=-10 | struct= | liq=spread=NA;vol_1m=8.33261753;vol_floor>=25;vol_base=3.344632954666666666666666667;vol_need>=1.6723;atr_norm=0.0007036388658208218;violations=VOLUME_BELOW_MIN;penalty=-10
+  detail: trend_ok=0 score=20 reasons=spread_ok(11.64bps) | px=74057.405 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=66 | delta=-15 | adj_score=51 | watch_th=58 | trade_th=85 | trend_strength=0.00116 | vol=0.00066 | liq:spread=NA;vol_1m=1.86471793;vol_floor>=25;vol_base=1.775632359333333333333333333;vol_need>=0.8878;atr_norm=0.0006559716300119555;violations=VOLUME_BELOW_MIN;penalty=-10 | liq_penalty=-10 | struct= | liq=spread=NA;vol_1m=1.86471793;vol_floor>=25;vol_base=1.775632359333333333333333333;vol_need>=0.8878;atr_norm=0.0006559716300119555;violations=VOLUME_BELOW_MIN;penalty=-10
