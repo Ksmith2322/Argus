@@ -61,7 +61,8 @@ async def pwa_icon_512():
     return FileResponse(STATIC_DIR / "icon-512.png", media_type="image/png")
 
 
-COINS = ["ETH", "BTC", "SOL"]
+COINS = ["ETH", "BTC"]
+POOL_FILE = REPO / "ops" / "coin_pool.json"
 
 
 def get_coin_log_dir(coin: str) -> Path:
@@ -326,6 +327,16 @@ def read_governor_latest(coin: str = "ETH") -> dict:
         return {}
 
 
+def read_coin_pool() -> dict:
+    """Read coin pool registry."""
+    try:
+        if POOL_FILE.exists():
+            return json.loads(POOL_FILE.read_text())
+    except Exception:
+        pass
+    return {"max_active": 2, "active": ["ETH", "BTC"], "coins": {}}
+
+
 def read_queue_status(skip_pc2: bool = False) -> dict:
     """Read queue files and detect running/pending/completed jobs."""
     result = {"pending_pc1": 0, "pending_pc2": 0, "pending_labels": [],
@@ -344,13 +355,18 @@ def read_queue_status(skip_pc2: bool = False) -> dict:
                     pass
         except Exception:
             pass
-    # Pending PC2
+    # Pending PC2 — only count as pending if file was modified recently (within 24h)
     q2 = REPO / "ops" / "backtest_queue_pc2.jsonl"
     if q2.exists():
         try:
-            with open(q2) as _qf:
-                lines = [l.strip() for l in _qf.readlines() if l.strip()]
-            result["pending_pc2"] = len(lines)
+            age_hours = (time.time() - os.path.getmtime(q2)) / 3600
+            if age_hours < 24:
+                with open(q2) as _qf:
+                    lines = [l.strip() for l in _qf.readlines() if l.strip()]
+                result["pending_pc2"] = len(lines)
+            else:
+                result["pending_pc2"] = 0
+                result["pc2_queue_stale"] = True
         except Exception:
             pass
     # Running job: most recent run_header with no matching bt_summary
@@ -878,6 +894,10 @@ async def api_config():
                         cfg[k] = v.strip()
     except Exception:
         pass
+    cfg["coin_configs"] = {
+        "ETH": {k: v for k, v in (read_coin_pool().get("coins", {}).get("ETH", {}).get("config", {})).items()},
+        "BTC": {k: v for k, v in (read_coin_pool().get("coins", {}).get("BTC", {}).get("config", {})).items()},
+    }
     return JSONResponse(cfg)
 
 
@@ -1050,8 +1070,8 @@ def _build_projection(summaries: list) -> dict:
     best_run = max(runs_with_pnl, key=lambda r: r["pf"])
     best_daily = best_run["pnl"] / best_run["days"]
 
-    # 3-coin multiplier: $500 per coin x 3 coins
-    num_coins = 3
+    # num_coins: use actual active coins list
+    num_coins = len(COINS)
     per_coin_cash = start_cash
 
     scenarios = []
@@ -1287,15 +1307,15 @@ def _build_readiness_tracker(summaries: list) -> dict:
                     pass
 
     # --- Live metrics (per coin) ---
-    live_trades = {"ETH": 0, "BTC": 0, "SOL": 0}
-    live_pnl = {"ETH": 0.0, "BTC": 0.0, "SOL": 0.0}
-    live_equity = {"ETH": 500.0, "BTC": 500.0, "SOL": 500.0}
+    live_trades = {"ETH": 0, "BTC": 0}
+    live_pnl = {"ETH": 0.0, "BTC": 0.0}
+    live_equity = {"ETH": 500.0, "BTC": 500.0}
     live_max_consec_loss = 0
     live_max_dd_pct = 0.0
     live_days_profitable = 0
     total_live_trades = 0
 
-    for coin in ["ETH", "BTC", "SOL"]:
+    for coin in ["ETH", "BTC"]:
         coin_lower = coin.lower()
         fills_path = OPS_LOGS / coin_lower / "fills.csv"
         if not fills_path.exists():
@@ -1343,10 +1363,8 @@ def _build_readiness_tracker(summaries: list) -> dict:
     if daily_rate_3coin > 0 and total_live_equity > 0:
         compound_rate_current = (daily_rate_3coin / total_live_equity) * 100
 
-    # Check BTC/SOL backtest existence
+    # Check BTC backtest existence
     btc_bt_done = any("BTC" in str(s.get("symbol", "")) or "btc" in str(s.get("label", "")).lower()
-                       for s in summaries)
-    sol_bt_done = any("SOL" in str(s.get("symbol", "")) or "sol" in str(s.get("label", "")).lower()
                        for s in summaries)
 
     # --- Build checklist ---
@@ -1370,9 +1388,6 @@ def _build_readiness_tracker(summaries: list) -> dict:
                 {"name": "BTC Backtest Validated", "target": "Done",
                  "current": "Done" if btc_bt_done else "Pending",
                  "pass": btc_bt_done, "format": "bool"},
-                {"name": "SOL Backtest Validated", "target": "Done",
-                 "current": "Done" if sol_bt_done else "Pending",
-                 "pass": sol_bt_done, "format": "bool"},
             ],
         },
         {
@@ -1382,8 +1397,6 @@ def _build_readiness_tracker(summaries: list) -> dict:
                  "pass": live_trades["ETH"] >= 50, "format": "int"},
                 {"name": "BTC: 50+ Paper Trades", "target": 50, "current": live_trades["BTC"],
                  "pass": live_trades["BTC"] >= 50, "format": "int"},
-                {"name": "SOL: 50+ Paper Trades", "target": 50, "current": live_trades["SOL"],
-                 "pass": live_trades["SOL"] >= 50, "format": "int"},
                 {"name": "Live PF >= 1.1 (aggregate)", "target": 1.1, "current": "N/A",
                  "pass": False, "format": "pf"},
                 {"name": "Max Drawdown < 5% per coin", "target": "< 5%", "current": "N/A",
@@ -1405,15 +1418,12 @@ def _build_readiness_tracker(summaries: list) -> dict:
                 {"name": "BTC: $500 → $2,000", "target": 2000,
                  "current": round(live_equity.get("BTC", 500), 2),
                  "pass": live_equity.get("BTC", 500) >= 2000, "format": "usd"},
-                {"name": "SOL: $500 → $2,000", "target": 2000,
-                 "current": round(live_equity.get("SOL", 500), 2),
-                 "pass": live_equity.get("SOL", 500) >= 2000, "format": "usd"},
-                {"name": "All 3 Coins → $5,000 each", "target": 5000,
+                {"name": "Both Coins → $5,000 each", "target": 5000,
                  "current": round(min_equity, 2),
                  "pass": min_equity >= 5000, "format": "usd"},
-                {"name": "Portfolio Total >= $15,000", "target": 15000,
+                {"name": "Portfolio Total >= $10,000", "target": 10000,
                  "current": round(total_live_equity, 2),
-                 "pass": total_live_equity >= 15000, "format": "usd"},
+                 "pass": total_live_equity >= 10000, "format": "usd"},
             ],
         },
         {
@@ -1463,6 +1473,12 @@ def _build_readiness_tracker(summaries: list) -> dict:
     }
 
 
+@app.get("/api/pool")
+async def api_pool():
+    """Coin pool registry — active, screened, disabled coins."""
+    return JSONResponse(read_coin_pool())
+
+
 @app.get("/api/evolution")
 async def api_evolution():
     summaries = _load_bt_summaries(50)
@@ -1470,7 +1486,6 @@ async def api_evolution():
         "evo": _build_evo_points(summaries),
         "scatter": _build_scatter_data(summaries),
         "projection": _build_projection(summaries),
-        "readiness": _build_readiness_tracker(summaries),
         "ml_network": _build_ml_network_data(),
         "strategy_compare": _build_strategy_compare(summaries),
         "trade_analytics": _build_trade_analytics(summaries),
@@ -1759,7 +1774,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="coin-tabs">
   <button class="coin-tab active" data-coin="ETH" onclick="switchCoin('ETH')">ETH</button>
   <button class="coin-tab" data-coin="BTC" onclick="switchCoin('BTC')">BTC</button>
-  <button class="coin-tab" data-coin="SOL" onclick="switchCoin('SOL')">SOL</button>
 </div>
 
 <div class="multi-overview" id="multi-overview">
@@ -1777,19 +1791,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="coin-detail">Equity: <span id="ms-eq-BTC">—</span> | Qty: <span id="ms-qty-BTC">0</span></div>
     <div class="coin-detail">Updated: <span id="ms-ts-BTC">—</span></div>
   </div>
-  <div class="coin-summary" onclick="switchCoin('SOL')" id="summary-SOL">
-    <div class="coin-name">SOL-USD</div>
-    <div class="coin-state">State: <span id="ms-state-SOL" class="state-FLAT">—</span></div>
-    <div class="coin-pnl" id="ms-pnl-SOL">$0.00</div>
-    <div class="coin-detail">Equity: <span id="ms-eq-SOL">—</span> | Qty: <span id="ms-qty-SOL">0</span></div>
-    <div class="coin-detail">Updated: <span id="ms-ts-SOL">—</span></div>
-  </div>
 </div>
 
 <!-- 3-coin aggregate portfolio bar -->
 <div id="portfolio-aggregate" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <div style="color:#00d4ff; font-weight:bold; font-size:0.85em; letter-spacing:1px;">PORTFOLIO TOTAL (3 COINS)</div>
+    <div style="color:#00d4ff; font-weight:bold; font-size:0.85em; letter-spacing:1px;">PORTFOLIO TOTAL (2 COINS)</div>
     <div style="font-size:0.72em; color:#7b8ab8;">Updated: <span id="agg-ts">—</span></div>
   </div>
   <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:6px;">
@@ -1800,6 +1807,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div><span style="color:#7b8ab8; font-size:0.78em;">Daily Rate:</span>
       <span id="agg-daily" style="font-size:1.0em; font-weight:bold;">$0.00/day</span></div>
   </div>
+</div>
+
+<!-- Coin Pool Panel -->
+<div id="coin-pool-panel" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+    <div style="color:#ba68c8; font-weight:bold; font-size:0.85em; letter-spacing:1px;">COIN POOL</div>
+    <div style="font-size:0.72em; color:#7b8ab8;">Max active: <span id="pool-max-active">2</span> | Active: <span id="pool-active-count">2</span></div>
+  </div>
+  <div id="pool-coins-container" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
 </div>
 
 <div class="grid">
@@ -1859,6 +1875,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="chart-container">
   <h2 style="color:#7b8ab8; font-size:0.85em; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Equity Curve</h2>
   <canvas id="equity-chart" height="200"></canvas>
+  <div id="equity-no-data" style="display:none; height:200px; align-items:center; justify-content:center; color:#7b8ab8; font-size:0.85em; background:#0d1321; border-radius:4px;">Equity curve — no trade data yet</div>
 </div>
 
 <div class="card" style="margin-bottom:12px;">
@@ -1956,12 +1973,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div id="milestone-100k" style="margin-top:10px; display:none;"></div>
-  </div>
-
-  <!-- Go-Live Readiness Tracker -->
-  <div id="readiness-section" style="margin-bottom:16px;">
-    <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">GO-LIVE READINESS TRACKER</h2>
-    <div id="readiness-content" style="color:#7b8ab8;">Loading...</div>
   </div>
 
   <h2 style="color:#7b8ab8; font-size:0.85em; letter-spacing:1px; padding:0 0 4px;">PROFIT FACTOR & WIN RATE OVER TIME</h2>
@@ -2179,7 +2190,6 @@ function loadEvolution() {
     // Year-end projection
     renderProjection(data.projection || {});
     renderMilestone100k(data.projection || {});
-    renderReadiness(data.readiness || {});
   }).catch(e => {
     console.error('Evolution load error', e);
     document.getElementById('evo-stats-bar').innerHTML = '<div class="evo-stat"><div class="val" style="color:#ff5252">Load Error</div></div>';
@@ -3260,7 +3270,7 @@ async function loadMultiOverview() {
     const resp = await fetch('/api/multi');
     const data = await resp.json();
     let aggEq = 0, aggPnl = 0, latestTs = '';
-    ['ETH', 'BTC', 'SOL'].forEach(coin => {
+    ['ETH', 'BTC'].forEach(coin => {
       const c = data[coin];
       if (!c) return;
       const stEl = document.getElementById('ms-state-' + coin);
@@ -3295,6 +3305,50 @@ async function loadMultiOverview() {
     }
     if (aggTsEl) aggTsEl.textContent = latestTs;
   } catch(e) { console.error('multi fetch error', e); }
+}
+
+async function loadPool() {
+  try {
+    const r = await fetch('/api/pool');
+    const data = await r.json();
+    const coins = data.coins || {};
+    const active = data.active || [];
+    const maxActive = data.max_active || 2;
+    document.getElementById('pool-max-active').textContent = maxActive;
+    document.getElementById('pool-active-count').textContent = active.length;
+    const statusColor = {
+      'ACTIVE': '#00e676',
+      'DISABLED': '#ff5252',
+      'SCREENED_FAIL': '#ff9800',
+      'CANDIDATE': '#00d4ff'
+    };
+    const statusLabel = {
+      'ACTIVE': 'LIVE',
+      'DISABLED': 'OFF',
+      'SCREENED_FAIL': 'FAIL',
+      'CANDIDATE': 'READY'
+    };
+    let html = '';
+    // Sort: ACTIVE first, then CANDIDATE, then SCREENED_FAIL, then DISABLED
+    const order = ['ACTIVE','CANDIDATE','SCREENED_FAIL','DISABLED'];
+    const sorted = Object.entries(coins).sort((a,b) => {
+      return (order.indexOf(a[1].status||'') - order.indexOf(b[1].status||''));
+    });
+    for (const [coin, info] of sorted) {
+      const st = info.status || 'UNKNOWN';
+      const col = statusColor[st] || '#7b8ab8';
+      const lbl = statusLabel[st] || st;
+      const pf = info.backtest_pf ? info.backtest_pf.toFixed(3) : '—';
+      const wr = info.backtest_wr_pct ? info.backtest_wr_pct.toFixed(0)+'%' : '—';
+      const gov = info.governor_trained ? '✓' : '✗';
+      html += `<div title="${info.notes||''}" style="background:#0d1321; border:1px solid ${col}44; border-left:3px solid ${col}; border-radius:4px; padding:6px 10px; min-width:100px; cursor:default;">
+        <div style="font-weight:bold; font-size:0.85em; color:${col};">${coin} <span style="font-size:0.75em; color:#7b8ab8;">[${lbl}]</span></div>
+        <div style="font-size:0.72em; color:#e0e0e0; margin-top:2px;">PF: ${pf} | WR: ${wr}</div>
+        <div style="font-size:0.68em; color:#7b8ab8;">Gov: ${gov} | ${info.backtest_window||'—'}</div>
+      </div>`;
+    }
+    document.getElementById('pool-coins-container').innerHTML = html || '<span style="color:#7b8ab8; font-size:0.8em;">No pool data</span>';
+  } catch(e) { console.error('pool fetch error', e); }
 }
 
 function initChart() {
@@ -3461,9 +3515,16 @@ async function loadEquity() {
   try {
     const resp = await fetch('/api/equity?coin=' + currentCoin);
     const data = await resp.json();
-    if (equityChart && data.length > 0) {
+    const canvas = document.getElementById('equity-chart');
+    const noData = document.getElementById('equity-no-data');
+    if (equityChart && data.length >= 2) {
       equityChart.data.datasets[0].data = data;
       equityChart.update('none');
+      if (canvas) canvas.style.display = '';
+      if (noData) noData.style.display = 'none';
+    } else {
+      if (canvas) canvas.style.display = 'none';
+      if (noData) { noData.style.display = 'flex'; noData.textContent = data.length === 1 ? 'Equity curve — 1 point, waiting for more trades...' : 'Equity curve — no trade data yet for ' + currentCoin; }
     }
   } catch(e) { console.error('equity fetch error', e); }
 }
@@ -3692,12 +3753,14 @@ loadBacktests();
 loadJournal();
 loadDecisions();
 loadMultiOverview();
+loadPool();
 loadLeaderboard();
 setInterval(loadEquity, 30000);
 setInterval(loadBacktests, 60000);
 setInterval(loadJournal, 120000);
 setInterval(loadDecisions, 15000);
 setInterval(loadMultiOverview, 10000);
+setInterval(loadPool, 60000);
 setInterval(loadLeaderboard, 120000);  // refresh leaderboard every 2 min
 connectSSE();
 

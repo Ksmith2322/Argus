@@ -1,7 +1,7 @@
 # ops/launch_multi.ps1 -- Launch parallel Argus runners for multiple coins
 #
 # Usage:
-#   .\ops\launch_multi.ps1              # launch ETH, BTC, SOL in separate windows
+#   .\ops\launch_multi.ps1              # launch ETH, BTC in separate windows (SOL disabled)
 #   .\ops\launch_multi.ps1 -Coins ETH   # launch just ETH
 #   .\ops\launch_multi.ps1 -DryRun      # show what would run
 #
@@ -9,7 +9,7 @@
 #   - Its own PowerShell window with title "Argus-<COIN>"
 #   - Isolated log directory: ops/logs/<coin>/
 #   - Isolated state file: state/runtime_state_<COIN>_USD.json (automatic)
-#   - Per-coin config overlay: .env.btc / .env.sol (only overridden keys)
+#   - Per-coin config overlay: .env.btc (only overridden keys; see ops/coin_pool.json for pool registry)
 #
 # The base .env PRODUCT_ID is overridden per-coin via environment variable.
 # Per-coin .env overlay (if exists) layers coin-specific params on top.
