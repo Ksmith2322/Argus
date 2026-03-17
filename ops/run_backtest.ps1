@@ -151,7 +151,16 @@ function Assert-EquityArtifact {
     $p = Join-Path $logsDir ("equity_{0}.csv" -f $runId)
     if (!(Test-Path $p)) {
         # BT_LITE_MODE skips equity CSV — not an error
-        if ($env:BT_LITE_MODE -eq "true") {
+        # Check both process env and .env file (Python dotenv loads .env, PS doesn't)
+        $liteMode = $env:BT_LITE_MODE
+        if (-not $liteMode) {
+            $envFile = Join-Path $PSScriptRoot "..\\.env"
+            if (Test-Path $envFile) {
+                $match = Select-String -Path $envFile -Pattern "^BT_LITE_MODE\s*=\s*(.+)" -ErrorAction SilentlyContinue
+                if ($match) { $liteMode = $match.Matches[0].Groups[1].Value.Trim() }
+            }
+        }
+        if ($liteMode -eq "true") {
             Write-Host "SKIP: equity artifact check (BT_LITE_MODE=true)"
             return
         }
