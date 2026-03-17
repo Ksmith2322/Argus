@@ -280,9 +280,6 @@ def load_candles_csv(
                 )
             )
 
-            if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                break
-
     # -------------------------
     # Coinbase Exchange candles
     # -------------------------
@@ -318,8 +315,6 @@ def load_candles_csv(
 
                 out.append(CandleRow(epoch=int(epoch), open=opn, high=high, low=low, close=clo, volume=vol_val))
 
-                if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                    break
         else:
             # no header, assume: time, low, high, open, close, volume?
             for r in body:
@@ -332,8 +327,6 @@ def load_candles_csv(
                 clo = _to_decimal(r[4])
                 vol = _to_decimal(r[5]) if len(r) > 5 and (r[5] or "").strip() != "" else None
                 out.append(CandleRow(epoch=int(epoch), open=opn, high=high, low=low, close=clo, volume=vol))
-                if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                    break
 
     # -------------------------
     # Generic OHLCV
@@ -385,8 +378,6 @@ def load_candles_csv(
                         vol_val = None
 
             out.append(CandleRow(epoch=int(epoch), open=opn, high=hig, low=low, close=clo, volume=vol_val))
-            if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                break
 
     # -------------------------
     # Close-only (optionally with volume)
@@ -418,8 +409,7 @@ def load_candles_csv(
                             vol_val = None
 
                 out.append(CandleRow(epoch=int(epoch), open=clo, high=clo, low=clo, close=clo, volume=vol_val))
-                if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                    break
+
         else:
             # no header: expect epoch, close, [volume]
             for r in body:
@@ -429,8 +419,6 @@ def load_candles_csv(
                 clo = _to_decimal(r[1])
                 vol = _to_decimal(r[2]) if len(r) > 2 and (r[2] or "").strip() != "" else None
                 out.append(CandleRow(epoch=int(epoch), open=clo, high=clo, low=clo, close=clo, volume=vol))
-                if limit is not None and int(limit) > 0 and len(out) >= int(limit):
-                    break
 
     else:
         raise ValueError(f"Unknown format_hint: {fmt}")
