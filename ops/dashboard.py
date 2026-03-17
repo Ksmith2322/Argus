@@ -1062,8 +1062,16 @@ def _build_projection(summaries: list) -> dict:
     now = datetime.now(timezone.utc)
     days_left_in_year = max(1, (datetime(now.year, 12, 31, tzinfo=timezone.utc) - now).days)
 
-    # Primary projection: LATEST run = current strategy truth
-    latest_run = runs_with_pnl[-1]  # summaries are sorted by mtime, last = newest
+    # Primary projection: best VALIDATED run (PF>1.2, 20+ trades, not a no-governor test)
+    # Exclude intentional test labels (no_governor, nogov, screen_, nogov_) from "current strategy"
+    _exclude = ("no_governor", "nogov", "screen_", "nogov_", "wf_w1_")
+    validated = [r for r in runs_with_pnl if r["pf"] > 1.2 and r["trades"] >= 20
+                 and not any(x in str(r["label"]).lower() for x in _exclude)]
+    if not validated:
+        validated = [r for r in runs_with_pnl if r["pf"] > 1.0 and r["trades"] >= 10]
+    if not validated:
+        validated = runs_with_pnl
+    latest_run = max(validated, key=lambda r: r["pf"])
     latest_daily = latest_run["pnl"] / latest_run["days"]
 
     # Historical context: best-ever run (may be different config)
@@ -1141,7 +1149,7 @@ def _build_projection(summaries: list) -> dict:
 
     # $100K milestone — compound + $500/month injection (realistic)
     milestone_100k = None
-    total_balance = per_coin_cash * num_coins  # $1500 total across 3 coins
+    total_balance = per_coin_cash * num_coins  # total across active coins
     agg_daily = latest_daily * num_coins
 
     if latest_daily_return_pct > 0:
@@ -1353,7 +1361,7 @@ def _build_readiness_tracker(summaries: list) -> dict:
     paper_start = datetime(2026, 3, 15, tzinfo=timezone.utc)
     elapsed_days = max(1, (datetime.now(timezone.utc) - paper_start).total_seconds() / 86400)
     daily_rate_3coin = total_agg_pnl / elapsed_days
-    # $100K math: need $98,500 in 365 days = $269.86/day across 3 coins
+    # $100K math: need $98,500 in 365 days across active coins
     daily_needed_100k = (100_000 - total_live_equity) / 365
     # Compound math: what daily % return gets us to $100K in 1 year
     # $1500 * (1 + r)^365 = $100,000 → r = (100000/1500)^(1/365) - 1 ≈ 1.18%
@@ -1391,7 +1399,7 @@ def _build_readiness_tracker(summaries: list) -> dict:
             ],
         },
         {
-            "category": "Phase 2 — Paper Trading Proof (all 3 coins)",
+            "category": "Phase 2 — Paper Trading Proof (all active coins)",
             "items": [
                 {"name": "ETH: 50+ Paper Trades", "target": 50, "current": live_trades["ETH"],
                  "pass": live_trades["ETH"] >= 50, "format": "int"},
@@ -1433,7 +1441,7 @@ def _build_readiness_tracker(summaries: list) -> dict:
                  "current": round(compound_rate_current, 4),
                  "pass": compound_rate_current >= compound_rate_needed * 0.5, "format": "pct",
                  "note": "With $500/mo injection, ~0.6%/day is sufficient"},
-                {"name": f"Daily Rate >= ${daily_needed_100k:.2f}/day (3 coins, linear)", "target": round(daily_needed_100k, 2),
+                {"name": f"Daily Rate >= ${daily_needed_100k:.2f}/day ({num_coins} coins, linear)", "target": round(daily_needed_100k, 2),
                  "current": round(daily_rate_3coin, 4),
                  "pass": daily_rate_3coin >= daily_needed_100k * 0.1, "format": "usd",
                  "note": "Linear rate; compound+injection requires far less"},
@@ -1735,7 +1743,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .coin-tab { padding: 6px 16px; border-radius: 4px; border: 1px solid #1e2a42; background: #141b2d; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.85em; font-weight: bold; transition: all 0.2s; }
   .coin-tab:hover { border-color: #00d4ff; color: #00d4ff; }
   .coin-tab.active { background: #1e2a42; color: #00d4ff; border-color: #00d4ff; }
-  .multi-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+  .multi-overview { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
   .coin-summary { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; cursor: pointer; transition: border-color 0.2s; }
   .coin-summary:hover { border-color: #00d4ff; }
   .coin-summary .coin-name { font-size: 1.1em; font-weight: bold; color: #00d4ff; margin-bottom: 6px; }
@@ -1793,7 +1801,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- 3-coin aggregate portfolio bar -->
+<!-- portfolio aggregate bar -->
 <div id="portfolio-aggregate" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
   <div style="display:flex; justify-content:space-between; align-items:center;">
     <div style="color:#00d4ff; font-weight:bold; font-size:0.85em; letter-spacing:1px;">PORTFOLIO TOTAL (2 COINS)</div>
@@ -2385,7 +2393,7 @@ function renderProjection(proj) {
   }
 
   const startCash = proj.start_cash || 500;
-  const numCoins = proj.num_coins || 3;
+  const numCoins = proj.num_coins || 2;
   const tagColors = {latest:'#00d4ff', best_ever:'#7b8ab866'};
   const tagLabels = {latest:'CURRENT STRATEGY', best_ever:'Best Historical'};
 

@@ -388,3 +388,15 @@ Write-Host "LATEST RUN PACK"
 $pack2 | Sort Name | Select Name,Length
 Write-Host "------------------------------------------------------------"
 "LAST_RUN_ID=$rid2"
+
+# ------------------------------------------------------------
+# 9) Nightly coin rotation health check
+# ------------------------------------------------------------
+Write-Host "------------------------------------------------------------"
+Write-Host "COIN ROTATION HEALTH CHECK"
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" "C:\Argus\repo\ops\rotate_coin.py" --apply 2>&1
+    Write-Host "Rotation check complete."
+} catch {
+    Write-Host "WARNING: rotation check failed: $_"
+}
