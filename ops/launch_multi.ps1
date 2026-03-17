@@ -9,10 +9,10 @@
 #   - Its own PowerShell window with title "Argus-<COIN>"
 #   - Isolated log directory: ops/logs/<coin>/
 #   - Isolated state file: state/runtime_state_<COIN>_USD.json (automatic)
-#   - Shared .env base config (all strategy params identical across coins)
+#   - Per-coin config overlay: .env.btc / .env.sol (only overridden keys)
 #
 # The base .env PRODUCT_ID is overridden per-coin via environment variable.
-# All other config (strategy, risk, governor, etc.) comes from .env unchanged.
+# Per-coin .env overlay (if exists) layers coin-specific params on top.
 
 param(
     [string[]]$Coins = @("ETH", "BTC", "SOL"),
@@ -45,6 +45,13 @@ foreach ($coin in $Coins) {
 Set-Location '$repoRoot'
 `$env:PRODUCT_ID = '$productId'
 `$env:ARGUS_LOG_DIR = '$logDir'
+`$coinEnvFile = Join-Path '$repoRoot' ".env.$($coin.ToLower())"
+if (Test-Path `$coinEnvFile) {
+    `$env:ARGUS_COIN_ENV = `$coinEnvFile
+    Write-Host "Per-coin overlay: `$coinEnvFile" -ForegroundColor Yellow
+} else {
+    `$env:ARGUS_COIN_ENV = ''
+}
 Write-Host '=== Argus Runner: $productId ===' -ForegroundColor Cyan
 Write-Host "Log dir: $logDir" -ForegroundColor Gray
 Write-Host ''
