@@ -149,7 +149,14 @@ function Assert-EquityArtifact {
     )
     # line above: param(
     $p = Join-Path $logsDir ("equity_{0}.csv" -f $runId)
-    if (!(Test-Path $p)) { throw "FAIL: missing equity artifact: $p" }
+    if (!(Test-Path $p)) {
+        # BT_LITE_MODE skips equity CSV — not an error
+        if ($env:BT_LITE_MODE -eq "true") {
+            Write-Host "SKIP: equity artifact check (BT_LITE_MODE=true)"
+            return
+        }
+        throw "FAIL: missing equity artifact: $p"
+    }
 
     $lines = Get-Content $p
     if ($lines.Count -lt 2) { throw "FAIL: equity file too short: $p" }
