@@ -743,6 +743,9 @@ def run_backtest(
     bt_print_events = _as_bool_env("BT_PRINT_EVENTS", False)
     bt_signal_log_every_n = _as_int_env("BT_SIGNAL_LOG_EVERY_N", 1) or 1
     bt_equity_every_n = _as_int_env("BT_EQUITY_EVERY_N", 1) or 1
+    bt_lite_mode = _as_bool_env("BT_LITE_MODE", False)
+    bt_events_sample_n = _as_int_env("BT_EVENTS_SAMPLE_N", 1) or 1
+    _events_written = 0  # counter for event sampling
 
     # Backtest log hygiene (default ON)
     bt_truncate_logs = _as_bool_env("BT_TRUNCATE_LOGS", True)
@@ -855,7 +858,7 @@ def run_backtest(
             if bt_equity_every_n <= 1 or (i % bt_equity_every_n == 0):
                 eq_val = _p_decimal(getattr(snap, "equity_usd", getattr(snap, "equity", "0")), "0")
                 equity_curve.append((int(getattr(snap, "epoch", 0)), eq_val))
-                if write_logs:
+                if write_logs and not bt_lite_mode:
                     try:
                         log_bt_equity(
                             run_id=run_id,
@@ -903,55 +906,57 @@ def run_backtest(
                     except Exception:
                         pass
 
-                    if write_logs:
-                        # write the synthetic boundary events into the SAME events file
-                        try:
-                            log_bt_event(
-                                symbol=symbol,
-                                epoch=int(getattr(snap, "epoch", 0)),
-                                price=getattr(snap, "px", ""),
-                                event="ENTRY_METRICS",
-                                detail=metrics_msg,
-                                paused=bool(getattr(snap, "paused", False)),
-                                stale=bool(getattr(snap, "stale", False)),
-                                action=str(getattr(snap, "action", "")),
-                                action_reason=str(getattr(snap, "action_reason", "")),
-                                risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
-                                confluence_score=getattr(snap, "confluence_score", None),
-                                confluence_gate=str(getattr(snap, "confluence_gate", "")),
-                                confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
-                                regime=str(getattr(snap, "regime", "") or ""),
-                                ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
-                                vol_used=getattr(snap, "vol_used", None),
-                                sizing_note=str(getattr(snap, "sizing_note", "") or ""),
-                                notify_title=str(getattr(ev, "notify_title", "") or ""),
-                                notify_body=str(getattr(ev, "notify_body", "") or ""),
-                                path=events_path,
-                            )
-                            log_bt_event(
-                                symbol=symbol,
-                                epoch=int(getattr(snap, "epoch", 0)),
-                                price=getattr(snap, "px", ""),
-                                event="ENTRY_ATTEMPT",
-                                detail=attempt_msg,
-                                paused=bool(getattr(snap, "paused", False)),
-                                stale=bool(getattr(snap, "stale", False)),
-                                action=str(getattr(snap, "action", "")),
-                                action_reason=str(getattr(snap, "action_reason", "")),
-                                risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
-                                confluence_score=getattr(snap, "confluence_score", None),
-                                confluence_gate=str(getattr(snap, "confluence_gate", "")),
-                                confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
-                                regime=str(getattr(snap, "regime", "") or ""),
-                                ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
-                                vol_used=getattr(snap, "vol_used", None),
-                                sizing_note=str(getattr(snap, "sizing_note", "") or ""),
-                                notify_title=str(getattr(ev, "notify_title", "") or ""),
-                                notify_body=str(getattr(ev, "notify_body", "")),
-                                path=events_path,
-                            )
-                        except Exception:
-                            pass
+                    if write_logs and not bt_lite_mode:
+                        _events_written += 1
+                        if bt_events_sample_n <= 1 or (_events_written % bt_events_sample_n == 0):
+                            # write the synthetic boundary events into the SAME events file
+                            try:
+                                log_bt_event(
+                                    symbol=symbol,
+                                    epoch=int(getattr(snap, "epoch", 0)),
+                                    price=getattr(snap, "px", ""),
+                                    event="ENTRY_METRICS",
+                                    detail=metrics_msg,
+                                    paused=bool(getattr(snap, "paused", False)),
+                                    stale=bool(getattr(snap, "stale", False)),
+                                    action=str(getattr(snap, "action", "")),
+                                    action_reason=str(getattr(snap, "action_reason", "")),
+                                    risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                                    confluence_score=getattr(snap, "confluence_score", None),
+                                    confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                                    confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                                    regime=str(getattr(snap, "regime", "") or ""),
+                                    ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                                    vol_used=getattr(snap, "vol_used", None),
+                                    sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                                    notify_title=str(getattr(ev, "notify_title", "") or ""),
+                                    notify_body=str(getattr(ev, "notify_body", "") or ""),
+                                    path=events_path,
+                                )
+                                log_bt_event(
+                                    symbol=symbol,
+                                    epoch=int(getattr(snap, "epoch", 0)),
+                                    price=getattr(snap, "px", ""),
+                                    event="ENTRY_ATTEMPT",
+                                    detail=attempt_msg,
+                                    paused=bool(getattr(snap, "paused", False)),
+                                    stale=bool(getattr(snap, "stale", False)),
+                                    action=str(getattr(snap, "action", "")),
+                                    action_reason=str(getattr(snap, "action_reason", "")),
+                                    risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                                    confluence_score=getattr(snap, "confluence_score", None),
+                                    confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                                    confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                                    regime=str(getattr(snap, "regime", "") or ""),
+                                    ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "") or ""),
+                                    vol_used=getattr(snap, "vol_used", None),
+                                    sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                                    notify_title=str(getattr(ev, "notify_title", "") or ""),
+                                    notify_body=str(getattr(ev, "notify_body", "")),
+                                    path=events_path,
+                                )
+                            except Exception:
+                                pass
 
                 # Entry attempt sampling (for BUY and MISSED_BUY_*)
                 if name in BUY_EVENTS or name.startswith("MISSED_BUY_"):
@@ -963,32 +968,34 @@ def run_backtest(
                 except Exception:
                     pass
 
-                if write_logs:
-                    try:
-                        log_bt_event(
-                            symbol=symbol,
-                            epoch=int(getattr(snap, "epoch", 0)),
-                            price=getattr(snap, "px", ""),
-                            event=name,
-                            detail=msg,
-                            paused=bool(getattr(snap, "paused", False)),
-                            stale=bool(getattr(snap, "stale", False)),
-                            action=str(getattr(snap, "action", "")),
-                            action_reason=str(getattr(snap, "action_reason", "")),
-                            risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
-                            confluence_score=getattr(snap, "confluence_score", None),
-                            confluence_gate=str(getattr(snap, "confluence_gate", "")),
-                            confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
-                            regime=str(getattr(snap, "regime", "") or ""),
-                            ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "")),
-                            vol_used=getattr(snap, "vol_used", None),
-                            sizing_note=str(getattr(snap, "sizing_note", "") or ""),
-                            notify_title=str(getattr(ev, "notify_title", "") or ""),
-                            notify_body=str(getattr(ev, "notify_body", "") or ""),
-                            path=events_path,
-                        )
-                    except Exception:
-                        pass
+                if write_logs and not bt_lite_mode:
+                    _events_written += 1
+                    if bt_events_sample_n <= 1 or (_events_written % bt_events_sample_n == 0):
+                        try:
+                            log_bt_event(
+                                symbol=symbol,
+                                epoch=int(getattr(snap, "epoch", 0)),
+                                price=getattr(snap, "px", ""),
+                                event=name,
+                                detail=msg,
+                                paused=bool(getattr(snap, "paused", False)),
+                                stale=bool(getattr(snap, "stale", False)),
+                                action=str(getattr(snap, "action", "")),
+                                action_reason=str(getattr(snap, "action_reason", "")),
+                                risk_blocked_reason=str(getattr(snap, "risk_blocked_reason", "")),
+                                confluence_score=getattr(snap, "confluence_score", None),
+                                confluence_gate=str(getattr(snap, "confluence_gate", "")),
+                                confluence_reasons=str(getattr(snap, "confluence_reasons", "")),
+                                regime=str(getattr(snap, "regime", "") or ""),
+                                ac_adjusted_gate=str(getattr(snap, "ac_adjusted_gate", "")),
+                                vol_used=getattr(snap, "vol_used", None),
+                                sizing_note=str(getattr(snap, "sizing_note", "") or ""),
+                                notify_title=str(getattr(ev, "notify_title", "") or ""),
+                                notify_body=str(getattr(ev, "notify_body", "") or ""),
+                                path=events_path,
+                            )
+                        except Exception:
+                            pass
 
                 if bt_print_events:
                     print("[BT_EVENT]", name, msg)
@@ -1031,7 +1038,7 @@ def run_backtest(
                     open_trade = None
 
             # ---- run-scoped signals ----
-            if write_logs and (bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
+            if write_logs and not bt_lite_mode and (bt_signal_log_every_n <= 1 or (i % bt_signal_log_every_n == 0)):
                 try:
                     # legacy compatibility (writes to sandbox LIVE_SIGNALS_CSV)
                     log_signal_snapshot(snap, symbol=symbol, price=getattr(snap, "px", None))
