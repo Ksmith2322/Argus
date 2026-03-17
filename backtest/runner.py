@@ -783,11 +783,16 @@ def run_backtest(
     else:
         _write_run_header(run_id=run_id, mode="bt", cfg=cfg, candles_csv=candles_csv, out_dir=out_dir)
 
-    candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
+    candles = load_candles_csv(candles_csv, format_hint=csv_format_hint)
 
-    # ---- Phase 7 testing window: force last N candles if requested ----
-    # Line above: candles = load_candles_csv(candles_csv, format_hint=csv_format_hint, limit=limit)
-    if limit is not None and limit > 0 and bt_last_n and len(candles) > limit:
+    # ---- Walk-forward window slicing ----
+    # BACKTEST_SKIP_LAST: drop the last N candles (for walk-forward windows)
+    skip_last = int(os.environ.get("BACKTEST_SKIP_LAST", "0") or "0")
+    if skip_last > 0 and len(candles) > skip_last:
+        candles = candles[:-skip_last]
+
+    # BACKTEST_LIMIT: take the last N candles from what remains
+    if limit is not None and limit > 0 and len(candles) > limit:
         candles = candles[-limit:]
 
     if not candles:
