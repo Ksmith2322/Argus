@@ -368,6 +368,32 @@ def load_config() -> dict:
     cfg["REGIME_MIN_GATE_SCORE"] = _clamp_int(cfg["REGIME_MIN_GATE_SCORE"], 0, 100)
 
     # -------------------------
+    # Phase 4B.2 — Dynamic regime exits
+    # -------------------------
+    # Per-regime multipliers for exit parameters (1.0 = no change)
+    cfg["EXIT_TP_MULT_TREND_UP"] = _d("EXIT_TP_MULT_TREND_UP", "1.5")        # wider TP in uptrend
+    cfg["EXIT_TP_MULT_TREND_DOWN"] = _d("EXIT_TP_MULT_TREND_DOWN", "0.6")    # tighter TP in downtrend
+    cfg["EXIT_TP_MULT_RANGE"] = _d("EXIT_TP_MULT_RANGE", "0.8")             # tighter TP in range
+    cfg["EXIT_TP_MULT_VOLATILE_RANGE"] = _d("EXIT_TP_MULT_VOLATILE_RANGE", "1.2")  # slightly wider in vol range
+
+    cfg["EXIT_SL_MULT_TREND_UP"] = _d("EXIT_SL_MULT_TREND_UP", "1.0")
+    cfg["EXIT_SL_MULT_TREND_DOWN"] = _d("EXIT_SL_MULT_TREND_DOWN", "0.7")   # tighter SL in downtrend
+    cfg["EXIT_SL_MULT_RANGE"] = _d("EXIT_SL_MULT_RANGE", "0.8")
+    cfg["EXIT_SL_MULT_VOLATILE_RANGE"] = _d("EXIT_SL_MULT_VOLATILE_RANGE", "1.2")
+
+    cfg["EXIT_HOLD_MULT_TREND_UP"] = _d("EXIT_HOLD_MULT_TREND_UP", "1.5")   # hold longer in uptrend
+    cfg["EXIT_HOLD_MULT_TREND_DOWN"] = _d("EXIT_HOLD_MULT_TREND_DOWN", "0.5")  # cut faster in downtrend
+    cfg["EXIT_HOLD_MULT_RANGE"] = _d("EXIT_HOLD_MULT_RANGE", "0.75")
+    cfg["EXIT_HOLD_MULT_VOLATILE_RANGE"] = _d("EXIT_HOLD_MULT_VOLATILE_RANGE", "1.0")
+
+    cfg["USE_DYNAMIC_REGIME_EXITS"] = _b("USE_DYNAMIC_REGIME_EXITS", "false")
+
+    for _k in ["EXIT_TP_MULT_TREND_UP", "EXIT_TP_MULT_TREND_DOWN", "EXIT_TP_MULT_RANGE", "EXIT_TP_MULT_VOLATILE_RANGE",
+               "EXIT_SL_MULT_TREND_UP", "EXIT_SL_MULT_TREND_DOWN", "EXIT_SL_MULT_RANGE", "EXIT_SL_MULT_VOLATILE_RANGE",
+               "EXIT_HOLD_MULT_TREND_UP", "EXIT_HOLD_MULT_TREND_DOWN", "EXIT_HOLD_MULT_RANGE", "EXIT_HOLD_MULT_VOLATILE_RANGE"]:
+        cfg[_k] = _clamp_decimal(cfg[_k], Decimal("0.1"), Decimal("5.0"))
+
+    # -------------------------
     # Phase 4C — Adaptive confluence
     # -------------------------
     cfg["USE_ADAPTIVE_CONFLUENCE"] = _b("USE_ADAPTIVE_CONFLUENCE", "false")
@@ -620,6 +646,12 @@ def load_config() -> dict:
     cfg["CROSS_COIN_SYMBOLS"] = _s("CROSS_COIN_SYMBOLS", "ETH-USD,BTC-USD,SOL-USD")
     cfg["CROSS_COIN_MAX_OPEN"] = _i("CROSS_COIN_MAX_OPEN", "2")
     cfg["CROSS_COIN_MAX_OPEN"] = _clamp_int(cfg["CROSS_COIN_MAX_OPEN"], 0, 20)
+
+    # -------------------------
+    # BTC Momentum Gate — block alt entries when BTC trends down
+    # -------------------------
+    cfg["USE_BTC_MOMENTUM_GATE"] = _b("USE_BTC_MOMENTUM_GATE", "false")
+    cfg["BTC_MOMENTUM_BLOCK_REGIMES"] = _s("BTC_MOMENTUM_BLOCK_REGIMES", "TREND_DOWN")
 
     # -------------------------
     # Trade tracker

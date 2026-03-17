@@ -176,17 +176,13 @@ def _extract_run_features(run_id: str, min_trades: int = 0) -> list[dict]:
         else:
             feat["duration_bucket"] = "unknown"
 
-        # Signal features at entry
+        # Signal features at entry — find nearest signal regardless of distance
         sig = signal_index.get(entry_epoch, {})
-        if not sig:
-            # Try nearby epochs (within 60s)
-            for offset in range(1, 61):
-                sig = signal_index.get(entry_epoch + offset, {})
-                if sig:
-                    break
-                sig = signal_index.get(entry_epoch - offset, {})
-                if sig:
-                    break
+        if not sig and signal_index:
+            # Find closest epoch in index (signals may be sampled every Nth tick)
+            best_epoch = min(signal_index.keys(), key=lambda e: abs(e - entry_epoch))
+            if abs(best_epoch - entry_epoch) < 3600:  # within 1 hour
+                sig = signal_index[best_epoch]
 
         for field in SIGNAL_FEATURES:
             val = sig.get(field, "")
