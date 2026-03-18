@@ -619,6 +619,37 @@ def _apply_ob_imbalance_overlay(
     return eff_score, eff_gate, eff_reason
 
 
+def _apply_btc_lag_overlay(score: int, cfg: dict, symbol: str) -> Tuple[int, Optional[float], int]:
+    """Apply BTC lag signal score adjustment for non-BTC coins.
+
+    Returns (adjusted_score, btc_delta_pct, adj_applied)
+    """
+    if not _bool_cfg(cfg, "USE_BTC_LAG_SIGNAL", False):
+        return score, None, 0
+    # Only apply to non-BTC coins
+    if "BTC" in symbol.upper():
+        return score, None, 0
+
+    from btc_momentum_guard import read_btc_lag_delta
+    delta_pct, age_s = read_btc_lag_delta()
+
+    if delta_pct is None:
+        return score, None, 0
+
+    adj = 0
+    bull_thresh = cfg.get("BTC_LAG_BULL_THRESHOLD_PCT", 0.15)
+    bear_thresh = cfg.get("BTC_LAG_BEAR_THRESHOLD_PCT", -0.15)
+    bull_adj = cfg.get("BTC_LAG_BULL_SCORE_ADJ", 8)
+    bear_adj = cfg.get("BTC_LAG_BEAR_SCORE_ADJ", -10)
+
+    if delta_pct >= bull_thresh:
+        adj = bull_adj
+    elif delta_pct <= bear_thresh:
+        adj = bear_adj
+
+    return score + adj, delta_pct, adj
+
+
 def _gate_from_score(eff_score: Optional[int], min_score: int) -> str:
     if eff_score is None:
         return "NONE"
@@ -1108,6 +1139,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 regime=state.regime.regime,
                 trend_strength=float(state.regime.trend_strength),
                 vol=float(state.regime.vol),
+                px=float(px),
             )
         except Exception:
             pass
@@ -1401,6 +1433,21 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
             ob_imbalance=_ob_imbalance,
             cfg=cfg,
         )
+
+    # BTC lag signal overlay — boost/suppress ETH score based on BTC 60s move
+    if eff_gate not in ("BLOCK",) and eff_score is not None:
+        _btc_lag_score, _btc_lag_delta, _btc_lag_adj = _apply_btc_lag_overlay(
+            int(eff_score), cfg, symbol
+        )
+        snap.btc_lag_delta_pct = _btc_lag_delta
+        snap.btc_lag_score_adj = _btc_lag_adj
+        if _btc_lag_adj != 0:
+            eff_score = _btc_lag_score
+            note = f"btc_lag={_btc_lag_delta:+.3f}%({'+'  if _btc_lag_adj > 0 else ''}{_btc_lag_adj})"
+            eff_reason = (eff_reason + " | " if eff_reason else "") + note
+    else:
+        snap.btc_lag_delta_pct = None
+        snap.btc_lag_score_adj = 0
 
     if require_confluence and eff_gate not in ("NONE", "BLOCK"):
         eff_gate = _gate_from_score(eff_score, confluence_min_score)

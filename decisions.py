@@ -363,6 +363,12 @@ class DecisionSnapshot:
     ob_imbalance: Optional[float] = None
 
     # -------------------------
+    # BTC Lag Signal
+    # -------------------------
+    btc_lag_delta_pct: Optional[float] = None   # BTC 60s price delta % when this signal fired
+    btc_lag_score_adj: int = 0                   # score adjustment applied from BTC lag
+
+    # -------------------------
     # Decision
     # -------------------------
     action: str = "HOLD"

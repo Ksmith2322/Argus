@@ -344,6 +344,17 @@ def read_coin_pool() -> dict:
     return {"max_active": 2, "active": ["ETH", "BTC"], "coins": {}}
 
 
+def _get_rotation_candidates() -> list:
+    """Return list of coin names that are rotation candidates (non-critical, returns [] on error)."""
+    try:
+        from ops.coin_rotation import check_rotation_candidates, read_coin_pool as _rcp
+        pool = read_coin_pool()
+        candidates = check_rotation_candidates(pool)
+        return [c["coin"] for c in candidates]
+    except Exception:
+        return []
+
+
 def read_queue_status(skip_pc2: bool = False) -> dict:
     """Read queue files and detect running/pending/completed jobs."""
     result = {"pending_pc1": 0, "pending_pc2": 0, "pending_labels": [],
@@ -628,6 +639,7 @@ def build_status(coin: str = "ETH") -> dict:
         "coin": coin.upper(),
         "queue": read_queue_status(skip_pc2=True),
         "governor": read_governor_latest(coin),
+        "rotation_candidates": _get_rotation_candidates(),
     }
 
 
@@ -1598,6 +1610,16 @@ def _build_readiness_tracker(summaries: list) -> dict:
 async def api_pool():
     """Coin pool registry — active, screened, disabled coins."""
     return JSONResponse(read_coin_pool())
+
+
+@app.get("/api/rotation_status")
+async def api_rotation_status():
+    """Live coin performance metrics and rotation candidates."""
+    try:
+        from ops.coin_rotation import get_rotation_status
+        return JSONResponse(get_rotation_status())
+    except Exception as e:
+        return JSONResponse({"error": str(e), "candidates": [], "pool": {}})
 
 
 @app.get("/api/evolution")

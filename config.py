@@ -519,6 +519,14 @@ def load_config() -> dict:
     cfg["OB_EXIT_ENABLED"] = _b("OB_EXIT_ENABLED", "false")
     cfg["OB_EXIT_BEAR_THRESHOLD"] = _f("OB_EXIT_BEAR_THRESHOLD", "-0.20")
 
+    # =========================================================
+    # IBKR Feed / Execution (Phase IBKR)
+    # =========================================================
+    cfg["FEED_SOURCE"] = os.environ.get("FEED_SOURCE", "COINBASE").upper().strip()
+    cfg["IBKR_GATEWAY_URL"] = os.environ.get("IBKR_GATEWAY_URL", "https://localhost:5000").strip()
+    cfg["IBKR_ACCOUNT_ID"] = os.environ.get("IBKR_ACCOUNT_ID", "").strip()
+    cfg["IBKR_PAPER"] = _b("IBKR_PAPER", "true")
+
     # -------------------------
     # Phase 5B — Liquidity Filters
     # -------------------------
@@ -677,6 +685,13 @@ def load_config() -> dict:
     cfg["USE_BTC_MOMENTUM_GATE"] = _b("USE_BTC_MOMENTUM_GATE", "false")
     cfg["BTC_MOMENTUM_BLOCK_REGIMES"] = _s("BTC_MOMENTUM_BLOCK_REGIMES", "TREND_DOWN")
 
+    # BTC Lag Signal — score boost/penalty based on BTC 60s price delta
+    cfg["USE_BTC_LAG_SIGNAL"] = _b("USE_BTC_LAG_SIGNAL", "false")
+    cfg["BTC_LAG_BULL_THRESHOLD_PCT"] = float(os.getenv("BTC_LAG_BULL_THRESHOLD_PCT", "0.15"))
+    cfg["BTC_LAG_BEAR_THRESHOLD_PCT"] = float(os.getenv("BTC_LAG_BEAR_THRESHOLD_PCT", "-0.15"))
+    cfg["BTC_LAG_BULL_SCORE_ADJ"] = int(os.getenv("BTC_LAG_BULL_SCORE_ADJ", "8"))
+    cfg["BTC_LAG_BEAR_SCORE_ADJ"] = int(os.getenv("BTC_LAG_BEAR_SCORE_ADJ", "-10"))
+
     # -------------------------
     # Trade tracker
     # -------------------------
@@ -695,7 +710,7 @@ def load_config() -> dict:
         cfg["EXECUTION_MODE"] = "ENGINE"
 
     cfg["EXECUTION_ADAPTER"] = _s("EXECUTION_ADAPTER", "PAPER").upper()
-    if cfg["EXECUTION_ADAPTER"] not in ("PAPER",):
+    if cfg["EXECUTION_ADAPTER"] not in ("PAPER", "IBKR"):
         cfg["EXECUTION_ADAPTER"] = "PAPER"
 
     cfg["ACCOUNT_CURRENCY"] = _s("ACCOUNT_CURRENCY", "USD") or "USD"

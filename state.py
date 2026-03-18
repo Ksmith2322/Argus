@@ -388,6 +388,20 @@ class BotState:
                     ),
                     px_precision=_as_str(cfg.get("PAPER_PX_PRECISION", "0.01"), "0.01"),
                 )
+            elif adapter_name == "IBKR":
+                from feed_ibkr import IBKRClient
+                from execution.ibkr_adapter import IBKRAdapter
+                _ibkr_client = IBKRClient(
+                    gateway_url=str(cfg.get("IBKR_GATEWAY_URL", "https://localhost:5000")),
+                    account_id=str(cfg.get("IBKR_ACCOUNT_ID", "")),
+                    verify_ssl=False,
+                )
+                execution_adapter = IBKRAdapter(
+                    client=_ibkr_client,
+                    account_id=str(cfg.get("IBKR_ACCOUNT_ID", "")),
+                    artifact_dir=ops_log_dir,
+                    currency=_as_str(cfg.get("ACCOUNT_CURRENCY", "USD"), "USD"),
+                )
             else:
                 raise ValueError(f"Unsupported EXECUTION_ADAPTER={adapter_name!r}")
 

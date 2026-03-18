@@ -308,6 +308,13 @@ def _signals_header() -> List[str]:
         # Must stay at END so _safe_header_upgrade can append to existing files
         # =========================
         "ob_imbalance",
+
+        # =========================
+        # BTC Lag Signal
+        # Must stay at END so _safe_header_upgrade can append to existing files
+        # =========================
+        "btc_lag_delta_pct",
+        "btc_lag_score_adj",
     ]
 
 

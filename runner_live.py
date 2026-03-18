@@ -2846,6 +2846,20 @@ async def run_live(
 
     http = make_http()
 
+    # IBKR feed client (only created if FEED_SOURCE=IBKR)
+    _ibkr_feed_client = None
+    if str(cfg.get("FEED_SOURCE", "COINBASE")).upper() == "IBKR":
+        try:
+            from feed_ibkr import IBKRClient
+            _ibkr_feed_client = IBKRClient(
+                gateway_url=str(cfg.get("IBKR_GATEWAY_URL", "https://localhost:5000")),
+                account_id=str(cfg.get("IBKR_ACCOUNT_ID", "")),
+                verify_ssl=False,
+            )
+            print(f"[IBKR] Feed client initialized for {cfg.get('PRODUCT_ID', 'EURUSD')}")
+        except Exception as _ibkr_err:
+            print(f"[IBKR] Feed init failed: {_ibkr_err}")
+
     # Phase 20 — Order book imbalance fetched via REST in fetch_tick() each poll.
     # (Coinbase Exchange WS level2 now requires auth; AT WS DNS unreliable on Windows.)
     if _as_bool(cfg.get("USE_OB_IMBALANCE", False)):
@@ -2947,24 +2961,45 @@ async def run_live(
 
     needed = max(cfg["MA_TREND_200"], cfg["MA_TREND_50"], cfg["MA_SLOW"], cfg["MA_FAST"]) + 10
     try:
-        seeded_1m = await preload_indicator_history(
-            indicator_engine=state.strat_1m.ind,
-            http=http,
-            cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS", 60))},
-            needed_candles=needed,
-        )
-        seeded_5m = await preload_indicator_history(
-            indicator_engine=state.strat_5m.ind,
-            http=http,
-            cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_5M", cfg.get("TF_5M_SECONDS", 300)))} ,
-            needed_candles=needed,
-        )
-        seeded_1h = await preload_indicator_history(
-            indicator_engine=state.strat_1h.ind,
-            http=http,
-            cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_1H", cfg.get("TF_1H_SECONDS", 3600)))} ,
-            needed_candles=needed,
-        )
+        if _ibkr_feed_client is not None:
+            from feed_ibkr import preload_indicator_history as _ibkr_preload
+            seeded_1m = await _ibkr_preload(
+                indicator_engine=state.strat_1m.ind,
+                client=_ibkr_feed_client,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS", 60))},
+                needed_candles=needed,
+            )
+            seeded_5m = await _ibkr_preload(
+                indicator_engine=state.strat_5m.ind,
+                client=_ibkr_feed_client,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_5M", cfg.get("TF_5M_SECONDS", 300)))},
+                needed_candles=needed,
+            )
+            seeded_1h = await _ibkr_preload(
+                indicator_engine=state.strat_1h.ind,
+                client=_ibkr_feed_client,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_1H", cfg.get("TF_1H_SECONDS", 3600)))},
+                needed_candles=needed,
+            )
+        else:
+            seeded_1m = await preload_indicator_history(
+                indicator_engine=state.strat_1m.ind,
+                http=http,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS", 60))},
+                needed_candles=needed,
+            )
+            seeded_5m = await preload_indicator_history(
+                indicator_engine=state.strat_5m.ind,
+                http=http,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_5M", cfg.get("TF_5M_SECONDS", 300)))} ,
+                needed_candles=needed,
+            )
+            seeded_1h = await preload_indicator_history(
+                indicator_engine=state.strat_1h.ind,
+                http=http,
+                cfg={**cfg, "CANDLE_SECONDS": int(cfg.get("CANDLE_SECONDS_1H", cfg.get("TF_1H_SECONDS", 3600)))} ,
+                needed_candles=needed,
+            )
         print(f"[PRELOAD] Seeded 1m={seeded_1m} 5m={seeded_5m} 1h={seeded_1h} (needed~{needed})")
         log_event(symbol, "PRELOAD", f"1m={seeded_1m} 5m={seeded_5m} 1h={seeded_1h} needed~{needed}")
     except Exception as e:
@@ -3028,6 +3063,8 @@ async def run_live(
 
     _last_health_ts = 0.0
     _health_interval = float(cfg.get("HEALTH_CHECK_INTERVAL_S", 60))
+    _last_rotation_ts = 0.0
+    _rotation_interval = 3600.0  # update coin pool metrics every hour
 
     fail_count = 0
     did_one = False
@@ -3053,7 +3090,11 @@ async def run_live(
             paused = is_paused(cfg)
 
             try:
-                tick = await fetch_spot_price(http, cfg)
+                if _ibkr_feed_client is not None:
+                    from feed_ibkr import fetch_tick as _ibkr_fetch_tick
+                    tick = await _ibkr_fetch_tick(_ibkr_feed_client, cfg)
+                else:
+                    tick = await fetch_spot_price(http, cfg)
                 fail_count = 0
 
                 try:
@@ -3108,6 +3149,16 @@ async def run_live(
                                 )
                     except Exception:
                         pass
+
+            # --- Hourly coin pool metrics update ---
+            _now_rot = time.time()
+            if (_now_rot - _last_rotation_ts) >= _rotation_interval:
+                _last_rotation_ts = _now_rot
+                try:
+                    from ops.coin_rotation import update_coin_pool_metrics
+                    update_coin_pool_metrics()
+                except Exception:
+                    pass
 
             snap = step(state, tick, cfg, paused=paused)
 
