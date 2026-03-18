@@ -75,8 +75,17 @@ def can_enter_cross_coin(
     """Check if a new entry is allowed given cross-coin exposure.
 
     Returns (allowed, reason).
+
+    NOTE: guard is disabled in backtest mode (ARGUS_MODE=bt) because each
+    backtest runs in isolation and the live state files reflect the live
+    runner's position, not the backtest's in-memory state.
     """
     if not _as_bool(cfg.get("USE_CROSS_COIN_GUARD", False)):
+        return True, ""
+
+    # Disable in backtest — live state files are irrelevant to BT isolation
+    mode = os.environ.get("ARGUS_MODE", "").strip().lower()
+    if mode in ("bt", "backtest"):
         return True, ""
 
     max_open = int(cfg.get("CROSS_COIN_MAX_OPEN", 2))
