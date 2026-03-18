@@ -60,9 +60,11 @@ from io_logs import (
     events_csv_path,
     log_bt_signal_snapshot,   # ✅ run-scoped signals
     log_bt_equity,            # ✅ run-scoped equity
+    log_bt_entry_features,    # ✅ ML entry features (written at every WOULD_BUY)
     bt_events_csv_path,       # ✅ run-scoped events path helper
     bt_signals_csv_path,      # ✅ run-scoped signals path helper
     bt_equity_csv_path,       # ✅ run-scoped equity path helper
+    bt_entry_features_csv_path,  # ✅ run-scoped ML entry features path helper
     ensure_signals_header_matches_path,  # ✅ header upgrade for run-scoped signals
 )
 from feed_coinbase import make_http
@@ -1021,6 +1023,19 @@ def run_backtest(
                     qty=_p_decimal(qty, "0"),
                 )
                 trades.append(open_trade)
+
+                # ML: always capture full signal state at every entry fill
+                # (separate from sampled bt_signals — ensures all entry ticks are present)
+                if write_logs and not bt_lite_mode:
+                    try:
+                        log_bt_entry_features(
+                            snap,
+                            run_id=run_id,
+                            symbol=symbol,
+                            price=getattr(snap, "px", None),
+                        )
+                    except Exception:
+                        pass
 
             sell_ev = _extract_first_event(snap, SELL_EVENTS)
             if sell_ev is not None:

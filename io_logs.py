@@ -69,6 +69,33 @@ def bt_signals_csv_path(run_id: Optional[str] = None) -> str:
     return os.path.join(logs_dir(), name)
 
 
+def bt_entry_features_csv_path(run_id: Optional[str] = None) -> str:
+    """
+    Dedicated ML entry-features file written at every WOULD_BUY fill.
+    Separate from bt_signals (sampled) to ensure all entry ticks are captured.
+      - if run_id is provided -> entry_features_<run_id>.csv
+      - else -> entry_features.csv
+    """
+    name = "entry_features.csv" if not run_id else f"entry_features_{run_id}.csv"
+    return os.path.join(logs_dir(), name)
+
+
+def log_bt_entry_features(
+    snap: Any,
+    *,
+    run_id: str,
+    symbol: Optional[str] = None,
+    price: Optional[Any] = None,
+) -> None:
+    """
+    Write the full signal snapshot at entry time to the per-run entry features CSV.
+    Called at every WOULD_BUY fill; uses the same schema as bt_signals so ml_extract_features.py
+    can use this file as a higher-quality source for training data.
+    """
+    row = snapshot_to_signal_row(snap, symbol=symbol, price=price)
+    append_signal_row_to_path(bt_entry_features_csv_path(run_id), row)
+
+
 def bt_equity_csv_path(run_id: Optional[str] = None) -> str:
     """
     Backtest-only equity file.
@@ -275,6 +302,12 @@ def _signals_header() -> List[str]:
         "tl_proj_support",
         "tl_proj_resist",
         "trendline_reasons",
+
+        # =========================
+        # Phase 20 — Order Book Imbalance
+        # Must stay at END so _safe_header_upgrade can append to existing files
+        # =========================
+        "ob_imbalance",
     ]
 
 

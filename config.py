@@ -502,6 +502,24 @@ def load_config() -> dict:
     cfg["ML_GOVERNOR_THRESHOLD"] = str(_d("ML_GOVERNOR_THRESHOLD", "0.30"))
 
     # -------------------------
+    # Phase 20 — Order Book Imbalance (WebSocket L2 feed)
+    # -------------------------
+    cfg["USE_OB_IMBALANCE"] = _b("USE_OB_IMBALANCE", "false")
+    cfg["OB_IMBALANCE_DEPTH"] = _clamp_int(_i("OB_IMBALANCE_DEPTH", "10"), 1, 100)
+    # Score modifiers: imbalance > threshold adds bonus, imbalance < threshold subtracts penalty
+    cfg["OB_IMBALANCE_BULL_THRESHOLD"] = _f("OB_IMBALANCE_BULL_THRESHOLD", "0.10")
+    cfg["OB_IMBALANCE_BULL_BONUS"] = _clamp_int(_i("OB_IMBALANCE_BULL_BONUS", "8"), 0, 50)
+    cfg["OB_IMBALANCE_STRONG_BULL"] = _f("OB_IMBALANCE_STRONG_BULL", "0.25")
+    cfg["OB_IMBALANCE_STRONG_BULL_BONUS"] = _clamp_int(_i("OB_IMBALANCE_STRONG_BULL_BONUS", "15"), 0, 50)
+    cfg["OB_IMBALANCE_BEAR_THRESHOLD"] = _f("OB_IMBALANCE_BEAR_THRESHOLD", "-0.10")
+    cfg["OB_IMBALANCE_BEAR_PENALTY"] = _clamp_int(_i("OB_IMBALANCE_BEAR_PENALTY", "12"), 0, 50)
+    # Hard entry gate: imbalance must be >= this to allow entries (0 = disabled)
+    cfg["OB_IMBALANCE_MIN_FOR_ENTRY"] = _f("OB_IMBALANCE_MIN_FOR_ENTRY", "0")
+    # OB exit signal: exit open position when book flips strongly bearish
+    cfg["OB_EXIT_ENABLED"] = _b("OB_EXIT_ENABLED", "false")
+    cfg["OB_EXIT_BEAR_THRESHOLD"] = _f("OB_EXIT_BEAR_THRESHOLD", "-0.20")
+
+    # -------------------------
     # Phase 5B — Liquidity Filters
     # -------------------------
     cfg["USE_LIQUIDITY_FILTERS"] = _b("USE_LIQUIDITY_FILTERS", "false")

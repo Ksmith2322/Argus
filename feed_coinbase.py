@@ -2,14 +2,70 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
+import time as _time_mod
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
 # line above: import requests
 from utils import utc_ts, now_unix
+
+
+# ---------------------------------------------------------------------------
+# Phase 20 — JWT credentials for order book REST endpoint
+# Loaded once from .env.coinbase (CB_API_KEY_NAME + CB_API_PRIVATE_KEY)
+# ---------------------------------------------------------------------------
+
+_OB_JWT_CACHE: Dict[str, Any] = {}  # {"token": str, "expires": float}
+
+
+def _load_cb_creds() -> tuple:
+    """Return (key_name, private_key_pem) from .env.coinbase, or (None, None)."""
+    env_file = _Path(__file__).resolve().parent / ".env.coinbase"
+    if not env_file.exists():
+        return None, None
+    env: Dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        env[k.strip()] = v.strip()
+    key_name = env.get("CB_API_KEY_NAME", "")
+    private_key = env.get("CB_API_PRIVATE_KEY", "").replace("\\n", "\n")
+    return (key_name or None, private_key or None)
+
+
+def _get_ob_jwt() -> Optional[str]:
+    """Return a cached JWT for the product_book endpoint; regenerate when near expiry."""
+    now = _time_mod.time()
+    if _OB_JWT_CACHE.get("token") and _OB_JWT_CACHE.get("expires", 0) > now + 30:
+        return _OB_JWT_CACHE["token"]
+    key_name, private_key = _load_cb_creds()
+    if not key_name or not private_key:
+        return None
+    try:
+        import jwt as _pyjwt
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        pk = load_pem_private_key(private_key.encode(), password=None)
+        token = _pyjwt.encode(
+            {
+                "sub": key_name, "iss": "cdp",
+                "nbf": int(now), "exp": int(now) + 120,
+                "uri": "GET api.coinbase.com/api/v3/brokerage/product_book",
+            },
+            pk, algorithm="ES256",
+            headers={"kid": key_name, "nonce": secrets.token_hex(16)},
+        )
+        _OB_JWT_CACHE["token"] = token
+        _OB_JWT_CACHE["expires"] = now + 120
+        return token
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -31,6 +87,11 @@ class PriceTick:
 
     # Optional future field (engine may ignore unless wired)
     atr_norm: Optional[Decimal] = None
+
+    # Phase 20 — real-time order book imbalance from WebSocket feed
+    # (bid_vol - ask_vol) / total_vol over top N book levels; range [-1, +1]
+    # None when WS feed is down or not yet ready (engine treats None as N/A)
+    ob_imbalance: Optional[float] = None
 
 
 # =============================================================================
@@ -100,6 +161,45 @@ def _resolve_candles_url(cfg: Dict[str, Any]) -> str:
     if not url:
         raise KeyError("Missing COINBASE_EXCHANGE_CANDLES_URL (or legacy COINBASE_CANDLES_URL) in cfg")
     return str(url).strip()
+
+
+# =============================================================================
+# Phase 20 — Order book imbalance (Coinbase Advanced Trade REST)
+# =============================================================================
+
+def fetch_coinbase_book_imbalance_sync(
+    http: requests.Session,
+    product_id: str,
+    depth: int,
+    timeout: float,
+) -> Optional[float]:
+    """Fetch top `depth` OB levels via Coinbase Advanced Trade REST.
+
+    Returns (bid_vol - ask_vol) / total_vol in range [-1.0, +1.0].
+    Returns None on any failure (auth not configured, network error, etc).
+    """
+    token = _get_ob_jwt()
+    if token is None:
+        return None
+    try:
+        r = http.get(
+            "https://api.coinbase.com/api/v3/brokerage/product_book",
+            params={"product_id": product_id, "limit": depth},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        pricebook = r.json().get("pricebook", {})
+        bids = pricebook.get("bids", [])
+        asks = pricebook.get("asks", [])
+        bid_vol = sum(float(b["size"]) for b in bids[:depth] if "size" in b)
+        ask_vol = sum(float(a["size"]) for a in asks[:depth] if "size" in a)
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return None
+        return (bid_vol - ask_vol) / total
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -294,6 +394,18 @@ async def fetch_tick(
         except Exception:
             vol_1m = None
 
+    # 4) Phase 20 — order book imbalance (best-effort; None if auth not configured)
+    ob_imbalance: Optional[float] = None
+    if cfg.get("USE_OB_IMBALANCE"):
+        try:
+            _ob_depth = int(cfg.get("OB_IMBALANCE_DEPTH", 10))
+            ob_imbalance = await asyncio.to_thread(
+                fetch_coinbase_book_imbalance_sync,
+                http, product_id, _ob_depth, timeout,
+            )
+        except Exception:
+            ob_imbalance = None
+
     return PriceTick(
         ts=utc_ts(),
         px=Decimal(str(px_final)),
@@ -302,6 +414,7 @@ async def fetch_tick(
         ask=ask,
         vol_1m=vol_1m,
         atr_norm=None,
+        ob_imbalance=ob_imbalance,
     )
 
 

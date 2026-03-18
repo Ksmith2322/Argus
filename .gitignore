@@ -36,3 +36,7 @@ backtest/trades_from_events.csv
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Coinbase API credentials
+cdp_api_key.json
+.env.coinbase

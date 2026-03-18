@@ -557,6 +557,68 @@ def _apply_liquidity_overlay_to_confluence(
     return eff_score, eff_gate, eff_reason, hard_blocks
 
 
+def _apply_ob_imbalance_overlay(
+    *,
+    eff_score: Optional[int],
+    eff_gate: str,
+    eff_reason: str,
+    ob_imbalance: Optional[float],
+    cfg: dict,
+) -> Tuple[Optional[int], str, str]:
+    """Apply order-book imbalance scoring overlay (Phase 20).
+
+    Adjusts the effective confluence score based on real-time L2 order book
+    pressure.  Positive imbalance (more bid volume) boosts score; negative
+    imbalance (more ask volume) penalises score.
+
+    Config keys (all optional, safe to omit in backtest):
+      USE_OB_IMBALANCE               bool   — master toggle (default False)
+      OB_IMBALANCE_BULL_THRESHOLD    float  — imbalance > this → apply bonus (default 0.10)
+      OB_IMBALANCE_BULL_BONUS        int    — score points to add (default 8)
+      OB_IMBALANCE_STRONG_BULL       float  — imbalance > this → strong bonus (default 0.25)
+      OB_IMBALANCE_STRONG_BULL_BONUS int    — score points for strong signal (default 15)
+      OB_IMBALANCE_BEAR_THRESHOLD    float  — imbalance < this → apply penalty (default -0.10)
+      OB_IMBALANCE_BEAR_PENALTY      int    — score points to subtract (default 12)
+      OB_IMBALANCE_MIN_FOR_ENTRY     float  — hard block if imbalance < this (0 = disabled)
+    """
+    if not _bool_cfg(cfg, "USE_OB_IMBALANCE", False):
+        return eff_score, eff_gate, eff_reason
+
+    if ob_imbalance is None:
+        # Feed not ready — skip; don't penalise missing data
+        return eff_score, eff_gate, eff_reason
+
+    # Hard minimum: block entry when book shows too much ask pressure
+    min_for_entry = float(cfg.get("OB_IMBALANCE_MIN_FOR_ENTRY", 0))
+    if min_for_entry != 0 and ob_imbalance < min_for_entry:
+        note = f"ob_imbalance={ob_imbalance:+.3f}<min={min_for_entry:+.3f}"
+        eff_reason = (eff_reason + " | " if eff_reason else "") + note
+        return eff_score, "BLOCK", eff_reason
+
+    bull_threshold = float(cfg.get("OB_IMBALANCE_BULL_THRESHOLD", 0.10))
+    bull_bonus = int(cfg.get("OB_IMBALANCE_BULL_BONUS", 8))
+    strong_bull = float(cfg.get("OB_IMBALANCE_STRONG_BULL", 0.25))
+    strong_bull_bonus = int(cfg.get("OB_IMBALANCE_STRONG_BULL_BONUS", 15))
+    bear_threshold = float(cfg.get("OB_IMBALANCE_BEAR_THRESHOLD", -0.10))
+    bear_penalty = int(cfg.get("OB_IMBALANCE_BEAR_PENALTY", 12))
+
+    adj = 0
+    if ob_imbalance >= strong_bull:
+        adj = strong_bull_bonus
+    elif ob_imbalance >= bull_threshold:
+        adj = bull_bonus
+    elif ob_imbalance <= bear_threshold:
+        adj = -bear_penalty
+
+    note = f"ob_imbalance={ob_imbalance:+.3f}({'neutral' if adj == 0 else ('+' if adj > 0 else '') + str(adj)})"
+    eff_reason = (eff_reason + " | " if eff_reason else "") + note
+
+    if adj != 0 and eff_score is not None:
+        eff_score = max(0, min(100, eff_score + adj))
+
+    return eff_score, eff_gate, eff_reason
+
+
 def _gate_from_score(eff_score: Optional[int], min_score: int) -> str:
     if eff_score is None:
         return "NONE"
@@ -1328,6 +1390,18 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         liq_blocks = list(liq_blocks) + ["BLOCK:ARGUS_FORCED_LIQ"]
         eff_reason = (eff_reason + " | " if eff_reason else "") + "liq:ARGUS_FORCED_BLOCK"
 
+    # Phase 20 — Order book imbalance overlay (live mode only; None in backtest)
+    _ob_imbalance: Optional[float] = getattr(tick, "ob_imbalance", None)
+    snap.ob_imbalance = _ob_imbalance
+    if eff_gate not in ("BLOCK",):  # don't override a hard block
+        eff_score, eff_gate, eff_reason = _apply_ob_imbalance_overlay(
+            eff_score=eff_score,
+            eff_gate=eff_gate,
+            eff_reason=eff_reason,
+            ob_imbalance=_ob_imbalance,
+            cfg=cfg,
+        )
+
     if require_confluence and eff_gate not in ("NONE", "BLOCK"):
         eff_gate = _gate_from_score(eff_score, confluence_min_score)
 
@@ -1550,6 +1624,14 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 elif take_profit is not None and px >= take_profit:
                     action = would_sell_action
                     action_reason = "TAKE_PROFIT"
+                elif (
+                    _bool_cfg(cfg, "OB_EXIT_ENABLED", False)
+                    and _ob_imbalance is not None
+                    and _ob_imbalance <= float(cfg.get("OB_EXIT_BEAR_THRESHOLD", -0.20))
+                ):
+                    # Phase 20: microstructure exit — strong ask pressure while in position
+                    action = would_sell_action
+                    action_reason = f"OB_BEAR_PRESSURE (imbalance={_ob_imbalance:+.3f})"
 
         if action == would_sell_action and emit_actions:
             ev_name = _map_trade_event(cfg, "WOULD_SELL")

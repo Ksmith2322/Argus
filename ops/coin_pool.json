@@ -1,13 +1,16 @@
 {
-  "_comment": "Argus coin pool registry — tracks all coins tested, active, or disqualified. max_active enforced by launch_multi.ps1 and dashboard.",
+  "_comment": "Argus coin pool registry \u00e2\u20ac\u201d tracks all coins tested, active, or disqualified. max_active enforced by launch_multi.ps1 and dashboard.",
   "max_active": 2,
-  "active": ["ETH", "BTC"],
+  "active": [
+    "ETH",
+    "BTC"
+  ],
   "coins": {
     "ETH": {
       "status": "ACTIVE",
       "product_id": "ETH-USD",
       "env_overlay": ".env.eth",
-      "backtest_pf": 1.640,
+      "backtest_pf": 1.64,
       "backtest_wr_pct": 34.0,
       "backtest_trades": 100,
       "backtest_window": "45d",
@@ -23,7 +26,15 @@
         "COMPOUND_SIZE_PCT": 0.05
       },
       "governor_trained": true,
-      "notes": "Primary coin. score88/gate38/tp015 confirmed optimal in 46-run sweep 2026-03-17."
+      "notes": "Primary coin. score88/gate38/tp015 confirmed optimal in 46-run sweep 2026-03-17.",
+      "live_metrics": {
+        "window": 20,
+        "n_trades": 0,
+        "rolling_pf": null,
+        "rolling_wr": null,
+        "total_pnl": 0.0,
+        "updated": "2026-03-18T03:45:24Z"
+      }
     },
     "BTC": {
       "status": "ACTIVE",
@@ -45,7 +56,15 @@
         "COMPOUND_SIZE_PCT": 0.05
       },
       "governor_trained": true,
-      "notes": "tp025 (PF=2.344) and gov35 (PF=1.585) confirmed optimal in sweep 2026-03-17."
+      "notes": "tp025 (PF=2.344) and gov35 (PF=1.585) confirmed optimal in sweep 2026-03-17.",
+      "live_metrics": {
+        "window": 20,
+        "n_trades": 0,
+        "rolling_pf": null,
+        "rolling_wr": null,
+        "total_pnl": 0.0,
+        "updated": "2026-03-18T03:45:24Z"
+      }
     },
     "SOL": {
       "status": "DISABLED",
@@ -116,7 +135,7 @@
       "status": "SCREENED_FAIL",
       "product_id": "ICP-USD",
       "env_overlay": null,
-      "backtest_pf": 0.720,
+      "backtest_pf": 0.72,
       "backtest_wr_pct": 26.9,
       "backtest_trades": 245,
       "backtest_window": "90d",
@@ -255,5 +274,6 @@
       "governor_trained": false,
       "notes": "Screened 2026-03-17 (no governor). PnL=-$9.72."
     }
-  }
+  },
+  "last_checked": "2026-03-18T03:45:24Z"
 }

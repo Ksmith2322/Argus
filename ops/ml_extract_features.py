@@ -104,8 +104,11 @@ def _extract_run_features(run_id: str, min_trades: int = 0) -> list[dict]:
     if not trades_path.exists():
         return []
 
-    # Find signals CSV
+    # Find signals source: prefer dedicated entry_features file (exact match at entry epoch)
+    # fall back to bt_signals (sampled, may have timing drift).
+    entry_features_path = LOGS / f"entry_features_{run_id}.csv"
     signals_path = LOGS / f"bt_signals_{run_id}.csv"
+    use_entry_features = entry_features_path.exists()
 
     # Find run header for label
     header_path = LOGS / f"run_header_{run_id}.json"
@@ -129,9 +132,12 @@ def _extract_run_features(run_id: str, min_trades: int = 0) -> list[dict]:
         return []
 
     # Pre-load signals index for faster lookup
+    # entry_features has one row per trade (exact epoch match)
+    # bt_signals is sampled (nearest-epoch lookup, up to 50 bars away)
     signal_index = {}
-    if signals_path.exists():
-        with open(signals_path, newline="") as f:
+    source_path = entry_features_path if use_entry_features else signals_path
+    if source_path.exists():
+        with open(source_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -176,10 +182,11 @@ def _extract_run_features(run_id: str, min_trades: int = 0) -> list[dict]:
         else:
             feat["duration_bucket"] = "unknown"
 
-        # Signal features at entry — find nearest signal regardless of distance
+        # Signal features at entry
+        # entry_features: exact epoch match guaranteed; no fuzzy search needed
+        # bt_signals: sampled — fall back to nearest epoch within 1 hour
         sig = signal_index.get(entry_epoch, {})
-        if not sig and signal_index:
-            # Find closest epoch in index (signals may be sampled every Nth tick)
+        if not sig and signal_index and not use_entry_features:
             best_epoch = min(signal_index.keys(), key=lambda e: abs(e - entry_epoch))
             if abs(best_epoch - entry_epoch) < 3600:  # within 1 hour
                 sig = signal_index[best_epoch]
@@ -260,7 +267,10 @@ def main():
         feats = _extract_run_features(rid, min_trades)
         if feats:
             all_features.extend(feats)
-            print(f"  {rid}: {len(feats)} trades extracted")
+            # show which signal source was used
+            entry_feat_path = LOGS / f"entry_features_{rid}.csv"
+            source = "entry_features" if entry_feat_path.exists() else "bt_signals"
+            print(f"  {rid}: {len(feats)} trades extracted [source={source}]")
 
     if not all_features:
         print("No trades extracted.")

@@ -2836,6 +2836,12 @@ async def run_live(
     ensure_signals_header_matches_file()
 
     http = make_http()
+
+    # Phase 20 — Order book imbalance fetched via REST in fetch_tick() each poll.
+    # (Coinbase Exchange WS level2 now requires auth; AT WS DNS unreliable on Windows.)
+    if _as_bool(cfg.get("USE_OB_IMBALANCE", False)):
+        print(f"[OB] Order book imbalance enabled (REST, top-{cfg.get('OB_IMBALANCE_DEPTH', 10)} levels)")
+
     state = BotState.from_config(cfg)
     symbol = state.symbol
     exec_mode = _execution_mode(cfg, state)

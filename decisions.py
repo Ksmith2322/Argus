@@ -358,6 +358,11 @@ class DecisionSnapshot:
     governor_score_modifier: int = 0
 
     # -------------------------
+    # Phase 20 — Order Book Imbalance
+    # -------------------------
+    ob_imbalance: Optional[float] = None
+
+    # -------------------------
     # Decision
     # -------------------------
     action: str = "HOLD"
