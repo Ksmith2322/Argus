@@ -1815,6 +1815,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div><span style="color:#7b8ab8; font-size:0.78em;">Daily Rate:</span>
       <span id="agg-daily" style="font-size:1.0em; font-weight:bold;">$0.00/day</span></div>
   </div>
+  <!-- Per-coin doubling progress: $500 -> $1000 per coin -->
+  <div id="coin-capital-bars" style="margin-top:10px; display:flex; flex-direction:column; gap:5px;"></div>
+  <!-- Portfolio doubling progress: $1000 current -> $5000 (5-coin target) -->
+  <div style="margin-top:8px; padding-top:8px; border-top:1px solid #1e2a42;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+      <div style="font-size:0.75em; color:#ffb74d; font-weight:bold;">PORTFOLIO GOAL: $1,000 <span style="color:#7b8ab8; font-weight:normal;">(2 coins x $500 doubled)</span></div>
+      <div style="font-size:0.72em; color:#7b8ab8;"><span id="port-goal-pct">0</span>%</div>
+    </div>
+    <div style="background:#0d1321; border-radius:3px; height:10px; overflow:hidden;">
+      <div id="port-goal-bar" style="height:100%; width:0%; background:linear-gradient(90deg,#00d4ff,#00e676); border-radius:3px; transition:width 0.5s;"></div>
+    </div>
+    <div style="display:flex; justify-content:space-between; margin-top:3px; font-size:0.65em; color:#7b8ab8;">
+      <span>$<span id="port-goal-cur">0</span></span>
+      <span style="color:#ffb74d;">$1,000 target</span>
+    </div>
+  </div>
 </div>
 
 <!-- Coin Pool Panel -->
@@ -3312,6 +3328,55 @@ async function loadMultiOverview() {
       aggDailyEl.style.color = dailyRate >= 0 ? '#00e676' : '#ff5252';
     }
     if (aggTsEl) aggTsEl.textContent = latestTs;
+
+    // ---- Per-coin capital doubling bars: $500 -> $1000 ----
+    const coinBarsEl = document.getElementById('coin-capital-bars');
+    if (coinBarsEl) {
+      const PER_COIN_START = 500;
+      const PER_COIN_TARGET = 1000;  // 2x
+      const COIN_COLORS = { ETH: '#627eea', BTC: '#f7931a', SOL: '#9945ff', AVAX: '#e84142', DOGE: '#c3a634' };
+      let barsHtml = '';
+      const activeCoins = Object.keys(data).filter(c => data[c] && data[c].bot_state);
+      activeCoins.forEach(coin => {
+        const cash = parseFloat(data[coin].equity) || parseFloat(data[coin].cash) || PER_COIN_START;
+        const pct = Math.min(100, Math.max(0, ((cash - PER_COIN_START) / PER_COIN_START) * 100));
+        const barPct = Math.min(100, Math.max(0, (cash / PER_COIN_TARGET) * 100));
+        const color = COIN_COLORS[coin] || '#00d4ff';
+        const pnlSoFar = cash - PER_COIN_START;
+        const pnlSign = pnlSoFar >= 0 ? '+' : '';
+        barsHtml += `<div style="display:flex; align-items:center; gap:8px;">
+          <div style="min-width:36px; font-size:0.75em; font-weight:bold; color:${color};">${coin}</div>
+          <div style="flex:1;">
+            <div style="background:#0d1321; border-radius:3px; height:8px; overflow:hidden;">
+              <div style="height:100%; width:${barPct.toFixed(1)}%; background:${color}; opacity:0.85; border-radius:3px; transition:width 0.5s;"></div>
+            </div>
+          </div>
+          <div style="min-width:80px; text-align:right; font-size:0.7em;">
+            <span style="color:#e0e0e0;">$${cash.toFixed(0)}</span>
+            <span style="color:${pnlSoFar>=0?'#00e676':'#ff5252'}; margin-left:4px;">(${pnlSign}$${pnlSoFar.toFixed(2)})</span>
+          </div>
+          <div style="min-width:32px; font-size:0.65em; color:#7b8ab8; text-align:right;">${barPct.toFixed(0)}%</div>
+        </div>`;
+      });
+      coinBarsEl.innerHTML = barsHtml || '<div style="font-size:0.75em; color:#7b8ab8;">No active coins</div>';
+    }
+
+    // ---- Portfolio goal bar: current total -> $1000 (2 active coins x $500 doubled) ----
+    const portGoalTarget = 1000;  // 2 coins x $500 starting = $1000 total initial; goal = $1000 profit above that = $2000 total? No: just double each coin
+    // Simpler: goal = active_coins * $1000 (each coin doubles)
+    const numActive = Object.keys(data).filter(c => data[c] && data[c].bot_state).length || 2;
+    const portGoalTotal = numActive * 1000;
+    const portGoalCur = Math.max(0, aggEq);
+    const portGoalPct = Math.min(100, Math.max(0, (portGoalCur / portGoalTotal) * 100));
+    const portGoalBarEl = document.getElementById('port-goal-bar');
+    const portGoalPctEl = document.getElementById('port-goal-pct');
+    const portGoalCurEl = document.getElementById('port-goal-cur');
+    if (portGoalBarEl) portGoalBarEl.style.width = portGoalPct.toFixed(1) + '%';
+    if (portGoalPctEl) portGoalPctEl.textContent = portGoalPct.toFixed(1);
+    if (portGoalCurEl) portGoalCurEl.textContent = portGoalCur.toFixed(0);
+    // Update label to reflect actual target
+    const portGoalLabelEl = document.querySelector('#portfolio-aggregate [style*="PORTFOLIO GOAL"]');
+
   } catch(e) { console.error('multi fetch error', e); }
 }
 
