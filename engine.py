@@ -17,7 +17,7 @@ from utils import pct_dist, safe_str
 from structure import StructureResult
 
 # Phase 18
-from trendlines import TrendlineResult
+from trendlines import TrendlineResult, MultiTFTrendlineResult
 
 # Phase 5B
 from liquidity import LiquidityResult  # noqa: F401
@@ -434,6 +434,37 @@ def _compute_trendlines(
 
         last_closed = getattr(state, "last_closed_candle_1h", None)
         return te.evaluate(px, last_closed)
+    except Exception:
+        return None
+
+
+def _compute_mtf_trendlines(
+    state,
+    *,
+    px: Decimal,
+    epoch: int,
+    closed_5m,
+    closed_1h,
+    closed_4h,
+    cfg: dict,
+) -> Optional[MultiTFTrendlineResult]:
+    """Drive the multi-timeframe trendline engine (5m/1h/4h)."""
+    if not _bool_cfg(cfg, "USE_TRENDLINES", False):
+        return None
+
+    mte = getattr(state, "mtf_trendline_engine", None)
+    if mte is None:
+        return None
+
+    try:
+        if closed_5m is not None:
+            mte.update_5m(closed_5m)
+        if closed_1h is not None:
+            mte.update_1h(closed_1h)
+        if closed_4h is not None:
+            mte.update_4h(closed_4h)
+
+        return mte.evaluate(px, epoch)
     except Exception:
         return None
 
@@ -1059,6 +1090,19 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.tl_proj_support = trendlines.proj_support
         snap.tl_proj_resist = trendlines.proj_resist
 
+    # Multi-TF trendlines (5m/1h/4h confluence)
+    mtf_trendlines: Optional[MultiTFTrendlineResult] = _compute_mtf_trendlines(
+        state,
+        px=px,
+        epoch=now_e,
+        closed_5m=closed_5m,
+        closed_1h=closed_1h,
+        closed_4h=closed_4h,
+        cfg=cfg,
+    )
+    if mtf_trendlines is not None:
+        snap.mtf_trendlines = mtf_trendlines
+
     atr_norm_fb: Optional[Decimal] = None
     try:
         if getattr(tick, "atr_norm", None) is not None:
@@ -1201,6 +1245,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
             st_1h=st_1h_tf,
             structure=structure,
             trendlines=trendlines,
+            mtf_trendlines=mtf_trendlines,
         )
         state.last_conf = base_conf
     except Exception as e:

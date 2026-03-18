@@ -281,7 +281,7 @@ class DecisionSnapshot:
     structure_reasons: str = ""
 
     # -------------------------
-    # Phase 18: Trendlines (1h)
+    # Phase 18: Trendlines (1h, and multi-TF 5m/1h/4h)
     # -------------------------
     near_support_tl: bool = False
     near_resist_tl: bool = False
@@ -290,6 +290,8 @@ class DecisionSnapshot:
     tl_proj_support: Optional[Decimal] = None
     tl_proj_resist: Optional[Decimal] = None
     trendline_reasons: str = ""
+    # Multi-TF result object (not serialized to CSV directly — accessed by confluence)
+    mtf_trendlines: Optional[Any] = None
 
     # -------------------------
     # Phase 5B liquidity

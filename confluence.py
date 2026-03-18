@@ -279,16 +279,90 @@ class ConfluenceEngine:
         self,
         conf_score: int,
         trendlines,
+        mtf_trendlines=None,
     ) -> Tuple[int, List[str], List[str]]:
         """
-        Phase 18: adjust confluence score based on dynamic 1h trendlines.
+        Phase 18 (multi-TF): adjust confluence score based on trendlines.
+
+        Uses mtf_trendlines (MultiTFTrendlineResult) when available for
+        multi-timeframe confirmation bonuses.  Falls back to single-TF
+        TrendlineResult when mtf_trendlines is None.
+
         Returns: (new_score, tl_notes, tl_blocks)
         """
-        if (not self.use_trendlines) or (trendlines is None):
+        if not self.use_trendlines:
             return conf_score, [], []
 
         notes: List[str] = []
         blocks: List[str] = []
+
+        # ── Multi-TF path (preferred) ─────────────────────────────────────
+        if mtf_trendlines is not None:
+            mtf = mtf_trendlines
+            bk = int(getattr(mtf, "tf_breakout_count", 0))
+            sup = int(getattr(mtf, "tf_support_count", 0))
+            bkd = int(getattr(mtf, "tf_breakdown_count", 0))
+
+            # Breakout bonuses — tiered by TF confluence
+            if bk >= 2:
+                bonus = min(100, self.tl_bonus_broke_above + 10)
+                conf_score = min(100, conf_score + bonus)
+                notes.append(f"+{bonus}(broke_above_{bk}TF)")
+            elif bk == 1:
+                conf_score = min(100, conf_score + self.tl_bonus_broke_above)
+                notes.append(f"+{self.tl_bonus_broke_above}(broke_above_1TF)")
+
+            # Support proximity bonuses — tiered
+            if sup >= 2:
+                bonus = min(100, self.tl_bonus_near_support + 7)
+                conf_score = min(100, conf_score + bonus)
+                notes.append(f"+{bonus}(near_support_{sup}TF)")
+            elif sup == 1:
+                conf_score = min(100, conf_score + self.tl_bonus_near_support)
+                notes.append(f"+{self.tl_bonus_near_support}(near_support_1TF)")
+
+            # Resistance proximity penalties
+            if bool(getattr(mtf, "near_resist_1h", False)) or bool(getattr(mtf, "near_resist_4h", False)):
+                conf_score = max(0, conf_score - self.tl_penalty_near_resist)
+                notes.append(f"-{self.tl_penalty_near_resist}(near_resist_tl)")
+
+            # Breakdown penalties — tiered
+            if bkd >= 2:
+                penalty = self.tl_penalty_broke_below + 10
+                conf_score = max(0, conf_score - penalty)
+                notes.append(f"-{penalty}(broke_below_{bkd}TF)")
+                blocks.append("BLOCK:TL_BROKE_BELOW_SUPPORT")
+            elif bkd == 1 and bool(getattr(mtf, "broke_below_1h", False)):
+                conf_score = max(0, conf_score - self.tl_penalty_broke_below)
+                notes.append(f"-{self.tl_penalty_broke_below}(broke_below_1h)")
+                if self.tl_block_long_broke_below:
+                    blocks.append("BLOCK:TL_BROKE_BELOW_SUPPORT")
+
+            # Trend change signal — strong bonus
+            if bool(getattr(mtf, "trend_change_up", False)):
+                conf_score = min(100, conf_score + 5)
+                notes.append("+5(trend_change_up)")
+
+            # Bullish TF alignment bonus
+            if bool(getattr(mtf, "tf_aligned_bullish", False)):
+                conf_score = min(100, conf_score + 3)
+                notes.append("+3(tf_aligned_bull)")
+
+            # 4h descending resistance = sell pressure overhead
+            if self.tl_penalty_resist_slope_neg > 0 and bool(getattr(mtf, "resist_down_4h", False)):
+                conf_score = max(0, conf_score - self.tl_penalty_resist_slope_neg)
+                notes.append(f"-{self.tl_penalty_resist_slope_neg}(4h_resist_down)")
+
+            if self.tl_block_long_near_resist and (
+                bool(getattr(mtf, "near_resist_1h", False)) or bool(getattr(mtf, "near_resist_4h", False))
+            ):
+                blocks.append("BLOCK:TL_NEAR_RESIST")
+
+            return conf_score, notes, blocks
+
+        # ── Legacy single-TF path (fallback) ─────────────────────────────
+        if trendlines is None:
+            return conf_score, [], []
 
         if bool(getattr(trendlines, "near_support_tl", False)):
             conf_score = min(100, conf_score + self.tl_bonus_near_support)
@@ -323,7 +397,8 @@ class ConfluenceEngine:
         st_5m: Optional[TFState],
         st_1h: Optional[TFState],
         structure: Optional[StructureResult] = None,   # Phase 5A optional
-        trendlines=None,                               # Phase 18 optional (TrendlineResult)
+        trendlines=None,                               # Phase 18 optional (TrendlineResult, legacy)
+        mtf_trendlines=None,                           # Phase 18 multi-TF (MultiTFTrendlineResult)
     ) -> ConfluenceResult:
 
         def norm(st: Optional[TFState], tf: str) -> TFState:
@@ -384,7 +459,9 @@ class ConfluenceEngine:
         # -------------------------
         # Phase 18 trendline overlay (score shaping + optional blocks)
         # -------------------------
-        conf_score, tl_notes, tl_blocks = self._apply_trendline_overlay(conf_score, trendlines)
+        conf_score, tl_notes, tl_blocks = self._apply_trendline_overlay(
+            conf_score, trendlines, mtf_trendlines=mtf_trendlines
+        )
 
         # Gate from score (raw)
         if conf_score >= self.trade_threshold:

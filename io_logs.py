@@ -264,6 +264,17 @@ def _signals_header() -> List[str]:
         "governor_win_prob",
         "governor_recommendation",
         "governor_score_modifier",
+
+        # =========================
+        # Phase 18 — Trendlines
+        # =========================
+        "near_support_tl",
+        "near_resist_tl",
+        "broke_above_resist_tl",
+        "broke_below_support_tl",
+        "tl_proj_support",
+        "tl_proj_resist",
+        "trendline_reasons",
     ]
 
 
@@ -749,6 +760,11 @@ def snapshot_to_signal_row(
             "rejection_at_sup",
             "liq_ok",
             "argus_forced_liq_block",
+            # Phase 18 trendlines
+            "near_support_tl",
+            "near_resist_tl",
+            "broke_above_resist_tl",
+            "broke_below_support_tl",
         ):
             if out is None or out == "":
                 return ""

@@ -32,7 +32,7 @@ from structure import StructureEngine, StructureResult
 from liquidity import LiquidityEngine, LiquidityResult
 
 # Phase 18 additions
-from trendlines import TrendlineEngine, TrendlineResult
+from trendlines import TrendlineEngine, TrendlineResult, MultiTFTrendlineEngine
 
 # --------- LINE ABOVE: from liquidity import LiquidityEngine, LiquidityResult
 # Phase 8 additions
@@ -189,10 +189,11 @@ class BotState:
     last_liquidity: Optional[LiquidityResult] = None
 
     # -------------------------
-    # Phase 18: Trendlines (1h)
+    # Phase 18: Trendlines (multi-timeframe: 5m/1h/4h)
     # -------------------------
-    trendline_engine: Optional[TrendlineEngine] = None
+    trendline_engine: Optional[TrendlineEngine] = None      # legacy 1h-only (kept for compat)
     last_trendline: Optional[TrendlineResult] = None
+    mtf_trendline_engine: Optional[MultiTFTrendlineEngine] = None  # multi-TF engine
 
     # -------------------------
     # Phase 5C: Session overlay (cached for audit/debug)
@@ -344,9 +345,10 @@ class BotState:
         structure_engine = StructureEngine.from_config(cfg) if use_structure else None
 
         # --------- LINE ABOVE: structure_engine = StructureEngine.from_config(cfg) if use_structure else None
-        # Phase 18 engine (optional)
+        # Phase 18 engine (optional) — multi-TF (5m/1h/4h) + legacy 1h
         use_trendlines = _as_bool(cfg.get("USE_TRENDLINES", False), False)
         trendline_engine = TrendlineEngine.from_config(cfg) if use_trendlines else None
+        mtf_trendline_engine = MultiTFTrendlineEngine.from_config(cfg) if use_trendlines else None
 
         # Phase 5B engine (optional)
         # Prefer canonical flag name from config.py
@@ -421,6 +423,7 @@ class BotState:
             adaptive_confluence=adaptive_confluence,
             structure_engine=structure_engine,
             trendline_engine=trendline_engine,
+            mtf_trendline_engine=mtf_trendline_engine,
             liquidity_engine=liquidity_engine,
             execution_mode=execution_mode,
             execution_adapter=execution_adapter,
