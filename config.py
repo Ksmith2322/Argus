@@ -159,10 +159,13 @@ def load_config() -> dict:
     cfg["TAKE_PROFIT_PCT"] = _d("TAKE_PROFIT_PCT", "0.03")
     cfg["TRAIL_STOP_PCT"] = _d("TRAIL_STOP_PCT", "0.015")
     cfg["STOP_LOSS_PCT"] = _d("STOP_LOSS_PCT", "0.02")
+    # Fraction of TP distance price must move before trail engages (0=always active)
+    cfg["TRAIL_ACTIVATION_PCT"] = _d("TRAIL_ACTIVATION_PCT", "0")
 
     cfg["TAKE_PROFIT_PCT"] = _clamp_decimal(cfg["TAKE_PROFIT_PCT"], Decimal("0"), Decimal("1"))
     cfg["TRAIL_STOP_PCT"] = _clamp_decimal(cfg["TRAIL_STOP_PCT"], Decimal("0"), Decimal("1"))
     cfg["STOP_LOSS_PCT"] = _clamp_decimal(cfg["STOP_LOSS_PCT"], Decimal("0"), Decimal("1"))
+    cfg["TRAIL_ACTIVATION_PCT"] = _clamp_decimal(cfg["TRAIL_ACTIVATION_PCT"], Decimal("0"), Decimal("1"))
 
     # -------------------------
     # Adaptive distance

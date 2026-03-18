@@ -745,6 +745,111 @@ async def api_queue():
     return JSONResponse(base)
 
 
+@app.get("/api/sweep")
+async def api_sweep():
+    """Sweep phase progress and best results so far."""
+    import re
+
+    # Build label → (fee_bps, tp_pct, sl_pct) map from run headers
+    header_meta: dict = {}
+    for hdr_path in OPS_LOGS.glob("run_header_*.json"):
+        try:
+            with open(hdr_path) as f:
+                h = json.load(f)
+            rid = h.get("run_id", "")
+            lbl = h.get("label", "")
+            if rid and lbl:
+                header_meta[rid] = {
+                    "label": lbl,
+                    "fee_bps": float(h.get("fee_bps", 60)),
+                    "tp_pct": float(h.get("take_profit_pct", 0) or 0),
+                    "sl_pct": float(h.get("stop_loss_pct", 0) or 0),
+                }
+        except Exception:
+            pass
+
+    def _classify(lbl: str, fee: float) -> str:
+        if not lbl.startswith("sweep_"): return "other"
+        has_wide = bool(re.search(r"_tp(6|8|10|12)_", lbl))
+        is_maker = "_maker" in lbl
+        is_trail = "_trail" in lbl
+        if not has_wide: return "phase1"
+        if is_trail: return "phase2_trail"
+        if is_maker or fee <= 45: return "phase2_maker"
+        return "phase2_60"
+
+    phases = {"phase1": [], "phase2_60": [], "phase2_maker": [], "phase2_trail": [], "other": []}
+
+    for sumf in OPS_LOGS.glob("bt_summary_*.json"):
+        try:
+            with open(sumf) as f:
+                d = json.load(f)
+            rid = d.get("run_id", "")
+            meta = header_meta.get(rid, {})
+            lbl = meta.get("label", "")
+            if not lbl.startswith("sweep_"): continue
+            fee = meta.get("fee_bps", 60.0)
+            phase = _classify(lbl, fee)
+            tp = meta.get("tp_pct", 0) or 0
+            sl = meta.get("sl_pct", 0) or 0
+            pf = float(d.get("profit_factor", 0) or 0)
+            wr = float(d.get("win_rate_pct", 0) or 0)
+            trades = int(d.get("trades_closed", 0) or 0)
+            pnl = float(d.get("pnl_usd", 0) or 0)
+            # breakeven WR
+            if tp > 0 and sl > 0:
+                fee_pct = fee / 10000.0
+                net_win = tp - 2 * fee_pct
+                net_loss = sl + 2 * fee_pct
+                be_wr = (net_loss / (net_win + net_loss) * 100) if net_win > 0 else None
+            else:
+                be_wr = None
+            phases[phase].append({
+                "label": lbl, "pf": pf, "wr": wr, "trades": trades,
+                "pnl": pnl, "fee_bps": fee, "tp_pct": tp, "sl_pct": sl,
+                "be_wr": be_wr,
+            })
+        except Exception:
+            pass
+
+    def _phase_summary(runs: list) -> dict:
+        valid = [r for r in runs if r["trades"] >= 15]
+        if not valid:
+            return {"count": len(runs), "profitable": 0, "best_pf": 0, "best": None}
+        profitable = [r for r in valid if r["pf"] >= 1.0]
+        best = max(valid, key=lambda x: x["pf"])
+        return {
+            "count": len(runs),
+            "valid": len(valid),
+            "profitable": len(profitable),
+            "best_pf": best["pf"],
+            "best": best,
+        }
+
+    # Count pending queue entries by phase
+    queue_pending = {"phase1": 0, "phase2_60": 0, "phase2_maker": 0, "phase2_trail": 0}
+    q_path = REPO / "ops" / "backtest_queue.jsonl"
+    if q_path.exists():
+        for line in open(q_path, encoding="utf-8-sig"):
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+                lbl = d.get("label", "")
+                fee = float((d.get("env") or {}).get("FEE_BPS", 60))
+                ph = _classify(lbl, fee)
+                if ph in queue_pending:
+                    queue_pending[ph] += 1
+            except Exception:
+                pass
+
+    return JSONResponse({
+        "phases": {k: _phase_summary(v) for k, v in phases.items()},
+        "queue_pending": queue_pending,
+        "total_completed": sum(len(v) for v in phases.values()),
+    })
+
+
 @app.get("/api/equity")
 async def api_equity(request: Request):
     return JSONResponse(read_equity_series(_coin_param(request)))
@@ -1881,6 +1986,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="label">Completed today: <span id="queue-completed">0</span></div>
     <div id="queue-labels" class="label" style="margin-top:4px;"></div>
   </div>
+
+  <div class="card" id="sweep-card">
+    <h2>Sweep Progress</h2>
+    <div id="sweep-best-alert" style="display:none; background:#0d3320; border:1px solid #00e676; border-radius:4px; padding:6px 10px; margin-bottom:8px; font-size:0.85em;"></div>
+    <table style="width:100%; border-collapse:collapse; font-size:0.78em;">
+      <thead><tr style="color:#7b8ab8;">
+        <th style="text-align:left; padding:2px 4px;">Phase</th>
+        <th style="text-align:right; padding:2px 4px;">Done</th>
+        <th style="text-align:right; padding:2px 4px;">Queue</th>
+        <th style="text-align:right; padding:2px 4px;">Profitable</th>
+        <th style="text-align:right; padding:2px 4px;">Best PF</th>
+      </tr></thead>
+      <tbody id="sweep-table-body">
+        <tr><td colspan="5" style="color:#7b8ab8; text-align:center; padding:6px;">loading…</td></tr>
+      </tbody>
+    </table>
+    <div id="sweep-best-config" style="margin-top:6px; font-size:0.75em; color:#a0b0c8;"></div>
+  </div>
+
   <div class="card">
     <h2>ML Governor</h2>
     <div id="gov-status" class="metric" style="font-size:1.0em; color:#7b8ab8;">DISABLED</div>
@@ -2159,6 +2283,7 @@ function switchPage(page) {
     document.querySelectorAll('.page-nav-btn')[2].classList.add('active');
     document.getElementById('queue-page').classList.add('active');
     loadQueueStatus();
+    loadSweepProgress();
   } else {
     document.querySelectorAll('.page-nav-btn')[0].classList.add('active');
     document.getElementById('live-page').classList.add('active');
@@ -2392,6 +2517,7 @@ function loadQueueStatus() {
       queueInterval = setInterval(() => {
         if (document.getElementById('queue-page').classList.contains('active')) {
           loadQueueStatus();
+          loadSweepProgress();
         }
       }, 30000);
     }
@@ -2399,6 +2525,62 @@ function loadQueueStatus() {
     console.error('Queue load error', e);
     document.getElementById('q-running').innerHTML = '<span style="color:#ff5252;">Load Error</span>';
   });
+}
+
+function loadSweepProgress() {
+  fetch('/api/sweep').then(r => r.json()).then(data => {
+    const phases = data.phases || {};
+    const pending = data.queue_pending || {};
+    const phaseNames = {
+      phase1:       {label: 'Phase 1 (TP 3-5%)', color: '#7b8ab8'},
+      phase2_60:    {label: 'Phase 2 (TP 6-12%, 60bps)', color: '#00d4ff'},
+      phase2_maker: {label: 'Phase 2 (TP 6-12%, 40bps)', color: '#00e676'},
+      phase2_trail: {label: 'Phase 2 (Trail50 variants)', color: '#ffb74d'},
+    };
+    let bestOverall = null;
+    let rows = '';
+    for (const [key, meta] of Object.entries(phaseNames)) {
+      const ph = phases[key] || {};
+      const qPend = pending[key] || 0;
+      const done = ph.count || 0;
+      const profitable = ph.profitable || 0;
+      const bestPf = ph.best_pf || 0;
+      const best = ph.best;
+      const profColor = profitable > 0 ? '#00e676' : (done > 0 ? '#ff5252' : '#7b8ab8');
+      const pfColor = bestPf >= 1.2 ? '#00e676' : bestPf >= 1.0 ? '#ffc107' : '#ff5252';
+      rows += '<tr style="border-bottom:1px solid #1e2a42;">' +
+        '<td style="padding:4px 6px; color:' + meta.color + '; font-size:0.8em;">' + meta.label + '</td>' +
+        '<td style="text-align:right; padding:4px 6px;">' + done + '</td>' +
+        '<td style="text-align:right; padding:4px 6px; color:#7b8ab8;">' + (qPend > 0 ? qPend : '—') + '</td>' +
+        '<td style="text-align:right; padding:4px 6px; color:' + profColor + '; font-weight:bold;">' + profitable + '</td>' +
+        '<td style="text-align:right; padding:4px 6px; color:' + pfColor + '; font-weight:bold;">' + (done > 0 ? bestPf.toFixed(3) : '—') + '</td>' +
+        '</tr>';
+      if (best && (!bestOverall || best.pf > bestOverall.pf)) {
+        bestOverall = {...best, phase: meta.label};
+      }
+    }
+    document.getElementById('sweep-table-body').innerHTML = rows;
+
+    // Best config alert
+    const alertEl = document.getElementById('sweep-best-alert');
+    const bestCfgEl = document.getElementById('sweep-best-config');
+    if (bestOverall && bestOverall.pf >= 1.0) {
+      alertEl.style.display = 'block';
+      const be = bestOverall.be_wr ? bestOverall.be_wr.toFixed(0) + '% needed' : '?';
+      alertEl.innerHTML = '&#10003; <b style="color:#00e676;">PROFITABLE CONFIG FOUND!</b> ' +
+        'PF=' + bestOverall.pf.toFixed(3) + ' WR=' + bestOverall.wr.toFixed(1) + '% ' +
+        'TP=' + (bestOverall.tp_pct*100).toFixed(0) + '% SL=' + (bestOverall.sl_pct*100).toFixed(1) + '% ' +
+        '| BE-WR: ' + be;
+      bestCfgEl.textContent = bestOverall.label;
+    } else {
+      alertEl.style.display = 'none';
+      if (bestOverall) {
+        const be = bestOverall.be_wr ? bestOverall.be_wr.toFixed(0) + '%' : '?';
+        bestCfgEl.textContent = 'Best so far: PF=' + bestOverall.pf.toFixed(3) +
+          ' | ' + bestOverall.label + ' | need WR>=' + be + ' to profit';
+      }
+    }
+  }).catch(e => console.error('Sweep load error', e));
 }
 
 function renderProjection(proj) {

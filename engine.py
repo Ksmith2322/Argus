@@ -1393,7 +1393,21 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
 
         take_profit = state.ledger.avg_entry_px * (Decimal("1") + take_profit_pct)
         stop_loss = state.ledger.avg_entry_px * (Decimal("1") - stop_loss_pct)
-        trail_stop = state.peak_price * (Decimal("1") - trail_stop_pct)
+
+        # Trail activation gate: trail only engages after price moves X% of the TP distance.
+        # TRAIL_ACTIVATION_PCT=0   → trail is always active from entry (legacy behavior)
+        # TRAIL_ACTIVATION_PCT=0.5 → trail engages only once peak >= entry + 50% of TP dist
+        trail_activation_pct = _as_decimal(cfg.get("TRAIL_ACTIVATION_PCT", "0"), "0")
+        if trail_activation_pct > 0 and state.ledger.avg_entry_px is not None:
+            trail_activation_px = state.ledger.avg_entry_px * (
+                Decimal("1") + take_profit_pct * trail_activation_pct
+            )
+            if state.peak_price >= trail_activation_px:
+                trail_stop = state.peak_price * (Decimal("1") - trail_stop_pct)
+            else:
+                trail_stop = None  # trail not yet active; static SL guards downside
+        else:
+            trail_stop = state.peak_price * (Decimal("1") - trail_stop_pct)
     else:
         state.peak_price = None
         state.entry_epoch = None
