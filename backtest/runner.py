@@ -657,6 +657,9 @@ def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_cs
             "artifact_root": _artifact_root(),
             "artifact_dir": out_dir,
             "candles_csv": os.path.abspath(candles_csv),
+            "fee_bps": int(cfg.get("FEE_BPS", 60)),
+            "take_profit_pct": float(cfg.get("TAKE_PROFIT_PCT", 0.03) or 0.03),
+            "stop_loss_pct": float(cfg.get("STOP_LOSS_PCT", 0.02) or 0.02),
         }
         path = os.path.join(out_dir, f"run_header_{run_id}.json")
         ok = _write_json_atomic(path, hdr)

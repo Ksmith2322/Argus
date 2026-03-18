@@ -82,11 +82,29 @@ def _parse_label(label: str) -> Dict[str, Any]:
 # Load all sweep results
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _breakeven_wr(tp_pct: Optional[float], sl_pct: Optional[float],
+                  fee_bps: float = 60.0) -> Optional[float]:
+    """Return the WR% needed to break even after round-trip fees.
+    Uses: WR_be = net_loss / (net_win + net_loss)
+    net_win  = TP_pct - 2 * fee_pct
+    net_loss = SL_pct + 2 * fee_pct
+    """
+    if tp_pct is None or sl_pct is None:
+        return None
+    fee_pct = fee_bps / 10000.0
+    net_win  = tp_pct - 2 * fee_pct
+    net_loss = sl_pct + 2 * fee_pct
+    if net_win <= 0 or (net_win + net_loss) <= 0:
+        return None
+    return net_loss / (net_win + net_loss) * 100.0
+
+
 def load_results(log_dir: Path = LOG_DIR) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
-    # Build run_id → label map from run_headers
+    # Build run_id → (label, fee_bps) map from run_headers
     label_map: Dict[str, str] = {}
+    fee_map: Dict[str, float] = {}
     for hdr_file in log_dir.glob("run_header_*.json"):
         try:
             with open(hdr_file) as f:
@@ -95,6 +113,13 @@ def load_results(log_dir: Path = LOG_DIR) -> List[Dict[str, Any]]:
             lbl = h.get("label", "")
             if rid and lbl:
                 label_map[rid] = lbl
+            # Read FEE_BPS: check direct field first, then queue env dict
+            if "fee_bps" in h:
+                fee_map[rid] = float(h["fee_bps"])
+            else:
+                env = h.get("env") or {}
+                if isinstance(env, dict) and "FEE_BPS" in env:
+                    fee_map[rid] = float(env["FEE_BPS"])
         except Exception:
             pass
 
@@ -124,15 +149,19 @@ def load_results(log_dir: Path = LOG_DIR) -> List[Dict[str, Any]]:
                 # Try to infer coin from symbol
                 params["coin"] = coin
 
+            fee_bps = fee_map.get(run_id, 60.0)
+            tp_p = params.get("tp_pct")
+            sl_p = params.get("sl_pct")
             r: Dict[str, Any] = {
                 "run_id": run_id,
                 "label": label,
                 "coin": params.get("coin", coin),
-                "tp_pct": params.get("tp_pct"),
-                "sl_pct": params.get("sl_pct"),
+                "tp_pct": tp_p,
+                "sl_pct": sl_p,
                 "score": params.get("score"),
                 "gate": params.get("gate"),
                 "hold_s": params.get("hold_s"),
+                "fee_bps": fee_bps,
                 "pf": float(d.get("profit_factor", 0) or 0),
                 "wr_pct": float(d.get("win_rate_pct", 0) or 0),
                 "pnl": float(d.get("pnl_usd", 0) or 0),
@@ -141,6 +170,7 @@ def load_results(log_dir: Path = LOG_DIR) -> List[Dict[str, Any]]:
                 "expectancy": float(d.get("expectancy_usd", 0) or 0),
                 "exposure_pct": float(d.get("exposure_pct", 0) or 0),
                 "avg_duration_s": float(d.get("avg_trade_duration_s", 0) or 0),
+                "breakeven_wr": _breakeven_wr(tp_p, sl_p, fee_bps),
             }
             results.append(r)
 
@@ -208,6 +238,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                    choices=["tp_pct", "sl_pct", "score", "gate", "hold_s"],
                    help="Show pivot table for a parameter")
     p.add_argument("--save", action="store_true", help="Save results to CSV")
+    p.add_argument("--fee-bps", type=float, default=None,
+                   help="Override fee rate for breakeven WR calc (default: from run header or 60)")
     args = p.parse_args(argv)
 
     results = load_results()
@@ -255,30 +287,40 @@ def main(argv: Optional[List[str]] = None) -> None:
             continue
 
         # Header
-        print(f"\n  {'#':>2}  {'TP':>4} {'SL':>4} {'Score':>5} {'Gate':>4} {'Hold':>4} "
-              f"{'PF':>5} {'WR%':>6} {'PnL':>7} {'Trades':>6} {'DD%':>5} {'E[$/t]':>7}")
-        print("  " + "-" * 70)
+        print(f"\n  {'#':>2}  {'TP':>4} {'SL':>5} {'Score':>5} {'Hold':>4} "
+              f"{'PF':>5} {'WR%':>6} {'BE-WR':>6} {'PnL':>7} {'Trades':>6} {'E[$/t]':>7}")
+        print("  " + "-" * 72)
 
         for i, r in enumerate(top_n, 1):
             tp = _fmt_pct(r.get("tp_pct"))
             sl = _fmt_pct(r.get("sl_pct"))
             score = str(r.get("score") or "?")
-            gate = f"{r.get('gate', 0) or 0:.2f}" if r.get("gate") else "?"
             hold = _fmt_hold(r.get("hold_s"))
             pf_v = r["pf"]
             pf_str = f"{pf_v:.3f}"
             pf_color = "\033[92m" if pf_v >= 1.2 else ("\033[93m" if pf_v >= 1.0 else "\033[91m")
-            wr = f"{r['wr_pct']:.1f}"
+            wr_v = r["wr_pct"]
+            wr = f"{wr_v:.1f}"
+            be_wr = r.get("breakeven_wr")
+            if be_wr is not None:
+                # Override fee if --fee-bps passed
+                if args.fee_bps is not None:
+                    be_wr = _breakeven_wr(r.get("tp_pct"), r.get("sl_pct"), args.fee_bps) or be_wr
+                be_str = f"{be_wr:.0f}%"
+                be_color = "\033[92m" if wr_v >= be_wr else "\033[91m"
+                be_fmt = f"{be_color}{be_str}\033[0m"
+            else:
+                be_fmt = "  ?%"
             pnl_v = r["pnl"]
             pnl_str = f"{pnl_v:+.3f}"
             pnl_color = "\033[92m" if pnl_v > 0 else "\033[91m"
             trades = str(r["trades"])
-            dd = f"{r['max_dd_pct']:.2f}"
             exp = f"{r['expectancy']:+.4f}"
 
-            print(f"  {i:>2}  {tp:>4} {sl:>4} {score:>5} {gate:>4} {hold:>4} "
+            print(f"  {i:>2}  {tp:>4} {sl:>5} {score:>5} {hold:>4} "
                   f"{pf_color}{pf_str}\033[0m {wr:>6} "
-                  f"{pnl_color}{pnl_str}\033[0m {trades:>6} {dd:>5} {exp:>7}")
+                  f"{be_fmt:>6} "
+                  f"{pnl_color}{pnl_str}\033[0m {trades:>6} {exp:>7}")
 
         # Pivot table
         if args.pivot:
@@ -292,8 +334,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Save CSV
     if args.save and results:
         out_path = LOG_DIR / "sweep_analysis.csv"
-        fieldnames = ["coin", "tp_pct", "sl_pct", "score", "gate", "hold_s",
-                      "pf", "wr_pct", "pnl", "trades", "max_dd_pct", "expectancy", "run_id", "label"]
+        fieldnames = ["coin", "tp_pct", "sl_pct", "score", "gate", "hold_s", "fee_bps",
+                      "pf", "wr_pct", "breakeven_wr", "pnl", "trades", "max_dd_pct", "expectancy",
+                      "run_id", "label"]
         with open(out_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             w.writeheader()
