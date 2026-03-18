@@ -7,24 +7,28 @@
 #   schtasks /create /tn "ArgusWatchdog" /tr "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\Argus\repo\ops\watchdog.ps1" /sc minute /mo 5 /f
 #
 # Multi-coin aware:
-#   1. Checks if runner_live.py processes are running (python with runner_live in cmdline)
-#   2. Checks per-coin state freshness (ETH, BTC, SOL) via saved_at timestamp
-#   3. If no runners found, sends Discord alert and restarts via launch_multi.ps1
-#   4. If running, optionally sends heartbeat to Discord (every 6 hours)
-#   5. Warns about stale coins (state not updated within StaleMinutes)
-#   6. Logs all actions to ops/logs/watchdog.log
+#   1. Checks if runner_live.py processes are running per coin (ETH, BTC)
+#   2. Checks per-coin state freshness via saved_at timestamp
+#   3. If ALL runners dead -> full restart via launch_multi.ps1
+#   4. If individual coin stale (state not updated >StaleRestartMinutes) -> restart just that coin
+#   5. If running, optionally sends heartbeat to Discord (every 6 hours)
+#   6. Warns about stale coins (state not updated within StaleMinutes)
+#   7. Logs all actions to ops/logs/watchdog.log
 
 param(
     [switch]$DryRun,
     [int]$HeartbeatEveryHours = 6,
-    [int]$StaleMinutes = 5
+    [int]$StaleMinutes = 5,
+    [int]$StaleRestartMinutes = 10
 )
 
 $repoRoot = "C:\Argus\repo"
 $pyExe = "C:\Argus\.venv\Scripts\python.exe"
 $logFile = Join-Path $repoRoot "ops\logs\watchdog.log"
 $heartbeatFile = Join-Path $repoRoot "ops\logs\watchdog_last_heartbeat.txt"
-$coins = @("ETH", "BTC", "SOL")
+$coinRestartFile = Join-Path $repoRoot "ops\logs\watchdog_coin_restart.json"
+$dailyDigestFile = Join-Path $repoRoot "ops\logs\watchdog_last_daily_digest.txt"
+$coins = @("ETH", "BTC")
 
 function Write-WatchdogLog($msg) {
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -53,6 +57,7 @@ function Get-RunnerProcesses {
                     Pid = $p.Id
                     Uptime = $uptime
                     UptimeStr = "$([math]::Round($uptime.TotalHours, 1))h"
+                    CmdLine = $cmdline
                 }
             }
         } catch {}
@@ -69,6 +74,7 @@ function Get-CoinStatus {
         BotState = "UNKNOWN"
         Cash = 0
         Pnl = 0
+        DailyPnl = 0
         Stale = $true
         AgeMinutes = -1
     }
@@ -79,6 +85,9 @@ function Get-CoinStatus {
             $result.BotState = $state.bot_state
             $result.Cash = [math]::Round([double]$state.cash, 2)
             $result.Pnl = [math]::Round([double]$state.realized_pnl, 4)
+            if ($state.PSObject.Properties.Name -contains "daily_realized_pnl") {
+                $result.DailyPnl = [math]::Round([double]$state.daily_realized_pnl, 4)
+            }
             $savedAt = [double]$state.saved_at
             if ($savedAt -gt 0) {
                 $savedTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$savedAt).UtcDateTime
@@ -89,6 +98,36 @@ function Get-CoinStatus {
         } catch {}
     }
     return $result
+}
+
+function Should-SendDailyDigest {
+    $todayKey = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+    if (-not (Test-Path $dailyDigestFile)) { return $true }
+    try {
+        $lastDay = (Get-Content $dailyDigestFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+        return ($lastDay -ne $todayKey)
+    } catch { return $true }
+}
+
+function Send-DailyDigest {
+    param($CoinStatuses)
+    $todayKey = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+    $statsLines = @()
+    foreach ($cs in $CoinStatuses) {
+        if ($cs.Found) {
+            $statsLines += "{`"symbol`":`"$($cs.Coin)-USD`",`"total_pnl_usd`":$($cs.Pnl),`"cash`":$($cs.Cash),`"trades_today`":0,`"daily_pnl_usd`":0}"
+        }
+    }
+    if ($statsLines.Count -eq 0) { return }
+    $statsJson = "[" + ($statsLines -join ",") + "]"
+    try {
+        $pyScript = "import sys,json; sys.path.insert(0,r'$repoRoot'); from ops.notify import notify_daily_digest; notify_daily_digest(json.loads(r'$statsJson'))"
+        & $pyExe -c $pyScript 2>&1 | Out-Null
+        $todayKey | Set-Content $dailyDigestFile -ErrorAction SilentlyContinue
+        Write-WatchdogLog "DAILY_DIGEST: sent for $($statsLines.Count) coin(s)"
+    } catch {
+        Write-WatchdogLog "WARNING: Daily digest send failed: $_"
+    }
 }
 
 function Should-SendHeartbeat {
@@ -103,6 +142,43 @@ function Should-SendHeartbeat {
     }
 }
 
+function Get-CoinRestartTimes {
+    $times = @{}
+    if (Test-Path $coinRestartFile) {
+        try {
+            $data = Get-Content $coinRestartFile -Raw | ConvertFrom-Json
+            $data.PSObject.Properties | ForEach-Object { $times[$_.Name] = [DateTime]::Parse($_.Value) }
+        } catch {}
+    }
+    return $times
+}
+
+function Set-CoinRestartTime {
+    param([string]$coin, [hashtable]$existing)
+    $existing[$coin] = (Get-Date).ToUniversalTime().ToString("o")
+    $existing | ConvertTo-Json | Set-Content $coinRestartFile -ErrorAction SilentlyContinue
+}
+
+function Restart-Coin {
+    param([string]$coin)
+    Write-WatchdogLog "RESTART_COIN: Launching $coin runner..."
+    try {
+        & "$repoRoot\ops\launch_multi.ps1" -Coins @($coin)
+        Start-Sleep -Seconds 10
+        $cs = Get-CoinStatus -coin $coin
+        if (-not $cs.Stale -or $cs.AgeMinutes -lt 2) {
+            Write-WatchdogLog "RESTART_COIN OK: $coin state updated"
+            Send-Discord "Argus $coin runner restarted (was stale)"
+        } else {
+            Write-WatchdogLog "RESTART_COIN UNCERTAIN: $coin state age=$($cs.AgeMinutes)m after restart"
+            Send-Discord "Argus $coin restart attempted - verify manually"
+        }
+    } catch {
+        Write-WatchdogLog "RESTART_COIN ERROR: $coin - $_"
+        Send-Discord "CRITICAL: Argus $coin restart FAILED: $_"
+    }
+}
+
 # --- Main ---
 Set-Location $repoRoot
 
@@ -112,6 +188,7 @@ $runnerCount = @($runners).Count
 # Collect per-coin status
 $coinStatuses = @()
 $staleCoinsList = @()
+$staleRestartCandidates = @()
 $healthyCoins = @()
 foreach ($coin in $coins) {
     $cs = Get-CoinStatus -coin $coin
@@ -120,6 +197,9 @@ foreach ($coin in $coins) {
         $healthyCoins += $coin
     } elseif ($cs.Found -and $cs.Stale) {
         $staleCoinsList += $coin
+        if ($cs.AgeMinutes -ge $StaleRestartMinutes) {
+            $staleRestartCandidates += $coin
+        }
     }
 }
 
@@ -150,8 +230,38 @@ if ($runnerCount -gt 0) {
         Write-WatchdogLog "OK: ${runnerCount} runner(s), heartbeat not due | $statusSummary"
     }
 
-    # Warn about stale coins even if runners are alive
-    if ($staleCoinsList.Count -gt 0) {
+    # Daily digest: send once per UTC day
+    if (Should-SendDailyDigest -and -not $DryRun) {
+        Send-DailyDigest -CoinStatuses $coinStatuses
+    }
+
+    # Per-coin stale restart: if runners are alive but a specific coin is stale >StaleRestartMinutes
+    if ($staleRestartCandidates.Count -gt 0) {
+        $restartTimes = Get-CoinRestartTimes
+        foreach ($coin in $staleRestartCandidates) {
+            $lastRestart = $restartTimes[$coin]
+            $cooldownMinutes = 15
+            $shouldRestart = $true
+            if ($lastRestart) {
+                $elapsed = ((Get-Date).ToUniversalTime() - $lastRestart).TotalMinutes
+                if ($elapsed -lt $cooldownMinutes) {
+                    Write-WatchdogLog "STALE_COIN: $coin stale but restart cooldown active ($([math]::Round($elapsed,1))m ago, wait ${cooldownMinutes}m)"
+                    $shouldRestart = $false
+                }
+            }
+            if ($shouldRestart) {
+                $staleAge = ($coinStatuses | Where-Object { $_.Coin -eq $coin }).AgeMinutes
+                Write-WatchdogLog "STALE_COIN: $coin not updated in ${staleAge}m - restarting"
+                Send-Discord "WARNING: Argus $coin stale ${staleAge}m - restarting coin runner"
+                Set-CoinRestartTime -coin $coin -existing $restartTimes
+                if (-not $DryRun) {
+                    Restart-Coin -coin $coin
+                } else {
+                    Write-WatchdogLog "DRY RUN: would restart $coin"
+                }
+            }
+        }
+    } elseif ($staleCoinsList.Count -gt 0) {
         $staleMsg = "WARNING: stale coins: $($staleCoinsList -join ', ') (state not updated in >$StaleMinutes m)"
         Write-WatchdogLog $staleMsg
     }

@@ -146,6 +146,44 @@ def notify_trade_close(row: dict):
     send_discord(embed=embed)
 
 
+def notify_daily_digest(coin_stats: list):
+    """Send end-of-day P&L digest for all active coins.
+
+    coin_stats: list of dicts with keys: symbol, trades_today, daily_pnl_usd, total_pnl_usd, cash
+    """
+    if not coin_stats:
+        return
+
+    total_daily = sum(float(c.get("daily_pnl_usd", 0) or 0) for c in coin_stats)
+    total_pnl = sum(float(c.get("total_pnl_usd", 0) or 0) for c in coin_stats)
+    color = 0x00E676 if total_daily >= 0 else 0xFF5252
+
+    fields = []
+    for c in coin_stats:
+        sym = c.get("symbol", "?")
+        dpnl = float(c.get("daily_pnl_usd", 0) or 0)
+        trades = int(c.get("trades_today", 0) or 0)
+        cash = float(c.get("cash", 0) or 0)
+        sign = "+" if dpnl >= 0 else ""
+        fields.append({
+            "name": sym,
+            "value": f"Daily: {sign}${dpnl:.2f} | Trades: {trades} | Cash: ${cash:.2f}",
+            "inline": False,
+        })
+
+    sign_total = "+" if total_daily >= 0 else ""
+    fields.append({"name": "Portfolio Daily", "value": f"{sign_total}${total_daily:.2f}", "inline": True})
+    fields.append({"name": "All-Time PnL", "value": f"${total_pnl:.2f}", "inline": True})
+
+    embed = {
+        "title": "Daily Digest",
+        "color": color,
+        "fields": fields,
+        "footer": {"text": "Argus Daily Summary"},
+    }
+    send_discord(embed=embed)
+
+
 def notify_error(error: str):
     embed = {
         "title": "Argus Error",

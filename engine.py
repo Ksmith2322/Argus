@@ -1153,7 +1153,25 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.liq_reasons = str(getattr(liq, "reasons", "") or "")
 
     payload = state.risk.ensure_day(now_e, cfg)
-    if payload:
+    if payload and not payload.get("auto_synced") and not payload.get("ignored_rewind"):
+        old_day = payload.get("old_day", "?")
+        old_trades = payload.get("old_trades_today", 0)
+        old_pnl = payload.get("old_daily_realized", "0")
+        try:
+            pnl_f = float(old_pnl)
+            pnl_sign = "+" if pnl_f >= 0 else ""
+            notify_body = (
+                f"{snap.symbol} | Day: {old_day} | Trades: {old_trades} | "
+                f"Daily P&L: {pnl_sign}${pnl_f:.2f}"
+            )
+        except Exception:
+            notify_body = payload["msg"]
+        _add_event(
+            snap, "RISK_DAY_RESET", payload["msg"],
+            notify_title="Daily Reset",
+            notify_body=notify_body,
+        )
+    elif payload:
         _add_event(snap, "RISK_DAY_RESET", payload["msg"])
 
     cooldown_remaining = max(0, int(state.cooldown_until_epoch) - now_e)
@@ -1302,7 +1320,13 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     realized_pnl = state.ledger.realized_pnl_usd
 
     # Drawdown circuit breaker — update rolling equity tracker
-    state.risk.update_equity(equity, now_e, cfg)
+    _dd_reason = state.risk.update_equity(equity, now_e, cfg)
+    if _dd_reason:
+        _add_event(
+            snap, "DRAWDOWN_CIRCUIT_BREAKER", _dd_reason,
+            notify_title="DRAWDOWN BREACH",
+            notify_body=_dd_reason,
+        )
 
     take_profit = stop_loss = trail_stop = None
     hold_s = 0

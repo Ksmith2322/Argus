@@ -144,6 +144,7 @@ class PaperAdapter(ExecutionAdapter):
         currency: str = "USD",
         fee_bps: Decimal | str = Decimal("0"),
         slippage_bps: Decimal | str = Decimal("0"),
+        stop_loss_slippage_bps: Decimal | str = Decimal("0"),
         qty_precision: str = "0.00000001",
         px_precision: str = "0.01",
         money_precision: str = "0.00000001",
@@ -160,6 +161,7 @@ class PaperAdapter(ExecutionAdapter):
         self._starting_cash = self._to_decimal(starting_cash, "starting_cash")
         self._fee_bps = self._to_decimal(fee_bps, "fee_bps")
         self._slippage_bps = self._to_decimal(slippage_bps, "slippage_bps")
+        self._stop_loss_slippage_bps = self._to_decimal(stop_loss_slippage_bps, "stop_loss_slippage_bps")
         self._qty_quant = Decimal(str(qty_precision))
         self._px_quant = Decimal(str(px_precision))
         self._money_quant = Decimal(str(money_precision))
@@ -1127,7 +1129,17 @@ class PaperAdapter(ExecutionAdapter):
             base_px = self._synthetic_fill_px(order)
 
         slip_mult = self._fee_multiplier(self._slippage_bps, positive=(order.side == "BUY"))
-        return self._q_px(base_px * slip_mult)
+        fill_px = base_px * slip_mult
+
+        # Extra stop-loss slippage: SELL orders tagged as stop-loss exits fill at worse price
+        if (
+            self._stop_loss_slippage_bps > 0
+            and order.side == "SELL"
+            and "STOP_LOSS" in str((order.raw or {}).get("tags", {}).get("action_reason", "")).upper()
+        ):
+            fill_px = fill_px * self._fee_multiplier(self._stop_loss_slippage_bps, positive=False)
+
+        return self._q_px(fill_px)
 
     def _limit_fill_px(
         self,

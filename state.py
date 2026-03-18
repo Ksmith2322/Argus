@@ -379,6 +379,7 @@ class BotState:
                     currency=_as_str(cfg.get("ACCOUNT_CURRENCY", "USD"), "USD"),
                     fee_bps=_as_decimal(cfg.get("PAPER_FEE_BPS", "0"), "0"),
                     slippage_bps=_as_decimal(cfg.get("PAPER_SLIPPAGE_BPS", "0"), "0"),
+                    stop_loss_slippage_bps=_as_decimal(cfg.get("STOP_LOSS_SLIPPAGE_BPS", "0"), "0"),
                     qty_precision=_as_str(
                         cfg.get("PAPER_QTY_PRECISION", "0.00000001"),
                         "0.00000001",

@@ -186,9 +186,12 @@ def load_config() -> dict:
     # -------------------------
     cfg["FEE_BPS"] = _d("FEE_BPS", "5")
     cfg["SLIPPAGE_BPS"] = _d("SLIPPAGE_BPS", "2")
+    # Extra slippage applied only on stop-loss exits (gap-through penalty)
+    cfg["STOP_LOSS_SLIPPAGE_BPS"] = _d("STOP_LOSS_SLIPPAGE_BPS", "0")
 
     cfg["FEE_BPS"] = _clamp_decimal(cfg["FEE_BPS"], Decimal("0"), Decimal("1000"))
     cfg["SLIPPAGE_BPS"] = _clamp_decimal(cfg["SLIPPAGE_BPS"], Decimal("0"), Decimal("1000"))
+    cfg["STOP_LOSS_SLIPPAGE_BPS"] = _clamp_decimal(cfg["STOP_LOSS_SLIPPAGE_BPS"], Decimal("0"), Decimal("1000"))
 
     # -------------------------
     # Anti-thrash
