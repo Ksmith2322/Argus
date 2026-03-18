@@ -30,7 +30,7 @@ import ml_governor
 
 # Cross-Coin Correlation Guard
 from correlation_guard import can_enter_cross_coin
-from btc_momentum_guard import check_btc_momentum, write_btc_trend_state
+from btc_momentum_guard import check_btc_momentum, write_btc_trend_state, write_eth_trend_state, read_eth_lag_delta
 
 
 def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
@@ -379,6 +379,52 @@ def _apply_phase4_vol_sizing(
     return final_qty, f"VOL_APPLIED vol={vol} ({why})", vol, qty_vol_d
 
 
+def _apply_score_size_mult(qty: Decimal, eff_score: int, cfg: dict) -> Tuple[Decimal, str]:
+    """Scale position size by signal quality tier. Disabled by default."""
+    if not cfg.get("USE_SCORE_SIZE_MULT"):
+        return qty, ""
+    low_max  = int(cfg.get("SCORE_SIZE_LOW_MAX",  92))
+    high_min = int(cfg.get("SCORE_SIZE_HIGH_MIN", 98))
+    low_pct  = Decimal(str(cfg.get("SCORE_SIZE_LOW_PCT",  "0.60")))
+    mid_pct  = Decimal(str(cfg.get("SCORE_SIZE_MID_PCT",  "1.00")))
+    high_pct = Decimal(str(cfg.get("SCORE_SIZE_HIGH_PCT", "1.30")))
+    if eff_score <= low_max:
+        mult, tier = low_pct, "LOW"
+    elif eff_score >= high_min:
+        mult, tier = high_pct, "HIGH"
+    else:
+        mult, tier = mid_pct, "MID"
+    return (qty * mult).quantize(Decimal("0.00000001")), f"SCORE_SIZE_{tier}(x{mult})"
+
+
+def _vol_spike_ok(state, tick, cfg: dict) -> Tuple[bool, str]:
+    """Return (ok, reason). Passes if filter disabled or volume confirms move."""
+    if not cfg.get("USE_VOL_SPIKE_FILTER"):
+        return True, ""
+    min_ratio = float(cfg.get("VOL_SPIKE_MIN_RATIO", 1.20))
+    # Current 1m volume
+    vol_now = getattr(state, "last_candle_volume_1m", None)
+    if vol_now is None:
+        vol_now = getattr(tick, "vol_1m", None)
+    if vol_now is None:
+        return True, "VOL_SPIKE_NO_DATA"  # pass-through if no data
+    # Baseline from liquidity engine
+    le = getattr(state, "liquidity_engine", None)
+    vol_base = None
+    if le is not None:
+        for attr in ("vol_baseline", "_vol_baseline", "baseline"):
+            v = getattr(le, attr, None)
+            if v is not None:
+                vol_base = float(v() if callable(v) else v)
+                break
+    if vol_base is None or vol_base <= 0:
+        return True, "VOL_SPIKE_NO_BASELINE"  # pass-through if no baseline yet
+    ratio = float(vol_now) / vol_base
+    if ratio < min_ratio:
+        return False, f"VOL_SPIKE_WEAK(ratio={ratio:.2f}<{min_ratio})"
+    return True, f"VOL_SPIKE_OK(ratio={ratio:.2f})"
+
+
 def _ensure_state_has_regime_inputs(st_1m: StrategyState, vol: Optional[Decimal]):
     if vol is None:
         return
@@ -620,18 +666,30 @@ def _apply_ob_imbalance_overlay(
 
 
 def _apply_btc_lag_overlay(score: int, cfg: dict, symbol: str) -> Tuple[int, Optional[float], int]:
-    """Apply BTC lag signal score adjustment for non-BTC coins.
+    """Apply lag signal score adjustment based on lead coin's 60s price delta.
 
-    Returns (adjusted_score, btc_delta_pct, adj_applied)
+    For non-BTC coins: reads BTC lag delta (BTC leads ETH/alts).
+    For BTC: reads ETH lag delta (ETH can also lead BTC in some regimes).
+    Returns (adjusted_score, delta_pct, adj_applied)
     """
     if not _bool_cfg(cfg, "USE_BTC_LAG_SIGNAL", False):
         return score, None, 0
-    # Only apply to non-BTC coins
-    if "BTC" in symbol.upper():
-        return score, None, 0
 
-    from btc_momentum_guard import read_btc_lag_delta
-    delta_pct, age_s = read_btc_lag_delta()
+    sym_upper = symbol.upper()
+
+    if "BTC" in sym_upper:
+        # BTC runner: use ETH lag signal
+        try:
+            delta_pct, age_s = read_eth_lag_delta()
+        except Exception:
+            return score, None, 0
+    else:
+        # Non-BTC runner: use BTC lag signal
+        try:
+            from btc_momentum_guard import read_btc_lag_delta
+            delta_pct, age_s = read_btc_lag_delta()
+        except Exception:
+            return score, None, 0
 
     if delta_pct is None:
         return score, None, 0
@@ -1131,18 +1189,31 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         snap.regime = "UNKNOWN"
         snap.trend_strength = None
 
-    # BTC momentum gate: publish BTC trend state for other coins to read
-    if "BTC" in symbol.upper() and state.regime is not None:
-        try:
-            write_btc_trend_state(
-                cfg,
-                regime=state.regime.regime,
-                trend_strength=float(state.regime.trend_strength),
-                vol=float(state.regime.vol),
-                px=float(px),
-            )
-        except Exception:
-            pass
+    # BTC momentum gate: publish trend state for cross-coin lag signals
+    if state.regime is not None:
+        sym_upper = symbol.upper()
+        if "BTC" in sym_upper:
+            try:
+                write_btc_trend_state(
+                    cfg,
+                    regime=state.regime.regime,
+                    trend_strength=float(state.regime.trend_strength),
+                    vol=float(state.regime.vol),
+                    px=float(px),
+                )
+            except Exception:
+                pass
+        elif "ETH" in sym_upper:
+            try:
+                write_eth_trend_state(
+                    cfg,
+                    regime=state.regime.regime,
+                    trend_strength=float(state.regime.trend_strength),
+                    vol=float(state.regime.vol),
+                    px=float(px),
+                )
+            except Exception:
+                pass
 
     structure: Optional[StructureResult] = _compute_structure(
         state,
@@ -1846,8 +1917,229 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             extra=f"gate={safe_str(conf_gate)}",
                         )
                     else:
-                        qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+                        _vs_ok, _vs_reason = _vol_spike_ok(state, tick, cfg)
+                        if not _vs_ok:
+                            _emit_missed_buy(
+                                snap,
+                                event="MISSED_BUY_VOL_SPIKE",
+                                prefix=_vs_reason,
+                                px=px,
+                                confluence_min_score=confluence_min_score,
+                                cooldown_remaining=int(cooldown_remaining),
+                                equity=equity,
+                                exposure=exposure,
+                            )
+                        else:
+                            qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
 
+                            qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
+                                state=state,
+                                px=px,
+                                qty_cap=_as_decimal(qty_cap, "0"),
+                                cfg=cfg,
+                            )
+
+                            if qty > 0:
+                                qty, _ssm_note = _apply_score_size_mult(qty, int(eff_score if eff_score is not None else 0), cfg)
+                                if _ssm_note:
+                                    sizing_note = f"{sizing_note}|{_ssm_note}" if sizing_note else _ssm_note
+
+                            watch_gated = False
+                            if require_confluence and conf_gate != "TRADE" and qty > 0:
+                                try:
+                                    pre_mult_qty = qty
+                                    qty = qty * conf_size_mult
+                                    if qty <= 0 < pre_mult_qty:
+                                        watch_gated = True
+                                except Exception:
+                                    pass
+
+                            if qty <= 0:
+                                ev = "MISSED_BUY_WATCH_GATED" if watch_gated else _missed_buy_event_from_qty_reason(qty_reason)
+                                _emit_missed_buy(
+                                    snap,
+                                    event=ev,
+                                    prefix="SIZE_BLOCK",
+                                    px=px,
+                                    confluence_min_score=confluence_min_score,
+                                    cooldown_remaining=int(cooldown_remaining),
+                                    equity=equity,
+                                    exposure=exposure,
+                                    extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated else ''}",
+                                )
+                            else:
+                                if hasattr(state.risk, "can_enter_with_context"):
+                                    allowed, why = state.risk.can_enter_with_context(
+                                        now_epoch=now_e,
+                                        cfg=cfg,
+                                        spread_bps=getattr(snap, "liq_spread_bps", None),
+                                        proposed_qty=qty,
+                                        current_qty=state.ledger.position_qty,
+                                        px=px,
+                                        current_exposure_usd=exposure,
+                                        stale=bool(stale),
+                                        last_market_data_epoch=getattr(state, "last_good_tick_epoch", None),
+                                        symbol=symbol,
+                                    )
+                                else:
+                                    allowed, why = state.risk.can_enter(now_e, cfg)
+
+                                if not allowed:
+                                    ev = _missed_buy_event_from_risk_reason(why)
+                                    lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
+                                    lockout_fmt = _fmt_lockout(now_e, lockout_until)
+
+                                    _emit_missed_buy(
+                                        snap,
+                                        event=ev,
+                                        prefix="RISK_BLOCK",
+                                        px=px,
+                                        confluence_min_score=confluence_min_score,
+                                        cooldown_remaining=int(cooldown_remaining),
+                                        equity=equity,
+                                        exposure=exposure,
+                                        extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
+                                    )
+                                    risk_blocked_reason = str(why or "")
+                                else:
+                                    # ML Governor GATE check (evaluation already done above)
+                                    gov = _gov_result  # reuse early evaluation
+                                    gov_mode = str(cfg.get("ML_GOVERNOR_MODE", "LOG_ONLY")).upper()
+                                    if gov_mode == "GATE" and gov.recommendation == "BLOCK" and gov.model_loaded:
+                                        _emit_missed_buy(
+                                            snap,
+                                            event="MISSED_BUY_GOVERNOR",
+                                            prefix="ML_GOVERNOR_BLOCK",
+                                            px=px,
+                                            confluence_min_score=confluence_min_score,
+                                            cooldown_remaining=int(cooldown_remaining),
+                                            equity=equity,
+                                            exposure=exposure,
+                                            extra=f"win_prob={gov.win_prob:.3f} threshold={cfg.get('ML_GOVERNOR_THRESHOLD', '0.30')}",
+                                        )
+                                    else:
+                                        if gov_mode == "SCORE_MODIFY" and gov.model_loaded and gov.score_modifier != 0:
+                                            old_score = snap.confluence_score
+                                            if old_score is not None:
+                                                snap.confluence_score = max(0, min(100, old_score + gov.score_modifier))
+
+                                        # Cross-coin correlation guard
+                                        cc_ok, cc_reason = can_enter_cross_coin(symbol, cfg)
+                                        if not cc_ok:
+                                            _emit_missed_buy(
+                                                snap,
+                                                event="MISSED_BUY_CROSS_COIN",
+                                                prefix="CROSS_COIN_BLOCK",
+                                                px=px,
+                                                confluence_min_score=confluence_min_score,
+                                                cooldown_remaining=int(cooldown_remaining),
+                                                equity=equity,
+                                                exposure=exposure,
+                                                extra=f"cross_coin={cc_reason}",
+                                            )
+                                        else:
+                                            # BTC momentum gate — block alt entries when BTC trends down
+                                            btc_ok, btc_reason = check_btc_momentum(symbol, cfg)
+                                            if not btc_ok:
+                                                _emit_missed_buy(
+                                                    snap,
+                                                    event="MISSED_BUY_BTC_MOMENTUM",
+                                                    prefix="BTC_MOMENTUM_BLOCK",
+                                                    px=px,
+                                                    confluence_min_score=confluence_min_score,
+                                                    cooldown_remaining=int(cooldown_remaining),
+                                                    equity=equity,
+                                                    exposure=exposure,
+                                                    extra=f"btc_momentum={btc_reason}",
+                                                )
+                                            else:
+                                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                                                snap.vol_used = vol_used
+                                                snap.vol_sizing_qty = qty_vol
+                                                snap.execution_qty = qty
+                                                snap.vol_reason = qty_reason
+                                                snap.sizing_note = sizing_note
+
+                                                if _adapter_mode_enabled(cfg, state):
+                                                    snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                                    snap.entry_intent_id = snap.intent_id
+                                                    snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                                    snap.execution_status = "PENDING_SUBMIT"
+                                                    snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
+
+                                                    _add_event(
+                                                        snap,
+                                                        ev_name,
+                                                        (
+                                                            f"ENTRY_INTENT | px={px} qty={qty} "
+                                                            f"client_order_id={snap.client_order_id} | "
+                                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                                        ),
+                                                        notify_title="BUY",
+                                                        notify_body=(
+                                                            f"{symbol} BUY intent\n"
+                                                            f"px={px}\nqty={qty}\n"
+                                                            f"client_order_id={snap.client_order_id}"
+                                                        ),
+                                                        client_order_id=snap.client_order_id,
+                                                    )
+
+                                                    action = "BUY"
+                                                    action_reason = "ENTRY_INTENT"
+                                                else:
+                                                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                                    state.risk.record_entry(now_e, cfg)
+
+                                                    state.entry_epoch = now_e
+                                                    state.peak_price = px
+                                                    state.trend_below_count = 0
+                                                    state.mfe_pct = Decimal("0")
+                                                    state.mae_pct = Decimal("0")
+                                                    state.high_since_entry = px
+                                                    state.low_since_entry = px
+
+                                                    _add_event(
+                                                        snap,
+                                                        ev_name,
+                                                        (
+                                                            f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                                        ),
+                                                        notify_title="BUY",
+                                                        notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                                    )
+
+                                                    action = ev_name
+                                                    action_reason = "ENTRY_FILLED"
+
+            else:
+                if require_confluence and (not conf_ok):
+                    _emit_missed_buy(
+                        snap,
+                        event="MISSED_BUY_CONFLUENCE",
+                        prefix="CONFLUENCE_VETO",
+                        px=px,
+                        confluence_min_score=confluence_min_score,
+                        cooldown_remaining=int(cooldown_remaining),
+                        equity=equity,
+                        exposure=exposure,
+                        extra=f"gate={safe_str(conf_gate)}",
+                    )
+                else:
+                    _vs_ok2, _vs_reason2 = _vol_spike_ok(state, tick, cfg)
+                    if not _vs_ok2:
+                        _emit_missed_buy(
+                            snap,
+                            event="MISSED_BUY_VOL_SPIKE",
+                            prefix=_vs_reason2,
+                            px=px,
+                            confluence_min_score=confluence_min_score,
+                            cooldown_remaining=int(cooldown_remaining),
+                            equity=equity,
+                            exposure=exposure,
+                        )
+                    else:
+                        qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
                         qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
                             state=state,
                             px=px,
@@ -1855,18 +2147,23 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             cfg=cfg,
                         )
 
-                        watch_gated = False
+                        if qty > 0:
+                            qty, _ssm_note2 = _apply_score_size_mult(qty, int(eff_score if eff_score is not None else 0), cfg)
+                            if _ssm_note2:
+                                sizing_note = f"{sizing_note}|{_ssm_note2}" if sizing_note else _ssm_note2
+
+                        watch_gated2 = False
                         if require_confluence and conf_gate != "TRADE" and qty > 0:
                             try:
-                                pre_mult_qty = qty
+                                pre_mult_qty2 = qty
                                 qty = qty * conf_size_mult
-                                if qty <= 0 < pre_mult_qty:
-                                    watch_gated = True
+                                if qty <= 0 < pre_mult_qty2:
+                                    watch_gated2 = True
                             except Exception:
                                 pass
 
                         if qty <= 0:
-                            ev = "MISSED_BUY_WATCH_GATED" if watch_gated else _missed_buy_event_from_qty_reason(qty_reason)
+                            ev = "MISSED_BUY_WATCH_GATED" if watch_gated2 else _missed_buy_event_from_qty_reason(qty_reason)
                             _emit_missed_buy(
                                 snap,
                                 event=ev,
@@ -1876,7 +2173,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 cooldown_remaining=int(cooldown_remaining),
                                 equity=equity,
                                 exposure=exposure,
-                                extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated else ''}",
+                                extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated2 else ''}",
                             )
                         else:
                             if hasattr(state.risk, "can_enter_with_context"):
@@ -1913,268 +2210,79 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                 )
                                 risk_blocked_reason = str(why or "")
                             else:
-                                # ML Governor GATE check (evaluation already done above)
-                                gov = _gov_result  # reuse early evaluation
-                                gov_mode = str(cfg.get("ML_GOVERNOR_MODE", "LOG_ONLY")).upper()
-                                if gov_mode == "GATE" and gov.recommendation == "BLOCK" and gov.model_loaded:
+                                # Cross-coin correlation guard
+                                cc_ok2, cc_reason2 = can_enter_cross_coin(symbol, cfg)
+                                if not cc_ok2:
                                     _emit_missed_buy(
                                         snap,
-                                        event="MISSED_BUY_GOVERNOR",
-                                        prefix="ML_GOVERNOR_BLOCK",
+                                        event="MISSED_BUY_CROSS_COIN",
+                                        prefix="CROSS_COIN_BLOCK",
                                         px=px,
                                         confluence_min_score=confluence_min_score,
                                         cooldown_remaining=int(cooldown_remaining),
                                         equity=equity,
                                         exposure=exposure,
-                                        extra=f"win_prob={gov.win_prob:.3f} threshold={cfg.get('ML_GOVERNOR_THRESHOLD', '0.30')}",
+                                        extra=f"cross_coin={cc_reason2}",
                                     )
                                 else:
-                                    if gov_mode == "SCORE_MODIFY" and gov.model_loaded and gov.score_modifier != 0:
-                                        old_score = snap.confluence_score
-                                        if old_score is not None:
-                                            snap.confluence_score = max(0, min(100, old_score + gov.score_modifier))
+                                    ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                                    snap.vol_used = vol_used
+                                    snap.vol_sizing_qty = qty_vol
+                                    snap.execution_qty = qty
+                                    snap.vol_reason = qty_reason
+                                    snap.sizing_note = sizing_note
 
-                                    # Cross-coin correlation guard
-                                    cc_ok, cc_reason = can_enter_cross_coin(symbol, cfg)
-                                    if not cc_ok:
-                                        _emit_missed_buy(
+                                    if _adapter_mode_enabled(cfg, state):
+                                        snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                        snap.entry_intent_id = snap.intent_id
+                                        snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                        snap.execution_status = "PENDING_SUBMIT"
+                                        snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
+
+                                        _add_event(
                                             snap,
-                                            event="MISSED_BUY_CROSS_COIN",
-                                            prefix="CROSS_COIN_BLOCK",
-                                            px=px,
-                                            confluence_min_score=confluence_min_score,
-                                            cooldown_remaining=int(cooldown_remaining),
-                                            equity=equity,
-                                            exposure=exposure,
-                                            extra=f"cross_coin={cc_reason}",
+                                            ev_name,
+                                            (
+                                                f"ENTRY_INTENT | px={px} qty={qty} "
+                                                f"client_order_id={snap.client_order_id} | "
+                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                            ),
+                                            notify_title="BUY",
+                                            notify_body=(
+                                                f"{symbol} BUY intent\n"
+                                                f"px={px}\nqty={qty}\n"
+                                                f"client_order_id={snap.client_order_id}"
+                                            ),
+                                            client_order_id=snap.client_order_id,
                                         )
+
+                                        action = "BUY"
+                                        action_reason = "ENTRY_INTENT"
                                     else:
-                                        # BTC momentum gate — block alt entries when BTC trends down
-                                        btc_ok, btc_reason = check_btc_momentum(symbol, cfg)
-                                        if not btc_ok:
-                                            _emit_missed_buy(
-                                                snap,
-                                                event="MISSED_BUY_BTC_MOMENTUM",
-                                                prefix="BTC_MOMENTUM_BLOCK",
-                                                px=px,
-                                                confluence_min_score=confluence_min_score,
-                                                cooldown_remaining=int(cooldown_remaining),
-                                                equity=equity,
-                                                exposure=exposure,
-                                                extra=f"btc_momentum={btc_reason}",
-                                            )
-                                        else:
-                                            ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                                            snap.vol_used = vol_used
-                                            snap.vol_sizing_qty = qty_vol
-                                            snap.execution_qty = qty
-                                            snap.vol_reason = qty_reason
-                                            snap.sizing_note = sizing_note
+                                        fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                        state.risk.record_entry(now_e, cfg)
 
-                                            if _adapter_mode_enabled(cfg, state):
-                                                snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
-                                                snap.entry_intent_id = snap.intent_id
-                                                snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
-                                                snap.execution_status = "PENDING_SUBMIT"
-                                                snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
+                                        state.entry_epoch = now_e
+                                        state.peak_price = px
+                                        state.trend_below_count = 0
+                                        state.mfe_pct = Decimal("0")
+                                        state.mae_pct = Decimal("0")
+                                        state.high_since_entry = px
+                                        state.low_since_entry = px
 
-                                                _add_event(
-                                                    snap,
-                                                    ev_name,
-                                                    (
-                                                        f"ENTRY_INTENT | px={px} qty={qty} "
-                                                        f"client_order_id={snap.client_order_id} | "
-                                                        f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                                    ),
-                                                    notify_title="BUY",
-                                                    notify_body=(
-                                                        f"{symbol} BUY intent\n"
-                                                        f"px={px}\nqty={qty}\n"
-                                                        f"client_order_id={snap.client_order_id}"
-                                                    ),
-                                                    client_order_id=snap.client_order_id,
-                                                )
+                                        _add_event(
+                                            snap,
+                                            ev_name,
+                                            (
+                                                f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                            ),
+                                            notify_title="BUY",
+                                            notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                        )
 
-                                                action = "BUY"
-                                                action_reason = "ENTRY_INTENT"
-                                            else:
-                                                fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                                                state.risk.record_entry(now_e, cfg)
-
-                                                state.entry_epoch = now_e
-                                                state.peak_price = px
-                                                state.trend_below_count = 0
-                                                state.mfe_pct = Decimal("0")
-                                                state.mae_pct = Decimal("0")
-                                                state.high_since_entry = px
-                                                state.low_since_entry = px
-
-                                                _add_event(
-                                                    snap,
-                                                    ev_name,
-                                                    (
-                                                        f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                                        f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                                    ),
-                                                    notify_title="BUY",
-                                                    notify_body=f"{symbol} BUY px={px} qty={qty}",
-                                                )
-
-                                                action = ev_name
-                                                action_reason = "ENTRY_FILLED"
-
-            else:
-                if require_confluence and (not conf_ok):
-                    _emit_missed_buy(
-                        snap,
-                        event="MISSED_BUY_CONFLUENCE",
-                        prefix="CONFLUENCE_VETO",
-                        px=px,
-                        confluence_min_score=confluence_min_score,
-                        cooldown_remaining=int(cooldown_remaining),
-                        equity=equity,
-                        exposure=exposure,
-                        extra=f"gate={safe_str(conf_gate)}",
-                    )
-                else:
-                    qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
-                    qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
-                        state=state,
-                        px=px,
-                        qty_cap=_as_decimal(qty_cap, "0"),
-                        cfg=cfg,
-                    )
-                    watch_gated2 = False
-                    if require_confluence and conf_gate != "TRADE" and qty > 0:
-                        try:
-                            pre_mult_qty2 = qty
-                            qty = qty * conf_size_mult
-                            if qty <= 0 < pre_mult_qty2:
-                                watch_gated2 = True
-                        except Exception:
-                            pass
-
-                    if qty <= 0:
-                        ev = "MISSED_BUY_WATCH_GATED" if watch_gated2 else _missed_buy_event_from_qty_reason(qty_reason)
-                        _emit_missed_buy(
-                            snap,
-                            event=ev,
-                            prefix="SIZE_BLOCK",
-                            px=px,
-                            confluence_min_score=confluence_min_score,
-                            cooldown_remaining=int(cooldown_remaining),
-                            equity=equity,
-                            exposure=exposure,
-                            extra=f"qty_reason={safe_str(qty_reason)}{' watch_gate='+conf_gate if watch_gated2 else ''}",
-                        )
-                    else:
-                        if hasattr(state.risk, "can_enter_with_context"):
-                            allowed, why = state.risk.can_enter_with_context(
-                                now_epoch=now_e,
-                                cfg=cfg,
-                                spread_bps=getattr(snap, "liq_spread_bps", None),
-                                proposed_qty=qty,
-                                current_qty=state.ledger.position_qty,
-                                px=px,
-                                current_exposure_usd=exposure,
-                                stale=bool(stale),
-                                last_market_data_epoch=getattr(state, "last_good_tick_epoch", None),
-                                symbol=symbol,
-                            )
-                        else:
-                            allowed, why = state.risk.can_enter(now_e, cfg)
-
-                        if not allowed:
-                            ev = _missed_buy_event_from_risk_reason(why)
-                            lockout_until = int(getattr(state.risk, "lockout_until_epoch", 0) or 0)
-                            lockout_fmt = _fmt_lockout(now_e, lockout_until)
-
-                            _emit_missed_buy(
-                                snap,
-                                event=ev,
-                                prefix="RISK_BLOCK",
-                                px=px,
-                                confluence_min_score=confluence_min_score,
-                                cooldown_remaining=int(cooldown_remaining),
-                                equity=equity,
-                                exposure=exposure,
-                                extra=f"risk_reason={safe_str(why)} lockout_until={lockout_fmt}",
-                            )
-                            risk_blocked_reason = str(why or "")
-                        else:
-                            # Cross-coin correlation guard
-                            cc_ok2, cc_reason2 = can_enter_cross_coin(symbol, cfg)
-                            if not cc_ok2:
-                                _emit_missed_buy(
-                                    snap,
-                                    event="MISSED_BUY_CROSS_COIN",
-                                    prefix="CROSS_COIN_BLOCK",
-                                    px=px,
-                                    confluence_min_score=confluence_min_score,
-                                    cooldown_remaining=int(cooldown_remaining),
-                                    equity=equity,
-                                    exposure=exposure,
-                                    extra=f"cross_coin={cc_reason2}",
-                                )
-                            else:
-                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                                snap.vol_used = vol_used
-                                snap.vol_sizing_qty = qty_vol
-                                snap.execution_qty = qty
-                                snap.vol_reason = qty_reason
-                                snap.sizing_note = sizing_note
-
-                                if _adapter_mode_enabled(cfg, state):
-                                    snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
-                                    snap.entry_intent_id = snap.intent_id
-                                    snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
-                                    snap.execution_status = "PENDING_SUBMIT"
-                                    snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
-
-                                    _add_event(
-                                        snap,
-                                        ev_name,
-                                        (
-                                            f"ENTRY_INTENT | px={px} qty={qty} "
-                                            f"client_order_id={snap.client_order_id} | "
-                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                        ),
-                                        notify_title="BUY",
-                                        notify_body=(
-                                            f"{symbol} BUY intent\n"
-                                            f"px={px}\nqty={qty}\n"
-                                            f"client_order_id={snap.client_order_id}"
-                                        ),
-                                        client_order_id=snap.client_order_id,
-                                    )
-
-                                    action = "BUY"
-                                    action_reason = "ENTRY_INTENT"
-                                else:
-                                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                                    state.risk.record_entry(now_e, cfg)
-
-                                    state.entry_epoch = now_e
-                                    state.peak_price = px
-                                    state.trend_below_count = 0
-                                    state.mfe_pct = Decimal("0")
-                                    state.mae_pct = Decimal("0")
-                                    state.high_since_entry = px
-                                    state.low_since_entry = px
-
-                                    _add_event(
-                                        snap,
-                                        ev_name,
-                                        (
-                                            f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                        ),
-                                        notify_title="BUY",
-                                        notify_body=f"{symbol} BUY px={px} qty={qty}",
-                                    )
-
-                                    action = ev_name
-                                    action_reason = "ENTRY_FILLED"
+                                        action = ev_name
+                                        action_reason = "ENTRY_FILLED"
 
     track_holds = _bool_cfg(cfg, "TRACK_HOLD_REASONS", True)
     if track_holds and (not state.ledger.in_pos()):

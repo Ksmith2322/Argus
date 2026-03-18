@@ -34,11 +34,13 @@ def _state_dir(cfg: Dict) -> Path:
 
 
 BTC_TREND_FILE = "btc_trend.json"
+ETH_TREND_FILE = "eth_trend.json"
 STALE_THRESHOLD_S = 300  # ignore BTC trend data older than 5 minutes
 _LAG_STALE_THRESHOLD_S = 30  # shorter stale window for lag signal
 
-# Rolling price buffer: list of (epoch_float, price_float), max 10 entries
+# Rolling price buffers: list of (epoch_float, price_float), max 10 entries
 _btc_price_buf: List[Tuple[float, float]] = []
+_eth_price_buf: List[Tuple[float, float]] = []
 
 
 def write_btc_trend_state(cfg: Dict, regime: str, trend_strength: float, vol: float, px: float = 0.0) -> None:
@@ -108,6 +110,78 @@ def read_btc_lag_delta() -> Tuple[Optional[float], float]:
         return None, float(age)
 
     delta = data.get("btc_px_delta_60s_pct")
+    if delta is None:
+        return None, float(age)
+
+    return float(delta), float(age)
+
+
+def write_eth_trend_state(cfg: Dict, regime: str, trend_strength: float, vol: float, px: float = 0.0) -> None:
+    """Called by ETH runner each tick to publish trend state for BTC to read."""
+    global _eth_price_buf
+
+    state_dir = _state_dir(cfg)
+    path = state_dir / ETH_TREND_FILE
+
+    now = time.time()
+
+    # Update rolling price buffer
+    if px and float(px) > 0:
+        _eth_price_buf.append((now, float(px)))
+        _eth_price_buf = _eth_price_buf[-10:]
+
+    # Compute 60s price delta pct
+    eth_px_delta_60s_pct: Optional[float] = None
+    if _eth_price_buf and float(px) > 0:
+        cutoff = now - 60.0
+        old_entries = [(t, p) for (t, p) in _eth_price_buf if t <= cutoff]
+        if old_entries:
+            oldest_px = old_entries[0][1]
+            if oldest_px > 0:
+                eth_px_delta_60s_pct = (float(px) - oldest_px) / oldest_px * 100.0
+
+    payload: Dict[str, Any] = {
+        "ts": int(now),
+        "regime": str(regime),
+        "trend_strength": float(trend_strength),
+        "vol": float(vol),
+    }
+    if eth_px_delta_60s_pct is not None:
+        payload["eth_px_delta_60s_pct"] = eth_px_delta_60s_pct
+
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def read_eth_lag_delta() -> Tuple[Optional[float], float]:
+    """Read ETH 60s price delta from shared state file.
+
+    Returns (eth_px_delta_60s_pct, age_seconds).
+    Returns (None, 999) if file missing, stale (>30s), or delta not available.
+    """
+    path = Path("./state") / ETH_TREND_FILE
+
+    if not path.exists():
+        return None, 999.0
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, 999.0
+
+    ts = int(data.get("ts", 0))
+    age = time.time() - ts
+
+    if age > _LAG_STALE_THRESHOLD_S:
+        return None, float(age)
+
+    delta = data.get("eth_px_delta_60s_pct")
     if delta is None:
         return None, float(age)
 

@@ -692,6 +692,18 @@ def load_config() -> dict:
     cfg["BTC_LAG_BULL_SCORE_ADJ"] = int(os.getenv("BTC_LAG_BULL_SCORE_ADJ", "8"))
     cfg["BTC_LAG_BEAR_SCORE_ADJ"] = int(os.getenv("BTC_LAG_BEAR_SCORE_ADJ", "-10"))
 
+    # Score-proportional position sizing — scale qty by confluence score tier
+    cfg["USE_SCORE_SIZE_MULT"] = _b("USE_SCORE_SIZE_MULT", "false")
+    cfg["SCORE_SIZE_LOW_PCT"] = float(os.getenv("SCORE_SIZE_LOW_PCT", "0.60"))   # score 88-92: 60% of base size
+    cfg["SCORE_SIZE_MID_PCT"] = float(os.getenv("SCORE_SIZE_MID_PCT", "1.00"))   # score 93-97: 100% (unchanged)
+    cfg["SCORE_SIZE_HIGH_PCT"] = float(os.getenv("SCORE_SIZE_HIGH_PCT", "1.30"))  # score 98+:   130% of base size
+    cfg["SCORE_SIZE_LOW_MAX"] = int(os.getenv("SCORE_SIZE_LOW_MAX", "92"))
+    cfg["SCORE_SIZE_HIGH_MIN"] = int(os.getenv("SCORE_SIZE_HIGH_MIN", "98"))
+
+    # Volume spike confirmation filter — require elevated volume at entry
+    cfg["USE_VOL_SPIKE_FILTER"] = _b("USE_VOL_SPIKE_FILTER", "false")
+    cfg["VOL_SPIKE_MIN_RATIO"] = float(os.getenv("VOL_SPIKE_MIN_RATIO", "1.20"))  # current vol must be >= 1.2x baseline
+
     # -------------------------
     # Trade tracker
     # -------------------------
