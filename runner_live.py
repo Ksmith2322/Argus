@@ -333,7 +333,16 @@ def _atomic_write_text(path: str, content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        # Retry on WinError 5 (Access Denied) — transient lock from antivirus / dashboard
+        for _attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except OSError as _e:
+                if _attempt < 4 and getattr(_e, "winerror", None) == 5:
+                    time.sleep(0.05 * (_attempt + 1))
+                else:
+                    raise
     finally:
         try:
             if os.path.exists(tmp_path):

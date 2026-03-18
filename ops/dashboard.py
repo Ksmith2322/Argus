@@ -245,10 +245,10 @@ def read_decision_flow(n: int = 30, coin: str = "ETH") -> list:
     if path.exists():
         try:
             rows = []
-            with open(path) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    event = row.get("event", "")
+            # Tail the file to avoid scanning 100k+ rows every SSE tick
+            tail_rows = _tail_csv(path, 500)
+            for row in tail_rows:
+                    event = row.get("event") or ""
                     if any(k in event for k in ["BUY", "MISSED_BUY", "ENTRY", "GOVERNOR"]):
                         rows.append(row)
             for row in rows[-n:]:
@@ -271,9 +271,7 @@ def read_decision_flow(n: int = 30, coin: str = "ETH") -> list:
     if sig_path.exists():
         try:
             gov_rows = []
-            with open(sig_path) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
+            for row in _tail_csv(sig_path, 200):
                     prob = row.get("governor_win_prob", "")
                     action = row.get("action", "")
                     if prob and action not in ("HOLD", ""):
@@ -307,21 +305,30 @@ def read_governor_latest(coin: str = "ETH") -> dict:
         return {}
     try:
         last = {}
-        with open(sig_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                last = row
-        prob = last.get("governor_win_prob", "")
-        if prob:
-            return {
-                "win_prob": float(prob),
-                "recommendation": last.get("governor_recommendation", ""),
-                "score_modifier": last.get("governor_score_modifier", ""),
-                "confluence_score": last.get("confluence_score", ""),
-                "regime": last.get("regime", ""),
-                "session": last.get("session", ""),
-            }
-        return {}
+        rows = _tail_csv(sig_path, 5)
+        if rows:
+            last = rows[-1]
+        # Return signal health data as long as we have at least a score
+        if not last:
+            return {}
+        action_reason_raw = last.get("action_reason", "")
+        prob_raw = last.get("governor_win_prob", "")
+        return {
+            "win_prob": float(prob_raw) if prob_raw else None,
+            "recommendation": last.get("governor_recommendation", ""),
+            "score_modifier": last.get("governor_score_modifier", ""),
+            "confluence_score": last.get("confluence_score", ""),
+            "regime": last.get("regime", ""),
+            "session": last.get("session", ""),
+            "score": last.get("score", ""),
+            "action": last.get("action", ""),
+            "action_reason": action_reason_raw[:120] if action_reason_raw else "",
+            "ob_imbalance": last.get("ob_imbalance", ""),
+            "gate": last.get("confluence_gate", ""),
+            "price": last.get("price", "") or last.get("px", ""),
+            "entry_px": last.get("entry_px", ""),
+            "position_qty": last.get("position_qty", "") or "",
+        }
     except Exception:
         log.warning("Failed to read governor latest: %s", sig_path, exc_info=True)
         return {}
@@ -654,6 +661,7 @@ async def api_multi():
             "equity": latest_acct.get("equity", state.get("cash", "0")),
             "realized_pnl": state.get("realized_pnl", "0"),
             "position_qty": state.get("position_qty", "0"),
+            "unrealized_pnl": latest_acct.get("unrealized_pnl", "0"),
             "saved_at": state.get("saved_at", 0),
             "saved_at_iso": datetime.fromtimestamp(
                 state.get("saved_at", 0), tz=timezone.utc
@@ -1869,6 +1877,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .dot-block { background: #ff5252; }
   .dot-caution { background: #ffc107; }
   .dot-unknown { background: #7b8ab8; }
+  .signal-ready { color: #00e676; }
+  .signal-watch { color: #ffc107; }
+  .signal-blocked { color: #ff5252; }
+  .badge-trend-up { background: #0d3320; color: #00e676; border: 1px solid #00e676; }
+  .badge-trend-down { background: #3d0d0d; color: #ff5252; border: 1px solid #ff5252; }
+  .badge-range { background: #2a2a0d; color: #ffc107; border: 1px solid #ffc107; }
+  .badge-volatile { background: #3d1a0d; color: #ff9800; border: 1px solid #ff9800; }
+  .coin-summary { padding: 14px; }
 </style>
 </head>
 <body>
@@ -1880,7 +1896,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="page-nav">
   <button class="page-nav-btn active" onclick="switchPage('live')">LIVE</button>
   <button class="page-nav-btn" onclick="switchPage('evolution')">BACKTEST EVOLUTION</button>
-  <button class="page-nav-btn" onclick="switchPage('queue')">QUEUE STATUS</button>
 </div>
 
 <div id="live-page" class="page-content active">
@@ -1896,6 +1911,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="coin-pnl" id="ms-pnl-ETH">$0.00</div>
     <div class="coin-detail">Equity: <span id="ms-eq-ETH">—</span> | Qty: <span id="ms-qty-ETH">0</span></div>
     <div class="coin-detail">Updated: <span id="ms-ts-ETH">—</span></div>
+    <div class="coin-signal-bar" id="ms-signal-ETH" style="margin-top:6px;"></div>
   </div>
   <div class="coin-summary" onclick="switchCoin('BTC')" id="summary-BTC">
     <div class="coin-name">BTC-USD</div>
@@ -1903,6 +1919,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="coin-pnl" id="ms-pnl-BTC">$0.00</div>
     <div class="coin-detail">Equity: <span id="ms-eq-BTC">—</span> | Qty: <span id="ms-qty-BTC">0</span></div>
     <div class="coin-detail">Updated: <span id="ms-ts-BTC">—</span></div>
+    <div class="coin-signal-bar" id="ms-signal-BTC" style="margin-top:6px;"></div>
   </div>
 </div>
 
@@ -1938,15 +1955,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Coin Pool Panel -->
-<div id="coin-pool-panel" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-    <div style="color:#ba68c8; font-weight:bold; font-size:0.85em; letter-spacing:1px;">COIN POOL</div>
-    <div style="font-size:0.72em; color:#7b8ab8;">Max active: <span id="pool-max-active">2</span> | Active: <span id="pool-active-count">2</span></div>
-  </div>
-  <div id="pool-coins-container" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
-</div>
-
 <div class="grid">
   <div class="card">
     <h2>Position</h2>
@@ -1975,34 +1983,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
   <div class="card">
     <h2>Queue Status</h2>
-    <div id="queue-running" class="metric" style="font-size:1.0em; color:#00d4ff;">Idle</div>
-    <div id="queue-progress" style="margin:6px 0;">
-      <div style="background:#1e2a42; border-radius:3px; height:14px; overflow:hidden;">
-        <div id="queue-progress-bar" style="background:#00d4ff; height:100%; width:0%; transition:width 0.5s;"></div>
-      </div>
-      <div class="label" id="queue-progress-text" style="margin-top:2px;">—</div>
-    </div>
-    <div class="label">Pending PC1: <span id="queue-pending-pc1">0</span> | PC2: <span id="queue-pending-pc2">0</span></div>
-    <div class="label">Completed today: <span id="queue-completed">0</span></div>
-    <div id="queue-labels" class="label" style="margin-top:4px;"></div>
-  </div>
-
-  <div class="card" id="sweep-card">
-    <h2>Sweep Progress</h2>
-    <div id="sweep-best-alert" style="display:none; background:#0d3320; border:1px solid #00e676; border-radius:4px; padding:6px 10px; margin-bottom:8px; font-size:0.85em;"></div>
-    <table style="width:100%; border-collapse:collapse; font-size:0.78em;">
-      <thead><tr style="color:#7b8ab8;">
-        <th style="text-align:left; padding:2px 4px;">Phase</th>
-        <th style="text-align:right; padding:2px 4px;">Done</th>
-        <th style="text-align:right; padding:2px 4px;">Queue</th>
-        <th style="text-align:right; padding:2px 4px;">Profitable</th>
-        <th style="text-align:right; padding:2px 4px;">Best PF</th>
-      </tr></thead>
-      <tbody id="sweep-table-body">
-        <tr><td colspan="5" style="color:#7b8ab8; text-align:center; padding:6px;">loading…</td></tr>
-      </tbody>
-    </table>
-    <div id="sweep-best-config" style="margin-top:6px; font-size:0.75em; color:#a0b0c8;"></div>
+    <div id="queue-running" class="metric" style="font-size:1.0em; color:#7b8ab8;">Idle</div>
+    <div class="label">Pending: <span id="queue-pending-pc1">0</span> PC1 | <span id="queue-pending-pc2">0</span> PC2</div>
+    <div class="label">Done today: <span id="queue-completed">0</span></div>
   </div>
 
   <div class="card">
@@ -2017,6 +2000,83 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="label" style="margin-top:4px;">Recommendation: <span id="gov-rec" style="font-weight:bold;">—</span></div>
     <div class="label">Score mod: <span id="gov-mod">0</span> | Confluence: <span id="gov-conf">—</span></div>
     <div class="label">Regime: <span id="gov-regime">—</span> | Session: <span id="gov-session">—</span></div>
+  </div>
+</div>
+
+<!-- Signal Health Panel -->
+<div class="card" id="signal-health-panel" style="margin-bottom:12px; border-left: 3px solid #00d4ff;">
+  <h2>Signal Health — <span id="sh-coin">ETH-USD</span></h2>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+    <div>
+      <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px; letter-spacing:1px;">CONFLUENCE SCORE</div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+        <div style="flex:1; background:#0d1321; border-radius:4px; height:18px; overflow:hidden; position:relative;">
+          <div id="sh-score-bar" style="height:100%; width:0%; border-radius:4px; transition:width 0.5s; background:#ff5252;"></div>
+          <span id="sh-score-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:18px; font-size:0.8em; font-weight:bold; color:#fff;">—</span>
+        </div>
+        <div id="sh-gate-badge" style="font-size:0.7em; padding:2px 8px; border-radius:10px; background:#1e2a42; color:#7b8ab8; white-space:nowrap;">—</div>
+      </div>
+      <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px; letter-spacing:1px;">GOVERNOR WIN PROBABILITY</div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+        <div style="flex:1; background:#0d1321; border-radius:4px; height:14px; overflow:hidden; position:relative;">
+          <div id="sh-gov-bar" style="height:100%; width:0%; border-radius:4px; transition:width 0.5s; background:#7b8ab8;"></div>
+          <span id="sh-gov-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:14px; font-size:0.72em; font-weight:bold; color:#fff;">—</span>
+        </div>
+        <div id="sh-gov-rec" style="font-size:0.7em; padding:2px 8px; border-radius:10px; background:#1e2a42; color:#7b8ab8; white-space:nowrap;">—</div>
+      </div>
+      <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px; letter-spacing:1px;">ORDER BOOK IMBALANCE</div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+        <div style="flex:1; background:#0d1321; border-radius:4px; height:14px; overflow:hidden; position:relative;">
+          <div id="sh-ob-fill" style="position:absolute; height:100%; background:#00d4ff; opacity:0.4; transition:all 0.5s;"></div>
+          <div id="sh-ob-center" style="position:absolute; left:50%; top:0; height:100%; width:1px; background:#2a3a5c;"></div>
+          <span id="sh-ob-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:14px; font-size:0.72em; font-weight:bold; color:#fff;">—</span>
+        </div>
+        <div id="sh-ob-badge" style="font-size:0.7em; padding:2px 8px; border-radius:10px; background:#1e2a42; color:#7b8ab8; white-space:nowrap; min-width:50px; text-align:center;">—</div>
+      </div>
+    </div>
+    <div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">
+        <div><div style="font-size:0.68em; color:#7b8ab8; margin-bottom:2px;">REGIME</div><div id="sh-regime" style="padding:3px 10px; border-radius:10px; background:#1e2a42; color:#7b8ab8; font-size:0.78em; font-weight:bold;">—</div></div>
+        <div><div style="font-size:0.68em; color:#7b8ab8; margin-bottom:2px;">SESSION</div><div id="sh-session" style="padding:3px 10px; border-radius:10px; background:#1e2a42; color:#7b8ab8; font-size:0.78em; font-weight:bold;">—</div></div>
+        <div><div style="font-size:0.68em; color:#7b8ab8; margin-bottom:2px;">ACTION</div><div id="sh-action" style="padding:3px 10px; border-radius:10px; background:#1e2a42; color:#7b8ab8; font-size:0.78em; font-weight:bold;">—</div></div>
+      </div>
+      <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px; letter-spacing:1px;">ENTRY READINESS</div>
+      <div id="sh-readiness" style="font-size:2em; font-weight:bold; color:#7b8ab8; letter-spacing:2px;">—</div>
+      <div id="sh-action-reason" style="font-size:0.72em; color:#7b8ab8; margin-top:4px; max-height:60px; overflow:hidden; line-height:1.4;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Trade Progress Panel (shown only when OPEN) -->
+<div class="card" id="trade-progress-panel" style="margin-bottom:12px; display:none; border-left:3px solid #00e676;">
+  <h2>Open Trade Progress</h2>
+  <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:12px; margin-bottom:10px;">
+    <div>
+      <div style="font-size:0.7em; color:#7b8ab8;">ENTRY PRICE</div>
+      <div id="tp-entry" style="font-size:1.3em; font-weight:bold; color:#e0e0e0;">—</div>
+    </div>
+    <div>
+      <div style="font-size:0.7em; color:#7b8ab8;">CURRENT PRICE</div>
+      <div id="tp-current" style="font-size:1.3em; font-weight:bold; color:#00d4ff;">—</div>
+    </div>
+    <div>
+      <div style="font-size:0.7em; color:#7b8ab8;">UNREALIZED PnL</div>
+      <div id="tp-upnl" style="font-size:1.3em; font-weight:bold;">—</div>
+    </div>
+    <div>
+      <div style="font-size:0.7em; color:#7b8ab8;">HOLD TIME</div>
+      <div id="tp-hold" style="font-size:1.3em; font-weight:bold; color:#ffc107;">—</div>
+    </div>
+  </div>
+  <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px; letter-spacing:1px;">MOVE TO TAKE PROFIT</div>
+  <div style="background:#0d1321; border-radius:4px; height:12px; overflow:hidden; margin-bottom:10px; position:relative;">
+    <div id="tp-tp-bar" style="height:100%; width:0%; background:linear-gradient(90deg,#00d4ff,#00e676); border-radius:4px; transition:width 0.5s;"></div>
+    <span id="tp-tp-label" style="position:absolute; right:4px; top:50%; transform:translateY(-50%); font-size:0.7em; color:#7b8ab8;"></span>
+  </div>
+  <div style="display:flex; gap:12px; font-size:0.78em;">
+    <span style="color:#7b8ab8;">TP Target: <span id="tp-tp-price" style="color:#00e676;">—</span></span>
+    <span style="color:#7b8ab8;">Stop Loss: <span id="tp-sl-price" style="color:#ff5252;">��</span></span>
+    <span style="color:#7b8ab8;">OB now: <span id="tp-ob-now" style="color:#e0e0e0;">—</span></span>
   </div>
 </div>
 
@@ -2051,19 +2111,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="card" style="margin-top:10px;">
-  <h2>Live Config (.env)</h2>
-  <div id="config-panel" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:4px; font-size:0.78em;"></div>
-</div>
-
-<div class="card" style="margin-top:10px;">
-  <h2>Backtest Runs</h2>
-  <table id="bt-table">
-    <thead><tr><th>Run ID</th><th>Status</th><th>Progress</th><th>Trades</th><th>WR%</th><th>PF</th><th>PnL</th></tr></thead>
-    <tbody></tbody>
-  </table>
-</div>
-
-<div class="card" style="margin-top:10px;">
   <h2>Trade Journal</h2>
   <div id="journal-filters" style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; font-size:0.78em;">
     <select id="jf-result" style="background:#1e2a42; color:#e0e0e0; border:1px solid #2a3a5c; border-radius:3px; padding:2px 6px;">
@@ -2087,25 +2134,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="card" style="margin-top:10px;">
-  <h2>Backtest Leaderboard</h2>
-  <div style="display:flex; gap:8px; margin-bottom:8px; font-size:0.78em;">
-    <span id="lb-count" style="color:#7b8ab8;">Loading...</span>
-    <button onclick="loadLeaderboard()" style="margin-left:auto; background:#1e2a42; color:#7b8ab8; border:1px solid #2a3a5c; border-radius:3px; padding:2px 10px; cursor:pointer; font-size:0.9em;">Refresh</button>
-  </div>
-  <div style="max-height:350px; overflow-y:auto;">
-  <table id="leaderboard-table">
-    <thead><tr>
-      <th>#</th><th>Label</th><th>Trades</th><th>WR%</th><th>PF</th>
-      <th>PnL</th><th>Exp</th><th>DD%</th><th>Avg W</th><th>Avg L</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
-  </div>
-</div>
-
 <div class="footer">
-  Last update: <span id="last-update">—</span> | Run: <span id="run-id">—</span> | Saved: <span id="saved-at">—</span>
+  <span id="connection-status-footer"></span> |
+  Last update: <span id="last-update">—</span> |
+  Run: <span id="run-id">—</span>
 </div>
 </div><!-- end live-page -->
 
@@ -2192,77 +2224,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div><!-- end evo-page -->
 
-<div id="queue-page" class="page-content">
-  <h2 style="color:#00d4ff; margin-bottom:12px;">BACKTEST COMMAND CENTER</h2>
-
-  <!-- SECTION 1: Active Jobs -->
-  <div class="card" style="border-left:3px solid #ffc107; margin-bottom:12px;">
-    <h2>ACTIVE JOBS</h2>
-    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
-      <div>
-        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC1 (LOCAL)</div>
-        <div id="q-running" style="color:#7b8ab8;">Loading...</div>
-        <div id="q-progress-wrap" style="display:none; margin-top:8px;">
-          <div style="background:#1e2a42; border-radius:4px; height:22px; overflow:hidden; position:relative;">
-            <div id="q-progress-bar" style="background:linear-gradient(90deg,#00d4ff,#00e676); height:100%; transition:width 0.5s;"></div>
-            <div id="q-progress-label" style="position:absolute; top:0; left:0; width:100%; text-align:center; line-height:22px; font-size:0.75em; color:#fff; font-weight:bold;"></div>
-          </div>
-        </div>
-      </div>
-      <div>
-        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC2 (REMOTE)</div>
-        <div id="q-pc2-status" style="color:#7b8ab8;">Loading...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- SECTION 2: Pending Queues -->
-  <div class="card" style="border-left:3px solid #00d4ff; margin-bottom:12px;">
-    <h2>UP NEXT</h2>
-    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
-      <div>
-        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC1 Queue (<span id="q-pending-count">0</span> jobs)</div>
-        <div id="q-pending" style="color:#7b8ab8;">None</div>
-      </div>
-      <div>
-        <div style="font-size:0.75em; color:#7b8ab8; margin-bottom:4px;">PC2 Queue (<span id="q-pc2-pending-count">0</span> jobs)</div>
-        <div id="q-pc2-pending" style="color:#7b8ab8;">None</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- SECTION 3: All Completed Results (unified table) -->
-  <div class="card" style="border-left:3px solid #00e676; margin-bottom:12px;">
-    <h2>COMPLETED RESULTS (All PCs)</h2>
-    <div style="overflow-x:auto; max-height:500px; overflow-y:auto;">
-      <table id="q-results-table" style="width:100%; border-collapse:collapse; font-size:0.8em;">
-        <thead><tr style="color:#7b8ab8; font-size:0.85em; border-bottom:1px solid #1e2a42; position:sticky; top:0; background:#0a0e1a;">
-          <th style="text-align:left; padding:6px 8px;">Label</th>
-          <th style="padding:6px 4px;">PC</th>
-          <th style="padding:6px 4px;">Coin</th>
-          <th style="padding:6px 4px;">Days</th>
-          <th style="padding:6px 4px;">Trades</th>
-          <th style="padding:6px 4px;">PF</th>
-          <th style="padding:6px 4px;">WR%</th>
-          <th style="padding:6px 4px;">PnL</th>
-          <th style="padding:6px 4px;">Exp</th>
-          <th style="padding:6px 4px;">DD%</th>
-          <th style="padding:6px 4px;">MFE%</th>
-          <th style="padding:6px 4px;">MAE%</th>
-        </tr></thead>
-        <tbody id="q-results"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- SECTION 4: Queue Log -->
-  <div class="card" style="border-left:3px solid #ff5252;">
-    <h2>QUEUE LOG</h2>
-    <div style="overflow-y:auto; max-height:250px;">
-      <div id="q-log" style="font-size:0.75em; font-family:monospace;"></div>
-    </div>
-  </div>
-</div><!-- end queue-page -->
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -2279,11 +2240,6 @@ function switchPage(page) {
     document.querySelectorAll('.page-nav-btn')[1].classList.add('active');
     document.getElementById('evo-page').classList.add('active');
     if (!evoLoaded) { loadEvolution(); }
-  } else if (page === 'queue') {
-    document.querySelectorAll('.page-nav-btn')[2].classList.add('active');
-    document.getElementById('queue-page').classList.add('active');
-    loadQueueStatus();
-    loadSweepProgress();
   } else {
     document.querySelectorAll('.page-nav-btn')[0].classList.add('active');
     document.getElementById('live-page').classList.add('active');
@@ -2525,6 +2481,157 @@ function loadQueueStatus() {
     console.error('Queue load error', e);
     document.getElementById('q-running').innerHTML = '<span style="color:#ff5252;">Load Error</span>';
   });
+}
+
+function updateSignalHealth(gov, botState, coin) {
+  if (!gov || !Object.keys(gov).length) return;
+
+  document.getElementById('sh-coin').textContent = (coin || 'ETH') + '-USD';
+
+  // Score bar
+  const score = parseInt(gov.score) || 0;
+  const scoreBar = document.getElementById('sh-score-bar');
+  const scoreLabel = document.getElementById('sh-score-label');
+  const scoreColor = score >= 88 ? '#00e676' : score >= 55 ? '#ffc107' : '#ff5252';
+  if (scoreBar) { scoreBar.style.width = Math.min(100, score) + '%'; scoreBar.style.background = scoreColor; }
+  if (scoreLabel) scoreLabel.textContent = score + ' / 100';
+
+  // Gate badge
+  const gate = gov.gate || '';
+  const gateBadge = document.getElementById('sh-gate-badge');
+  if (gateBadge) {
+    const gateColor = gate === 'TRADE' ? '#00e676' : gate === 'WATCH' ? '#ffc107' : gate === 'BLOCK' ? '#ff5252' : '#7b8ab8';
+    gateBadge.textContent = gate || 'HOLD';
+    gateBadge.style.color = gateColor;
+    gateBadge.style.borderColor = gateColor;
+    gateBadge.style.border = '1px solid ' + gateColor;
+  }
+
+  // Governor bar
+  const prob = parseFloat(gov.win_prob) || 0;
+  const pct = Math.round(prob * 100);
+  const govBar = document.getElementById('sh-gov-bar');
+  const govLabel = document.getElementById('sh-gov-label');
+  const govRec = document.getElementById('sh-gov-rec');
+  const govColor = prob >= 0.45 ? '#00e676' : prob >= 0.30 ? '#ffc107' : '#ff5252';
+  if (govBar) { govBar.style.width = pct + '%'; govBar.style.background = govColor; }
+  if (govLabel) govLabel.textContent = pct + '% win prob';
+  if (govRec) {
+    const rec = gov.recommendation || '—';
+    govRec.textContent = rec;
+    govRec.style.color = rec === 'ALLOW' ? '#00e676' : rec === 'BLOCK' ? '#ff5252' : '#ffc107';
+  }
+
+  // OB imbalance meter (centered, -1 to +1)
+  const obVal = parseFloat(gov.ob_imbalance);
+  const obFill = document.getElementById('sh-ob-fill');
+  const obLabel = document.getElementById('sh-ob-label');
+  const obBadge = document.getElementById('sh-ob-badge');
+  if (!isNaN(obVal)) {
+    const offset = obVal * 50; // -50 to +50
+    const color = obVal > 0.1 ? '#00e676' : obVal < -0.1 ? '#ff5252' : '#7b8ab8';
+    if (obFill) {
+      if (offset >= 0) {
+        obFill.style.left = '50%'; obFill.style.width = offset + '%'; obFill.style.background = color;
+      } else {
+        obFill.style.left = (50 + offset) + '%'; obFill.style.width = (-offset) + '%'; obFill.style.background = color;
+      }
+    }
+    if (obLabel) obLabel.textContent = (obVal >= 0 ? '+' : '') + obVal.toFixed(3);
+    if (obBadge) {
+      obBadge.textContent = obVal > 0.25 ? 'BULL ▲' : obVal > 0.1 ? 'MILD ▲' : obVal < -0.25 ? 'BEAR ▼' : obVal < -0.1 ? 'MILD ▼' : 'NEUTRAL';
+      obBadge.style.color = color;
+    }
+  } else {
+    if (obLabel) obLabel.textContent = 'N/A';
+    if (obBadge) { obBadge.textContent = 'N/A'; obBadge.style.color = '#7b8ab8'; }
+  }
+
+  // Regime badge
+  const regimeEl = document.getElementById('sh-regime');
+  if (regimeEl) {
+    const regime = gov.regime || '—';
+    regimeEl.textContent = regime;
+    regimeEl.style.background = regime === 'TREND_UP' ? '#0d3320' : regime === 'TREND_DOWN' ? '#3d0d0d' : regime === 'RANGE' ? '#2a2a0d' : '#1e2a42';
+    regimeEl.style.color = regime === 'TREND_UP' ? '#00e676' : regime === 'TREND_DOWN' ? '#ff5252' : regime === 'RANGE' ? '#ffc107' : '#7b8ab8';
+  }
+
+  // Session badge
+  const sessionEl = document.getElementById('sh-session');
+  if (sessionEl) {
+    const session = gov.session || '—';
+    sessionEl.textContent = session;
+    const sessionColor = session === 'OVERLAP' || session === 'NY' ? '#00e676' : session === 'LONDON' ? '#00d4ff' : session === 'ASIA' ? '#ffc107' : '#7b8ab8';
+    sessionEl.style.color = sessionColor;
+    sessionEl.style.background = '#1e2a42';
+  }
+
+  // Action badge
+  const actionEl = document.getElementById('sh-action');
+  if (actionEl) {
+    const action = gov.action || '—';
+    actionEl.textContent = action;
+    actionEl.style.color = action === 'WOULD_BUY' ? '#00e676' : action === 'WOULD_SELL' ? '#ff5252' : '#7b8ab8';
+  }
+
+  // Readiness indicator
+  const readEl = document.getElementById('sh-readiness');
+  if (readEl) {
+    const isReady = score >= 88 && (gov.recommendation === 'ALLOW' || !gov.recommendation) && gate === 'TRADE';
+    const isWatch = score >= 55 && score < 88;
+    readEl.textContent = isReady ? '● TRADE READY' : isWatch ? '◑ WATCHING' : '○ NOT READY';
+    readEl.style.color = isReady ? '#00e676' : isWatch ? '#ffc107' : '#ff5252';
+    readEl.style.fontSize = isReady ? '1.4em' : '1.2em';
+  }
+
+  // Action reason
+  const reasonEl = document.getElementById('sh-action-reason');
+  if (reasonEl) reasonEl.textContent = gov.action_reason || '';
+}
+
+function updateTradeProgress(data) {
+  const panel = document.getElementById('trade-progress-panel');
+  if (!panel) return;
+  const isOpen = (data.bot_state === 'OPEN' || data.bot_state === 'LONG');
+  panel.style.display = isOpen ? '' : 'none';
+  if (!isOpen) return;
+
+  const gov = data.governor || {};
+  const entryPx = parseFloat(gov.entry_px) || 0;
+  const currentPx = parseFloat(gov.price) || 0;
+  const upnl = parseFloat(data.unrealized_pnl) || 0;
+
+  const entryEl = document.getElementById('tp-entry');
+  const curEl = document.getElementById('tp-current');
+  const upnlEl = document.getElementById('tp-upnl');
+
+  if (entryEl) entryEl.textContent = entryPx > 0 ? '$' + entryPx.toFixed(2) : '—';
+  if (curEl) curEl.textContent = currentPx > 0 ? '$' + currentPx.toFixed(2) : '—';
+  if (upnlEl) {
+    upnlEl.textContent = '$' + upnl.toFixed(4);
+    upnlEl.style.color = upnl > 0 ? '#00e676' : upnl < 0 ? '#ff5252' : '#e0e0e0';
+  }
+
+  // OB now
+  const obNow = document.getElementById('tp-ob-now');
+  const obVal = parseFloat(gov.ob_imbalance);
+  if (obNow) obNow.textContent = !isNaN(obVal) ? (obVal >= 0 ? '+' : '') + obVal.toFixed(3) : '—';
+
+  // TP progress bar (if entry price known)
+  const tpPct = parseFloat('1.5'); // TAKE_PROFIT_PCT default 1.5%
+  if (entryPx > 0 && currentPx > 0) {
+    const moveToTP = (currentPx - entryPx) / entryPx;
+    const barPct = Math.min(100, Math.max(0, (moveToTP / (tpPct/100)) * 100));
+    const tpBar = document.getElementById('tp-tp-bar');
+    const tpLabel = document.getElementById('tp-tp-label');
+    if (tpBar) tpBar.style.width = barPct.toFixed(1) + '%';
+    if (tpLabel) tpLabel.textContent = (moveToTP * 100).toFixed(3) + '%';
+
+    const tpPrice = document.getElementById('tp-tp-price');
+    const slPrice = document.getElementById('tp-sl-price');
+    if (tpPrice) tpPrice.textContent = '$' + (entryPx * 1.015).toFixed(2);
+    if (slPrice) slPrice.textContent = '$' + (entryPx * 0.98).toFixed(2);
+  }
 }
 
 function loadSweepProgress() {
@@ -3494,6 +3601,31 @@ async function loadMultiOverview() {
       const tsStr = c.saved_at_iso ? new Date(c.saved_at_iso).toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
       if (tsEl) tsEl.textContent = tsStr;
       if (c.saved_at_iso) latestTs = tsStr;
+      // Signal health mini-bar
+      const sigBarEl = document.getElementById('ms-signal-' + coin);
+      if (sigBarEl && c.governor) {
+        const g = c.governor;
+        const score = parseInt(g.score) || 0;
+        const scoreColor = score >= 88 ? '#00e676' : score >= 55 ? '#ffc107' : '#ff5252';
+        const prob = parseFloat(g.win_prob) || 0;
+        const govColor = prob >= 0.45 ? '#00e676' : prob >= 0.30 ? '#ffc107' : '#ff5252';
+        sigBarEl.innerHTML = `
+          <div style="display:flex; align-items:center; gap:4px; margin-bottom:3px;">
+            <div style="font-size:0.6em; color:#7b8ab8; min-width:28px;">SCORE</div>
+            <div style="flex:1; background:#0d1321; border-radius:2px; height:6px; overflow:hidden;">
+              <div style="height:100%; width:${Math.min(100,score)}%; background:${scoreColor}; border-radius:2px; transition:width 0.5s;"></div>
+            </div>
+            <div style="font-size:0.6em; color:${scoreColor}; min-width:22px; text-align:right;">${score}</div>
+          </div>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <div style="font-size:0.6em; color:#7b8ab8; min-width:28px;">GOV</div>
+            <div style="flex:1; background:#0d1321; border-radius:2px; height:6px; overflow:hidden;">
+              <div style="height:100%; width:${Math.round(prob*100)}%; background:${govColor}; border-radius:2px; transition:width 0.5s;"></div>
+            </div>
+            <div style="font-size:0.6em; color:${govColor}; min-width:22px; text-align:right;">${Math.round(prob*100)}%</div>
+          </div>
+        `;
+      }
     });
     // Update portfolio aggregate bar
     const aggEqEl = document.getElementById('agg-equity');
@@ -3569,8 +3701,10 @@ async function loadPool() {
     const coins = data.coins || {};
     const active = data.active || [];
     const maxActive = data.max_active || 2;
-    document.getElementById('pool-max-active').textContent = maxActive;
-    document.getElementById('pool-active-count').textContent = active.length;
+    const poolMaxEl = document.getElementById('pool-max-active');
+    const poolActEl = document.getElementById('pool-active-count');
+    if (poolMaxEl) poolMaxEl.textContent = maxActive;
+    if (poolActEl) poolActEl.textContent = active.length;
     const statusColor = {
       'ACTIVE': '#00e676',
       'DISABLED': '#ff5252',
@@ -3602,7 +3736,8 @@ async function loadPool() {
         <div style="font-size:0.68em; color:#7b8ab8;">Gov: ${gov} | ${info.backtest_window||'—'}</div>
       </div>`;
     }
-    document.getElementById('pool-coins-container').innerHTML = html || '<span style="color:#7b8ab8; font-size:0.8em;">No pool data</span>';
+    const poolCoinsEl = document.getElementById('pool-coins-container');
+    if (poolCoinsEl) poolCoinsEl.innerHTML = html || '<span style="color:#7b8ab8; font-size:0.8em;">No pool data</span>';
   } catch(e) { console.error('pool fetch error', e); }
 }
 
@@ -3672,7 +3807,6 @@ function updateDashboard(data) {
 
   // Footer
   document.getElementById('run-id').textContent = data.run_id || '—';
-  document.getElementById('saved-at').textContent = data.saved_at_iso || '—';
   document.getElementById('last-update').textContent = new Date().toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true}) + ' CT';
 
   // Fills table
@@ -3712,9 +3846,9 @@ function updateDashboard(data) {
   }
 
   // Governor panel
-  if (data.governor && data.governor.win_prob !== undefined) {
+  if (data.governor && data.governor.score !== undefined) {
     const g = data.governor;
-    const prob = g.win_prob;
+    const prob = g.win_prob !== null ? g.win_prob : 0;
     const pct = Math.round(prob * 100);
     const rec = g.recommendation || '—';
     const barColor = prob >= 0.45 ? '#00e676' : prob >= 0.30 ? '#ffc107' : '#ff5252';
@@ -3736,33 +3870,25 @@ function updateDashboard(data) {
     document.getElementById('gov-status').style.color = '#7b8ab8';
   }
 
-  // Queue panel
+  // Signal health panel + trade progress
+  updateSignalHealth(data.governor, data.bot_state, currentCoin);
+  updateTradeProgress(data);
+
+  // Queue panel (minimal — no progress bar)
   if (data.queue) {
     const q = data.queue;
     const runEl = document.getElementById('queue-running');
-    const barEl = document.getElementById('queue-progress-bar');
-    const textEl = document.getElementById('queue-progress-text');
     if (q.running_job) {
       const rj = q.running_job;
       runEl.textContent = rj.label || rj.run_id.slice(-16);
       runEl.style.color = '#00d4ff';
-      barEl.style.width = rj.pct + '%';
-      textEl.textContent = rj.total_bars ? (rj.pct + '% (' + rj.progress + '/' + rj.total_bars + ' bars)') : (rj.progress + ' bars');
     } else {
       runEl.textContent = 'Idle';
       runEl.style.color = '#7b8ab8';
-      barEl.style.width = '0%';
-      textEl.textContent = 'No job running';
     }
     document.getElementById('queue-pending-pc1').textContent = q.pending_pc1 || 0;
     document.getElementById('queue-pending-pc2').textContent = q.pending_pc2 || 0;
     document.getElementById('queue-completed').textContent = q.completed_today || 0;
-    const labelsEl = document.getElementById('queue-labels');
-    if (q.pending_labels && q.pending_labels.length > 0) {
-      labelsEl.innerHTML = 'Next: ' + q.pending_labels.map(l => '<span class="badge badge-running" style="margin:1px;">' + l + '</span>').join(' ');
-    } else {
-      labelsEl.innerHTML = '';
-    }
   }
 }
 
@@ -4003,20 +4129,15 @@ async function loadLeaderboard() {
 // Init
 initChart();
 loadEquity();
-loadConfig();
-loadBacktests();
 loadJournal();
 loadDecisions();
 loadMultiOverview();
 loadPool();
-loadLeaderboard();
 setInterval(loadEquity, 30000);
-setInterval(loadBacktests, 60000);
 setInterval(loadJournal, 120000);
 setInterval(loadDecisions, 15000);
 setInterval(loadMultiOverview, 10000);
 setInterval(loadPool, 60000);
-setInterval(loadLeaderboard, 120000);  // refresh leaderboard every 2 min
 connectSSE();
 
 // PWA Service Worker registration
