@@ -3155,8 +3155,20 @@ async def run_live(
             if (_now_rot - _last_rotation_ts) >= _rotation_interval:
                 _last_rotation_ts = _now_rot
                 try:
-                    from ops.coin_rotation import update_coin_pool_metrics
-                    update_coin_pool_metrics()
+                    from ops.coin_rotation import update_coin_pool_metrics, check_rotation_candidates
+                    pool = update_coin_pool_metrics()
+                    candidates = check_rotation_candidates(pool)
+                    if candidates and cfg.get("DISCORD_WEBHOOK_URL"):
+                        try:
+                            from ops.notify import send_discord
+                            names = ", ".join(c["coin"] for c in candidates)
+                            reasons = "; ".join(f"{c['coin']}: {c['reason']}" for c in candidates)
+                            send_discord(
+                                f"ROTATION ALERT: {names} underperforming. {reasons}",
+                                webhook_url=cfg.get("DISCORD_WEBHOOK_URL"),
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -3460,6 +3472,13 @@ async def run_live(
                                     pass
 
                             _capture_entry_context_from_fill(state=state, fill=fill, snap=snap, cfg=cfg)
+
+                            # Discord: trade opened
+                            try:
+                                from ops.notify import notify_trade
+                                notify_trade("BUY", symbol, float(fill.price), float(fill.qty))
+                            except Exception:
+                                pass
 
                         elif fill_side == "SELL":
                             if close_to_flat:

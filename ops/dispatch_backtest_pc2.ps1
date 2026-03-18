@@ -25,6 +25,15 @@ $singleRunFlag = if ($SingleRun) { " -SingleRun" } else { "" }
 Write-Host "Pulling latest code on PC2..."
 ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git pull origin $BRANCH`""
 
+# Verify PC2 is on same commit as PC1
+$pc1Hash = git rev-parse HEAD
+$pc2Hash = ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git rev-parse HEAD`"" 2>$null
+if ($pc2Hash -and $pc2Hash.Trim() -ne $pc1Hash.Trim()) {
+    Write-Warning "PC2 commit ($($pc2Hash.Trim().Substring(0,7))) != PC1 ($($pc1Hash.Trim().Substring(0,7))) — pull may have failed"
+} else {
+    Write-Host "PC2 in sync: $($pc1Hash.Trim().Substring(0,7))" -ForegroundColor Green
+}
+
 # Build launcher script lines (avoids quoting hell over SSH)
 # Wrapper redirects stdout/stderr to a log file so we can diagnose crashes
 $ts = (Get-Date -Format "yyyyMMddTHHmmss")

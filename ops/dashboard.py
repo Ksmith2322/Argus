@@ -1928,18 +1928,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="multi-overview" id="multi-overview">
   <div class="coin-summary" onclick="switchCoin('ETH')" id="summary-ETH">
-    <div class="coin-name">ETH-USD</div>
+    <div class="coin-name">ETH-USD <span id="ms-rotate-ETH" style="display:none;font-size:0.65em;background:#ff5252;color:#fff;padding:1px 5px;border-radius:3px;margin-left:4px;">ROTATE</span></div>
     <div class="coin-state">State: <span id="ms-state-ETH" class="state-FLAT">—</span></div>
     <div class="coin-pnl" id="ms-pnl-ETH">$0.00</div>
     <div class="coin-detail">Equity: <span id="ms-eq-ETH">—</span> | Qty: <span id="ms-qty-ETH">0</span></div>
+    <div class="coin-detail" id="ms-perf-ETH" style="font-size:0.7em;color:#7b8ab8;">PF: — | WR: — | Trades: —</div>
     <div class="coin-detail">Updated: <span id="ms-ts-ETH">—</span></div>
     <div class="coin-signal-bar" id="ms-signal-ETH" style="margin-top:6px;"></div>
   </div>
   <div class="coin-summary" onclick="switchCoin('BTC')" id="summary-BTC">
-    <div class="coin-name">BTC-USD</div>
+    <div class="coin-name">BTC-USD <span id="ms-rotate-BTC" style="display:none;font-size:0.65em;background:#ff5252;color:#fff;padding:1px 5px;border-radius:3px;margin-left:4px;">ROTATE</span></div>
     <div class="coin-state">State: <span id="ms-state-BTC" class="state-FLAT">—</span></div>
     <div class="coin-pnl" id="ms-pnl-BTC">$0.00</div>
     <div class="coin-detail">Equity: <span id="ms-eq-BTC">—</span> | Qty: <span id="ms-qty-BTC">0</span></div>
+    <div class="coin-detail" id="ms-perf-BTC" style="font-size:0.7em;color:#7b8ab8;">PF: — | WR: — | Trades: —</div>
     <div class="coin-detail">Updated: <span id="ms-ts-BTC">—</span></div>
     <div class="coin-signal-bar" id="ms-signal-BTC" style="margin-top:6px;"></div>
   </div>
@@ -3604,6 +3606,15 @@ async function loadMultiOverview() {
   try {
     const resp = await fetch('/api/multi');
     const data = await resp.json();
+    // Fetch rotation status (non-blocking — fails silently)
+    let rotCandidates = [];
+    let poolCoins = {};
+    try {
+      const rotResp = await fetch('/api/rotation_status');
+      const rotData = await rotResp.json();
+      rotCandidates = (rotData.candidates || []).map(c => c.coin);
+      poolCoins = rotData.pool && rotData.pool.coins ? rotData.pool.coins : {};
+    } catch(_) {}
     let aggEq = 0, aggPnl = 0, latestTs = '';
     ['ETH', 'BTC'].forEach(coin => {
       const c = data[coin];
@@ -3623,6 +3634,19 @@ async function loadMultiOverview() {
       const tsStr = c.saved_at_iso ? new Date(c.saved_at_iso).toLocaleString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit',hour12:true}) : '—';
       if (tsEl) tsEl.textContent = tsStr;
       if (c.saved_at_iso) latestTs = tsStr;
+      // Rolling PF/WR from coin pool
+      const perfEl = document.getElementById('ms-perf-' + coin);
+      if (perfEl && poolCoins[coin]) {
+        const m = poolCoins[coin].live_metrics || {};
+        const pf = m.rolling_pf != null ? parseFloat(m.rolling_pf).toFixed(3) : '—';
+        const wr = m.rolling_wr != null ? (parseFloat(m.rolling_wr)*100).toFixed(1)+'%' : '—';
+        const n = m.n_trades || 0;
+        const pfColor = m.rolling_pf == null ? '#7b8ab8' : m.rolling_pf >= 1.2 ? '#00e676' : m.rolling_pf >= 0.9 ? '#ffc107' : '#ff5252';
+        perfEl.innerHTML = `PF: <span style="color:${pfColor}">${pf}</span> | WR: ${wr} | Trades: ${n}`;
+      }
+      // Rotation warning badge
+      const rotEl = document.getElementById('ms-rotate-' + coin);
+      if (rotEl) rotEl.style.display = rotCandidates.includes(coin) ? 'inline' : 'none';
       // Signal health mini-bar
       const sigBarEl = document.getElementById('ms-signal-' + coin);
       if (sigBarEl && c.governor) {
