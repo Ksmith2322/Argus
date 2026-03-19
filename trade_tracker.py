@@ -62,7 +62,7 @@ DEFAULT_KEYS = [
     "HOLD_ENTRY_SIGNAL_FALSE",
     "HOLD_ENTRY_NO_SIZE",
     "HOLD_IN_POSITION",
-    "HOLD_OTHER",
+    "HOLD_SIGNAL_OK_GATE_PENDING",
 ]
 
 MISSED_BUY_PREFIX = "MISSED_BUY_"
@@ -194,7 +194,7 @@ class TradeTracker:
             return
 
         if not key:
-            key = "HOLD_OTHER"
+            key = "HOLD_SIGNAL_OK_GATE_PENDING"
 
         if key not in self.counts:
             self.counts[key] = 0

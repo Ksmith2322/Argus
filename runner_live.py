@@ -31,6 +31,7 @@ if __package__ in (None, ""):
 # line above: from config import load_config
 from config import load_config
 from feed_coinbase import make_http, fetch_spot_price, preload_indicator_history
+from feed_ws import CoinbaseWsFeed
 from io_logs import (
     ensure_logs,
     ensure_signals_header_matches_file,
@@ -1552,11 +1553,29 @@ def _submit_adapter_order_from_snapshot(
     if qty <= 0:
         return None
 
+    # Phase 20: use LIMIT orders when WS provides real-time bid/ask
+    order_type = "MARKET"
+    limit_px = None
+    if _as_bool(cfg.get("USE_LIMIT_ORDERS", False), False):
+        _ws = getattr(state, "_ws_feed", None)
+        if _ws is not None and _ws.is_ready():
+            if action == "BUY":
+                ws_ask = _ws.get_best_ask()
+                if ws_ask is not None:
+                    order_type = "LIMIT"
+                    limit_px = ws_ask  # buy at the ask (aggressive limit)
+            elif action == "SELL":
+                ws_bid = _ws.get_best_bid()
+                if ws_bid is not None:
+                    order_type = "LIMIT"
+                    limit_px = ws_bid  # sell at the bid (aggressive limit)
+
     req = OrderRequest(
         symbol=str(getattr(snap, "symbol", state.symbol)),
         side=action,
         qty=qty,
-        order_type="MARKET",
+        order_type=order_type,
+        limit_px=limit_px,
         client_order_id=client_order_id,
         tags={
             "intent_id": str(getattr(snap, "intent_id", "") or ""),
@@ -3070,6 +3089,19 @@ async def run_live(
     did_one = False
     forced_test_consumed = False
 
+    # Phase 20: WebSocket L2 feed for real-time order book
+    _ws_feed: Optional[CoinbaseWsFeed] = None
+    if _as_bool(cfg.get("USE_WS_FEED", True), True):
+        try:
+            _ws_feed = CoinbaseWsFeed(symbol)
+            asyncio.get_event_loop().create_task(_ws_feed.run())
+            print(f"  [WS] WebSocket L2 feed started for {symbol}")
+        except Exception as e:
+            print(f"  [WS] WebSocket feed failed to start: {e} — falling back to REST")
+            _ws_feed = None
+    # Attach WS feed to state for limit order access
+    state._ws_feed = _ws_feed
+
     # Discord startup notification
     try:
         from ops.notify import send_discord
@@ -3101,6 +3133,23 @@ async def run_live(
                     _clamp_tick_time(state=state, tick=tick, cfg=cfg, symbol=symbol)
                 except Exception:
                     pass
+
+                # Phase 20: overlay WebSocket L2 data onto tick
+                if _ws_feed is not None and _ws_feed.is_ready():
+                    try:
+                        ws_imb = _ws_feed.get_imbalance(
+                            depth=int(cfg.get("OB_IMBALANCE_DEPTH", 10))
+                        )
+                        if ws_imb is not None:
+                            tick.ob_imbalance = ws_imb
+                        ws_bid = _ws_feed.get_best_bid()
+                        ws_ask = _ws_feed.get_best_ask()
+                        if ws_bid is not None:
+                            tick.bid = ws_bid
+                        if ws_ask is not None:
+                            tick.ask = ws_ask
+                    except Exception:
+                        pass
 
                 if _adapter_mode_enabled(cfg, state):
                     try:
@@ -3764,7 +3813,30 @@ async def run_live(
             if terminate_after_fill_processing and forced_test_complete_reason:
                 return 0
 
-            await asyncio.sleep(float(getattr(snap, "next_poll_s", 1.0)))
+            # Phase 20: fast-exit micro-poll — if in position and WS is live,
+            # check order book between full engine cycles for rapid adverse detection
+            poll_s = float(getattr(snap, "next_poll_s", 1.0))
+            in_position = state.bot_state not in ("FLAT", None, "")
+            ob_exit_enabled = _as_bool(cfg.get("OB_EXIT_ENABLED", False), False)
+            if in_position and _ws_feed is not None and _ws_feed.is_ready() and ob_exit_enabled and poll_s > 1.5:
+                ob_exit_thresh = float(cfg.get("OB_EXIT_BEAR_THRESHOLD", -0.20))
+                fast_check_interval = 0.5  # check every 500ms
+                elapsed = 0.0
+                while elapsed < poll_s:
+                    await asyncio.sleep(fast_check_interval)
+                    elapsed += fast_check_interval
+                    try:
+                        imb = _ws_feed.get_imbalance(
+                            depth=int(cfg.get("OB_IMBALANCE_DEPTH", 10))
+                        )
+                        if imb is not None and imb <= ob_exit_thresh:
+                            log_event(symbol, "FAST_EXIT_OB_TRIGGER",
+                                      f"OB imbalance {imb:.3f} <= {ob_exit_thresh} — forcing early re-eval")
+                            break  # break out of micro-poll to run full step() immediately
+                    except Exception:
+                        pass
+            else:
+                await asyncio.sleep(poll_s)
 
     except ControlledAbort as e:
         try:

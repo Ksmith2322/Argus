@@ -1,8 +1,8 @@
 # ARGUS ROADMAP
-# Last updated: 2026-03-14
-# Goal: fully operational autonomous trading system, no outside interaction required,
-#        visual performance monitoring built-in, fail-closed behavior, human-governed
-#        promotion boundaries.
+# Last updated: 2026-03-18
+# Goal: Build multiple independent, automatable edge engines.
+# Each must have measurable EV, be automatable, and scale capital.
+# Strategy: narrow → prove → scale → expand
 
 ---
 
@@ -11,7 +11,7 @@
 Argus has three truth classes:
 
   1. Canonical execution truth
-     orders, fills, account, positions, decision events
+     orders, fills, account, positions, decision events, decision_trace
 
   2. Deterministic lifecycle truth
      trade lifecycle records rebuilt from canonical truth (trade_journal)
@@ -27,169 +27,269 @@ Rules:
 
 ---
 
+# SYSTEM PORTFOLIO (think in systems, not markets)
+
+  System 1: Momentum engine (Argus crypto)      — PRIMARY, ACTIVE
+  System 2: Event arb engine (Polymarket)        — BUILD NEXT
+  System 3: Validation engine (Forex via IBKR)   — INFRA ONLY
+  System 4: News momentum engine (Stocks/Swing)  — LATER
+
+  Each system: independent, measurable, scalable.
+  Rule: prove one edge loop end-to-end before expanding surface area.
+
+---
+
 # COMPLETED PHASES (collapsed — see git history for details)
 #   Phase 7:  Backtest determinism + sandbox rule [DONE]
 #   Phase 8:  PaperAdapter + fill persistence + startup recovery, Gate A PASS [DONE 2026-03-10]
 #   Phase 9:  Trade journal on SELL->FLAT, crash-restart proof [DONE 2026-03-10]
 #   Phase 10: Adversarial restart — 4 kill-point scenarios PASS [DONE 2026-03-10]
 #   Phase 11-16: Analytics, risk, attribution, reporting, ops infra [DONE 2026-03-11]
-#     (DATA PENDING — modules populate as live fills accumulate; need 30-50+ fills)
-
-## Phase 16.5 — Strategy Optimization  [IN PROGRESS]
-
-### Bugs Fixed (code in place):
-  1. Liq filter unit mismatch — ETH vol vs USD floor. Fixed: LIQ_MIN_VOL_UNITS_1M=25 ETH.
-  2. PENALIZE mode penalty never applied — early return bug. Fixed: penalty applied first.
-  3. TL_PENALTY_RESIST_SLOPE_NEG feature added (confluence.py + config.py + .env).
-
-### Fresh Baseline (2026-03-13, dataset Feb 11–Mar 13, 43K candles):
-  run_id: bt_20260313T060439Z_9518a56d (determinism confirmed)
-  77 trades, 24.68% WR, PF=0.74, PnL=-$5.92, avg_win=$0.52, avg_loss=$0.23 (R:R 2.2:1)
-
-### Key Findings:
-  Score 90+: 12 trades, 75.0% WR, PnL=+$5.71 (WINNING)
-  Score <85: mostly losing. RANGE regime: 0% WR (ALL LOSSES).
-  Duration <30m: 70.4% WR, PnL=+$11.75 (MASSIVE WINNER)
-  Duration 30m-3h: 3% WR (DEAD ZONE — all losers)
-  OVERLAP session: best WR. OFF session: worst.
-
-### Optimization Queue (running 2026-03-14, PC1+PC2):
-  PC1 (3 done + 2 queued):
-    [DONE] 90min-timestop_score90_regime → PF=1.06, WR=33.9%, 62 trades (BEST SO FAR)
-    [DONE] 30min-timestop_score80_regime → PF=0.76, WR=36.1%, 119 trades
-    [RUN]  30min-timestop_score85_regime
-    [QUEUE] 30min-timestop_score90_blockOFF
-    [QUEUE] 30min-timestop_score90_OVERLAPonly
-  PC2 (4 jobs dispatched):
-    [RUN]  30min-trendline-penalties_score80_regime
-    [QUEUE] btc-usd_30min_score80_regime (cross-asset)
-    [QUEUE] sol-usd_30min_score80_regime (cross-asset)
-    [QUEUE] compound-5pct_30min_score80_regime
-
-### Exit criteria: WR>=35% AND PF>=1.20
-  Best so far: 90min+score90+regime → PF=1.06 (gap: PF needs +0.14, WR needs +1.1%)
-  Session filtering (blockOFF, OVERLAP-only) is the next lever to test.
+#   Phase 16.5: Strategy optimization — parameter sweep, 663 backtests [DONE 2026-03-17]
+#   Phase 20: WebSocket L2 feed + fast-exit + sub-minute candles [DONE 2026-03-18]
+#   ML-1: Governor trained (1,029 trades, ROC-AUC 0.944) [DONE 2026-03-15]
+#   Multi-coin: ETH+BTC parallel runners, per-coin isolation [DONE 2026-03-17]
+#   v1.1 Cleanup: decision_trace.csv, HOLD taxonomy, OB/vol dedup, governor LOG_ONLY [DONE 2026-03-18]
 
 ---
 
-# ACTIVE ROADMAP
+# ===================================================================
+# SYSTEM 1: ARGUS CRYPTO MOMENTUM ENGINE (PRIMARY)
+# ===================================================================
 
-## Phase 17 — Paper Capital Proof  [NEXT — after Phase 16.5 passes]
+## Current State (v1.1_cleanup_pass)
 
-Goal: Prove paper growth under unattended operation with optimized config.
+  Config: score88, trendlines ON, structure OFF, 60min hold, 10% compound
+  Governor: LOG_ONLY (stamps all, blocks none — on probation)
+  Coins: ETH-USD, BTC-USD (SOL disabled — unprofitable)
+  Mode: Paper trading, $500/coin, ~$50/trade
+  Trace: decision_trace.csv LIVE — collecting forensic data
 
-Rules (hard):
-  * Fixed config, locked at run start (config hash enforced)
-  * No strategy edits during run
-  * No operator overrides except KILL_SWITCH or PAUSE
-  * Any halt is logged and explainable from artifacts
+### Key Findings (663-run sweep):
+  Score 90+: 75% WR, clear edge
+  RANGE regime: 0% WR (graveyard)
+  Duration <30m: 70% WR (massive winner)
+  Duration 30m-3h: 3% WR (dead zone)
+  OVERLAP session: best. OFF session: worst.
+  Only ETH and BTC viable — all 15 alts PF < 0.82
 
-Duration: minimum 4 weeks unattended
+## Phase A — Validate the Trace (NOW — in progress)
 
-Exit:
-  * Paper growth inside modeled expectancy and drawdown bounds
-  * Reconciliation passes every run
-  * 30+ live fills accumulated (unlocks Phase 11 data gate)
+  Goal: Confirm decision_trace.csv is complete and correct.
 
-## Phase 18 — Real Micro-Capital Validation  [AFTER PHASE 17]
+  Checks:
+    * every entry-eligible tick writes a row
+    * blockers populated consistently
+    * gate transitions not blank when score/gate changes
+    * CONFIG_VERSION present everywhere
+    * LOG_ONLY ML output stamped on all relevant rows
+    * no hidden fallback bucket under new hold reasons
 
-Goal: Validate live settlement, fees, slippage under real capital.
+## Phase B — Edge Extraction (after 200+ trace rows, 20+ in 88+ zone, 10+ trades)
 
-Build:
-  * execution/coinbase_adapter.py — real adapter (same interface as PaperAdapter)
-  * Model vs reality deviation tracker
+  Review gate (minimum before analysis):
+    * 200+ decision trace rows
+    * 20+ candidates in the 88+ zone
+    * 10+ taken trades
+    * single config version (v1.1_cleanup_pass)
+    * if 5-7 days arrives first, review anyway
 
-Rules:
-  * Minimal capital (defined before starting)
-  * Tight instrumentation
-  * Live behavior must stay inside friction model bounds
+  ### B.1 Hard blocker frequency (Table A)
+    Hard Blocker | Count | % of >=88 rows blocked | Avg blocked score
+    (risk lockout, cooldown, qty zero, liquidity fail, cross-coin, governor)
 
-Exit:
-  * Live behavior inside expected bounds
-  * Real slippage matches empirical friction model
-  * Live reconciliation passes consistently
+  ### B.2 Score suppressor frequency (Table B)
+    Score Suppressor | Mean delta | Count on blocked >=88 candidates | Avg base→final
+    (session penalty, OB penalty, BTC lag, structure/trendline deltas)
+
+  ### B.3 Score × Regime EV matrix
+    Buckets (threshold-centric, frozen threshold=88):
+      Regime | 70-79 | 80-87 (near-miss) | 88-91 (tradable) | 92+ (high-conviction)
+    Cols: TREND_UP, RANGE, TREND_DOWN (collapse VOLATILE if sparse)
+    Metrics: trade count, win rate, EV, median hold time
+
+  ### B.4 Score × Session EV matrix
+    Same score buckets × OVERLAP, NY, LONDON, ASIA, OFF
+
+  ### B.5 Blocked-high-score analysis
+    For each blocked row with final_score >= 88 (or base_score >= 88):
+      base_score, final_score, base_gate, final_gate
+      hard_blockers (list), score_suppressors (list with deltas)
+      regime, session, action_reason
+    → identifies whether leak is direct veto or death by accumulated penalties
+
+  ### B.6 Taken trade review
+    For each completed trade:
+      score, regime, session, duration, MAE/MFE, exit reason, PnL
+    → confirms edge zones match backtest findings
+
+## Phase C — First Intervention Ladder (after Phase B read)
+
+  Rule: change ONE thing, remeasure. Not multiple simultaneous changes.
+
+  ### C.1 Relax one soft policy constraint (first — likely highest ROI)
+    Likely candidates (pick based on Phase B data):
+      - session penalty weaker for 88+ TREND candidates
+      - OB penalty cap reduced
+      - MTF hard confirmation softened or converted to modifier in TREND only
+
+  ### C.2 Coarse sizing multipliers (second — capital concentration)
+    Not smooth EV sizing yet. Start with a grid:
+      TREND + 92+      → 1.25x
+      TREND + 88-91    → 1.00x
+      RANGE + 92+      → 0.60x
+      RANGE + 88-91    → 0.35x
+      OFF session      → 0.70x overlay
+
+  ### C.3 Shadow time-pressure exit (third — dead-zone suppression)
+    Shadow only first (log would-have-exited, don't actually exit):
+      RANGE + score<92 + no progress after X minutes → would-exit
+    Compare would-have-been vs actual
+    Only activate after shadow proves value
+
+  ### C.4 Harder regime suppression
+    If RANGE kills even high scores → hard suppress or 0.25x size
+    Test empirically from Phase B data, not by intuition
+    Exploits the short-duration advantage
+
+  ### C.3 Harder regime suppression
+    If RANGE kills even high scores → hard suppress or 0.25x size
+    Test empirically, not by intuition
+
+## Phase D — Strategic Decisions (after Phase B/C data)
+
+  ### D.1 MTF confirmation: score-only vs confirmation-doctrine
+    A/B test: hard MTF on vs off
+    Compare EV, trade count, drawdown by score bucket
+    → philosophy decision, not cleanup
+
+  ### D.2 ML governor mode: LOG_ONLY vs SCORE_MODIFY vs GATE
+    Only promote if proven incremental edge over deterministic rules
+    Risk: model becomes de facto brain, deterministic layer becomes ceremony
+    → secondary policy, not core signal truth
+
+  ### D.3 BTC overlays: lag vs momentum — which adds edge
+    Different timescales, not true duplicates
+    Evaluate after attribution data exists
+    → consolidate only after empirical comparison
+
+  ### D.4 Governor retrain
+    Must use single-config live trade data (30+ per coin)
+    Mixed-config training produces ROC-AUC 0.500 (useless)
+
+## Phase 17 — Paper Capital Proof (after Phase C optimizations)
+
+  Goal: Prove paper growth under unattended operation with optimized config.
+  Duration: minimum 4 weeks unattended
+  Rules:
+    * Fixed config, locked at run start (config hash enforced)
+    * No strategy edits during run
+    * No operator overrides except KILL_SWITCH or PAUSE
+  Exit:
+    * Paper growth inside modeled expectancy and drawdown bounds
+    * Reconciliation passes every run
+    * 30+ live fills accumulated
+
+## Phase 18 — Real Micro-Capital Validation (after Phase 17)
+
+  Goal: Validate live settlement, fees, slippage under real capital.
+  Build: execution/coinbase_adapter.py (or IBKR adapter)
+  Rules:
+    * Minimal capital
+    * Live behavior must stay inside friction model bounds
+  Exit:
+    * Real slippage matches empirical friction model
+    * Live reconciliation passes consistently
+
+## Phase 19 — Multi-Asset Expansion (after edge proven)
+
+  Add SOL, possibly LINK — same engine, minimal changes
+  ONLY after knowing where edge lives (score/regime/session)
+  Rule: same strategy, different symbols. Not new strategies.
+
+## Strategy Features (built, available for activation)
+
+  [BUILT] WebSocket L2 feed + fast-exit (500ms OB checks)
+  [BUILT] ATR dynamic stops (scale TP/SL by volatility)
+  [BUILT] Conviction sizing (70%/100%/140% by score tier)
+  [BUILT] Session scoring (OVERLAP +8, NY +5, ASIA -5, OFF -8)
+  [BUILT] MTF confirmation (5m trend alignment gate)
+  [BUILT] Adaptive cooldown (50% after wins, 200% after losses)
+  [BUILT] Partial TP ladder (34% at 1R, 50% at 1.5R, rest rides trail)
+  [BUILT] Cross-coin guard (max concurrent positions)
+  [BUILT] Limit orders via WS bid/ask (ready for IBKR)
+  [BUILT] Sub-minute candle aggregation from WS ticker
+  [BUILT] OB imbalance score shaping (+8/+15 bull, -12 bear)
+
+  [TODO] Short selling support (after IBKR approved)
+  [TODO] Pyramiding / add-to-winners (after 30+ live trades)
+  [TODO] Mean-reversion strategy for RANGE regime
 
 ---
 
-# PRIORITY 1 — Strategy Edge  [AFTER PHASE 16.5]
+# ===================================================================
+# SYSTEM 2: POLYMARKET EVENT ARBITRAGE ENGINE (BUILD NEXT)
+# ===================================================================
 
-  [TEST] Trendline penalties only (queued on PC2 — disable bonuses, keep penalties)
-  [TODO] Expand to BTC-USD after ETH edge confirmed
-  [TODO] Adaptive score threshold — auto-adjust CONFLUENCE_MIN_SCORE based on rolling WR
-  [TODO] Volume-weighted entry timing — prefer entries at volume spikes vs quiet periods
-  [TODO] Fake-out detection & mitigation
-    - Identify entries that reverse quickly after fill
-    - Signals: wick rejection, volume divergence, order book imbalance
-    - Confirmation delay: wait N bars after signal before entering
-    - Track fake-out rate per score bucket / regime / session
-    - Related: the 30m-3h dead zone is likely dominated by fake-outs
-  [TODO] Liquidation-aware entry gating
-    - Monitor large liquidation events by size (whale vs retail)
-    - Block entries near large liquidation cascades
-    - Use liquidations AS signals — large clusters can mark reversals
-    - Needs: liquidation data feed or estimation from price/volume spikes
-  [TODO] Short selling support
-    - Engine: SELL-to-open + BUY-to-close
-    - Ledger: negative positions, short PnL = (entry - exit) * qty
-    - PaperAdapter: simulate short fills
-    - Separate score thresholds and drawdown limits for short book
-    - Phase: after long-only edge proven (Phase 17+)
-  [TODO] Pyramiding / add-to-winners
-    - Add to position when profitable and trend continues
-    - Rules: unrealized PnL > X%, max N additions, trailing stop on full position
-    - Needs: multi-fill position tracking in ledger
-  [TODO] Mean-reversion strategy
-    - Entry: price deviates X std devs from MA → enter expecting reversion
-    - Signals: RSI, Bollinger extremes, volume exhaustion
-    - Best in RANGE regime (where momentum loses)
-    - Build as second strategy, test independently, then coordinate
+  Status: NOT STARTED
+  Why: Inefficient pricing, retail-driven, slow reaction to info, bots proving edge
 
-# PRIORITY 2 — Multi-Timeframe Strategy  [TODO — foundation built]
+  Strategy types:
+    A. News latency edge: event happens → price lags → buy before correction
+    B. Probability mispricing: model probability > market probability → buy
+    C. Cross-market arb: related markets inconsistent → exploit spread
 
-  [DONE] 4hr candle aggregation in engine (CandleBuilder + rolling buffer)
-  [TODO] S/R trendline detection on 4hr chart (pivot highs/lows → projected lines)
-  [TODO] Entry signals based on 4hr S/R bounces/breaks
-  [TODO] Sliding window position sizing (rolling WR/PF per signal → size scaling)
-  [TODO] Strategy coordination layer (1m confluence + 4hr swing coexistence)
+  Architecture:
+    Data: news APIs, twitter/X scraping, event feeds
+    Model: probability estimator, sentiment + keyword scoring
+    Execution: Polymarket API, track odds vs model
+    Risk: cap exposure per event, decay positions near resolution
 
-# PRIORITY 3 — ML as Governor  [READY — 1,029 backtest trades available]
+  Build phases:
+    Phase 1: Scrape markets, track price changes, detect anomalies
+    Phase 2: Simple probability model, compare vs market
+    Phase 3: Paper trading
+    Phase 4: Live with micro-capital
 
-  Trade data: 1,029 backtest trades (ETH+BTC+SOL) + 1 live trade
-  Threshold met: 500+ trades exceeded as of 2026-03-14
+  Integration with Argus: NONE (separate system, separate codebase)
 
-  Phase 1: Feature extraction + dataset build
-    [TODO] Extract per-trade feature vectors from backtest artifacts
-      - Entry: confluence_score, regime, session, MA distances, volume ratios, spread
-      - Context: time_of_day, day_of_week, recent_volatility, trend_strength
-      - Outcome: win/loss, PnL, duration, exit_reason, MAE, MFE
-    [TODO] Build unified trade dataset (CSV or parquet) across all runs
-    [TODO] Feature correlation analysis — identify redundant/useless features
+---
 
-  Phase 2: Regime classifier
-    [TODO] Train regime classifier: TREND_UP / TREND_DOWN / RANGE / VOLATILE
-      - Input: 1h candle features (MA slopes, ATR, volume trend, candle patterns)
-      - Output: regime label + confidence
-      - Validate against current deterministic regime detection
-    [TODO] Compare ML regime vs rule-based regime on historical data
+# ===================================================================
+# SYSTEM 3: FOREX VALIDATION ENGINE (IBKR — INFRA ONLY)
+# ===================================================================
 
-  Phase 3: Entry quality scoring
-    [TODO] Train win probability model on trade feature vectors
-      - Binary classification: win (PnL > 0) vs loss
-      - Features: score, regime, session, duration context, volume
-      - Output: P(win) as ML-adjusted score modifier
-    [TODO] Backtest with ML score modifier vs baseline
+  Status: WAITING ON IBKR APPROVAL (DUP472829)
+  Role: Validation engine — tests if edge generalizes to slower markets
 
-  Phase 4: Anomaly detection
-    [TODO] Train anomaly detector on fill patterns and execution metrics
-      - Flags: unusual latency, price deviation from expected, volume anomalies
-      - Goal: early warning for market microstructure changes
+  Now: Connect, fetch data, place paper trades. NO strategy work yet.
+  Later: Stripped Argus (no OB, no BTC logic), heavy session weighting
 
-  Rules (hard — never violate):
-    * ML NEVER replaces deterministic engine — acts as score modifier only
-    * All ML decisions must be logged and traceable
-    * ML can reduce position size or block entry, never force entry
-    * Deterministic rules always have final veto
-    * Model must be retrained on fresh data periodically
+  Build phases:
+    Phase 1: IBKR API connection + paper order placement
+    Phase 2: Data feed validation (tick/candle quality)
+    Phase 3: Stripped Argus strategy, paper only
+    Phase 4: Compare EV vs crypto — does the edge transfer?
+
+---
+
+# ===================================================================
+# SYSTEM 4: EQUITIES NEWS MOMENTUM ENGINE (LATER)
+# ===================================================================
+
+  Status: NOT STARTED
+  Constraint: PDT rule (<$25K → no frequent day trading)
+
+  Best path: Swing trading (1-3 day holds, no PDT issues)
+  Broker: IBKR (better API than Robinhood)
+
+  Strategy:
+    Gap + momentum continuation
+    Earnings/news driven moves
+    Premarket movers, volume spikes, news catalysts
+
+  Partial reuse from Argus: confluence scoring concept, risk framework
+  Different: data, timing, volatility, hold periods
 
 ---
 
@@ -213,21 +313,6 @@ Exit:
 
 ---
 
-# FUTURE EXTENSIONS (after Phase 18)
-
-  * Champion-challenger shadow runtime
-  * Dual-feed market data validation
-  * Hash-chained artifact integrity
-  * Deterministic replay certification
-  * Multi-venue portability (perpetual futures)
-  * Policy engine above strategy engine
-  * Regime black-swan library
-  * Storage and recovery maturity
-  * Multi-exchange arbitrage monitoring
-  * API rate limit / circuit breaker hardening
-
----
-
 # TWO-MACHINE SETUP
 
   PC1 (WINDOWS-5RCTEK3): runner_live.py 24/7, dev work, heavy backtests
@@ -236,24 +321,6 @@ Exit:
   SSH: passwordless ED25519 key, dispatch via ops/dispatch_backtest_pc2.ps1
   .env tracked in git (paper trading, no real keys)
   ops/logs/ NOT in git — artifacts are local to each machine
-
----
-
-# TRENDLINE ENGINE (currently disabled)
-
-  TrendlineEngine: detects pivot highs/lows on 1h candles, projects descending resistance
-  and ascending support trendlines, computes proximity and breakout signals.
-  Integrated into state.py, engine.py, confluence.py, decisions.py, config.py.
-
-  Score effects (when USE_TRENDLINES=true):
-    Near support trendline:      +5 to score (bonus)
-    Near resistance trendline:   -8 to score (penalty)
-    Broke above resistance:     +12 to score (bonus)
-    Broke below support:        -15 to score + HARD BLOCK
-    Resistance slope negative:   -5 to score (TL_PENALTY_RESIST_SLOPE_NEG)
-
-  Status: USE_TRENDLINES=false. Bonuses counterproductive in 2026-03-12 test.
-  Penalties-only test queued on PC2 (with TL_PENALTY_RESIST_SLOPE_NEG=5).
 
 ---
 
@@ -267,3 +334,15 @@ Exit:
   ArgusWeeklyDigest:    Sunday@06:00 -> ops/weekly_digest.py (Discord performance report)
   Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
   Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
+
+---
+
+# THE SCALING PATH
+
+  Phase 1 (NOW): Argus becomes profitable — identify edge zones via trace
+  Phase 2: Increase size in edge zones, add 1-2 crypto assets
+  Phase 3: Polymarket starts generating side income
+  Phase 4: Equities system adds another stream
+  Phase 5: Capital scaling across proven systems
+
+  Rule: stacking proven edges and scaling capital into them > adding more systems

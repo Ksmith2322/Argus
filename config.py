@@ -519,6 +519,14 @@ def load_config() -> dict:
     cfg["OB_EXIT_ENABLED"] = _b("OB_EXIT_ENABLED", "false")
     cfg["OB_EXIT_BEAR_THRESHOLD"] = _f("OB_EXIT_BEAR_THRESHOLD", "-0.20")
 
+    # -------------------------
+    # ATR-based dynamic stops: scale TP/SL/trail by current volatility
+    # -------------------------
+    cfg["USE_ATR_DYNAMIC_STOPS"] = _b("USE_ATR_DYNAMIC_STOPS", "false")
+    cfg["ATR_STOPS_BASELINE"] = _d("ATR_STOPS_BASELINE", "0.001")    # baseline ATR norm (ratio=1.0)
+    cfg["ATR_STOPS_MIN_MULT"] = _d("ATR_STOPS_MIN_MULT", "0.6")     # floor multiplier (low vol)
+    cfg["ATR_STOPS_MAX_MULT"] = _d("ATR_STOPS_MAX_MULT", "2.0")     # ceiling multiplier (high vol)
+
     # =========================================================
     # IBKR Feed / Execution (Phase IBKR)
     # =========================================================

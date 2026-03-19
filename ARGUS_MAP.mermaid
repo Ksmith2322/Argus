@@ -82,8 +82,40 @@ graph TD
     end
 
     subgraph Other["Other"]
+        btc_momentum_guard["btc_momentum_guard"]
+        correlation_guard["correlation_guard"]
+        feed_ibkr["feed_ibkr"]
+        feed_ws["feed_ws"]
+        ml_governor["ml_governor"]
         _debug_step["_debug_step"]
+        execution_ibkr_adapter["ibkr_adapter"]
+        ops_analyze_sweep["analyze_sweep"]
+        ops_check_candle_gaps["check_candle_gaps"]
+        ops_coin_rotation["coin_rotation"]
+        ops_compile_queue_results["compile_queue_results"]
+        ops_export_trades["export_trades"]
         ops_generate_map["generate_map"]
+        ops_health_check["health_check"]
+        ops_ml_extract_features["ml_extract_features"]
+        ops_ml_governor_score["ml_governor_score"]
+        ops_ml_retrain["ml_retrain"]
+        ops_ml_train_governor["ml_train_governor"]
+        ops_plot_backtest_evolution["plot_backtest_evolution"]
+        ops_plot_equity_overlay["plot_equity_overlay"]
+        ops_post_queue_report["post_queue_report"]
+        ops_rotate_coin["rotate_coin"]
+        ops_test_coinbase_connection["test_coinbase_connection"]
+        ops_weekly_digest["weekly_digest"]
+        ops__build_batch2["_build_batch2"]
+        ops__build_batch3["_build_batch3"]
+        ops__build_batch3b_val45d["_build_batch3b_val45d"]
+        ops__build_batch4b_pc2["_build_batch4b_pc2"]
+        ops__build_batch4_final["_build_batch4_final"]
+        ops__build_batch5_walkforward["_build_batch5_walkforward"]
+        ops__build_mega_queue["_build_mega_queue"]
+        ops__build_mega_queue_extended["_build_mega_queue_extended"]
+        ops__build_pc2_queue["_build_pc2_queue"]
+        ops__merge_and_rank["_merge_and_rank"]
         ops_logs_plot_equity_latest["plot_equity_latest"]
     end
 
@@ -102,6 +134,7 @@ graph TD
     backtest_runner --> engine
     backtest_runner --> feed_coinbase
     backtest_runner --> io_logs
+    backtest_runner --> risk
     backtest_runner --> state
     backtest_stress_runner --> backtest_friction_injector
     backtest_stress_runner --> backtest_runner
@@ -110,23 +143,36 @@ graph TD
     candles --> feed_coinbase
     execution_exec_io --> execution_intent
     execution_exec_io --> trade_journal
+    execution_ibkr_adapter --> execution_adapter
     execution_intent --> decisions
     execution_paper_adapter --> execution_adapter
+    feed_ibkr --> feed_coinbase
+    feed_ibkr --> utils
     ops_alerting --> notify
+    ops_check_candle_gaps --> ops_notify
+    ops_dashboard --> ops_coin_rotation
     ops_health --> runtime_mode
+    ops_health_check --> ops_notify
+    ops_ml_retrain --> ops_notify
+    ops_post_queue_report --> ops_notify
     ops_watchdog --> runtime_mode
+    ops_weekly_digest --> ops_notify
     regime --> utils
     runner_live --> config
     runner_live --> engine
     runner_live --> execution_adapter
     runner_live --> execution_recovery
     runner_live --> feed_coinbase
+    runner_live --> feed_ibkr
+    runner_live --> feed_ws
     runner_live --> io_logs
     runner_live --> notify
     runner_live --> ops_alerting
     runner_live --> ops_artifact_integrity
     runner_live --> ops_auto_throttle
+    runner_live --> ops_coin_rotation
     runner_live --> ops_health
+    runner_live --> ops_notify
     runner_live --> ops_run_manifest
     runner_live --> runtime_mode
     runner_live --> state
@@ -136,7 +182,9 @@ graph TD
     state --> candles
     state --> confluence
     state --> execution_adapter
+    state --> execution_ibkr_adapter
     state --> execution_paper_adapter
+    state --> feed_ibkr
     state --> ledger
     state --> liquidity
     state --> regime

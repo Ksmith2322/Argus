@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import threading
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
@@ -179,6 +180,11 @@ class CoinbaseWsFeed:
         self.product_id = product_id
         self._book = _OrderBook()
         self._connected = False
+        # Sub-minute candle aggregation: stores (epoch, price, volume) tuples
+        self._candle_lock = threading.Lock()
+        self._candle_ticks: List[tuple] = []  # (epoch_s, Decimal price, Decimal volume)
+        self._last_candle: Optional[dict] = None
+        self._max_tick_history = 600  # keep ~10 min of ticks
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -201,7 +207,7 @@ class CoinbaseWsFeed:
         sub_msg = json.dumps({
             "type": "subscribe",
             "product_ids": [self.product_id],
-            "channels": ["level2"],
+            "channels": ["level2", "ticker"],
         })
         async with websockets.connect(
             COINBASE_WS_URL,
@@ -227,7 +233,23 @@ class CoinbaseWsFeed:
                     )
                 elif mtype == "l2update":
                     self._book.apply_updates(msg.get("changes", []))
-                # ignore: subscriptions, heartbeat, ticker, error, etc.
+                elif mtype == "ticker":
+                    # Aggregate trade ticks for sub-minute candles
+                    try:
+                        px_str = msg.get("price", "")
+                        vol_str = msg.get("last_size", "0")
+                        if px_str:
+                            px = Decimal(px_str)
+                            vol = Decimal(vol_str) if vol_str else Decimal("0")
+                            epoch = int(time.time())
+                            with self._candle_lock:
+                                self._candle_ticks.append((epoch, px, vol))
+                                # Trim old ticks beyond max history
+                                if len(self._candle_ticks) > self._max_tick_history:
+                                    self._candle_ticks = self._candle_ticks[-self._max_tick_history:]
+                    except (InvalidOperation, ValueError):
+                        pass
+                # ignore: subscriptions, heartbeat, error, etc.
 
         self._connected = False
 
@@ -268,6 +290,50 @@ class CoinbaseWsFeed:
         """Total number of price levels in the book (for diagnostics)."""
         return self._book.get_book_depth()
 
+    # ------------------------------------------------------------------
+    # Sub-minute candle aggregation
+    # ------------------------------------------------------------------
+
+    def get_candle(self, seconds: int = 15) -> Optional[dict]:
+        """Get the current aggregated candle for the given interval.
+
+        Returns dict with keys: open, high, low, close, volume, ts, n_ticks.
+        Returns None if no ticks received yet.
+        """
+        with self._candle_lock:
+            if not self._candle_ticks:
+                return None
+            now = int(time.time())
+            bucket_start = now - (now % seconds)
+            # Filter ticks in current bucket
+            bucket_ticks = [
+                t for t in self._candle_ticks
+                if t[0] >= bucket_start
+            ]
+            if not bucket_ticks:
+                # Return last completed candle if available
+                return self._last_candle
+
+            prices = [t[1] for t in bucket_ticks]
+            volumes = [t[2] for t in bucket_ticks]
+            candle = {
+                "open": prices[0],
+                "high": max(prices),
+                "low": min(prices),
+                "close": prices[-1],
+                "volume": sum(volumes),
+                "ts": bucket_start,
+                "n_ticks": len(bucket_ticks),
+            }
+            return candle
+
+    def get_last_price(self) -> Optional[Decimal]:
+        """Latest trade price from the ticker channel."""
+        with self._candle_lock:
+            if self._candle_ticks:
+                return self._candle_ticks[-1][1]
+        return None
+
     def status(self) -> str:
         """Human-readable status string for logging/diagnostics."""
         if not self._connected:
@@ -277,4 +343,5 @@ class CoinbaseWsFeed:
         imb = self.get_imbalance()
         depth = self.get_book_depth()
         imb_str = f"{imb:+.3f}" if imb is not None else "N/A"
-        return f"READY depth={depth} imbalance={imb_str}"
+        ticks = len(self._candle_ticks) if hasattr(self, '_candle_ticks') else 0
+        return f"READY depth={depth} imbalance={imb_str} ticks={ticks}"

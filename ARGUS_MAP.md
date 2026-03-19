@@ -1,5 +1,5 @@
 # ARGUS MAP
-# Last updated: 2026-03-13 — ops tooling, two-machine automation, trendline engine
+# Last updated: 2026-03-18 — ops tooling, two-machine automation, trendline engine
 
 This map reflects your current working reality:
 - You run backtest from `C:\Argus\repo` (canonical CWD) using the venv python
@@ -366,7 +366,39 @@ Trade journal close_to_flat detection (runner_live.py):
 
 ---
 
-## 13) Phase 9 trade lifecycle finalization (completed 2026-03-10)
+## 13) Phase 20: WebSocket feed + performance features (2026-03-18)
+
+WebSocket L2 feed (`feed_ws.py`):
+- `CoinbaseWsFeed` background asyncio task, auto-reconnect, subscribes to `level2` + `ticker`
+- Provides: `get_imbalance(depth)`, `get_best_bid/ask()`, `get_spread_bps()`, `get_candle(seconds)`
+- Runner overlays WS data onto PriceTick before `engine.step()`
+- Fast-exit micro-poll: checks OB every 500ms in position, triggers early re-eval on book collapse
+
+Performance features (all config-gated):
+- ATR dynamic stops (`USE_ATR_DYNAMIC_STOPS`): scale TP/SL/trail by current vol vs baseline
+- Conviction sizing (`USE_SCORE_SIZE_MULT`): 70%/100%/140% size by score tier
+- Session scoring (`USE_SESSION_MODIFIERS`): OVERLAP +8, NY +5, ASIA -5, OFF -8
+- Multi-TF confirmation (`USE_MTF_CONFIRMATION`): require 5m trend alignment
+- Adaptive cooldown (`USE_ADAPTIVE_COOLDOWN`): 50% cooldown after wins, 200% after losses
+- Partial TP ladder (`USE_EXIT_INTEL`): 34% at 1R, 50% at 1.5R, rest rides trail
+- Cross-coin guard (`USE_CROSS_COIN_GUARD`): max concurrent positions across coins
+- Limit orders (`USE_LIMIT_ORDERS`): WS bid/ask placement (ready for IBKR)
+- Sub-minute candles: WS ticker aggregates 15s/30s candles from real-time trades
+
+Multi-coin architecture:
+- `ops/launch_multi.ps1`: parallel runners (ETH, BTC) in separate windows
+- Per-coin env overlays: `.env.eth`, `.env.btc`
+- Per-coin log isolation: `ops/logs/eth/`, `ops/logs/btc/`
+- Dashboard: dynamic coin cards, `/api/multi` endpoint, real-time WS data
+
+ML Governor (`ml_governor.py`):
+- Trained model (1,029 trades, 26 features, ROC-AUC 0.944)
+- GATE mode: threshold 0.38, blocks entries below win probability
+- Retrain: `ops/ml_retrain.py`
+
+---
+
+## 14) Phase 9 trade lifecycle finalization (completed 2026-03-10)
 
 Per-trade artifact fields written to `trade_journal_<run_id>.csv`:
 - Entry/exit timestamps (ISO-8601)

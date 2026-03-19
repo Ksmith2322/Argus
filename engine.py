@@ -307,7 +307,7 @@ def _classify_hold_reason(
         return "HOLD_ENTRY_SIGNAL_FALSE", f"trend_ok={int(st_1m.trend_ok)} signal={st_1m.signal}"
     if not conf_ok:
         return "HOLD_CONFLUENCE", f"conf_score={safe_str(conf_score)} min={conf_min}"
-    return "HOLD_OTHER", f"trend_ok={int(st_1m.trend_ok)} signal={st_1m.signal} conf={safe_str(conf_score)}"
+    return "HOLD_SIGNAL_OK_GATE_PENDING", f"trend_ok={int(st_1m.trend_ok)} signal={st_1m.signal} conf={safe_str(conf_score)}"
 
 
 def _map_trade_event(cfg: dict, would_name: str) -> str:
@@ -1384,6 +1384,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
         _add_event(snap, "RISK_DAY_RESET", payload["msg"])
 
     cooldown_remaining = max(0, int(state.cooldown_until_epoch) - now_e)
+    _decision_blockers: list = []  # Phase 20: accumulate blockers for decision_trace
 
     st_1m_tf = _to_tf_state(state.last_st_1m, "1m")
     st_5m_tf = _to_tf_state(state.last_st_5m, "5m")
@@ -1583,6 +1584,18 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
             take_profit_pct = take_profit_pct * _tp_mult
             stop_loss_pct = stop_loss_pct * _sl_mult
 
+        # ATR-based dynamic stops: scale TP/SL by current volatility vs baseline
+        if _bool_cfg(cfg, "USE_ATR_DYNAMIC_STOPS", False) and atr_norm_fb is not None and atr_norm_fb > 0:
+            _atr_baseline = _as_decimal(cfg.get("ATR_STOPS_BASELINE", "0.001"), "0.001")
+            _atr_min_mult = _as_decimal(cfg.get("ATR_STOPS_MIN_MULT", "0.6"), "0.6")
+            _atr_max_mult = _as_decimal(cfg.get("ATR_STOPS_MAX_MULT", "2.0"), "2.0")
+            if _atr_baseline > 0:
+                _atr_ratio = atr_norm_fb / _atr_baseline
+                _atr_mult = max(_atr_min_mult, min(_atr_max_mult, _atr_ratio))
+                take_profit_pct = take_profit_pct * _atr_mult
+                stop_loss_pct = stop_loss_pct * _atr_mult
+                trail_stop_pct = trail_stop_pct * _atr_mult
+
         take_profit = state.ledger.avg_entry_px * (Decimal("1") + take_profit_pct)
         stop_loss = state.ledger.avg_entry_px * (Decimal("1") - stop_loss_pct)
 
@@ -1695,6 +1708,45 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                     )
                     action = "SELL"
                     action_reason = "PARTIAL_TP_1R_INTENT"
+
+        # --- Partial Take-Profit at 2R (second ladder level) ---
+        if use_exit_intel and state.partial_tp_taken and not state.partial_tp_2r_taken and stop_loss is not None:
+            _2r_mult = _as_decimal(cfg.get("EXIT_PARTIAL_2R_MULT", "1.5"), "1.5")
+            stop_loss_pct_2r = _as_decimal(cfg.get("STOP_LOSS_PCT", "0.02"), "0.02")
+            two_r_target = state.ledger.avg_entry_px * (Decimal("1") + stop_loss_pct_2r * _2r_mult)
+            partial_2r_frac = _as_decimal(cfg.get("EXIT_PARTIAL_2R_FRACTION", "0.50"), "0.50")
+            if px >= two_r_target and partial_2r_frac > 0 and state.ledger.position_qty > 0 and emit_actions:
+                partial_qty_2r = (state.ledger.position_qty * partial_2r_frac).quantize(
+                    Decimal("0.00000001"), rounding=ROUND_DOWN
+                )
+                if partial_qty_2r > 0 and not _adapter_mode_enabled(cfg, state):
+                    eff_sell, proceeds, realized_2r = state.ledger.sell(
+                        px=px, epoch=now_e, cfg=cfg, qty=partial_qty_2r
+                    )
+                    state.partial_tp_2r_taken = True
+                    _add_event(
+                        snap, "PARTIAL_TP_2R",
+                        f"PARTIAL_TP_2R | px={px} qty={partial_qty_2r} proceeds={proceeds:.2f} realized={realized_2r:.2f}",
+                        notify_title="PARTIAL_TP_2R",
+                        notify_body=f"{symbol} PARTIAL TP at 2R\npx={px}\nqty={partial_qty_2r}\nproceeds={proceeds:.2f}",
+                    )
+                elif partial_qty_2r > 0 and _adapter_mode_enabled(cfg, state):
+                    state.partial_tp_2r_taken = True
+                    snap.intent_id = _new_intent_id(symbol, "SELL", now_e)
+                    snap.exit_intent_id = snap.intent_id
+                    snap.client_order_id = _new_client_order_id(symbol, "SELL", now_e)
+                    snap.execution_qty = partial_qty_2r
+                    snap.execution_status = "PENDING_SUBMIT"
+                    snap.execution_reason = "PARTIAL_TP_2R"
+                    _add_event(
+                        snap, "PARTIAL_TP_2R",
+                        f"PARTIAL_TP_2R_INTENT | px={px} qty={partial_qty_2r}",
+                        notify_title="PARTIAL_TP_2R",
+                        notify_body=f"{symbol} PARTIAL TP intent at 2R\npx={px}\nqty={partial_qty_2r}",
+                        client_order_id=snap.client_order_id,
+                    )
+                    action = "SELL"
+                    action_reason = "PARTIAL_TP_2R_INTENT"
 
         # Standalone breakeven stop: activate when price reaches trigger % above entry
         be_trigger_pct = _as_decimal(cfg.get("EXIT_BREAKEVEN_TRIGGER_PCT", "0"), "0")
@@ -1814,7 +1866,17 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 # Preserve MFE/MAE for snapshot BEFORE resetting state
                 _final_mfe = state.mfe_pct
                 _final_mae = state.mae_pct
-                state.cooldown_until_epoch = now_e + int(cfg["COOLDOWN_SECONDS"])
+                # Adaptive cooldown: shorter after wins, longer after losses
+                _base_cd = int(cfg["COOLDOWN_SECONDS"])
+                if _bool_cfg(cfg, "USE_ADAPTIVE_COOLDOWN", False) and realized_trade is not None:
+                    if realized_trade > 0:
+                        _cd_mult = float(cfg.get("COOLDOWN_MULT_AFTER_WIN", 0.5))
+                    elif realized_trade < 0:
+                        _cd_mult = float(cfg.get("COOLDOWN_MULT_AFTER_LOSS", 2.0))
+                    else:
+                        _cd_mult = 1.0
+                    _base_cd = max(30, int(_base_cd * _cd_mult))
+                state.cooldown_until_epoch = now_e + _base_cd
                 state.trend_below_count = 0
                 state.peak_price = None
                 state.entry_epoch = None
@@ -1823,6 +1885,7 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                 state.high_since_entry = None
                 state.low_since_entry = None
                 state.partial_tp_taken = False
+                state.partial_tp_2r_taken = False
                 state.breakeven_stop = None
                 # Stash final MFE/MAE so snapshot (built later) captures pre-reset values
                 state._sell_mfe_pct = _final_mfe
@@ -2053,64 +2116,93 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                                     extra=f"btc_momentum={btc_reason}",
                                                 )
                                             else:
-                                                ev_name = _map_trade_event(cfg, "WOULD_BUY")
-                                                snap.vol_used = vol_used
-                                                snap.vol_sizing_qty = qty_vol
-                                                snap.execution_qty = qty
-                                                snap.vol_reason = qty_reason
-                                                snap.sizing_note = sizing_note
-
-                                                if _adapter_mode_enabled(cfg, state):
-                                                    snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
-                                                    snap.entry_intent_id = snap.intent_id
-                                                    snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
-                                                    snap.execution_status = "PENDING_SUBMIT"
-                                                    snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
-
-                                                    _add_event(
+                                                # Multi-timeframe confirmation gate
+                                                mtf_ok = True
+                                                mtf_reason = ""
+                                                if _bool_cfg(cfg, "USE_MTF_CONFIRMATION", False):
+                                                    _mtf_require_5m = _bool_cfg(cfg, "MTF_REQUIRE_5M_TREND", True)
+                                                    _mtf_require_1h = _bool_cfg(cfg, "MTF_REQUIRE_1H_TREND", False)
+                                                    if _mtf_require_5m and st_5m_tf is not None:
+                                                        _5m_trend = getattr(st_5m_tf, "trend_ok", None)
+                                                        if _5m_trend is not None and not _5m_trend:
+                                                            mtf_ok = False
+                                                            mtf_reason = "5m_trend_down"
+                                                    if mtf_ok and _mtf_require_1h and st_1h_tf is not None:
+                                                        _1h_trend = getattr(st_1h_tf, "trend_ok", None)
+                                                        if _1h_trend is not None and not _1h_trend:
+                                                            mtf_ok = False
+                                                            mtf_reason = "1h_trend_down"
+                                                if not mtf_ok:
+                                                    _emit_missed_buy(
                                                         snap,
-                                                        ev_name,
-                                                        (
-                                                            f"ENTRY_INTENT | px={px} qty={qty} "
-                                                            f"client_order_id={snap.client_order_id} | "
-                                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                                        ),
-                                                        notify_title="BUY",
-                                                        notify_body=(
-                                                            f"{symbol} BUY intent\n"
-                                                            f"px={px}\nqty={qty}\n"
-                                                            f"client_order_id={snap.client_order_id}"
-                                                        ),
-                                                        client_order_id=snap.client_order_id,
+                                                        event="MISSED_BUY_MTF_CONFIRMATION",
+                                                        prefix="MTF_BLOCK",
+                                                        px=px,
+                                                        confluence_min_score=confluence_min_score,
+                                                        cooldown_remaining=int(cooldown_remaining),
+                                                        equity=equity,
+                                                        exposure=exposure,
+                                                        extra=f"mtf={mtf_reason}",
                                                     )
-
-                                                    action = "BUY"
-                                                    action_reason = "ENTRY_INTENT"
                                                 else:
-                                                    fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
-                                                    state.risk.record_entry(now_e, cfg)
+                                                    ev_name = _map_trade_event(cfg, "WOULD_BUY")
+                                                    snap.vol_used = vol_used
+                                                    snap.vol_sizing_qty = qty_vol
+                                                    snap.execution_qty = qty
+                                                    snap.vol_reason = qty_reason
+                                                    snap.sizing_note = sizing_note
 
-                                                    state.entry_epoch = now_e
-                                                    state.peak_price = px
-                                                    state.trend_below_count = 0
-                                                    state.mfe_pct = Decimal("0")
-                                                    state.mae_pct = Decimal("0")
-                                                    state.high_since_entry = px
-                                                    state.low_since_entry = px
+                                                    if _adapter_mode_enabled(cfg, state):
+                                                        snap.intent_id = _new_intent_id(symbol, "BUY", now_e)
+                                                        snap.entry_intent_id = snap.intent_id
+                                                        snap.client_order_id = _new_client_order_id(symbol, "BUY", now_e)
+                                                        snap.execution_status = "PENDING_SUBMIT"
+                                                        snap.execution_reason = f"{action_reason or 'ENTRY_INTENT'} | {sizing_note}"
 
-                                                    _add_event(
-                                                        snap,
-                                                        ev_name,
-                                                        (
-                                                            f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
-                                                            f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
-                                                        ),
-                                                        notify_title="BUY",
-                                                        notify_body=f"{symbol} BUY px={px} qty={qty}",
-                                                    )
+                                                        _add_event(
+                                                            snap,
+                                                            ev_name,
+                                                            (
+                                                                f"ENTRY_INTENT | px={px} qty={qty} "
+                                                                f"client_order_id={snap.client_order_id} | "
+                                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                                            ),
+                                                            notify_title="BUY",
+                                                            notify_body=(
+                                                                f"{symbol} BUY intent\n"
+                                                                f"px={px}\nqty={qty}\n"
+                                                                f"client_order_id={snap.client_order_id}"
+                                                            ),
+                                                            client_order_id=snap.client_order_id,
+                                                        )
 
-                                                    action = ev_name
-                                                    action_reason = "ENTRY_FILLED"
+                                                        action = "BUY"
+                                                        action_reason = "ENTRY_INTENT"
+                                                    else:
+                                                        fill_px, total_cost = state.ledger.buy(qty, px, now_e, cfg)
+                                                        state.risk.record_entry(now_e, cfg)
+
+                                                        state.entry_epoch = now_e
+                                                        state.peak_price = px
+                                                        state.trend_below_count = 0
+                                                        state.mfe_pct = Decimal("0")
+                                                        state.mae_pct = Decimal("0")
+                                                        state.high_since_entry = px
+                                                        state.low_since_entry = px
+
+                                                        _add_event(
+                                                            snap,
+                                                            ev_name,
+                                                            (
+                                                                f"ENTRY_FILLED | px={px} fill_px={fill_px} qty={qty} total_cost={total_cost} | "
+                                                                f"{sizing_note} | conf_gate={safe_str(conf_gate)}"
+                                                            ),
+                                                            notify_title="BUY",
+                                                            notify_body=f"{symbol} BUY px={px} qty={qty}",
+                                                        )
+
+                                                        action = ev_name
+                                                        action_reason = "ENTRY_FILLED"
 
             else:
                 if require_confluence and (not conf_ok):
@@ -2376,5 +2468,27 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     snap.action_reason = action_reason
     snap.risk_blocked_reason = risk_blocked_reason
     snap.next_poll_s = float(next_poll)
+
+    # Phase 20: write decision trace for entry-eligible ticks
+    if _bool_cfg(cfg, "USE_DECISION_TRACE", True) and entry_signal_ok:
+        try:
+            from decision_trace import build_trace_row, append_trace_row
+            # Extract blockers from snap events
+            _blockers = [
+                str(getattr(ev, "event", "") or getattr(ev, "name", "") or "")
+                for ev in (getattr(snap, "events", None) or [])
+                if "MISSED_BUY" in str(getattr(ev, "event", "") or getattr(ev, "name", "") or "")
+            ]
+            _trace = build_trace_row(
+                snap=snap,
+                cfg=cfg,
+                base_score=base_score,
+                base_gate=base_gate,
+                blockers=_blockers,
+                symbol=symbol,
+            )
+            append_trace_row(_trace, cfg)
+        except Exception:
+            pass  # trace must never crash the engine
 
     return snap

@@ -1,0 +1,145 @@
+ARGUS FILE TREE
+# Last updated: 2026-03-18
+# Excludes: .git/, __pycache__/, ops/logs/*, data/*, state/*, ops/archive/*
+
+C:\Argus\repo\
+│
+├── .env                          # Production config (ETH default)
+├── .env.btc                      # BTC per-coin overlay
+├── .env.eth                      # ETH per-coin overlay
+├── .env.sol                      # SOL per-coin overlay (disabled)
+├── .env.coinbase                 # Coinbase API credentials
+├── .env.smoke_test               # Gate A smoke test config
+├── .env.forex                    # Forex config (future)
+├── .gitignore
+│
+├── ARGUS_MAP.md                  # Architecture map + call graph + contracts
+├── ARGUS_MAP.mermaid             # Auto-generated Mermaid dependency diagram
+├── FILES_INDEX.md                # One-line-per-file index
+├── FILE_TREE.txt                 # This file
+├── CLAUDE.md                     # Claude Code guidance
+├── roadmap.txt                   # Project roadmap
+├── requirements.txt              # Python dependencies
+│
+├── ─── CORE ENGINE ───
+├── config.py                     # Config loader + defaults + env surface
+├── engine.py                     # Decision orchestrator: scoring, gating, events
+├── state.py                      # BotState: owns all sub-engines + caches
+├── decisions.py                  # DecisionSnapshot + EngineEvent schema
+├── runner_live.py                # Live loop: feed → step → execute → log
+├── _debug_step.py                # One-shot debug tick
+│
+├── ─── STRATEGY & SIGNALS ───
+├── strategy_phase2.py            # Strategy rules → StrategyState (signal/trend/score)
+├── confluence.py                 # Confluence scoring from TF states
+├── adaptive_confluence.py        # Regime-aware confluence adjustment
+├── regime.py                     # Regime detection (trend/range/volatile)
+├── structure.py                  # Market structure: S/R, breaks, retests
+├── liquidity.py                  # Liquidity filter: spread/vol/ATR + penalties
+├── session.py                    # Session classifier + score modifiers
+├── trendlines.py                 # Trendline engine: pivots, S/R projection
+├── indicators.py                 # SMA/EMA/ATR/volatility indicators
+├── candles.py                    # Candle + CandleBuilder (1m/5m/1h)
+├── risk.py                       # RiskManager: day limits, lockout, cooldown
+├── ml_governor.py                # ML governor: XGBoost win probability gate
+│
+├── ─── FEEDS & DATA ───
+├── feed_coinbase.py              # Coinbase REST: ticker, candles, OB imbalance
+├── feed_ws.py                    # Coinbase WebSocket L2 + ticker (Phase 20)
+├── feed_ibkr.py                  # IBKR feed stub (future)
+│
+├── ─── EXECUTION ───
+├── ledger.py                     # VirtualLedger: positions/cash/PnL
+├── pnl_shadow.py                 # Fill + PnL math helpers
+├── reconciliation.py             # Phase 8 reconciliation checks
+├── trade_journal.py              # Closed-trade row schema + CSV writer
+├── trade_tracker.py              # Hold/missed-buy counters
+├── notify.py                     # Discord webhook notifier
+├── io_logs.py                    # Canonical artifact writers (signals/events CSV)
+├── runtime_mode.py               # 5-level runtime mode system
+├── utils.py                      # Safe conversions + misc helpers
+│
+├── ─── MULTI-COIN ───
+├── correlation_guard.py          # Cross-coin entry guard (max concurrent)
+├── btc_momentum_guard.py         # BTC momentum gate for alt entries
+│
+├── execution/
+│   ├── adapter.py                # ExecutionAdapter ABC + data models
+│   ├── paper_adapter.py          # PaperAdapter: full order lifecycle
+│   ├── ibkr_adapter.py           # IBKR adapter (future)
+│   ├── recovery.py               # Startup reconciliation from fills.csv
+│   ├── exec_io.py                # Execution artifact CSV writers
+│   ├── intent.py                 # BuyIntent/SellIntent models
+│   └── checkpoint.py             # Atomic state saves
+│
+├── backtest/
+│   ├── runner.py                 # Backtest orchestration + artifact emission
+│   ├── loader.py                 # Load candle CSV → CandleRow list
+│   ├── feed.py                   # CandleRow → PriceTick stream
+│   ├── results.py                # Metrics: expectancy, DD, WR, invariants
+│   ├── download_candles.py       # Coinbase candle downloader
+│   ├── friction_injector.py      # Empirical friction injection
+│   ├── walk_forward.py           # N-window walk-forward validation
+│   ├── stress_runner.py          # Stress scenarios (spread/vol/regime)
+│   └── from_live_events.py       # Reconstruct trades from live events
+│
+├── analytics/
+│   ├── attribution.py            # Regime/session/hold-time attribution
+│   ├── friction_report.py        # Latency/slippage/spread distributions
+│   ├── research_report.py        # Walk-forward + stress summary
+│   └── risk_model.py             # PnL stats, Sharpe, Monte Carlo, Kelly
+│
+├── reporting/
+│   └── generate_report.py        # Self-contained HTML report
+│
+├── ops/
+│   ├── dashboard.py              # FastAPI dashboard (port 8080)
+│   ├── launch_multi.ps1          # Multi-coin launcher (ETH, BTC)
+│   ├── coin_rotation.py          # Passive coin health monitor
+│   ├── coin_pool.json            # Coin pool registry
+│   ├── run_backtest.ps1          # Canonical backtest wrapper
+│   ├── run_queue.ps1             # Backtest queue runner
+│   ├── refresh_candles.ps1       # Download latest candles
+│   ├── dispatch_backtest_pc2.ps1 # Dispatch backtest to PC2 via SSH
+│   ├── check_pc2.ps1             # PC2 status check
+│   ├── pull_pc2_results.ps1      # Pull results from PC2
+│   ├── restart_runner.ps1        # Graceful runner restart
+│   ├── auto_git_backup.ps1       # Nightly git commit+push
+│   ├── autostart_runner.ps1      # Auto-start on login
+│   ├── autostart_dashboard.ps1   # Auto-start dashboard
+│   ├── health.py                 # Health check framework
+│   ├── invariants.py             # Continuous invariant engine
+│   ├── run_manifest.py           # Config freeze + code hash
+│   ├── alerting.py               # Centralized alert dispatch
+│   ├── watchdog.py               # Supervisor + auto-restart
+│   ├── artifact_integrity.py     # Artifact integrity checks
+│   ├── auto_throttle.py          # Position size throttling
+│   ├── backup_restore.py         # Backup/restore utilities
+│   ├── generate_map.py           # Mermaid dependency diagram generator
+│   ├── ml_retrain.py             # Governor model retrain
+│   ├── ml_train_governor.py      # Initial governor training
+│   ├── ml_extract_features.py    # ML feature extraction
+│   ├── compare_runs.py           # Backtest run comparison
+│   ├── analyze_scores.py         # Score analysis tool
+│   ├── analyze_sweep.py          # Parameter sweep analysis
+│   ├── notify.py                 # Ops notification helpers
+│   ├── weekly_digest.py          # Weekly performance digest
+│   ├── validate_candles.py       # Candle data validation
+│   ├── export_trades.py          # Trade export utility
+│   ├── test_gate_a_phase8.ps1    # Phase 8 acceptance harness
+│   ├── test_gate_a_phase10.ps1   # Phase 10 adversarial harness
+│   ├── DISASTER_RECOVERY.md      # DR procedures
+│   └── logs/                     # Artifact root (per-coin subdirs)
+│       ├── eth/                  # ETH live artifacts
+│       └── btc/                  # BTC live artifacts
+│
+├── data/                         # Candle data (not in git)
+│   ├── eth_usd_1m.csv            # ETH 1m candles (45-day)
+│   ├── btc_usd_1m.csv            # BTC 1m candles
+│   ├── eth_usd_1m_90d.csv        # ETH 90-day dataset
+│   ├── btc_usd_1m_90d.csv        # BTC 90-day dataset
+│   └── sol_usd_1m_90d.csv        # SOL 90-day dataset
+│
+└── state/                        # Runtime state (not in git)
+    ├── runtime_state_ETH_USD.json
+    └── runtime_state_BTC_USD.json

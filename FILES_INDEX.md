@@ -1,5 +1,5 @@
 FILES INDEX (one line per file; no prose)
-# Last updated: 2026-03-13 — added ops tooling (dispatch, check, pull, restart, autostart, refresh), trendlines.py
+# Last updated: 2026-03-18 — added ops tooling (dispatch, check, pull, restart, autostart, refresh), trendlines.py
 
 FORMAT:
 file | TYPE | ROLE | CALLED BY | CALLS INTO | OWNS STATE | READS | WRITES | RISK TAGS
@@ -55,6 +55,16 @@ io_logs.py | IO (CANONICAL) | canonical artifact writers + pause/kill + path hel
 logger.py | IO (LEGACY) | duplicate/legacy writer (avoid) | unknown/legacy | utils (fallback import) | NO | filesystem | legacy logs | DUPLICATE-IO,drift-risk
 
 feed_coinbase.py | INTEGRATION | Coinbase HTTP fetch + preload/history helpers | runner_live,backtest/download_candles | requests,candles | NO | network | none | network,rate-limit
+
+feed_ws.py | CORE (Phase 20) | Coinbase WebSocket L2 order book feed + ticker; CoinbaseWsFeed class: background asyncio task, auto-reconnect, thread-safe _OrderBook; provides get_imbalance/get_best_bid/get_best_ask/get_spread_bps/get_candle; ticker channel aggregates sub-minute candles | runner_live | websockets | YES | network (wss://ws-feed.exchange.coinbase.com) | none | network,real-time,state
+
+feed_ibkr.py | INTEGRATION (stub) | IBKR feed stub for future live execution | runner_live | none | NO | network | none | network,future
+
+ml_governor.py | CORE (ML-1) | ML governor: trained XGBoost model (26 features, ROC-AUC 0.944); GATE/STAMP modes; evaluates entry signals with win probability; threshold-based gating | engine | xgboost,pandas | NO | ml_model.json,cfg | none | ML,gating
+
+correlation_guard.py | CORE | cross-coin entry guard: reads sibling runtime_state JSONs; blocks entries when concurrent open positions >= CROSS_COIN_MAX_OPEN | engine | json | NO | state/runtime_state_*.json | none | risk,multi-coin
+
+btc_momentum_guard.py | CORE | BTC momentum gate: blocks alt-coin entries when BTC trends down | engine | none | NO | cfg | none | risk,multi-coin
 
 notify.py | INTEGRATION | Discord webhook notifier | runner_live | requests | NO | cfg,network | network side-effect | side-effects,network
 
@@ -144,6 +154,22 @@ ops/refresh_candles.ps1 | OPS | download latest candles; -DaysBack (default 30),
 ops/auto_git_backup.ps1 | OPS | nightly git commit + push; only commits if changes; logs to ops/logs/git_backup_*.log | Task Scheduler daily@02:00 | git | NO | filesystem | ops/logs/git_backup_*.log | backup,survivability
 
 ops/run_comparison_tests.ps1 | OPS | sequential fixed_liq + trendlines comparison backtests; resets env between runs | manual | backtest.runner | NO | .env | none | strategy-research
+
+ops/dashboard.py | CORE (Phase 17) | FastAPI dashboard: multi-coin cards, signal health, equity sparklines, volatility/ATR bar, daily P&L, OB imbalance, governor win prob, decision flow, backtest evolution; serves on port 8080 | manual,autostart | fastapi,uvicorn | NO | ops/logs/*/live_signals.csv,account.csv,fills.csv,events.csv,trade_journal*.csv | none (HTTP only) | ops,monitoring,web
+
+ops/launch_multi.ps1 | OPS | launch parallel runners (ETH, BTC) in separate PowerShell windows with per-coin env (PRODUCT_ID, ARGUS_LOG_DIR, coin overlay) | manual | runner_live | NO | filesystem | none | multi-coin,launch
+
+ops/coin_rotation.py | OPS | passive coin health monitor: reads coin_pool.json, computes rolling PF/WR metrics per coin, flags degraded performers | dashboard | json | NO | coin_pool.json,trade_journal*.csv | none | multi-coin,monitoring
+
+ops/coin_pool.json | CONFIG | coin pool registry: max_active, active coins, per-coin metrics | coin_rotation,dashboard | n/a | NO | filesystem | none | multi-coin,config
+
+ops/run_queue.ps1 | OPS | backtest queue runner: reads ops/backtest_queue.jsonl, refreshes candles, runs each job sequentially | manual,Task Scheduler | backtest.runner | NO | backtest_queue.jsonl | ops/logs/bt_summary*.json | backtest,automation
+
+ops/ml_retrain.py | TOOL | governor model retrain: extracts features from trade journals, trains XGBoost, saves model | manual | xgboost,pandas | NO | trade_journal*.csv | ml_model.json | ML,retrain
+
+ops/ml_train_governor.py | TOOL | initial governor model training script | manual | xgboost,pandas | NO | trade data | ml_model.json | ML,training
+
+ops/ml_extract_features.py | TOOL | extract ML features from backtest/live trade data | manual | pandas | NO | trade_journal*.csv,signals*.csv | feature CSV | ML,data-prep
 
 --- ANALYTICS PACKAGE (C:\Argus\repo\analytics) ---
 
