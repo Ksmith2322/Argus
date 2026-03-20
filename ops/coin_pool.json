@@ -32,7 +32,7 @@
         "rolling_pf": null,
         "rolling_wr": null,
         "total_pnl": 0.0,
-        "updated": "2026-03-19T06:22:00.923235+00:00"
+        "updated": "2026-03-20T06:23:38.468966+00:00"
       }
     },
     "BTC": {
@@ -61,7 +61,7 @@
         "rolling_pf": null,
         "rolling_wr": null,
         "total_pnl": 0.0,
-        "updated": "2026-03-19T06:22:00.923235+00:00"
+        "updated": "2026-03-20T06:23:38.469963+00:00"
       }
     },
     "SOL": {
@@ -273,5 +273,5 @@
       "notes": "Screened 2026-03-17 (no governor). PnL=-$9.72."
     }
   },
-  "last_checked": "2026-03-19T06:22:00.923235+00:00"
+  "last_checked": "2026-03-20T06:23:38.469963+00:00"
 }
