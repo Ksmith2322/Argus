@@ -1068,7 +1068,7 @@ async def api_decision_trace(request: Request):
         for log_dir in [OPS_LOGS / coin.lower(), OPS_LOGS]:
             trace_path = log_dir / "decision_trace.csv"
             if trace_path.exists():
-                rows = _tail_csv(trace_path, 500)
+                rows = _tail_csv(trace_path, 5000)
                 result["rows"] = rows
                 # Blocker frequency
                 blockers = {}
@@ -1082,8 +1082,8 @@ async def api_decision_trace(request: Request):
                             b = b.strip()
                             if b:
                                 blockers[b] = blockers.get(b, 0) + 1
-                    # Score distribution
-                    fs = r.get("final_score", "")
+                    # Score distribution (use base_score to see pre-penalty signal quality)
+                    fs = r.get("base_score", "")
                     if fs:
                         try:
                             s = int(fs)
