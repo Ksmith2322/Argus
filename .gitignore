@@ -40,3 +40,13 @@ Thumbs.db
 # Coinbase API credentials
 cdp_api_key.json
 .env.coinbase
+
+# --- Argus Flow (Cascade/IBKR) ---
+# Data files too large for git (re-downloadable)
+argus_flow/data/
+argus_flow/replay_out/
+argus_flow/logs/
+# Keep configs in git
+!argus_flow/configs/*.json
+# IB Gateway installer
+ibgateway-*.exe

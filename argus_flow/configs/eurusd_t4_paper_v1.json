@@ -1,0 +1,35 @@
+{
+    "strategy": "T4_full_stack",
+    "version": "paper_v1",
+    "symbol": "EURUSD",
+    "instrument_type": "forex",
+    "ibkr_client_id": 10,
+    "trigger": {
+        "range_pct_min": 0.0012,
+        "range_accel_min": 0.0,
+        "vol_z_min": 0.0,
+        "session_start_utc": 8,
+        "session_end_utc": 19
+    },
+    "risk": {
+        "stop_pips": 20,
+        "target_pips": 40,
+        "timeout_minutes": 60,
+        "min_signal_gap_minutes": 15,
+        "lot_size": 20000
+    },
+    "direction": {
+        "dist_long_threshold": 0.4,
+        "dist_short_threshold": 0.6
+    },
+    "replay_expectations": {
+        "signals_per_day": 8.0,
+        "signals_per_day_range": [3, 20],
+        "win_rate": 0.542,
+        "win_rate_range": [0.40, 0.65],
+        "stop_rate": 0.125,
+        "target_rate": 0.015,
+        "timeout_rate": 0.86,
+        "exp_pips_per_trade": 0.98
+    }
+}
