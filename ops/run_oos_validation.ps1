@@ -162,11 +162,11 @@ function Print-OosResult {
         return $false
     }
 
-    $pnl    = [math]::Round([double]($Summary.pnl_usd ?? $Summary.total_pnl ?? 0), 4)
-    $pf     = [math]::Round([double]($Summary.profit_factor ?? 0), 3)
-    $wr     = [math]::Round([double]($Summary.win_rate_pct ?? ($Summary.win_rate * 100) ?? 0), 1)
-    $trades = [int]($Summary.trades_closed ?? $Summary.total_trades ?? 0)
-    $dd     = [math]::Round([double]($Summary.max_drawdown_pct ?? 0), 2)
+    $pnl    = [math]::Round([double]$(if ($Summary.pnl_usd) { $Summary.pnl_usd } elseif ($Summary.total_pnl) { $Summary.total_pnl } else { 0 }), 4)
+    $pf     = [math]::Round([double]$(if ($Summary.profit_factor) { $Summary.profit_factor } else { 0 }), 3)
+    $wr     = [math]::Round([double]$(if ($Summary.win_rate_pct) { $Summary.win_rate_pct } elseif ($Summary.win_rate) { $Summary.win_rate * 100 } else { 0 }), 1)
+    $trades = [int]$(if ($Summary.trades_closed) { $Summary.trades_closed } elseif ($Summary.total_trades) { $Summary.total_trades } else { 0 })
+    $dd     = [math]::Round([double]$(if ($Summary.max_drawdown_pct) { $Summary.max_drawdown_pct } else { 0 }), 2)
 
     $passed = ($pf -ge $OOS_MIN_PF) -and ($wr / 100 -ge $OOS_MIN_WR)
     $gateColor = if ($passed) { "Green" } else { "Red" }

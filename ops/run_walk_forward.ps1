@@ -113,8 +113,8 @@ function Print-StabilityGate {
         if ($w.status -ne "ok") {
             Write-Host "  [$wi] ERROR: $($w.error)" -ForegroundColor Red
         } else {
-            $wPnl = [math]::Round([double]($w.pnl_usd -ne $null ? $w.pnl_usd : 0), 2)
-            $wTrades = $w.trades_closed ?? 0
+            $wPnl = [math]::Round([double](if ($w.pnl_usd -ne $null) { $w.pnl_usd } else { 0 }), 2)
+            $wTrades = if ($w.trades_closed) { $w.trades_closed } else { 0 }
             $wWr = if ($w.PSObject.Properties.Name -contains "win_rate") { [math]::Round([double]$w.win_rate * 100, 1) } else { "?" }
             $wPf = if ($w.PSObject.Properties.Name -contains "profit_factor") { [math]::Round([double]$w.profit_factor, 3) } else { "?" }
             $pnlColor = if ($wPnl -gt 0) { "Green" } elseif ($wPnl -lt 0) { "Red" } else { "Gray" }

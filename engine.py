@@ -1017,6 +1017,8 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
     if getattr(state, "last_candle_volume_1m", None) is None:
         state.last_candle_volume_1m = None
 
+    entry_signal_ok = False  # default; set True in FLAT entry-eval branch
+
     symbol = state.symbol
     exec_mode = _execution_mode(cfg, state)
 

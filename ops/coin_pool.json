@@ -28,11 +28,12 @@
       "governor_trained": true,
       "notes": "Primary coin. score88/gate38/tp015 confirmed optimal in 46-run sweep 2026-03-17.",
       "live_metrics": {
+        "window": 20,
         "n_trades": 0,
         "rolling_pf": null,
         "rolling_wr": null,
         "total_pnl": 0.0,
-        "updated": "2026-03-21T06:24:38.647537+00:00"
+        "updated": "2026-03-22T06:59:59Z"
       }
     },
     "BTC": {
@@ -57,11 +58,12 @@
       "governor_trained": true,
       "notes": "tp025 (PF=2.344) and gov35 (PF=1.585) confirmed optimal in sweep 2026-03-17.",
       "live_metrics": {
+        "window": 20,
         "n_trades": 0,
         "rolling_pf": null,
         "rolling_wr": null,
         "total_pnl": 0.0,
-        "updated": "2026-03-21T06:24:38.647537+00:00"
+        "updated": "2026-03-22T06:59:59Z"
       }
     },
     "SOL": {
@@ -273,5 +275,5 @@
       "notes": "Screened 2026-03-17 (no governor). PnL=-$9.72."
     }
   },
-  "last_checked": "2026-03-21T06:24:38.647537+00:00"
+  "last_checked": "2026-03-22T06:59:59Z"
 }
