@@ -1735,6 +1735,8 @@ IBKR_RUNNERS = [
     {"name": "GBP/JPY", "symbol": "GBPJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/gbpjpy", "unit": "pips", "mult": 100},
     {"name": "AUD/USD", "symbol": "AUDUSD", "strategy": "Range NY", "log_dir": "argus_flow/logs/audusd", "unit": "pips", "mult": 10000},
     {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range NY", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
+    {"name": "MES", "symbol": "MES", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mes", "unit": "pts", "mult": 1},
+    {"name": "MYM", "symbol": "MYM", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mym", "unit": "pts", "mult": 1},
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:
@@ -2498,7 +2500,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <!-- Runner cards -->
-<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
+<!-- Fleet P&L Chart -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 8px 0;letter-spacing:1px;">FLEET P&L HISTORY</h3>
+  <canvas id="ibkr-pnl-chart" height="120"></canvas>
+</div>
+
+<!-- Runner cards -->
+<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
 
 <!-- Trade journal -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
@@ -2915,6 +2924,70 @@ async function loadIBKRFleet() {
       }
       html += '</table>';
       sigsDiv.innerHTML = html;
+    }
+
+    // Fleet P&L Chart
+    const allPnlData = [];
+    for (const r of data.runners) {
+      if (r.equity_curve && r.equity_curve.length > 0) {
+        // Normalize all curves to same length, sum them
+        for (let i = 0; i < r.equity_curve.length; i++) {
+          if (!allPnlData[i]) allPnlData[i] = 0;
+          allPnlData[i] += r.equity_curve[i];
+        }
+      }
+    }
+
+    const canvas = document.getElementById('ibkr-pnl-chart');
+    if (canvas && allPnlData.length > 1) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.parentElement.clientWidth - 28;
+      canvas.width = w;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const mn = Math.min(0, ...allPnlData);
+      const mx = Math.max(0, ...allPnlData);
+      const range = (mx - mn) || 1;
+      const pad = 5;
+
+      // Zero line
+      const zeroY = h - pad - ((0 - mn) / range) * (h - pad * 2);
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, zeroY);
+      ctx.lineTo(w, zeroY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // PnL line
+      ctx.strokeStyle = allPnlData[allPnlData.length - 1] >= 0 ? '#00ff88' : '#ff4444';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < allPnlData.length; i++) {
+        const x = (i / (allPnlData.length - 1)) * w;
+        const y = h - pad - ((allPnlData[i] - mn) / range) * (h - pad * 2);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Fill under curve
+      ctx.lineTo(w, zeroY);
+      ctx.lineTo(0, zeroY);
+      ctx.closePath();
+      ctx.fillStyle = allPnlData[allPnlData.length - 1] >= 0 ? 'rgba(0,255,136,0.08)' : 'rgba(255,68,68,0.08)';
+      ctx.fill();
+
+      // Labels
+      ctx.fillStyle = '#888';
+      ctx.font = '10px monospace';
+      ctx.fillText(mx.toFixed(1), 2, 12);
+      ctx.fillText(mn.toFixed(1), 2, h - 2);
+      const lastVal = allPnlData[allPnlData.length - 1];
+      ctx.fillStyle = lastVal >= 0 ? '#00ff88' : '#ff4444';
+      ctx.fillText((lastVal >= 0 ? '+' : '') + lastVal.toFixed(1), w - 60, 12);
     }
 
   } catch (e) {

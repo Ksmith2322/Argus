@@ -1,0 +1,33 @@
+{
+    "strategy": "vol_burst",
+    "version": "paper_v1",
+    "symbol": "MES",
+    "instrument_type": "future",
+    "exchange": "CME",
+    "expiry": "20260618",
+    "ibkr_client_id": 16,
+    "trigger": {
+        "vol_burst_z_min": 1.0,
+        "range_accel_min": 0.0,
+        "session_start_utc": 13,
+        "session_end_utc": 20
+    },
+    "risk": {
+        "stop_bps": 30,
+        "target_bps": 60,
+        "timeout_minutes": 60,
+        "min_signal_gap_minutes": 15,
+        "num_contracts": 1
+    },
+    "direction": {
+        "dist_long_threshold": 0.4,
+        "dist_short_threshold": 0.6
+    },
+    "replay_expectations": {
+        "signals_per_day": 5.3,
+        "signals_per_day_range": [2, 12],
+        "win_rate": 0.460,
+        "win_rate_range": [0.35, 0.60],
+        "exp_bps_per_trade": 2.23
+    }
+}
