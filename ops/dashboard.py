@@ -1739,6 +1739,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
     state_file = log_dir / "state.json"
     signal_file = log_dir / "signals.csv"
     trade_file = log_dir / "trades.csv"
+    mult = runner.get("mult", 10000)
 
     result = {
         "name": runner["name"],
@@ -1749,11 +1750,52 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "position": "FLAT",
         "trade_count": 0,
         "pnl": 0.0,
+        "entry_price": 0,
         "signal_count": 0,
         "closed_trades": 0,
         "trades": [],
         "recent_signals": [],
+        # Feature gauges (latest values)
+        "features": {},
+        # Session info
+        "session": "OFF",
+        "hour": 0,
+        # Performance metrics
+        "win_rate": 0,
+        "profit_factor": 0,
+        "avg_win": 0,
+        "avg_loss": 0,
+        "max_consec_loss": 0,
+        "equity_curve": [],
+        # Signals per day
+        "signals_today": 0,
+        "entries_today": 0,
+        "last_signal_ts": "",
+        "last_signal_age_s": 9999,
+        # Replay expectations
+        "replay_signals_per_day": 0,
+        "replay_win_rate": 0,
+        "replay_exp": 0,
+        # State age
+        "state_age_s": 9999,
     }
+
+    # Load replay expectations from config
+    cfg_map = {
+        "EURUSD": "eurusd_t4_paper_v1.json",
+        "MNQ": "mnq_vol_burst_paper_v1.json",
+        "GBPUSD": "gbpusd_range_paper_v1.json",
+    }
+    cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(runner["symbol"], "")
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            rexp = cfg.get("replay_expectations", {})
+            result["replay_signals_per_day"] = rexp.get("signals_per_day", 0)
+            result["replay_win_rate"] = rexp.get("win_rate", 0)
+            result["replay_exp"] = rexp.get("exp_pips_per_trade", rexp.get("exp_bps_per_trade", 0))
+        except Exception:
+            pass
 
     # State
     if state_file.exists():
@@ -1766,11 +1808,11 @@ def _read_ibkr_runner(runner: dict) -> dict:
             mtime = state_file.stat().st_mtime
             age = time.time() - mtime
             result["state_age_s"] = int(age)
-            result["status"] = "RUNNING" if age < 120 else "IDLE"
+            result["status"] = "RUNNING" if age < 120 else ("IDLE" if age < 600 else "STALE")
         except Exception:
             result["status"] = "ERROR"
 
-    # Signals (last 20)
+    # Signals
     if signal_file.exists():
         try:
             rows = []
@@ -1780,10 +1822,55 @@ def _read_ibkr_runner(runner: dict) -> dict:
                     rows.append(row)
             result["signal_count"] = len(rows)
             result["recent_signals"] = rows[-20:]
+
+            # Latest features
+            if rows:
+                last = rows[-1]
+                for feat in ["range_pct", "vol_z", "range_accel", "vol_burst_z", "dist_from_low"]:
+                    if feat in last and last[feat]:
+                        try:
+                            result["features"][feat] = float(last[feat])
+                        except (ValueError, TypeError):
+                            pass
+                # Hour and session
+                try:
+                    h = int(last.get("hour", 0))
+                    result["hour"] = h
+                    if 0 <= h <= 7:
+                        result["session"] = "ASIA"
+                    elif 8 <= h <= 12:
+                        result["session"] = "LONDON"
+                    elif 13 <= h <= 16:
+                        result["session"] = "NY"
+                    elif 17 <= h <= 20:
+                        result["session"] = "US_PM"
+                    else:
+                        result["session"] = "OFF"
+                except (ValueError, TypeError):
+                    pass
+                # Last signal timestamp and age
+                result["last_signal_ts"] = last.get("ts", "")
+                try:
+                    sig_dt = datetime.fromisoformat(last["ts"].replace("Z", "+00:00"))
+                    result["last_signal_age_s"] = int((datetime.now(timezone.utc) - sig_dt).total_seconds())
+                except Exception:
+                    pass
+                # Price
+                try:
+                    result["current_price"] = float(last.get("price", 0))
+                except (ValueError, TypeError):
+                    pass
+
+            # Signals today and entries today
+            now_utc = datetime.now(timezone.utc)
+            today_str = now_utc.strftime("%Y-%m-%d")
+            today_signals = [r for r in rows if r.get("ts", "").startswith(today_str)]
+            result["signals_today"] = len(today_signals)
+            result["entries_today"] = sum(1 for r in today_signals if r.get("action") == "ENTRY")
         except Exception:
             pass
 
-    # Trades
+    # Trades + performance metrics
     if trade_file.exists():
         try:
             rows = []
@@ -1793,6 +1880,46 @@ def _read_ibkr_runner(runner: dict) -> dict:
                     rows.append(row)
             result["closed_trades"] = len(rows)
             result["trades"] = rows[-20:]
+
+            if rows:
+                pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
+                pnls = []
+                for r in rows:
+                    try:
+                        pnls.append(float(r.get(pnl_field, 0)))
+                    except (ValueError, TypeError):
+                        pnls.append(0)
+
+                wins = [p for p in pnls if p > 0]
+                losses = [p for p in pnls if p <= 0]
+                result["win_rate"] = len(wins) / len(pnls) if pnls else 0
+                result["avg_win"] = sum(wins) / len(wins) if wins else 0
+                result["avg_loss"] = sum(losses) / len(losses) if losses else 0
+                sum_wins = sum(wins)
+                sum_losses = abs(sum(losses))
+                result["profit_factor"] = round(sum_wins / sum_losses, 2) if sum_losses > 0 else 0
+
+                # Max consecutive losses
+                max_cl = 0
+                cl = 0
+                for p in pnls:
+                    if p <= 0:
+                        cl += 1
+                        max_cl = max(max_cl, cl)
+                    else:
+                        cl = 0
+                result["max_consec_loss"] = max_cl
+
+                # Equity curve (cumulative PnL)
+                cum = 0
+                curve = []
+                for r in rows:
+                    try:
+                        cum += float(r.get(pnl_field, 0))
+                    except (ValueError, TypeError):
+                        pass
+                    curve.append(round(cum, 2))
+                result["equity_curve"] = curve[-50:]  # last 50 points
         except Exception:
             pass
 
@@ -2061,6 +2188,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .coin-summary { background: #141b2d; border: 2px solid #1e2a42; border-radius: 6px; padding: 12px; transition: border-color 0.4s, box-shadow 0.4s; }
   @keyframes trade-pulse { 0%,100%{box-shadow:0 0 8px rgba(0,230,118,0.2)} 50%{box-shadow:0 0 20px rgba(0,230,118,0.6)} }
   .coin-summary.trading-active { animation: trade-pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
   .coin-summary .coin-name { font-size: 1.1em; font-weight: bold; color: #00d4ff; margin-bottom: 6px; }
   .coin-summary .coin-state { font-size: 0.85em; margin-bottom: 4px; }
   .coin-summary .coin-pnl { font-size: 1.3em; font-weight: bold; }
@@ -2363,25 +2491,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
 </div>
 
-<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;" id="ibkr-runner-cards">
-  <!-- Populated by JS -->
+<!-- Fleet summary bar -->
+<div id="ibkr-fleet-summary" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;gap:30px;font-size:0.8em;">
+  <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
+  <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
+  <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
+  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/3</div>
 </div>
 
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">FLEET TOTALS</h3>
-  <div style="display:flex;gap:30px;">
-    <div>Total Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
-    <div>Total Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
-  </div>
-</div>
+<!-- Runner cards -->
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
 
+<!-- Trade journal -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">RECENT TRADES</h3>
+  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">TRADE JOURNAL</h3>
   <div id="ibkr-trades-table" style="font-size:0.75em;"></div>
 </div>
 
+<!-- Recent signals -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">RECENT SIGNALS</h3>
+  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">SIGNAL FEED</h3>
   <div id="ibkr-signals-table" style="font-size:0.75em;"></div>
 </div>
 </div><!-- end ibkr-page -->
@@ -2570,94 +2699,227 @@ function switchPage(page) {
   }
 }
 
+function ibkrGaugeBar(label, value, min, max, thresholds, unit) {
+  // thresholds: [{val, color}] sorted ascending
+  const pct = Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+  let color = '#444';
+  for (const t of (thresholds || [])) {
+    if (value >= t.val) color = t.color;
+  }
+  return `<div style="margin:2px 0;">
+    <div style="display:flex;justify-content:space-between;font-size:0.65em;color:#888;">
+      <span>${label}</span><span style="color:${color}">${typeof value==='number'?value.toFixed(4):value}${unit||''}</span>
+    </div>
+    <div style="background:#0d1117;border-radius:2px;height:6px;overflow:hidden;">
+      <div style="width:${pct}%;height:100%;background:${color};border-radius:2px;transition:width 0.3s;"></div>
+    </div>
+  </div>`;
+}
+
+function ibkrSessionBadge(session) {
+  const colors = {ASIA:'#ff9800',LONDON:'#2196f3',NY:'#00ff88',US_PM:'#4caf50',OVERLAP:'#00ff88',OFF:'#555'};
+  const c = colors[session] || '#555';
+  return `<span style="background:${c}22;color:${c};border:1px solid ${c}44;border-radius:3px;padding:1px 6px;font-size:0.65em;font-weight:bold;">${session}</span>`;
+}
+
+function ibkrMiniChart(data, width, height, color) {
+  if (!data || data.length < 2) return `<svg width="${width}" height="${height}"></svg>`;
+  const mn = Math.min(...data), mx = Math.max(...data);
+  const range = mx - mn || 1;
+  const pts = data.map((v, i) => `${(i/(data.length-1))*width},${height - ((v-mn)/range)*height}`).join(' ');
+  return `<svg width="${width}" height="${height}" style="vertical-align:middle;"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
+}
+
 async function loadIBKRFleet() {
   try {
     const resp = await fetch('/api/ibkr_fleet');
     const data = await resp.json();
 
-    document.getElementById('ibkr-timestamp').textContent = data.timestamp || '';
+    document.getElementById('ibkr-timestamp').textContent = (data.timestamp || '').substring(11,19) + ' UTC';
     document.getElementById('ibkr-total-signals').textContent = data.total_signals || 0;
     document.getElementById('ibkr-total-trades').textContent = data.total_trades || 0;
+
+    // Fleet PnL and active count
+    let fleetPnl = 0; let activeCount = 0;
+    for (const r of data.runners) {
+      fleetPnl += Number(r.pnl || 0);
+      if (r.status === 'RUNNING' || r.status === 'IDLE') activeCount++;
+    }
+    const fpEl = document.getElementById('ibkr-fleet-pnl');
+    fpEl.textContent = (fleetPnl >= 0 ? '+' : '') + fleetPnl.toFixed(1);
+    fpEl.style.color = fleetPnl >= 0 ? '#00ff88' : '#ff4444';
+    document.getElementById('ibkr-active-count').textContent = activeCount;
 
     // Runner cards
     const cardsDiv = document.getElementById('ibkr-runner-cards');
     cardsDiv.innerHTML = '';
-    for (const r of data.runners) {
-      const statusColor = r.status === 'RUNNING' ? '#00ff88' : r.status === 'IDLE' ? '#ffaa00' : r.status === 'ERROR' ? '#ff4444' : '#666';
-      const posColor = r.position === 'FLAT' ? '#666' : r.position === 'LONG' ? '#00ff88' : '#ff4444';
-      const pnlColor = r.pnl >= 0 ? '#00ff88' : '#ff4444';
 
-      cardsDiv.innerHTML += `
-        <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="color:#00d4ff;font-weight:bold;font-size:0.95em;">${r.name}</span>
-            <span style="color:${statusColor};font-size:0.7em;text-transform:uppercase;font-weight:bold;">${r.status}</span>
-          </div>
-          <div style="font-size:0.7em;color:#888;margin-bottom:8px;">${r.strategy}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:0.75em;">
-            <div>Position: <span style="color:${posColor};font-weight:bold;">${r.position}</span></div>
-            <div>PnL: <span style="color:${pnlColor};font-weight:bold;">${r.pnl >= 0 ? '+' : ''}${Number(r.pnl).toFixed(1)} ${r.unit}</span></div>
-            <div>Signals: <span style="color:#e0e0e0;">${r.signal_count}</span></div>
-            <div>Trades: <span style="color:#e0e0e0;">${r.closed_trades}</span></div>
-          </div>
+    for (const r of data.runners) {
+      const statusColors = {RUNNING:'#00ff88',IDLE:'#ffaa00',STALE:'#ff4444',ERROR:'#ff4444',NOT_STARTED:'#555'};
+      const sc = statusColors[r.status] || '#555';
+      const posColor = r.position === 'FLAT' ? '#666' : r.position === 'LONG' ? '#00ff88' : '#ff4444';
+      const pnl = Number(r.pnl || 0);
+      const pnlColor = pnl >= 0 ? '#00ff88' : '#ff4444';
+      const inTrade = r.position !== 'FLAT';
+      const borderColor = inTrade ? '#00ff88' : '#1e2a42';
+      const pulse = inTrade ? 'box-shadow:0 0 8px #00ff8844;' : '';
+      const f = r.features || {};
+
+      // Health indicator
+      const sigAge = r.last_signal_age_s || 9999;
+      const healthColor = sigAge < 120 ? '#00ff88' : sigAge < 600 ? '#ffaa00' : '#ff4444';
+      const healthLabel = sigAge < 120 ? 'LIVE' : sigAge < 600 ? 'SLOW' : 'STALE';
+
+      // Win rate comparison to replay
+      const wrLive = r.win_rate || 0;
+      const wrReplay = r.replay_win_rate || 0;
+      const wrDelta = r.closed_trades >= 5 ? ((wrLive - wrReplay) * 100).toFixed(0) : '—';
+
+      let card = `<div style="background:#141b2d;border:1px solid ${borderColor};border-radius:6px;padding:12px;${pulse}">`;
+
+      // Header: name + status + health
+      card += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div>
+          <span style="color:#00d4ff;font-weight:bold;font-size:0.95em;">${r.name}</span>
+          <span style="color:#555;font-size:0.65em;margin-left:6px;">${r.strategy}</span>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span style="color:${healthColor};font-size:0.6em;font-weight:bold;">&#9679; ${healthLabel}</span>
+          <span style="color:${sc};font-size:0.6em;font-weight:bold;text-transform:uppercase;">${r.status}</span>
+        </div>
+      </div>`;
+
+      // Position + Price row
+      const price = r.current_price ? Number(r.current_price).toFixed(r.symbol === 'MNQ' ? 2 : 5) : '—';
+      card += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:0.8em;">
+        <div>
+          ${inTrade ? `<span style="color:${posColor};font-weight:bold;animation:pulse 1.5s infinite;">${r.position}</span>
+            <span style="color:#888;margin-left:4px;">@ ${Number(r.entry_price||0).toFixed(r.symbol==='MNQ'?2:5)}</span>` :
+            `<span style="color:#666;">FLAT</span>`}
+        </div>
+        <div style="color:#e0e0e0;">${price}</div>
+      </div>`;
+
+      // PnL + metrics row
+      card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.75em;">
+        <div>PnL: <span style="color:${pnlColor};font-weight:bold;">${pnl>=0?'+':''}${pnl.toFixed(1)} ${r.unit}</span></div>
+        <div>WR: <span style="color:#e0e0e0;">${(wrLive*100).toFixed(0)}%</span>
+          <span style="color:#555;font-size:0.8em;">(replay: ${(wrReplay*100).toFixed(0)}%)</span></div>
+      </div>`;
+
+      // Equity mini chart
+      if (r.equity_curve && r.equity_curve.length > 1) {
+        const chartColor = r.equity_curve[r.equity_curve.length-1] >= 0 ? '#00ff88' : '#ff4444';
+        card += `<div style="margin-bottom:8px;text-align:right;">
+          ${ibkrMiniChart(r.equity_curve, 200, 30, chartColor)}
         </div>`;
+      }
+
+      // Feature gauges
+      card += `<div style="margin-bottom:6px;">`;
+      if (f.range_pct !== undefined) {
+        card += ibkrGaugeBar('Range %', f.range_pct, 0, 0.005,
+          [{val:0,color:'#444'},{val:0.0008,color:'#ffaa00'},{val:0.0012,color:'#00ff88'},{val:0.002,color:'#ff4444'}]);
+      }
+      if (f.vol_z !== undefined) {
+        card += ibkrGaugeBar('Vol Z', f.vol_z, -0.5, 1.5,
+          [{val:-0.5,color:'#444'},{val:0,color:'#ffaa00'},{val:0.2,color:'#00ff88'},{val:0.8,color:'#2196f3'}]);
+      }
+      if (f.range_accel !== undefined) {
+        card += ibkrGaugeBar('Accel', f.range_accel, -0.5, 1.0,
+          [{val:-0.5,color:'#ff4444'},{val:0,color:'#ffaa00'},{val:0.1,color:'#00ff88'},{val:0.5,color:'#2196f3'}]);
+      }
+      if (f.vol_burst_z !== undefined) {
+        card += ibkrGaugeBar('Vol Burst', f.vol_burst_z, -1, 3,
+          [{val:-1,color:'#444'},{val:0,color:'#ffaa00'},{val:1.0,color:'#00ff88'},{val:2.0,color:'#2196f3'}]);
+      }
+      if (f.dist_from_low !== undefined) {
+        card += ibkrGaugeBar('Dist Low', f.dist_from_low, 0, 1,
+          [{val:0,color:'#00ff88'},{val:0.3,color:'#ffaa00'},{val:0.5,color:'#888'},{val:0.7,color:'#ffaa00'}]);
+      }
+      card += `</div>`;
+
+      // Session + stats row
+      card += `<div style="display:flex;justify-content:space-between;align-items:center;font-size:0.7em;">
+        <div>${ibkrSessionBadge(r.session)} <span style="color:#555;margin-left:4px;">h${r.hour}</span></div>
+        <div style="color:#888;">
+          <span title="Signals today">S:${r.signals_today}</span>
+          <span style="margin-left:6px;" title="Entries today">E:${r.entries_today}</span>
+          <span style="margin-left:6px;" title="Closed trades">T:${r.closed_trades}</span>
+        </div>
+      </div>`;
+
+      // Performance stats (if trades exist)
+      if (r.closed_trades > 0) {
+        card += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e2a42;font-size:0.65em;color:#888;display:flex;justify-content:space-between;">
+          <span>PF: ${r.profit_factor}</span>
+          <span>Avg W: ${Number(r.avg_win).toFixed(1)}</span>
+          <span>Avg L: ${Number(r.avg_loss).toFixed(1)}</span>
+          <span>Max CL: ${r.max_consec_loss}</span>
+        </div>`;
+      }
+
+      card += `</div>`;
+      cardsDiv.innerHTML += card;
     }
 
     // Trades table
     const tradesDiv = document.getElementById('ibkr-trades-table');
     let allTrades = [];
     for (const r of data.runners) {
-      for (const t of (r.trades || [])) {
-        allTrades.push({...t, runner: r.name});
-      }
+      for (const t of (r.trades || [])) { allTrades.push({...t, runner: r.name, unit: r.unit}); }
     }
     allTrades.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
     if (allTrades.length === 0) {
-      tradesDiv.innerHTML = '<div style="color:#666;">No trades yet. Waiting for market open.</div>';
+      tradesDiv.innerHTML = '<div style="color:#666;">No trades yet. Waiting for triggers during active sessions.</div>';
     } else {
-      let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;">' +
-        '<th>Time</th><th>Runner</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th></tr>';
-      for (const t of allTrades.slice(0, 20)) {
+      let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;font-size:0.9em;">' +
+        '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Dur</th></tr>';
+      for (const t of allTrades.slice(0, 25)) {
         const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
-        const pnlColor = pnl >= 0 ? '#00ff88' : '#ff4444';
+        const pc = pnl >= 0 ? '#00ff88' : '#ff4444';
+        const dc = t.direction === 'long' ? '#00ff88' : '#ff4444';
         html += `<tr style="border-bottom:1px solid #0d1117;">
-          <td>${(t.ts || '').substring(11,19)}</td>
+          <td style="padding:2px 3px;">${(t.ts || '').substring(11,19)}</td>
           <td>${t.runner}</td>
-          <td style="color:${t.direction === 'long' ? '#00ff88' : '#ff4444'}">${t.direction}</td>
+          <td style="color:${dc};font-weight:bold;">${(t.direction||'').toUpperCase()}</td>
           <td>${t.entry_px}</td><td>${t.exit_px}</td>
-          <td style="color:${pnlColor}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}</td>
-          <td>${t.exit_reason || ''}</td></tr>`;
+          <td style="color:${pc};font-weight:bold;">${pnl>=0?'+':''}${pnl.toFixed(1)}</td>
+          <td style="color:#888;">${t.exit_reason || ''}</td>
+          <td style="color:#888;">${t.duration_min ? Number(t.duration_min).toFixed(0)+'m' : ''}</td></tr>`;
       }
       html += '</table>';
       tradesDiv.innerHTML = html;
     }
 
-    // Signals table (recent)
+    // Signals table (entries only + recent NO_TRIGGER)
     const sigsDiv = document.getElementById('ibkr-signals-table');
     let allSigs = [];
     for (const r of data.runners) {
-      for (const s of (r.recent_signals || [])) {
-        allSigs.push({...s, runner: r.name});
-      }
+      for (const s of (r.recent_signals || [])) { allSigs.push({...s, runner: r.name}); }
     }
     allSigs.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
     if (allSigs.length === 0) {
       sigsDiv.innerHTML = '<div style="color:#666;">No signals yet.</div>';
     } else {
-      let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;">' +
-        '<th>Time</th><th>Runner</th><th>Action</th><th>Dir</th><th>Price</th><th>Range%</th><th>Accel</th></tr>';
+      let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;font-size:0.9em;">' +
+        '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Action</th><th>Dir</th><th>Price</th><th>Range%</th><th>Vol Z</th><th>Accel</th><th>Dist</th></tr>';
       for (const s of allSigs.slice(0, 30)) {
-        const actionColor = s.action === 'ENTRY' ? '#00ff88' : '#666';
-        html += `<tr style="border-bottom:1px solid #0d1117;">
-          <td>${(s.ts || '').substring(11,19)}</td>
+        const isEntry = s.action === 'ENTRY';
+        const ac = isEntry ? '#00ff88' : '#555';
+        const bg = isEntry ? 'background:#00ff8811;' : '';
+        html += `<tr style="border-bottom:1px solid #0d1117;${bg}">
+          <td style="padding:2px 3px;">${(s.ts || '').substring(11,19)}</td>
           <td>${s.runner}</td>
-          <td style="color:${actionColor}">${s.action}</td>
-          <td>${s.direction || '-'}</td>
-          <td>${s.price || ''}</td>
-          <td>${s.range_pct || ''}</td>
-          <td>${s.range_accel || s.vol_burst_z || ''}</td></tr>`;
+          <td style="color:${ac};font-weight:${isEntry?'bold':'normal'};">${s.action}</td>
+          <td style="color:${s.direction==='long'?'#00ff88':s.direction==='short'?'#ff4444':'#555'}">${s.direction||'-'}</td>
+          <td>${s.price||''}</td>
+          <td>${s.range_pct||''}</td>
+          <td>${s.vol_z||s.vol_burst_z||''}</td>
+          <td>${s.range_accel||''}</td>
+          <td>${s.dist_from_low||''}</td></tr>`;
       }
       html += '</table>';
       sigsDiv.innerHTML = html;
@@ -4924,6 +5186,7 @@ setInterval(loadJournal, 120000);
 setInterval(loadDecisions, 15000);
 setInterval(loadMultiOverview, 10000);
 setInterval(loadPool, 60000);
+setInterval(() => { if (document.getElementById('ibkr-page').classList.contains('active')) loadIBKRFleet(); }, 10000);
 connectSSE();
 
 // PWA Service Worker registration
