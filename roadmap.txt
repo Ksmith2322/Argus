@@ -1,12 +1,12 @@
 # ARGUS ROADMAP
-# Last updated: 2026-03-18
+# Last updated: 2026-03-23
 # Goal: Build multiple independent, automatable edge engines.
 # Each must have measurable EV, be automatable, and scale capital.
-# Strategy: narrow → prove → scale → expand
+# Strategy: narrow -> prove -> scale -> expand
 
 ---
 
-# TRUTH-SURFACE DOCTRINE (architectural rule — never violate)
+# TRUTH-SURFACE DOCTRINE (architectural rule -- never violate)
 
 Argus has three truth classes:
 
@@ -27,25 +27,135 @@ Rules:
 
 ---
 
-# SYSTEM PORTFOLIO (think in systems, not markets)
+# GLOBAL INVARIANTS (binding contracts -- every system, every strategy)
 
-  System 1: Momentum engine (Argus crypto)      — PRIMARY, ACTIVE
-  System 2: Event arb engine (Polymarket)        — BUILD NEXT
-  System 3: Validation engine (Forex via IBKR)   — INFRA ONLY
-  System 4: News momentum engine (Stocks/Swing)  — LATER
+## Payoff Contract
+  Every strategy must define before paper trading begins:
+    - Min target move (pips, bps, or USD)
+    - Target reach rate: % of trades that hit TP. Kill if < 25%.
+    - Timeout rate: % of trades that expire at max hold. Kill if > 60%.
+    - Stop rate: % of trades that hit SL. Kill if > 2x target rate.
+    - MFE tail check: median MFE must exceed 1.5x cost to confirm real edge.
+    - Costs from day one: all backtests and paper runs include realistic fees,
+      spread, and slippage. No "add costs later" allowed.
 
-  Each system: independent, measurable, scalable.
-  Rule: prove one edge loop end-to-end before expanding surface area.
+  Template:
+    Strategy: _______________
+    Venue/Pair: _______________
+    Min target move: _______________
+    Expected target reach rate: _____ % (kill < 25%)
+    Expected timeout rate: _____ % (kill > 60%)
+    Expected stop rate: _____ % (kill > 2x target rate)
+    Median MFE vs cost: _____ x (kill < 1.5x)
+    RT cost model: _____ bps/pips
+
+## Execution Contract
+  Every strategy must define:
+    - Venue and instrument
+    - Fee structure (maker/taker, per-side, RT total)
+    - Spread model (median, P95, widening conditions)
+    - Slippage model (expected vs worst-case)
+    - Fill rate (% of signals that execute)
+    - Latency budget (signal-to-fill target)
+
+## Kill Discipline
+  - Payoff Contract fail = kill. No exceptions, no "one more week".
+  - Execution delta > 25% vs model = kill.
+  - 3 consecutive weeks negative with >= 15 trades/week = kill.
+  - Drawdown > 3x model (paper) or > 2x model (live) = kill.
+  - Kill = archived permanently. Strategy name retired. No resurrection.
+
+## Phase C Rollback Rules
+  - ONE variable per cycle. Never two simultaneous experiments.
+  - Minimum 5 days or 20 signals per cycle (whichever comes first).
+  - Revert if EV drops > 20% vs baseline.
+  - No simultaneous experiments across strategies within same system.
 
 ---
 
-# COMPLETED PHASES (collapsed — see git history for details)
+# SYSTEM PORTFOLIO (think in systems, not markets)
+
+  System 1: Argus Crypto (Coinbase)    -- PASSIVE OBSERVATION (fee-killed, 0/41 configs profitable at 60bps)
+  System 2: IBKR Trading Engine        -- PRIMARY ACTIVE (3 viable strategies found)
+  System 3: Polymarket                  -- LOCKED (waitlisted, contingency: reassign slot if not off waitlist by 2026-06-01)
+  System 4: Equities                   -- NOT STARTED ($25K PDT constraint)
+
+  Rules:
+    - Max 2 active systems at any time.
+    - Prove one complete edge loop (research -> paper -> live) before expanding.
+    - Each system: independent, measurable, scalable.
+
+---
+
+# PROMOTION PIPELINE (Research -> Paper -> Live -> Scale)
+
+## Research -> Paper gate:
+  - Payoff Contract defined and passing in backtest
+  - 7/7 stress suite pass (gap, spread spike, news, low liquidity, trending,
+    ranging, overnight)
+  - 14+ days of backtest data minimum
+  - 100+ signals in backtest
+
+## Paper -> Live gate:
+  - 30+ paper trades (acknowledge this is noisy evidence, not proof)
+  - Expectancy within 20% of backtest expectancy
+  - Replay-Live Divergence Guard passes (see below)
+
+## Live -> Scale gate:
+  - 30+ live fills
+  - Slippage within model bounds
+  - Expectancy within 30% of paper expectancy
+
+## DEMOTION paths:
+  - Live -> Paper: on 20% expectancy degradation (watch trigger, not instant kill)
+  - Scale -> Live: on drawdown > 1.5x model
+
+---
+
+# REPLAY-LIVE DIVERGENCE GUARD
+
+  Purpose: Detect when paper/live execution diverges from backtest assumptions.
+
+  Metrics monitored:
+    - Entry price delta (backtest vs paper/live)
+    - Signal timing delta (bar alignment)
+    - Expectancy delta: 20% = alert, 25% = kill
+    - Hit rate delta: 10pp = alert, 20pp = kill
+    - Timeout rate delta: 15pp = alert
+
+  Status: NOT YET BUILT. Required before any Paper -> Live promotion.
+
+---
+
+# GLOBAL RISK BUDGET
+
+  Allocation limits:
+    - Max single system allocation: 50% of capital (paper), 70% (live)
+    - No single strategy > 80% of trailing 30-day PnL
+
+  Correlation budget:
+    - EUR/USD + GBP/USD count as 1.5 systems, not 2 (correlated USD risk)
+    - Correlated pairs share a combined drawdown limit
+
+  Per-system drawdown limits:
+    - > 3x model = pause (paper)
+    - > 2x model = pause (live)
+    - > 1.5x model = reduce scale 50%
+
+  ML Governor rules:
+    - Never primary decision path. Advisory only.
+    - LOG_ONLY until proven incremental over deterministic rules.
+    - Retrain requires 30+ single-config trades. Mixed-config training forbidden.
+
+---
+
+# COMPLETED PHASES (collapsed -- see git history for details)
 #   Phase 7:  Backtest determinism + sandbox rule [DONE]
 #   Phase 8:  PaperAdapter + fill persistence + startup recovery, Gate A PASS [DONE 2026-03-10]
 #   Phase 9:  Trade journal on SELL->FLAT, crash-restart proof [DONE 2026-03-10]
-#   Phase 10: Adversarial restart — 4 kill-point scenarios PASS [DONE 2026-03-10]
+#   Phase 10: Adversarial restart -- 4 kill-point scenarios PASS [DONE 2026-03-10]
 #   Phase 11-16: Analytics, risk, attribution, reporting, ops infra [DONE 2026-03-11]
-#   Phase 16.5: Strategy optimization — parameter sweep, 663 backtests [DONE 2026-03-17]
+#   Phase 16.5: Strategy optimization -- parameter sweep, 663 backtests [DONE 2026-03-17]
 #   Phase 20: WebSocket L2 feed + fast-exit + sub-minute candles [DONE 2026-03-18]
 #   ML-1: Governor trained (1,029 trades, ROC-AUC 0.944) [DONE 2026-03-15]
 #   Multi-coin: ETH+BTC parallel runners, per-coin isolation [DONE 2026-03-17]
@@ -54,198 +164,130 @@ Rules:
 ---
 
 # ===================================================================
-# SYSTEM 1: ARGUS CRYPTO MOMENTUM ENGINE (PRIMARY)
+# SYSTEM 1: ARGUS CRYPTO (Coinbase) -- PASSIVE OBSERVATION
 # ===================================================================
 
-## Current State (v1.1_cleanup_pass)
+## Status: FEE-KILLED
 
-  Config: score88, trendlines ON, structure OFF, 60min hold, 10% compound
-  Governor: LOG_ONLY (stamps all, blocks none — on probation)
-  Coins: ETH-USD, BTC-USD (SOL disabled — unprofitable)
-  Mode: Paper trading, $500/coin, ~$50/trade
-  Trace: decision_trace.csv LIVE — collecting forensic data
+  The signal is real. Score 90+ delivers 75% WR in backtest. The venue kills it.
+  Coinbase 60bps round-trip fees destroy all edge across every tested configuration.
 
-### Key Findings (663-run sweep):
-  Score 90+: 75% WR, clear edge
-  RANGE regime: 0% WR (graveyard)
-  Duration <30m: 70% WR (massive winner)
-  Duration 30m-3h: 3% WR (dead zone)
-  OVERLAP session: best. OFF session: worst.
-  Only ETH and BTC viable — all 15 alts PF < 0.82
+  Payoff Contract: FAILED. Strategy needs 15-20bps RT max to be viable.
 
-## Phase A — Validate the Trace (NOW — in progress)
+  Evidence:
+    - 0/41 configs profitable across OOS, walk-forward, and 30-config parameter sweep
+    - Penalty analysis (2026-03-20) confirmed governor correctly blocking losing trades
+    - TREND_UP underperformance anomaly discovered but irrelevant given fee structure
+    - 663-run parameter sweep exhausted all reasonable parameter combinations
 
-  Goal: Confirm decision_trace.csv is complete and correct.
+  Current state:
+    - ETH-USD and BTC-USD runners still live for data collection only
+    - Governor in LOG_ONLY mode, stamping all signals for future analysis
+    - No Phase C intervention work justified until venue cost changes
+    - SOL disabled (PF 0.53-0.64, consistently unprofitable even before fees)
 
-  Checks:
-    * every entry-eligible tick writes a row
-    * blockers populated consistently
-    * gate transitions not blank when score/gate changes
-    * CONFIG_VERSION present everywhere
-    * LOG_ONLY ML output stamped on all relevant rows
-    * no hidden fallback bucket under new hold reasons
+  Infrastructure preserved:
+    - Full engine, backtest harness, decision_trace pipeline, dashboard
+    - All reusable for future low-cost venue (Kraken, IBKR crypto, DEX)
+    - WebSocket feed, fast-exit, sub-minute candles all built and tested
 
-## Phase B — Edge Extraction (after 200+ trace rows, 20+ in 88+ zone, 10+ trades)
-
-  Review gate (minimum before analysis):
-    * 200+ decision trace rows
-    * 20+ candidates in the 88+ zone
-    * 10+ taken trades
-    * single config version (v1.1_cleanup_pass)
-    * if 5-7 days arrives first, review anyway
-
-  ### B.1 Hard blocker frequency (Table A)
-    Hard Blocker | Count | % of >=88 rows blocked | Avg blocked score
-    (risk lockout, cooldown, qty zero, liquidity fail, cross-coin, governor)
-
-  ### B.2 Score suppressor frequency (Table B)
-    Score Suppressor | Mean delta | Count on blocked >=88 candidates | Avg base→final
-    (session penalty, OB penalty, BTC lag, structure/trendline deltas)
-
-  ### B.3 Score × Regime EV matrix
-    Buckets (threshold-centric, frozen threshold=88):
-      Regime | 70-79 | 80-87 (near-miss) | 88-91 (tradable) | 92+ (high-conviction)
-    Cols: TREND_UP, RANGE, TREND_DOWN (collapse VOLATILE if sparse)
-    Metrics: trade count, win rate, EV, median hold time
-
-  ### B.4 Score × Session EV matrix
-    Same score buckets × OVERLAP, NY, LONDON, ASIA, OFF
-
-  ### B.5 Blocked-high-score analysis
-    For each blocked row with final_score >= 88 (or base_score >= 88):
-      base_score, final_score, base_gate, final_gate
-      hard_blockers (list), score_suppressors (list with deltas)
-      regime, session, action_reason
-    → identifies whether leak is direct veto or death by accumulated penalties
-
-  ### B.6 Taken trade review
-    For each completed trade:
-      score, regime, session, duration, MAE/MFE, exit reason, PnL
-    → confirms edge zones match backtest findings
-
-## Phase C — First Intervention Ladder (after Phase B read)
-
-  Rule: change ONE thing, remeasure. Not multiple simultaneous changes.
-
-  ### C.1 Relax one soft policy constraint (first — likely highest ROI)
-    Likely candidates (pick based on Phase B data):
-      - session penalty weaker for 88+ TREND candidates
-      - OB penalty cap reduced
-      - MTF hard confirmation softened or converted to modifier in TREND only
-
-  ### C.2 Coarse sizing multipliers (second — capital concentration)
-    Not smooth EV sizing yet. Start with a grid:
-      TREND + 92+      → 1.25x
-      TREND + 88-91    → 1.00x
-      RANGE + 92+      → 0.60x
-      RANGE + 88-91    → 0.35x
-      OFF session      → 0.70x overlay
-
-  ### C.3 Shadow time-pressure exit (third — dead-zone suppression)
-    Shadow only first (log would-have-exited, don't actually exit):
-      RANGE + score<92 + no progress after X minutes → would-exit
-    Compare would-have-been vs actual
-    Only activate after shadow proves value
-
-  ### C.4 Harder regime suppression
-    If RANGE kills even high scores → hard suppress or 0.25x size
-    Test empirically from Phase B data, not by intuition
-    Exploits the short-duration advantage
-
-  ### C.3 Harder regime suppression
-    If RANGE kills even high scores → hard suppress or 0.25x size
-    Test empirically, not by intuition
-
-## Phase D — Strategic Decisions (after Phase B/C data)
-
-  ### D.1 MTF confirmation: score-only vs confirmation-doctrine
-    A/B test: hard MTF on vs off
-    Compare EV, trade count, drawdown by score bucket
-    → philosophy decision, not cleanup
-
-  ### D.2 ML governor mode: LOG_ONLY vs SCORE_MODIFY vs GATE
-    Only promote if proven incremental edge over deterministic rules
-    Risk: model becomes de facto brain, deterministic layer becomes ceremony
-    → secondary policy, not core signal truth
-
-  ### D.3 BTC overlays: lag vs momentum — which adds edge
-    Different timescales, not true duplicates
-    Evaluate after attribution data exists
-    → consolidate only after empirical comparison
-
-  ### D.4 Governor retrain
-    Must use single-config live trade data (30+ per coin)
-    Mixed-config training produces ROC-AUC 0.500 (useless)
-
-## Phase 17 — Paper Capital Proof (after Phase C optimizations)
-
-  Goal: Prove paper growth under unattended operation with optimized config.
-  Duration: minimum 4 weeks unattended
-  Rules:
-    * Fixed config, locked at run start (config hash enforced)
-    * No strategy edits during run
-    * No operator overrides except KILL_SWITCH or PAUSE
-  Exit:
-    * Paper growth inside modeled expectancy and drawdown bounds
-    * Reconciliation passes every run
-    * 30+ live fills accumulated
-
-## Phase 18 — Real Micro-Capital Validation (after Phase 17)
-
-  Goal: Validate live settlement, fees, slippage under real capital.
-  Build: execution/coinbase_adapter.py (or IBKR adapter)
-  Rules:
-    * Minimal capital
-    * Live behavior must stay inside friction model bounds
-  Exit:
-    * Real slippage matches empirical friction model
-    * Live reconciliation passes consistently
-
-## Phase 19 — Multi-Asset Expansion (after edge proven)
-
-  Add SOL, possibly LINK — same engine, minimal changes
-  ONLY after knowing where edge lives (score/regime/session)
-  Rule: same strategy, different symbols. Not new strategies.
-
-## Strategy Features (built, available for activation)
-
-  [BUILT] WebSocket L2 feed + fast-exit (500ms OB checks)
-  [BUILT] ATR dynamic stops (scale TP/SL by volatility)
-  [BUILT] Conviction sizing (70%/100%/140% by score tier)
-  [BUILT] Session scoring (OVERLAP +8, NY +5, ASIA -5, OFF -8)
-  [BUILT] MTF confirmation (5m trend alignment gate)
-  [BUILT] Adaptive cooldown (50% after wins, 200% after losses)
-  [BUILT] Partial TP ladder (34% at 1R, 50% at 1.5R, rest rides trail)
-  [BUILT] Cross-coin guard (max concurrent positions)
-  [BUILT] Limit orders via WS bid/ask (ready for IBKR)
-  [BUILT] Sub-minute candle aggregation from WS ticker
-  [BUILT] OB imbalance score shaping (+8/+15 bull, -12 bear)
-
-  [TODO] Short selling support (after IBKR approved)
-  [TODO] Pyramiding / add-to-winners (after 30+ live trades)
-  [TODO] Mean-reversion strategy for RANGE regime
+  Reactivation condition: access to venue with < 20bps RT fees for BTC/ETH spot.
 
 ---
 
 # ===================================================================
-# SYSTEM 2: POLYMARKET EVENT ARBITRAGE ENGINE (BUILD NEXT)
+# SYSTEM 2: IBKR TRADING ENGINE -- PRIMARY ACTIVE
 # ===================================================================
 
-  Status: NOT STARTED
+## Research Status
+
+  ### Closed (killed):
+    - Kraken BTC perpetuals (Cascade engine): killed, precursors killed
+    - All crypto-venue strategies at current fee structures
+
+  ### Active strategies (all in PAPER phase):
+
+    EUR/USD T4:
+      Status: PAPER
+      Edge: +0.98 pip/trade expectancy
+      Stress: 7/7 suite pass
+      Payoff Contract: PASS
+      Cost model: < 1bps RT (IBKR FX)
+
+    MNQ vol_burst:
+      Status: PAPER
+      Edge: +6.41 bps/trade expectancy
+      Stress: 7/7 suite pass
+      Payoff Contract: PASS
+      Cost model: ~3bps RT (IBKR futures)
+      Note: using delayed data (15min lag). CME real-time subscription pending.
+
+    GBP/USD range:
+      Status: PAPER
+      Edge: +0.97 pip/trade expectancy
+      Stress: 7/7 suite pass
+      Payoff Contract: PASS
+      Cost model: < 1bps RT (IBKR FX)
+
+  ### Correlation note:
+    EUR/USD + GBP/USD are correlated USD pairs. Per Global Risk Budget,
+    they count as 1.5 systems and share a combined drawdown limit.
+
+## IBKR Execution Recovery
+
+  Needed (NOT YET BUILT for IBKR):
+    - State files (position, pending orders, trade context)
+    - Crash restart with position reconciliation
+    - Fill backfill on reconnect
+    - Stale order detection and cleanup
+
+## IBKR Infrastructure
+
+  Account: DUP472829 (paper)
+  Gateway: TWS Gateway, port 4002
+
+  Runners:
+    runner_eurusd.py   (clientId=10)
+    runner_mnq.py      (clientId=11)
+    runner_gbpusd.py   (clientId=12)
+
+  Configs: argus_flow/configs/*.json (versioned, per-strategy)
+  Logs:    argus_flow/logs/{eurusd,mnq,gbpusd}/
+
+  Ops tools:
+    smoke_test.py    -- connection + order placement verification
+    health_check.py  -- runner liveness + position consistency
+    launch_all.ps1   -- start all runners with correct clientIds
+
+  MNQ data note:
+    Currently using delayed (15-minute) data. CME Level 1 subscription
+    pending. Strategy logic accounts for delay but live execution will
+    require real-time feed.
+
+---
+
+# ===================================================================
+# SYSTEM 3: POLYMARKET -- LOCKED
+# ===================================================================
+
+  Status: LOCKED (waitlisted for account access)
   Why: Inefficient pricing, retail-driven, slow reaction to info, bots proving edge
 
-  Strategy types:
-    A. News latency edge: event happens → price lags → buy before correction
-    B. Probability mispricing: model probability > market probability → buy
-    C. Cross-market arb: related markets inconsistent → exploit spread
+  Contingency: If not off waitlist by 2026-06-01, reassign this slot to next
+  highest-priority system (likely IBKR options or additional FX pairs).
 
-  Architecture:
+  Strategy types (planned):
+    A. News latency edge: event happens -> price lags -> buy before correction
+    B. Probability mispricing: model probability > market probability -> buy
+    C. Cross-market arb: related markets inconsistent -> exploit spread
+
+  Architecture (planned):
     Data: news APIs, twitter/X scraping, event feeds
     Model: probability estimator, sentiment + keyword scoring
     Execution: Polymarket API, track odds vs model
     Risk: cap exposure per event, decay positions near resolution
 
-  Build phases:
+  Build phases (when unlocked):
     Phase 1: Scrape markets, track price changes, detect anomalies
     Phase 2: Simple probability model, compare vs market
     Phase 3: Paper trading
@@ -256,29 +298,13 @@ Rules:
 ---
 
 # ===================================================================
-# SYSTEM 3: FOREX VALIDATION ENGINE (IBKR — INFRA ONLY)
-# ===================================================================
-
-  Status: WAITING ON IBKR APPROVAL (DUP472829)
-  Role: Validation engine — tests if edge generalizes to slower markets
-
-  Now: Connect, fetch data, place paper trades. NO strategy work yet.
-  Later: Stripped Argus (no OB, no BTC logic), heavy session weighting
-
-  Build phases:
-    Phase 1: IBKR API connection + paper order placement
-    Phase 2: Data feed validation (tick/candle quality)
-    Phase 3: Stripped Argus strategy, paper only
-    Phase 4: Compare EV vs crypto — does the edge transfer?
-
----
-
-# ===================================================================
-# SYSTEM 4: EQUITIES NEWS MOMENTUM ENGINE (LATER)
+# SYSTEM 4: EQUITIES -- NOT STARTED
 # ===================================================================
 
   Status: NOT STARTED
-  Constraint: PDT rule (<$25K → no frequent day trading)
+  Constraint: PDT rule (< $25K -> no frequent day trading)
+  Capital path: No accumulation path currently. Revisit when IBKR live
+  generates enough to cross $25K threshold.
 
   Best path: Swing trading (1-3 day holds, no PDT issues)
   Broker: IBKR (better API than Robinhood)
@@ -293,7 +319,7 @@ Rules:
 
 ---
 
-# INFRASTRUCTURE (ALL DONE — collapsed)
+# INFRASTRUCTURE (ALL DONE -- collapsed)
 
 ## Ops & Analysis Tools  [ALL DONE 2026-03-13/14]
   PC2 dispatch, run comparison, score/duration analyzer, post-backtest compare,
@@ -320,7 +346,7 @@ Rules:
   GitHub: Ksmith2322/Argus, branch phase6-hardening
   SSH: passwordless ED25519 key, dispatch via ops/dispatch_backtest_pc2.ps1
   .env tracked in git (paper trading, no real keys)
-  ops/logs/ NOT in git — artifacts are local to each machine
+  ops/logs/ NOT in git -- artifacts are local to each machine
 
 ---
 
@@ -339,10 +365,10 @@ Rules:
 
 # THE SCALING PATH
 
-  Phase 1 (NOW): Argus becomes profitable — identify edge zones via trace
-  Phase 2: Increase size in edge zones, add 1-2 crypto assets
-  Phase 3: Polymarket starts generating side income
-  Phase 4: Equities system adds another stream
-  Phase 5: Capital scaling across proven systems
+  Phase 1 (NOW): Prove EV (paper) -- IBKR runners live, accumulate 30+ trades each
+  Phase 2: Prove execution (micro live) -- real capital, real fills, real slippage
+  Phase 3: Prove stability -- N trades with bounded drawdown within model
+  Phase 4: Scale capital into proven edges
+  Phase 5: Add systems (only after current systems are profitable)
 
   Rule: stacking proven edges and scaling capital into them > adding more systems
