@@ -2219,29 +2219,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div style="display:flex; justify-content:space-between; align-items:center;">
-  <h1>ARGUS DASHBOARD</h1>
-  <span id="connection-status" class="disconnected">CONNECTING...</span>
+  <h1>ARGUS TRADING DASHBOARD</h1>
+  <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR PAPER</span>
 </div>
 
-<!-- CONTROL STRIP: answers "am I safe and live?" -->
+<!-- CONTROL STRIP -->
 <div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
-  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">FULL</span></div>
-  <div>CONFIG: <span id="cs-config-version" style="color:#00d4ff;">—</span></div>
-  <div>FEED: <span id="cs-feed-status" style="font-weight:bold;color:#00e676;">—</span></div>
-  <div>TICK AGE: <span id="cs-tick-age" style="font-weight:bold;">—</span></div>
-  <div>INVARIANTS: <span id="cs-invariant" style="font-weight:bold;color:#00e676;">—</span></div>
-  <div>COINS: <span id="cs-active-coins" style="color:#ffc107;">—</span></div>
-  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">v1.1 cleanup</span></div>
+  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">IBKR PAPER</span></div>
+  <div>ACCOUNT: <span style="color:#00d4ff;">DUP472829</span></div>
+  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">EUR/USD, MNQ, GBP/USD</span></div>
+  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Paper Proof</span></div>
 </div>
 
 <div class="page-nav">
-  <button class="page-nav-btn active" onclick="switchPage('live')">MISSION CONTROL</button>
-  <button class="page-nav-btn" onclick="switchPage('ibkr')">IBKR FLEET</button>
-  <button class="page-nav-btn" onclick="switchPage('decision')">DECISION</button>
+  <button class="page-nav-btn active" onclick="switchPage('ibkr')">FLEET DASHBOARD</button>
   <button class="page-nav-btn" onclick="switchPage('evolution')">RESEARCH</button>
 </div>
 
-<div id="live-page" class="page-content active">
+<div id="live-page" class="page-content" style="display:none;">
 <!-- Coin cards rendered dynamically by buildCoinCard() in loadMultiOverview() -->
 <div class="multi-overview" id="multi-overview"></div>
 
@@ -2681,21 +2676,15 @@ function switchPage(page) {
   document.querySelectorAll('.page-nav-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
   const btns = document.querySelectorAll('.page-nav-btn');
-  if (page === 'ibkr') {
+  if (page === 'evolution') {
     btns[1].classList.add('active');
-    document.getElementById('ibkr-page').classList.add('active');
-    loadIBKRFleet();
-  } else if (page === 'decision') {
-    btns[2].classList.add('active');
-    document.getElementById('decision-page').classList.add('active');
-    loadDecisionSurface();
-  } else if (page === 'evolution') {
-    btns[3].classList.add('active');
     document.getElementById('evo-page').classList.add('active');
     if (!evoLoaded) { loadEvolution(); }
   } else {
+    // Default: IBKR Fleet
     btns[0].classList.add('active');
-    document.getElementById('live-page').classList.add('active');
+    document.getElementById('ibkr-page').classList.add('active');
+    loadIBKRFleet();
   }
 }
 
@@ -5174,20 +5163,9 @@ async function loadLeaderboard() {
   } catch(e) { console.error('leaderboard error', e); }
 }
 
-// Init
-initChart();
-loadEquity();
-loadJournal();
-loadDecisions();
-loadMultiOverview();
-loadPool();
-setInterval(loadEquity, 30000);
-setInterval(loadJournal, 120000);
-setInterval(loadDecisions, 15000);
-setInterval(loadMultiOverview, 10000);
-setInterval(loadPool, 60000);
-setInterval(() => { if (document.getElementById('ibkr-page').classList.contains('active')) loadIBKRFleet(); }, 10000);
-connectSSE();
+// Init — IBKR Fleet is the primary dashboard
+loadIBKRFleet();
+setInterval(loadIBKRFleet, 10000);
 
 // PWA Service Worker registration
 if ('serviceWorker' in navigator) {
