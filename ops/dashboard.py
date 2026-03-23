@@ -1732,6 +1732,9 @@ IBKR_RUNNERS = [
     {"name": "EUR/USD", "symbol": "EURUSD", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurusd", "unit": "pips", "mult": 10000},
     {"name": "MNQ", "symbol": "MNQ", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mnq", "unit": "pts", "mult": 1},
     {"name": "GBP/USD", "symbol": "GBPUSD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips", "mult": 10000},
+    {"name": "GBP/JPY", "symbol": "GBPJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/gbpjpy", "unit": "pips", "mult": 100},
+    {"name": "AUD/USD", "symbol": "AUDUSD", "strategy": "Range NY", "log_dir": "argus_flow/logs/audusd", "unit": "pips", "mult": 10000},
+    {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range NY", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:

@@ -1,0 +1,31 @@
+{
+    "strategy": "range_accel_NY",
+    "version": "paper_v1",
+    "symbol": "USDJPY",
+    "instrument_type": "forex",
+    "trigger": {
+        "range_pct_min": 0.0012,
+        "range_accel_min": 0.0,
+        "vol_z_min": 0.0,
+        "session_start_utc": 13,
+        "session_end_utc": 17
+    },
+    "risk": {
+        "stop_pips": 20,
+        "target_pips": 40,
+        "timeout_minutes": 60,
+        "min_signal_gap_minutes": 15,
+        "lot_size": 20000
+    },
+    "direction": {
+        "dist_long_threshold": 0.4,
+        "dist_short_threshold": 0.6
+    },
+    "replay_expectations": {
+        "signals_per_day": 6.8,
+        "signals_per_day_range": [3, 15],
+        "win_rate": 0.566,
+        "win_rate_range": [0.40, 0.65],
+        "exp_pips_per_trade": 0.65
+    }
+}

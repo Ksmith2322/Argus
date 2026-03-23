@@ -16,6 +16,9 @@ RUNNERS = [
     {"name": "EUR/USD", "log_dir": "argus_flow/logs/eurusd"},
     {"name": "MNQ", "log_dir": "argus_flow/logs/mnq"},
     {"name": "GBP/USD", "log_dir": "argus_flow/logs/gbpusd"},
+    {"name": "GBP/JPY", "log_dir": "argus_flow/logs/gbpjpy"},
+    {"name": "AUD/USD", "log_dir": "argus_flow/logs/audusd"},
+    {"name": "USD/JPY", "log_dir": "argus_flow/logs/usdjpy"},
 ]
 
 
