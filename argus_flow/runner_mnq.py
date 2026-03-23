@@ -247,6 +247,11 @@ def main():
 
     log.info(f"Connected. Account: {ib.managedAccounts()}")
 
+    # Request delayed market data (type 3) if live isn't subscribed
+    # Type 1 = live, 3 = delayed (15 min), 4 = delayed-frozen
+    ib.reqMarketDataType(3)
+    log.info("Market data type: DELAYED (15min) — CME live data not subscribed")
+
     contract = Future(symbol=SYMBOL, exchange=EXCHANGE, lastTradeDateOrContractMonth=EXPIRY)
     qualified = ib.qualifyContracts(contract)
     if not qualified:
@@ -280,16 +285,21 @@ def main():
         while True:
             ib.sleep(1)
 
+            # Support both live and delayed data fields
             mid = None
-            if ticker.last and ticker.last > 0:
-                mid = ticker.last
-            elif ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0:
-                mid = (ticker.bid + ticker.ask) / 2
+            last = getattr(ticker, 'last', None) or getattr(ticker, 'delayedLast', None)
+            bid = getattr(ticker, 'bid', None) or getattr(ticker, 'delayedBid', None)
+            ask = getattr(ticker, 'ask', None) or getattr(ticker, 'delayedAsk', None)
+
+            if last and last > 0:
+                mid = last
+            elif bid and bid > 0 and ask and ask > 0:
+                mid = (bid + ask) / 2
 
             if mid is None or mid <= 0:
                 continue
 
-            vol = ticker.volume if ticker.volume and ticker.volume > 0 else 0
+            vol = getattr(ticker, 'volume', None) or getattr(ticker, 'delayedVolume', None) or 0
 
             now = datetime.now(timezone.utc)
             bar_minute = now.replace(second=0, microsecond=0)

@@ -1,10 +1,10 @@
 === ARGUS TRADE TRACKER (OPERATOR FEEDBACK ONLY) ===
 NOTE: This file is not authoritative trade lifecycle or PnL truth.
-Last update: 2026-03-22 01:59:18 CDT
+Last update: 2026-03-23 01:57:02 CDT
 
 Totals:
   - MISSED_BUY total: 0
-  - HOLD total:       4440
+  - HOLD total:       4725
 
 Missed buy counters:
   - MISSED_BUY_NO_CASH: 0
@@ -22,17 +22,17 @@ Hold reason counters:
   - HOLD_PAUSED: 0
   - HOLD_STALE_DATA: 2164
   - HOLD_COOLDOWN: 17
-  - HOLD_NO_SIGNAL: 533
-  - HOLD_NO_TREND_OK: 1480
+  - HOLD_NO_SIGNAL: 604
+  - HOLD_NO_TREND_OK: 1618
   - HOLD_CONFLUENCE: 15
   - HOLD_ENTRY_SIGNAL_FALSE: 0
   - HOLD_ENTRY_NO_SIZE: 0
   - HOLD_IN_POSITION: 0
-  - HOLD_SIGNAL_OK_GATE_PENDING: 231
+  - HOLD_SIGNAL_OK_GATE_PENDING: 307
 
 Other counters:
   - HOLD_OTHER: 459
 
 Last event:
   reason: HOLD_NO_TREND_OK
-  detail: trend_ok=0 score=20 reasons=spread_ok(2.71bps) | px=69152.525 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=20 | delta=-15 | adj_score=5 | watch_th=58 | trade_th=85 | trend_strength=0.00027 | vol=0.00034 | session_bonus=-5 (ASIA:['session:ASIA', 'score_bonus:-5', 'risk_mult:0.500', 'reason:UTC_hour=6']) | liq:spread=NA;vol_1m=0.01066827;vol_floor>=25;vol_base=0.4252583896666666666666666667;vol_need>=0.2126;atr_norm=0.0003386336627913788;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20 | liq_penalty=-20 | ob_imbalance=-0.108(-12) | struct= | liq=spread=NA;vol_1m=0.01066827;vol_floor>=25;vol_base=0.4252583896666666666666666667;vol_need>=0.2126;atr_norm=0.0003386336627913788;violations=VOLUME_BELOW_MIN,VOLUME_TOO_THIN;penalty=-20
+  detail: trend_ok=0 score=40 reasons=fast>slow;spread_ok(1.73bps) | px=2034.405 | penalty_range=-15 | trade_shift_range=+5 | watch_shift_range=+3 | regime=RANGE | base_score=19 | delta=-15 | adj_score=4 | watch_th=58 | trade_th=85 | trend_strength=0.00017 | vol=0.00101 | session_bonus=-4 (ASIA:['session:ASIA', 'score_bonus:-5', 'risk_mult:0.500', 'reason:UTC_hour=6']) | liq:spread=NA;vol_1m=69.41122366;vol_floor>=25;vol_base=104.1074768161666666666666667;vol_need>=52.0537;atr_norm=0.0010091702114795025;LIQ_OK | ob_imbalance=-0.953(-12) | struct= | liq=spread=NA;vol_1m=69.41122366;vol_floor>=25;vol_base=104.1074768161666666666666667;vol_need>=52.0537;atr_norm=0.0010091702114795025;LIQ_OK
