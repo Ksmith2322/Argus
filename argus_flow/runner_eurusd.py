@@ -10,6 +10,7 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -403,11 +404,49 @@ def main():
 
     except KeyboardInterrupt:
         log.info("Shutting down...")
-    finally:
         state.save()
         ib.disconnect()
         log.info(f"Final state: trades={state.trade_count} pnl={state.pnl_pips:+.1f}pip")
+        return False  # clean exit
+    except (ConnectionError, OSError, asyncio.CancelledError) as e:
+        log.warning(f"Connection lost: {e}. Will reconnect...")
+        state.save()
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return True  # signal reconnect
+    except Exception as e:
+        log.error(f"Unexpected error: {e}")
+        state.save()
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return True  # signal reconnect
+
+
+def run_with_reconnect():
+    """Wrapper that auto-reconnects on connection failures."""
+    import asyncio
+    max_retries = 100
+    retry_delay = 10
+
+    for attempt in range(max_retries):
+        if attempt > 0:
+            log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay}s...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, 120)  # exponential backoff, max 2min
+
+        should_reconnect = main()
+
+        if should_reconnect is False:
+            break  # clean exit (KeyboardInterrupt)
+
+        log.info("Runner exited. Preparing to reconnect...")
+
+    log.info("Runner stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    run_with_reconnect()

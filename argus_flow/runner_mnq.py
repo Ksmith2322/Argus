@@ -400,11 +400,38 @@ def main():
 
     except KeyboardInterrupt:
         log.info("Shutting down...")
-    finally:
         state.save()
-        ib.disconnect()
-        log.info(f"Final: trades={state.trade_count} pnl={state.pnl_points:+.2f}pts")
+        try: ib.disconnect()
+        except Exception: pass
+        return False
+    except (ConnectionError, OSError) as e:
+        log.warning(f"Connection lost: {e}. Will reconnect...")
+        state.save()
+        try: ib.disconnect()
+        except Exception: pass
+        return True
+    except Exception as e:
+        log.error(f"Unexpected error: {e}")
+        state.save()
+        try: ib.disconnect()
+        except Exception: pass
+        return True
+
+
+def run_with_reconnect():
+    max_retries = 100
+    retry_delay = 10
+    for attempt in range(max_retries):
+        if attempt > 0:
+            log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay}s...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, 120)
+        should_reconnect = main()
+        if should_reconnect is False:
+            break
+        log.info("Runner exited. Preparing to reconnect...")
+    log.info("Runner stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    run_with_reconnect()
