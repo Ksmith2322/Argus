@@ -11,8 +11,8 @@
         "session_end_utc": 20
     },
     "risk": {
-        "stop_bps": 30,
-        "target_bps": 60,
+        "stop_bps": 50,
+        "target_bps": 100,
         "timeout_minutes": 60,
         "min_signal_gap_minutes": 15,
         "num_contracts": 1
