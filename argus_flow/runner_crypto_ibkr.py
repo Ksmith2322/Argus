@@ -78,8 +78,13 @@ class State:
             d = json.loads(self.file.read_text())
             self.position = d.get("position", "FLAT")
             self.entry_price = d.get("entry_price", 0.0)
+            self.stop_price = d.get("stop_price", 0.0)
+            self.target_price = d.get("target_price", 0.0)
             self.trade_count = d.get("trade_count", 0)
             self.pnl_usd = d.get("pnl_pips", 0.0)
+            if self.position != "FLAT" and (self.stop_price == 0 or self.target_price == 0):
+                log.warning(f"Restored {self.position} but stop/target missing — forcing FLAT")
+                self.position = "FLAT"
             log.info(f"Restored: {self.position}, trades={self.trade_count}, pnl=${self.pnl_usd:.2f}")
 
 
