@@ -1728,24 +1728,11 @@ async def api_evolution():
 
 # ── IBKR Fleet API ──────────────────────────────────────────
 
+# ── Active Cohort (Class A) — frozen per COHORT_SPEC.md ──
 IBKR_RUNNERS = [
-    {"name": "EUR/USD", "symbol": "EURUSD", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurusd", "unit": "pips", "mult": 10000},
-    {"name": "MNQ", "symbol": "MNQ", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mnq", "unit": "pts", "mult": 1},
     {"name": "GBP/USD", "symbol": "GBPUSD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips", "mult": 10000},
-    {"name": "GBP/JPY", "symbol": "GBPJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/gbpjpy", "unit": "pips", "mult": 100},
-    {"name": "AUD/USD", "symbol": "AUDUSD", "strategy": "Range NY", "log_dir": "argus_flow/logs/audusd", "unit": "pips", "mult": 10000},
-    {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range NY", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
-    {"name": "MES", "symbol": "MES", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mes", "unit": "pts", "mult": 1},
-    {"name": "MYM", "symbol": "MYM", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mym", "unit": "pts", "mult": 1},
+    {"name": "EUR/USD", "symbol": "EURUSD", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurusd", "unit": "pips", "mult": 10000},
     {"name": "EUR/JPY", "symbol": "EURJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips", "mult": 100},
-    {"name": "AUD/JPY", "symbol": "AUDJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/audjpy", "unit": "pips", "mult": 100},
-    {"name": "CAD/JPY", "symbol": "CADJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/cadjpy", "unit": "pips", "mult": 100},
-    {"name": "Gold", "symbol": "MGC", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mgc", "unit": "pts", "mult": 1},
-    {"name": "Oil", "symbol": "MCL", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mcl", "unit": "pts", "mult": 1},
-    {"name": "Russell", "symbol": "M2K", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/m2k", "unit": "pts", "mult": 1},
-    {"name": "Nikkei", "symbol": "NKD", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/nkd", "unit": "pts", "mult": 1},
-    {"name": "BTC", "symbol": "BTC", "strategy": "Range Accel", "log_dir": "argus_flow/logs/btc_ibkr", "unit": "USD", "mult": 1},
-    {"name": "ETH", "symbol": "ETH", "strategy": "Range Accel", "log_dir": "argus_flow/logs/eth_ibkr", "unit": "USD", "mult": 1},
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:
@@ -1797,8 +1784,8 @@ def _read_ibkr_runner(runner: dict) -> dict:
     # Load replay expectations from config
     cfg_map = {
         "EURUSD": "eurusd_t4_paper_v1.json",
-        "MNQ": "mnq_vol_burst_paper_v1.json",
         "GBPUSD": "gbpusd_range_paper_v1.json",
+        "EURJPY": "eurjpy_t4_paper_v1.json",
     }
     cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(runner["symbol"], "")
     if cfg_path.exists():
@@ -2273,7 +2260,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Portfolio doubling progress: $1000 current -> $5000 (5-coin target) -->
   <div style="margin-top:8px; padding-top:8px; border-top:1px solid #1e2a42;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-      <div style="font-size:0.75em; color:#ffb74d; font-weight:bold;">PORTFOLIO GOAL: $2,000 <span style="color:#7b8ab8; font-weight:normal;">(2 coins x $500 doubled)</span></div>
+      <div style="font-size:0.75em; color:#ffb74d; font-weight:bold;">PORTFOLIO GOAL: $3,000 <span style="color:#7b8ab8; font-weight:normal;">(3 FX pairs x $500 doubled)</span></div>
       <div style="font-size:0.72em; color:#7b8ab8;"><span id="port-goal-pct">0</span>%</div>
     </div>
     <div style="background:#0d1321; border-radius:3px; height:10px; overflow:hidden;">
@@ -2505,7 +2492,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
-  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">17</span></div>
+  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">3</span></div>
 </div>
 
 <!-- Runner cards -->
@@ -2516,7 +2503,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <!-- Runner cards -->
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
 
 <!-- Trade journal -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">

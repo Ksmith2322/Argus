@@ -29,6 +29,8 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
+from argus_flow.schemas import signal_header, build_signal_row, trade_header
+
 load_dotenv()
 
 try:
@@ -185,12 +187,18 @@ def compute_features_fx(buf: BarBuffer) -> Optional[dict]:
     current_px = float(pre["close"].iloc[-1])
     dist_from_low = (current_px - ctx_low) / ctx_range if ctx_range > 0 else 0.5
 
+    # Use last bar timestamp for hour, not wall-clock (avoids drift on stall/reconnect)
+    try:
+        bar_hour = int(str(df["ts"].iloc[-1])[11:13])
+    except (ValueError, IndexError):
+        bar_hour = datetime.now(timezone.utc).hour
+
     return {
         "range_pct": range_pct,
         "vol_z": vol_z,
         "range_accel": range_accel,
         "dist_from_low": dist_from_low,
-        "hour": datetime.now(timezone.utc).hour,
+        "hour": bar_hour,
         "price": current_px,
     }
 
@@ -231,13 +239,19 @@ def compute_features_futures(buf: BarBuffer) -> Optional[dict]:
     current_px = float(pre["close"].iloc[-1])
     dist_from_low = (current_px - ctx_low) / ctx_range if ctx_range > 0 else 0.5
 
+    # Use last bar timestamp for hour, not wall-clock
+    try:
+        bar_hour = int(str(df["ts"].iloc[-1])[11:13])
+    except (ValueError, IndexError):
+        bar_hour = datetime.now(timezone.utc).hour
+
     return {
         "range_pct": range_pct,
         "vol_z": vol_z,
         "range_accel": range_accel,
         "vol_burst_z": vol_burst_z,
         "dist_from_low": dist_from_low,
-        "hour": datetime.now(timezone.utc).hour,
+        "hour": bar_hour,
         "price": current_px,
     }
 
@@ -383,41 +397,16 @@ class InstrumentRunner:
     def _ensure_signal_header(self) -> None:
         if not self.signal_log.exists():
             with open(self.signal_log, "w", newline="") as f:
-                w = csv.writer(f)
-                if self.instrument_type in ("future", "crypto"):
-                    w.writerow([
-                        "ts", "price", "range_pct", "vol_z", "range_accel",
-                        "vol_burst_z", "dist_from_low", "hour", "direction", "action",
-                    ])
-                else:
-                    w.writerow([
-                        "ts", "price", "range_pct", "vol_z", "range_accel",
-                        "dist_from_low", "hour", "direction", "action",
-                        "config_hash", "session_id",
-                    ])
+                csv.writer(f).writerow(signal_header(self.instrument_type))
 
     def _log_signal(self, features: dict, direction: Optional[str], action: str) -> None:
         self._ensure_signal_header()
+        features["ts"] = datetime.now(timezone.utc).isoformat()
         with open(self.signal_log, "a", newline="") as f:
-            w = csv.writer(f)
-            row = [
-                datetime.now(timezone.utc).isoformat(),
-                features["price"],
-                f"{features['range_pct']:.6f}",
-                f"{features['vol_z']:.4f}",
-                f"{features['range_accel']:.4f}",
-            ]
-            if self.instrument_type in ("future", "crypto"):
-                row.append(f"{features.get('vol_burst_z', 0):.4f}")
-            row += [
-                f"{features['dist_from_low']:.4f}",
-                features["hour"],
-                direction or "",
-                action,
-                getattr(self, '_config_hash', ''),
-                getattr(self, '_session_id', ''),
-            ]
-            w.writerow(row)
+            csv.writer(f).writerow(build_signal_row(
+                features, direction, action, self.instrument_type,
+                getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
+            ))
 
     def _evaluate_validity(self) -> tuple[bool, str]:
         """Determine if this trade is experimentally valid.
@@ -443,18 +432,7 @@ class InstrumentRunner:
     def _ensure_trade_header(self) -> None:
         if not self.trade_log.exists():
             with open(self.trade_log, "w", newline="") as f:
-                w = csv.writer(f)
-                validity_cols = ["experiment_valid", "invalid_reason", "config_hash", "session_id", "runtime_epoch"]
-                if self.uses_pips:
-                    w.writerow([
-                        "ts", "direction", "entry_px", "exit_px", "pnl_pips",
-                        "exit_reason", "duration_min", "trade_num",
-                    ] + validity_cols)
-                else:
-                    w.writerow([
-                        "ts", "direction", "entry_px", "exit_px", "pnl_pts",
-                        "pnl_usd", "exit_reason", "duration_min", "trade_num",
-                    ] + validity_cols)
+                csv.writer(f).writerow(trade_header(self.uses_pips))
 
     def _log_trade(self, exit_price: float, exit_reason: str, now: datetime) -> float:
         """Log closed trade, return PnL in pips (FX) or points (futures)."""
@@ -478,7 +456,7 @@ class InstrumentRunner:
         validity_fields = [
             str(valid).lower(), invalid_reason or "",
             getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
-            str(runtime_epoch),
+            str(runtime_epoch), getattr(self, '_git_sha', ''),
         ]
 
         self._ensure_trade_header()
@@ -632,6 +610,11 @@ class InstrumentRunner:
             if gap < self.min_gap:
                 direction = None
 
+        # Block new entries if reconciliation requires recovery
+        if direction and getattr(self, '_entries_blocked', False):
+            self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
+            direction = None
+
         if direction:
             entry_px = mid
             stop_px, target_px = self._compute_stops(entry_px, direction)
@@ -641,7 +624,7 @@ class InstrumentRunner:
             s.entry_time = now
             s.stop_price = stop_px
             s.target_price = target_px
-            s.timeout_time = now.replace(second=0) + timedelta(minutes=self.timeout_min)
+            s.timeout_time = now.replace(second=0, microsecond=0) + timedelta(minutes=self.timeout_min)
             s.last_signal_time = now
             s.trade_count += 1
             s.direction_str = direction
@@ -663,7 +646,7 @@ class InstrumentRunner:
             if now.minute % 5 == 0 and now.second < 2:
                 self._log_signal(features, None, "NO_TRIGGER")
 
-    # ── Seed historical bars ─────────────────────────────────
+    # ── Seed historical bars ───────────────────────────��─────
     def seed(self, ib: IB) -> None:
         """Load 5D of 1-min history to bootstrap feature computation."""
         what = "MIDPOINT" if self.instrument_type == "forex" else "TRADES"
@@ -721,11 +704,191 @@ def create_contract(cfg: dict):
 
 
 def log_dir_for(cfg: dict) -> Path:
-    """Derive per-instrument log directory."""
-    sym = cfg["symbol"].lower()
-    strategy = cfg.get("strategy", "default")
-    # Use symbol as directory (matches existing pattern)
-    return LOGS_ROOT / sym
+    """Derive per-instrument log directory from symbol.
+
+    NOTE: if you ever run two configs with the same symbol (e.g. two EURUSD strategies),
+    this will collide. The main() function checks for duplicates at startup.
+    """
+    return LOGS_ROOT / cfg["symbol"].lower()
+
+
+# =================================================================
+# Runtime state enum -- replaces scattered booleans
+# =================================================================
+class RuntimeMode:
+    """Process-level runtime state."""
+    BOOTING = "BOOTING"
+    RECONCILING = "RECONCILING"
+    READY = "READY"
+    DEGRADED = "DEGRADED"       # at least one instrument quarantined
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"  # unresolved broker mismatch
+
+
+class ReconcileResult:
+    """Per-instrument broker reconciliation outcome."""
+    CLEAN_FLAT = "CLEAN_FLAT"
+    CLEAN_OPEN_MATCHED = "CLEAN_OPEN_MATCHED"
+    LOCAL_FLAT_BROKER_OPEN = "LOCAL_FLAT_BROKER_OPEN"
+    LOCAL_OPEN_BROKER_FLAT = "LOCAL_OPEN_BROKER_FLAT"
+    BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE"
+    UNRESOLVED = "UNRESOLVED"
+
+
+# =================================================================
+# Broker reconciliation gate
+# =================================================================
+def _normalize_ib_key(contract) -> str:
+    """Normalize IB contract to canonical instrument key."""
+    sec_type = getattr(contract, "secType", "")
+    if sec_type == "CASH":
+        return f"{contract.symbol}.{contract.currency}"
+    elif sec_type == "FUT":
+        return contract.symbol
+    return getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "")
+
+
+def _runner_to_ib_key(runner: 'InstrumentRunner') -> str:
+    """Convert runner's contract to canonical key for broker matching."""
+    return _normalize_ib_key(runner.contract)
+
+
+def reconcile_instruments(ib, instruments: list) -> dict:
+    """Compare local state vs broker truth for all instruments.
+
+    Returns dict mapping runner.symbol -> {result, local_pos, broker_pos, detail}.
+    Writes incident artifacts for non-clean results.
+    """
+    results = {}
+
+    # Fetch broker positions
+    try:
+        broker_positions = {}
+        for p in ib.positions():
+            key = _normalize_ib_key(p.contract)
+            qty = float(p.position)
+            broker_positions[key] = {
+                "qty": qty,
+                "direction": "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"),
+                "avg_cost": float(p.avgCost),
+            }
+        broker_ok = True
+    except Exception as e:
+        log.error(f"Reconciliation: failed to fetch broker positions: {e}")
+        broker_ok = False
+        broker_positions = {}
+
+    for inst in instruments:
+        ib_key = _runner_to_ib_key(inst)
+        local_pos = inst.state.position
+        broker_info = broker_positions.get(ib_key, {"qty": 0, "direction": "FLAT"})
+        broker_dir = broker_info["direction"]
+
+        if not broker_ok:
+            result = ReconcileResult.BROKER_UNAVAILABLE
+            detail = "Could not query broker positions"
+        elif local_pos == "FLAT" and broker_dir == "FLAT":
+            result = ReconcileResult.CLEAN_FLAT
+            detail = "Both local and broker flat"
+        elif local_pos == broker_dir:
+            result = ReconcileResult.CLEAN_OPEN_MATCHED
+            detail = f"Both agree: {local_pos} qty={broker_info.get('qty', 0)}"
+        elif local_pos == "FLAT" and broker_dir in ("LONG", "SHORT"):
+            result = ReconcileResult.LOCAL_FLAT_BROKER_OPEN
+            detail = f"Orphan: broker has {broker_dir} qty={broker_info['qty']} but runner is FLAT"
+        elif local_pos in ("LONG", "SHORT") and broker_dir == "FLAT":
+            result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
+            detail = f"Phantom: runner says {local_pos} but broker is FLAT -- forcing local FLAT"
+            # Auto-correct: trust broker truth
+            inst.state.position = "FLAT"
+            inst.state.entry_price = 0.0
+            inst.state.stop_price = 0.0
+            inst.state.target_price = 0.0
+            inst.state.timeout_time = None
+            inst.state.save()
+        else:
+            result = ReconcileResult.UNRESOLVED
+            detail = f"local={local_pos} broker={broker_dir} -- cannot auto-resolve"
+
+        results[inst.symbol] = {
+            "result": result,
+            "local_position": local_pos,
+            "broker_position": broker_dir,
+            "broker_qty": broker_info.get("qty", 0),
+            "detail": detail,
+            "ib_key": ib_key,
+        }
+
+        # Store reconciliation result on the runner
+        inst._reconciliation = result
+
+        if result not in (ReconcileResult.CLEAN_FLAT, ReconcileResult.CLEAN_OPEN_MATCHED):
+            log.warning(f"[{inst.symbol}] RECONCILE: {result} -- {detail}")
+            _write_incident(inst, result, detail, local_pos, broker_info)
+        else:
+            log.info(f"[{inst.symbol}] RECONCILE: {result}")
+
+    # Check for orphaned broker positions not tracked by any runner
+    tracked_keys = {_runner_to_ib_key(inst) for inst in instruments}
+    for key, info in broker_positions.items():
+        if key not in tracked_keys and info["direction"] != "FLAT":
+            log.warning(f"ORPHAN DETECTED: broker has {info['direction']} in {key} -- not tracked by any runner")
+            results[f"_orphan_{key}"] = {
+                "result": ReconcileResult.UNRESOLVED,
+                "local_position": "NONE",
+                "broker_position": info["direction"],
+                "broker_qty": info["qty"],
+                "detail": f"Untracked broker position in {key}",
+                "ib_key": key,
+            }
+
+    return results
+
+
+def _write_incident(inst, result: str, detail: str,
+                    local_pos: str, broker_info: dict) -> None:
+    """Persist an incident artifact for audit trail."""
+    incident_dir = inst.log_dir / "incidents"
+    incident_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    session_id = getattr(inst, '_session_id', 'unknown')
+    incident_file = incident_dir / f"incident_{session_id}_{ts}.json"
+    incident_file.write_text(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instrument": inst.symbol,
+        "session_id": session_id,
+        "severity": "CRITICAL" if result in (ReconcileResult.LOCAL_FLAT_BROKER_OPEN, ReconcileResult.UNRESOLVED) else "WARNING",
+        "reconciliation_result": result,
+        "detail": detail,
+        "local_state": {
+            "position": local_pos,
+            "entry_price": inst.state.entry_price,
+            "stop_price": inst.state.stop_price,
+            "target_price": inst.state.target_price,
+        },
+        "broker_state": broker_info,
+        "action_taken": "forced_flat" if result == ReconcileResult.LOCAL_OPEN_BROKER_FLAT else "none",
+        "requires_manual_review": result in (ReconcileResult.LOCAL_FLAT_BROKER_OPEN, ReconcileResult.UNRESOLVED),
+    }, indent=2))
+    log.info(f"  Incident written: {incident_file}")
+
+
+def _determine_runtime_mode(recon_results: dict) -> str:
+    """Determine overall runtime mode from reconciliation results."""
+    has_critical = any(
+        r["result"] in (ReconcileResult.LOCAL_FLAT_BROKER_OPEN, ReconcileResult.UNRESOLVED)
+        for r in recon_results.values()
+    )
+    if has_critical:
+        return RuntimeMode.RECOVERY_REQUIRED
+
+    has_degraded = any(
+        r["result"] == ReconcileResult.BROKER_UNAVAILABLE
+        for r in recon_results.values()
+    )
+    if has_degraded:
+        return RuntimeMode.DEGRADED
+
+    return RuntimeMode.READY
 
 
 # ═════════════════════════════════════════════════════════════
@@ -831,6 +994,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         runner._session_id = getattr(main, '_session_id', str(uuid.uuid4())[:8])
         runner._runtime_start = getattr(main, '_runtime_start', time.time())
         runner._reconnected = getattr(main, '_is_reconnect', False)
+        runner._git_sha = getattr(main, '_git_sha', 'unknown')
 
         instruments.append(runner)
 
@@ -847,16 +1011,43 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         ib.disconnect()
         return False
 
+    # Check for duplicate symbols (would cause log/state dir collision)
+    seen_syms = {}
+    for inst in instruments:
+        sym = inst.symbol.lower()
+        if sym in seen_syms:
+            log.error(f"FATAL: duplicate symbol '{inst.symbol}' — configs '{seen_syms[sym]}' and '{inst.config_path}' would share log dir")
+            ib.disconnect()
+            return False
+        seen_syms[sym] = inst.config_path
+
     log.info(f"Loaded {len(instruments)} instruments ({skipped} skipped)")
     log.info("-" * 70)
 
-    # ── Seed historical data ─────────────────────────────────
+    # -- Broker reconciliation gate ------------------------------------
+    log.info("Running broker reconciliation...")
+    runtime_mode = RuntimeMode.RECONCILING
+    recon_results = reconcile_instruments(ib, instruments)
+    runtime_mode = _determine_runtime_mode(recon_results)
+    log.info(f"Reconciliation complete. Runtime mode: {runtime_mode}")
+
+    if runtime_mode == RuntimeMode.RECOVERY_REQUIRED:
+        log.error("RECOVERY REQUIRED: unresolved broker mismatch detected")
+        log.error("New entries BLOCKED until manual review. Monitor will continue.")
+        # Don't exit -- keep running for monitoring, but block entries
+        for inst in instruments:
+            inst._entries_blocked = True
+    else:
+        for inst in instruments:
+            inst._entries_blocked = False
+
+    # -- Seed historical data -----------------------------------------
     log.info("Seeding historical bars...")
     for inst in instruments:
         inst.seed(ib)
         ib.sleep(0.5)  # rate-limit historical data requests
 
-    # ── Main loop ────────────────────────────���───────────────
+    # -- Main loop ---------------------------------------------------���───────────────
     log.info("Starting main loop (Ctrl+C to stop)...")
     heartbeat_interval = 300  # log heartbeat every 5 min
     last_heartbeat = time.time()
@@ -879,8 +1070,11 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     if inst._consecutive_errors >= 10:
                         inst._log.error(f"QUARANTINED after {inst._consecutive_errors} consecutive errors")
                         inst._quarantined = True
+                        runtime_mode = RuntimeMode.DEGRADED
+                        _write_incident(inst, "QUARANTINED", f"{inst._consecutive_errors} consecutive tick errors",
+                                        inst.state.position, {"direction": "unknown", "qty": 0})
 
-            # Periodic heartbeat
+            # Periodic heartbeat (log + per-instrument heartbeat files)
             if time.time() - last_heartbeat > heartbeat_interval:
                 last_heartbeat = time.time()
                 positions = [
@@ -894,6 +1088,26 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     f"HEARTBEAT | {len(instruments)} instruments | "
                     f"{flat_count} flat | {pos_str}"
                 )
+                # Write per-instrument heartbeat files (used by position_monitor)
+                for inst in instruments:
+                    hb_file = inst.log_dir / "heartbeat.json"
+                    try:
+                        hb_file.write_text(json.dumps({
+                            "ts": now.isoformat(),
+                            "pid": os.getpid(),
+                            "session_id": getattr(inst, '_session_id', ''),
+                            "instrument": inst.symbol,
+                            "runtime_mode": runtime_mode,
+                            "position": inst.state.position,
+                            "entries_blocked": getattr(inst, '_entries_blocked', False),
+                            "quarantined": getattr(inst, '_quarantined', False),
+                            "consecutive_errors": getattr(inst, '_consecutive_errors', 0),
+                            "reconciliation": getattr(inst, '_reconciliation', ''),
+                            "last_bar_ts": str(inst.current_bar_minute) if inst.current_bar_minute else None,
+                            "broker_connected": ib.isConnected(),
+                        }))
+                    except Exception:
+                        pass
 
     except KeyboardInterrupt:
         log.info("Shutting down (Ctrl+C)...")
@@ -958,6 +1172,15 @@ def run_with_reconnect(
     main._session_id = str(uuid.uuid4())[:8]
     main._runtime_start = time.time()
     main._is_reconnect = False
+
+    # Capture git sha for cohort auditing
+    import subprocess as _sp
+    try:
+        main._git_sha = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=_sp.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        main._git_sha = "unknown"
 
     for attempt in range(max_retries):
         if attempt > 0:
