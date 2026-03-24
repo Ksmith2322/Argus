@@ -421,3 +421,74 @@ Gate A proof: `trade_journal_<run_id>.csv` written on SELL â†’ FLAT transition, 
 ---
 
 END
+
+# ===================================================================
+# ARGUS FLOW — IBKR TRADING SYSTEM (added 2026-03-24)
+# ===================================================================
+
+## Architecture
+
+    Unified Runner (runner_unified.py)
+        |
+        +-- Single IB() connection (TWS port 7496, clientId=1)
+        |
+        +-- InstrumentRunner (GBP/USD) -- BarBuffer, State, signals.csv, trades.csv
+        +-- InstrumentRunner (EUR/USD) -- BarBuffer, State, signals.csv, trades.csv
+        +-- InstrumentRunner (EUR/JPY) -- BarBuffer, State, signals.csv, trades.csv
+        |
+        +-- Auto-reconnect wrapper (exponential backoff)
+        +-- Per-runner fault isolation (try/except per tick)
+        +-- Experiment validity tracking (config_hash, session_id, valid/invalid)
+
+## Data Flow
+
+    IBKR TWS (port 7496)
+        |
+        v
+    runner_unified.py (single process)
+        |
+        +-- reqMktData() per instrument --> ticker objects
+        +-- reqHistoricalData() on startup --> seed BarBuffers
+        |
+        v
+    Per-instrument: tick() every second
+        |
+        +-- Build 1-min bars from ticks
+        +-- Compute features (range_pct, vol_z, range_accel, dist_from_low)
+        +-- Check trigger (T4 or vol_burst depending on config)
+        +-- Manage stops/targets/timeouts
+        |
+        v
+    Artifacts (per instrument):
+        argus_flow/logs/{symbol}/state.json   -- position persistence
+        argus_flow/logs/{symbol}/signals.csv  -- all signal evaluations
+        argus_flow/logs/{symbol}/trades.csv   -- closed trades with validity fields
+
+## Dashboard
+
+    ops/dashboard.py (FastAPI + SSE)
+        |
+        +-- /api/ibkr_fleet --> reads all 17 runner log dirs
+        +-- FLEET DASHBOARD tab (primary)
+        +-- RESEARCH tab (backtest evolution)
+        +-- Auto-refresh every 10 seconds
+
+## Ops Tools
+
+    smoke_test.py ---------> Pre-launch 7-point check
+    health_check.py -------> Fleet overview + IBKR connection
+    heartbeat_monitor.py --> Runner alive/dead (signal file ages)
+    position_monitor.py ---> IBKR vs runner state reconciliation
+    divergence_guard.py ---> Replay vs live comparison
+    correlation_guard.py --> USD pair exposure limit
+    daily_report.py -------> Fleet P&L summary
+    discord_alerts.py -----> Trade notifications
+    config_check.py -------> Config validation + SHA256 hash
+    refresh_ibkr_data.py --> Pull latest IBKR historical bars
+
+## Key Accounts
+
+    IBKR Live: U24860535 (Read-Only API for safety)
+    IBKR Paper: DUP472829 (backup)
+    TWS Port: 7496
+    Kraken: research closed, 0 balance

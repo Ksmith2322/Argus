@@ -249,3 +249,54 @@ bt_run_output.txt | SCRATCH | captured backtest stdout from manual run; supersed
 
 logs/ | STALE-DIR | pre-March-10 backtest artifacts written before ops/logs/ was canonical path | none | none | NO | filesystem | none | cleanup-candidate
 NOTE logs/: contains events/signals/bt_summary/equity/trades from 2026-02-22 through 2026-03-11 runs + old ops_backtest*.log files; safe to archive/delete once confirmed no longer needed for forensics
+
+--- ARGUS FLOW (IBKR TRADING SYSTEM) - added 2026-03-24 ---
+
+# Runners
+runner_unified.py | CORE | Single-process multi-instrument runner | CLI | ib_insync | YES | IBKR,configs | logs/ | execution
+runner_eurusd.py | RUNNER | EUR/USD (superseded by unified) | CLI | ib_insync | YES | IBKR | logs/eurusd/ | superseded
+runner_gbpusd.py | RUNNER | GBP/USD (superseded) | CLI | ib_insync | YES | IBKR | logs/gbpusd/ | superseded
+runner_mnq.py | RUNNER | MNQ (superseded) | CLI | ib_insync | YES | IBKR | logs/mnq/ | superseded
+runner_fx_generic.py | RUNNER | Generic FX (any pair) | CLI | ib_insync | YES | IBKR | logs/ | execution
+runner_futures_generic.py | RUNNER | Generic futures (any contract) | CLI | ib_insync | YES | IBKR | logs/ | execution
+runner_crypto_ibkr.py | RUNNER | IBKR Paxos crypto | CLI | ib_insync | YES | IBKR | logs/ | needs-subscription
+
+# Configs (17 strategy configs)
+configs/*_paper_v1.json | CONFIG | Per-instrument strategy parameters | runners | n/a | NO | n/a | n/a | frozen-cohort
+configs/hashes.json | DATA | Config SHA256 hashes | config_check | n/a | NO | configs | n/a | ops
+
+# Ops (12 tools)
+ops/smoke_test.py | OPS | Pre-launch verification | CLI | ib_insync | NO | IBKR,configs | stdout | ops
+ops/health_check.py | OPS | Fleet status | CLI | ib_insync | NO | IBKR,logs | stdout | ops
+ops/heartbeat_monitor.py | OPS | Runner alive/dead check | CLI | n/a | NO | logs | heartbeat.json | ops
+ops/position_monitor.py | OPS | IBKR position reconciliation | CLI | ib_insync | NO | IBKR,state | position_monitor.json | ops
+ops/divergence_guard.py | OPS | Replay vs live comparison | CLI | n/a | NO | configs,logs | divergence_report.json | governance
+ops/correlation_guard.py | OPS | USD pair exposure limit | CLI | n/a | NO | state | correlation_check.json | ops
+ops/daily_report.py | OPS | Daily P&L summary | CLI | n/a | NO | logs | daily_report.json | ops
+ops/discord_alerts.py | OPS | Trade notifications | CLI | requests | NO | .env,logs | Discord | ops
+ops/config_check.py | OPS | Config validation + hash | CLI | n/a | NO | configs | hashes.json | governance
+ops/refresh_ibkr_data.py | OPS | Pull IBKR historical bars | CLI | ib_insync | NO | IBKR | data/ | data
+
+# Analytics (8 research tools)
+analytics/replay_breakout_flow.py | RESEARCH | Cascade replay engine | CLI | n/a | NO | bars | replay_out/ | closed
+analytics/run_sweep.py | RESEARCH | Parameter grid sweep | CLI | replay | NO | bars | sweep_results | closed
+analytics/classify_edge.py | RESEARCH | Edge classifier | CLI | n/a | NO | sweep | classification | closed
+analytics/delay_simulator.py | RESEARCH | Entry delay impact | CLI | n/a | NO | events | delay_summary | closed
+analytics/displacement_analysis.py | RESEARCH | Payoff-first event finder | CLI | n/a | NO | bars | displacement | research
+analytics/eurusd_payoff_test.py | RESEARCH | EUR/USD backtest | CLI | n/a | NO | data | payoff_results | research
+analytics/eurusd_stress_test.py | RESEARCH | 7-test stress suite | CLI | payoff_test | NO | data | stdout | research
+analytics/index_futures_analysis.py | RESEARCH | Multi-instrument analysis | CLI | ib_insync | NO | IBKR | indices/ | research
+
+# Strategies (3 ICT/MambaFX - backtested, mixed results)
+strategies/fvg_detector.py | RESEARCH | Fair Value Gap (ICT) | test_all | n/a | NO | bars | stdout | research
+strategies/liquidity_sweep.py | RESEARCH | Liquidity sweep (ICT) | test_all | n/a | NO | bars | stdout | research
+strategies/volume_profile.py | RESEARCH | Volume Profile (MambaFX) | test_all | n/a | NO | bars | stdout | research
+
+# Tests (3 suites)
+tests/adversarial_tests.py | TEST | Tier 1 data injection (5 tests) | CLI | runner_eurusd | NO | n/a | stdout | test
+tests/test_unified_faults.py | TEST | Unified runner faults (5 tests) | CLI | runner_unified | NO | n/a | stdout | test
+tests/test_kraken_connectivity.py | TEST | Kraken API test | CLI | kraken_client | NO | Kraken | stdout | test
+
+# Docs
+COHORT_SPEC.md | DOC | Cohort governance (valid/invalid, promotion gates) | n/a | n/a | NO | n/a | n/a | governance
+PAPER_GATES.md | DOC | Paper trading acceptance/kill gates | n/a | n/a | NO | n/a | n/a | governance
