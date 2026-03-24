@@ -2505,7 +2505,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
-  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/3</div>
+  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">17</span></div>
 </div>
 
 <!-- Runner cards -->
@@ -2759,6 +2759,7 @@ async function loadIBKRFleet() {
     fpEl.textContent = (fleetPnl >= 0 ? '+' : '') + fleetPnl.toFixed(1);
     fpEl.style.color = fleetPnl >= 0 ? '#00ff88' : '#ff4444';
     document.getElementById('ibkr-active-count').textContent = activeCount;
+    document.getElementById('ibkr-total-count').textContent = data.runners.length;
 
     // Runner cards
     const cardsDiv = document.getElementById('ibkr-runner-cards');
@@ -2936,19 +2937,24 @@ async function loadIBKRFleet() {
     }
 
     // Fleet P&L Chart
-    const allPnlData = [];
+    // Build fleet equity curve: start at 0, add each trade's PnL
+    const allPnlData = [0]; // always start with zero baseline
+    const allTrades = [];
     for (const r of data.runners) {
-      if (r.equity_curve && r.equity_curve.length > 0) {
-        // Normalize all curves to same length, sum them
-        for (let i = 0; i < r.equity_curve.length; i++) {
-          if (!allPnlData[i]) allPnlData[i] = 0;
-          allPnlData[i] += r.equity_curve[i];
-        }
+      for (const t of (r.trades || [])) {
+        const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
+        allTrades.push({ts: t.ts, pnl: pnl, runner: r.name});
       }
+    }
+    allTrades.sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+    let cumPnl = 0;
+    for (const t of allTrades) {
+      cumPnl += t.pnl;
+      allPnlData.push(cumPnl);
     }
 
     const canvas = document.getElementById('ibkr-pnl-chart');
-    if (canvas && allPnlData.length > 1) {
+    if (canvas && allPnlData.length >= 1) {
       const ctx = canvas.getContext('2d');
       const w = canvas.parentElement.clientWidth - 28;
       canvas.width = w;
