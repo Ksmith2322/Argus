@@ -2239,10 +2239,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- CONTROL STRIP -->
 <div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
-  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">IBKR PAPER</span></div>
-  <div>ACCOUNT: <span style="color:#00d4ff;">DUP472829</span></div>
-  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">EUR/USD, MNQ, GBP/USD</span></div>
-  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Paper Proof</span></div>
+  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
+  <div>ACCOUNT: <span style="color:#00d4ff;">U24860535 (Read-Only)</span></div>
+  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">GBP/USD, EUR/USD, EUR/JPY (FX Cohort)</span></div>
+  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
 </div>
 
 <div class="page-nav">
