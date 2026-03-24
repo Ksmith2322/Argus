@@ -1737,6 +1737,15 @@ IBKR_RUNNERS = [
     {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range NY", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
     {"name": "MES", "symbol": "MES", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mes", "unit": "pts", "mult": 1},
     {"name": "MYM", "symbol": "MYM", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mym", "unit": "pts", "mult": 1},
+    {"name": "EUR/JPY", "symbol": "EURJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips", "mult": 100},
+    {"name": "AUD/JPY", "symbol": "AUDJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/audjpy", "unit": "pips", "mult": 100},
+    {"name": "CAD/JPY", "symbol": "CADJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/cadjpy", "unit": "pips", "mult": 100},
+    {"name": "Gold", "symbol": "MGC", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mgc", "unit": "pts", "mult": 1},
+    {"name": "Oil", "symbol": "MCL", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/mcl", "unit": "pts", "mult": 1},
+    {"name": "Russell", "symbol": "M2K", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/m2k", "unit": "pts", "mult": 1},
+    {"name": "Nikkei", "symbol": "NKD", "strategy": "Vol Burst", "log_dir": "argus_flow/logs/nkd", "unit": "pts", "mult": 1},
+    {"name": "BTC", "symbol": "BTC", "strategy": "Range Accel", "log_dir": "argus_flow/logs/btc_ibkr", "unit": "USD", "mult": 1},
+    {"name": "ETH", "symbol": "ETH", "strategy": "Range Accel", "log_dir": "argus_flow/logs/eth_ibkr", "unit": "USD", "mult": 1},
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:

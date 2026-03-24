@@ -1,0 +1,38 @@
+{
+    "strategy": "T4_full_stack",
+    "version": "paper_v1",
+    "symbol": "CADJPY",
+    "instrument_type": "forex",
+    "ibkr_client_id": 20,
+    "trigger": {
+        "range_pct_min": 0.0012,
+        "range_accel_min": 0.0,
+        "vol_z_min": 0.0,
+        "session_start_utc": 8,
+        "session_end_utc": 19
+    },
+    "risk": {
+        "stop_pips": 20,
+        "target_pips": 40,
+        "timeout_minutes": 60,
+        "min_signal_gap_minutes": 15,
+        "lot_size": 20000
+    },
+    "direction": {
+        "dist_long_threshold": 0.4,
+        "dist_short_threshold": 0.6
+    },
+    "replay_expectations": {
+        "signals_per_day": 5.0,
+        "win_rate": 0.52,
+        "exp_pips_per_trade": 1.0,
+        "signals_per_day_range": [
+            1,
+            20
+        ],
+        "win_rate_range": [
+            0.35,
+            0.65
+        ]
+    }
+}

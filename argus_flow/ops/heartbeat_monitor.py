@@ -21,6 +21,15 @@ RUNNERS = [
     {"name": "USD/JPY", "log_dir": "argus_flow/logs/usdjpy"},
     {"name": "MES", "log_dir": "argus_flow/logs/mes"},
     {"name": "MYM", "log_dir": "argus_flow/logs/mym"},
+    {"name": "EUR/JPY", "log_dir": "argus_flow/logs/eurjpy"},
+    {"name": "AUD/JPY", "log_dir": "argus_flow/logs/audjpy"},
+    {"name": "CAD/JPY", "log_dir": "argus_flow/logs/cadjpy"},
+    {"name": "Gold", "log_dir": "argus_flow/logs/mgc"},
+    {"name": "Oil", "log_dir": "argus_flow/logs/mcl"},
+    {"name": "Russell", "log_dir": "argus_flow/logs/m2k"},
+    {"name": "Nikkei", "log_dir": "argus_flow/logs/nkd"},
+    {"name": "BTC", "log_dir": "argus_flow/logs/btc_ibkr"},
+    {"name": "ETH", "log_dir": "argus_flow/logs/eth_ibkr"},
 ]
 
 
