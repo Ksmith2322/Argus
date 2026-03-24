@@ -106,6 +106,7 @@ class State:
             "entry_time": str(self.entry_time) if self.entry_time else None,
             "stop_price": self.stop_price,
             "target_price": self.target_price,
+            "timeout_time": str(self.timeout_time) if self.timeout_time else None,
             "trade_count": self.trade_count,
             "pnl_pips": self.pnl_pips,
             "pnl_points": self.pnl_points,
@@ -131,10 +132,19 @@ class State:
                 self.entry_time = datetime.fromisoformat(d["entry_time"])
             except (ValueError, TypeError):
                 pass
+        if d.get("timeout_time"):
+            try:
+                self.timeout_time = datetime.fromisoformat(d["timeout_time"])
+            except (ValueError, TypeError):
+                pass
         # Safety: if restored in-position but stops are zero, force FLAT
         if self.position != "FLAT" and (self.stop_price == 0 or self.target_price == 0):
             log.warning(f"[{sym_label}] Restored {self.position} but stop/target=0 — forcing FLAT")
             self.position = "FLAT"
+        # Safety: if restored in-position but timeout missing, mark invalid
+        if self.position != "FLAT" and self.timeout_time is None:
+            log.warning(f"[{sym_label}] Restored {self.position} but timeout_time missing — trade validity compromised")
+            self.had_zero_stops = True  # triggers invalid flag on close
         if self.position != "FLAT":
             self.restored_this_session = True
             log.info(
@@ -383,6 +393,7 @@ class InstrumentRunner:
                     w.writerow([
                         "ts", "price", "range_pct", "vol_z", "range_accel",
                         "dist_from_low", "hour", "direction", "action",
+                        "config_hash", "session_id",
                     ])
 
     def _log_signal(self, features: dict, direction: Optional[str], action: str) -> None:
@@ -403,18 +414,30 @@ class InstrumentRunner:
                 features["hour"],
                 direction or "",
                 action,
+                getattr(self, '_config_hash', ''),
+                getattr(self, '_session_id', ''),
             ]
             w.writerow(row)
 
     def _evaluate_validity(self) -> tuple[bool, str]:
-        """Determine if this trade is experimentally valid."""
+        """Determine if this trade is experimentally valid.
+
+        Taxonomy (ordered by priority):
+        - restored_from_file: state loaded from disk (first trade after restart)
+        - zero_stops_during_trade: stop/target were 0 at any point
+        - timeout_restoration_failure: timeout_time missing after restore
+        - reconnect_during_session: IBKR reconnect occurred (session-wide)
+        - repeated_tick_failures: runner had N+ consecutive errors during trade
+        """
         s = self.state
         if s.restored_this_session:
             return False, "restored_from_file"
         if s.had_zero_stops:
-            return False, "zero_stops_during_trade"
+            return False, "zero_stops_or_timeout_missing"
         if getattr(self, '_reconnected', False):
             return False, "reconnect_during_session"
+        if getattr(self, '_consecutive_errors', 0) >= 3:
+            return False, "repeated_tick_failures"
         return True, ""
 
     def _ensure_trade_header(self) -> None:
@@ -707,7 +730,7 @@ def log_dir_for(cfg: dict) -> Path:
 
 # ═════════════════════════════════════════════════════════════
 # Main loop
-# ═════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════���══════
 def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] = None) -> bool:
     """
     Run all instruments in a single event loop.
@@ -746,7 +769,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     # Request delayed data fallback (needed for futures outside RTH)
     ib.reqMarketDataType(3)
 
-    # ── Build instrument runners ─────────────────────────────
+    # ── Build instrument runners ────────���────────────────────
     instruments: list[InstrumentRunner] = []
     skipped = 0
 
@@ -844,10 +867,18 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             now = datetime.now(timezone.utc)
 
             for inst in instruments:
+                # Skip quarantined runners
+                if getattr(inst, '_quarantined', False):
+                    continue
                 try:
                     inst.tick(now)
+                    inst._consecutive_errors = 0  # reset on success
                 except Exception as e:
-                    inst._log.error(f"Tick error: {e}", exc_info=True)
+                    inst._consecutive_errors = getattr(inst, '_consecutive_errors', 0) + 1
+                    inst._log.error(f"Tick error ({inst._consecutive_errors}x): {e}")
+                    if inst._consecutive_errors >= 10:
+                        inst._log.error(f"QUARANTINED after {inst._consecutive_errors} consecutive errors")
+                        inst._quarantined = True
 
             # Periodic heartbeat
             if time.time() - last_heartbeat > heartbeat_interval:

@@ -1,5 +1,19 @@
 {
+  "audjpy_t4_paper_v1.json": "83864efdba400268",
+  "audusd_ny_paper_v1.json": "6fb2f8d2b0e047e9",
+  "btc_range_paper_v1.json": "3453382dfb1d0c84",
+  "cadjpy_t4_paper_v1.json": "13144b9d33b39c33",
+  "eth_range_paper_v1.json": "dac2fc4a29218ec4",
+  "eurjpy_t4_paper_v1.json": "6163c29ee6a4f2a6",
   "eurusd_t4_paper_v1.json": "1bf75e9520cc26e8",
+  "gbpjpy_t4_paper_v1.json": "ade0643d8fc50c94",
   "gbpusd_range_paper_v1.json": "91b9d30d841b13bb",
-  "mnq_vol_burst_paper_v1.json": "06a551c436d4eb43"
+  "m2k_vol_burst_paper_v1.json": "a4e974b26eb8672c",
+  "mcl_vol_burst_paper_v1.json": "f3ce74504bfa4b44",
+  "mes_vol_burst_paper_v1.json": "1fcac57425f5e234",
+  "mgc_vol_burst_paper_v1.json": "6abcc4d27ebe2663",
+  "mnq_vol_burst_paper_v1.json": "5e7f5a9882635263",
+  "mym_vol_burst_paper_v1.json": "c7d74338ee349b73",
+  "nkd_vol_burst_paper_v1.json": "dc36deee08314816",
+  "usdjpy_ny_paper_v1.json": "9bbbef83a355b087"
 }
