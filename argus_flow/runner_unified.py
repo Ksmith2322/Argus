@@ -15,9 +15,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import json
 import logging
 import os
+import uuid
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -94,6 +96,8 @@ class State:
         self.pnl_pips = 0.0    # FX
         self.pnl_points = 0.0  # Futures / bps-based
         self.direction_str = ""  # "long" or "short" for logging
+        self.restored_this_session = False  # True if loaded from file
+        self.had_zero_stops = False  # True if stop/target were 0 at any point
 
     def save(self) -> None:
         self.file.write_text(json.dumps({
@@ -132,6 +136,7 @@ class State:
             log.warning(f"[{sym_label}] Restored {self.position} but stop/target=0 — forcing FLAT")
             self.position = "FLAT"
         if self.position != "FLAT":
+            self.restored_this_session = True
             log.info(
                 f"[{sym_label}] Restored {self.position} entry={self.entry_price} "
                 f"stop={self.stop_price} target={self.target_price} "
@@ -401,20 +406,32 @@ class InstrumentRunner:
             ]
             w.writerow(row)
 
+    def _evaluate_validity(self) -> tuple[bool, str]:
+        """Determine if this trade is experimentally valid."""
+        s = self.state
+        if s.restored_this_session:
+            return False, "restored_from_file"
+        if s.had_zero_stops:
+            return False, "zero_stops_during_trade"
+        if getattr(self, '_reconnected', False):
+            return False, "reconnect_during_session"
+        return True, ""
+
     def _ensure_trade_header(self) -> None:
         if not self.trade_log.exists():
             with open(self.trade_log, "w", newline="") as f:
                 w = csv.writer(f)
+                validity_cols = ["experiment_valid", "invalid_reason", "config_hash", "session_id", "runtime_epoch"]
                 if self.uses_pips:
                     w.writerow([
                         "ts", "direction", "entry_px", "exit_px", "pnl_pips",
                         "exit_reason", "duration_min", "trade_num",
-                    ])
+                    ] + validity_cols)
                 else:
                     w.writerow([
                         "ts", "direction", "entry_px", "exit_px", "pnl_pts",
                         "pnl_usd", "exit_reason", "duration_min", "trade_num",
-                    ])
+                    ] + validity_cols)
 
     def _log_trade(self, exit_price: float, exit_reason: str, now: datetime) -> float:
         """Log closed trade, return PnL in pips (FX) or points (futures)."""
@@ -432,6 +449,15 @@ class InstrumentRunner:
             else:
                 pnl = s.entry_price - exit_price
 
+        # Evaluate experiment validity
+        valid, invalid_reason = self._evaluate_validity()
+        runtime_epoch = int(time.time() - self._runtime_start) if hasattr(self, '_runtime_start') else 0
+        validity_fields = [
+            str(valid).lower(), invalid_reason or "",
+            getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
+            str(runtime_epoch),
+        ]
+
         self._ensure_trade_header()
         with open(self.trade_log, "a", newline="") as f:
             w = csv.writer(f)
@@ -441,10 +467,9 @@ class InstrumentRunner:
                     f"{s.entry_price:.5f}",
                     f"{exit_price:.5f}", f"{pnl:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
-                ])
+                ] + validity_fields)
             else:
                 pnl_usd = pnl * self.multiplier
-                # Determine precision: futures use .2f, FX/crypto use .5f
                 if self.instrument_type == "future":
                     ep = f"{s.entry_price:.2f}"
                     xp = f"{exit_price:.2f}"
@@ -455,7 +480,12 @@ class InstrumentRunner:
                     now.isoformat(), s.position.lower(),
                     ep, xp, f"{pnl:.2f}", f"{pnl_usd:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
-                ])
+                ] + validity_fields)
+
+        # Reset validity flags after trade closes
+        s.restored_this_session = False
+        s.had_zero_stops = False
+
         return pnl
 
     # ── Feature & trigger dispatch ───────────────────────────
@@ -771,6 +801,14 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         ldir = log_dir_for(cfg)
         runner = InstrumentRunner(cfg, contract, ticker, ldir, str(cfg_path))
         runner.state.load(runner.label)
+
+        # Cohort tracking fields
+        cfg_content = cfg_path.read_text()
+        runner._config_hash = hashlib.sha256(cfg_content.encode()).hexdigest()[:16]
+        runner._session_id = getattr(main, '_session_id', str(uuid.uuid4())[:8])
+        runner._runtime_start = getattr(main, '_runtime_start', time.time())
+        runner._reconnected = getattr(main, '_is_reconnect', False)
+
         instruments.append(runner)
 
         itype = cfg.get("instrument_type", "?")
@@ -795,7 +833,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         inst.seed(ib)
         ib.sleep(0.5)  # rate-limit historical data requests
 
-    # ── Main loop ────────────────────────────────────────────
+    # ── Main loop ────────────────────────────���───────────────
     log.info("Starting main loop (Ctrl+C to stop)...")
     heartbeat_interval = 300  # log heartbeat every 5 min
     last_heartbeat = time.time()
@@ -885,11 +923,17 @@ def run_with_reconnect(
     max_retries = 200
     retry_delay = 10.0
 
+    # Generate session/cohort tracking once for entire session
+    main._session_id = str(uuid.uuid4())[:8]
+    main._runtime_start = time.time()
+    main._is_reconnect = False
+
     for attempt in range(max_retries):
         if attempt > 0:
             log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay:.0f}s...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 1.5, 120)  # cap at 2 min
+            main._is_reconnect = True  # mark subsequent attempts as reconnects
         else:
             retry_delay = 10.0
 
