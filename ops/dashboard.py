@@ -2494,7 +2494,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 </div><!-- end live-page -->
 
-<div id="ibkr-page" class="page-content">
+<div id="ibkr-page" class="page-content active">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
   <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR PAPER TRADING FLEET</h2>
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
@@ -2876,18 +2876,18 @@ async function loadIBKRFleet() {
 
     // Trades table
     const tradesDiv = document.getElementById('ibkr-trades-table');
-    let allTrades = [];
+    let tradeRows = [];
     for (const r of data.runners) {
-      for (const t of (r.trades || [])) { allTrades.push({...t, runner: r.name, unit: r.unit}); }
+      for (const t of (r.trades || [])) { tradeRows.push({...t, runner: r.name, unit: r.unit}); }
     }
-    allTrades.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+    tradeRows.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
-    if (allTrades.length === 0) {
+    if (tradeRows.length === 0) {
       tradesDiv.innerHTML = '<div style="color:#666;">No trades yet. Waiting for triggers during active sessions.</div>';
     } else {
       let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;font-size:0.9em;">' +
         '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Dur</th></tr>';
-      for (const t of allTrades.slice(0, 25)) {
+      for (const t of tradeRows.slice(0, 25)) {
         const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
         const pc = pnl >= 0 ? '#00ff88' : '#ff4444';
         const dc = t.direction === 'long' ? '#00ff88' : '#ff4444';
@@ -5255,8 +5255,14 @@ async function loadLeaderboard() {
 }
 
 // Init — IBKR Fleet is the primary dashboard
-loadIBKRFleet();
-setInterval(loadIBKRFleet, 10000);
+try {
+  loadIBKRFleet();
+  setInterval(loadIBKRFleet, 10000);
+  console.log('IBKR Fleet initialized');
+} catch(e) {
+  console.error('IBKR init error:', e);
+  document.getElementById('ibkr-runner-cards').innerHTML = '<div style="color:red;padding:20px;">Dashboard JS error: ' + e.message + '</div>';
+}
 
 // PWA Service Worker registration
 if ('serviceWorker' in navigator) {
@@ -5264,6 +5270,18 @@ if ('serviceWorker' in navigator) {
     console.log('SW registered, scope:', reg.scope);
   }).catch(err => console.warn('SW registration failed:', err));
 }
+</script>
+<script>
+// Fallback init — runs even if main script has errors
+window.addEventListener('load', function() {
+  if (typeof loadIBKRFleet === 'function') {
+    try { loadIBKRFleet(); } catch(e) { console.error('Fleet load error:', e); }
+  } else {
+    // loadIBKRFleet not defined — main script failed to parse
+    var cards = document.getElementById('ibkr-runner-cards');
+    if (cards) cards.innerHTML = '<div style="color:#ff4444;padding:20px;">Dashboard script error — check browser console (F12)</div>';
+  }
+});
 </script>
 </body>
 </html>"""
