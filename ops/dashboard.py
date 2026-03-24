@@ -1754,6 +1754,9 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "entry_price": 0,
         "signal_count": 0,
         "closed_trades": 0,
+        "valid_trades": 0,
+        "invalid_trades": 0,
+        "invalid_rate": 0,
         "trades": [],
         "recent_signals": [],
         # Feature gauges (latest values)
@@ -1882,10 +1885,19 @@ def _read_ibkr_runner(runner: dict) -> dict:
             result["closed_trades"] = len(rows)
             result["trades"] = rows[-20:]
 
-            if rows:
-                pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
+            # Split valid vs invalid trades
+            valid_rows = [r for r in rows if r.get("experiment_valid", "").lower() == "true"]
+            invalid_rows = [r for r in rows if r.get("experiment_valid", "").lower() != "true"]
+            result["valid_trades"] = len(valid_rows)
+            result["invalid_trades"] = len(invalid_rows)
+            result["invalid_rate"] = round(len(invalid_rows) / len(rows), 4) if rows else 0
+
+            # Performance metrics from VALID trades only
+            metric_rows = valid_rows if valid_rows else []
+            if metric_rows:
+                pnl_field = "pnl_pips" if "pnl_pips" in metric_rows[0] else "pnl_pts"
                 pnls = []
-                for r in rows:
+                for r in metric_rows:
                     try:
                         pnls.append(float(r.get(pnl_field, 0)))
                     except (ValueError, TypeError):
@@ -1900,7 +1912,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
                 sum_losses = abs(sum(losses))
                 result["profit_factor"] = round(sum_wins / sum_losses, 2) if sum_losses > 0 else 0
 
-                # Max consecutive losses
+                # Max consecutive losses (valid only)
                 max_cl = 0
                 cl = 0
                 for p in pnls:
@@ -1911,16 +1923,16 @@ def _read_ibkr_runner(runner: dict) -> dict:
                         cl = 0
                 result["max_consec_loss"] = max_cl
 
-                # Equity curve (cumulative PnL)
+                # Equity curve from valid trades only
                 cum = 0
                 curve = []
-                for r in rows:
+                for r in metric_rows:
                     try:
                         cum += float(r.get(pnl_field, 0))
                     except (ValueError, TypeError):
                         pass
                     curve.append(round(cum, 2))
-                result["equity_curve"] = curve[-50:]  # last 50 points
+                result["equity_curve"] = curve[-50:]
         except Exception:
             pass
 
