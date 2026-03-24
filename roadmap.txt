@@ -205,64 +205,78 @@ Rules:
     - Kraken BTC perpetuals (Cascade engine): killed, precursors killed
     - All crypto-venue strategies at current fee structures
 
-  ### Active strategies (all in PAPER phase):
+  ### Active Fleet (17 runners, all PAPER phase, live data via U24860535):
 
-    EUR/USD T4:
-      Status: PAPER
-      Edge: +0.98 pip/trade expectancy
-      Stress: 7/7 suite pass
-      Payoff Contract: PASS
-      Cost model: < 1bps RT (IBKR FX)
+    FX Majors (5 runners):
+      EUR/USD T4       clientId=10  +0.98 pip/trade  7/7 stress  Day1: +9.1pip
+      GBP/USD range    clientId=12  +0.97 pip/trade  7/7 stress  Day1: +53.4pip (star)
+      GBP/JPY T4       clientId=13  +3.22 bps/trade  backtested  Collecting data
+      AUD/USD NY       clientId=14  +1.08 bps/trade  backtested  Collecting data
+      USD/JPY NY       clientId=15  +0.65 bps/trade  backtested  Collecting data
 
-    MNQ vol_burst:
-      Status: PAPER
-      Edge: +6.41 bps/trade expectancy
-      Stress: 7/7 suite pass
-      Payoff Contract: PASS
-      Cost model: ~3bps RT (IBKR futures)
-      Note: using delayed data (15min lag). CME real-time subscription pending.
+    FX Crosses (3 runners):
+      EUR/JPY T4       clientId=18  Collecting data (no backtest yet)
+      AUD/JPY T4       clientId=19  Collecting data
+      CAD/JPY T4       clientId=20  Collecting data
 
-    GBP/USD range:
-      Status: PAPER
-      Edge: +0.97 pip/trade expectancy
-      Stress: 7/7 suite pass
-      Payoff Contract: PASS
-      Cost model: < 1bps RT (IBKR FX)
+    Index Futures (4 runners):
+      MNQ vol_burst    clientId=11  +6.41 bps/trade  7/7 stress  Day1: -128pts
+      MES vol_burst    clientId=16  +2.23 bps/trade  backtested  Collecting data
+      MYM vol_burst    clientId=17  Collecting data
+      M2K vol_burst    clientId=23  Collecting data (Russell 2000)
 
-  ### Correlation note:
-    EUR/USD + GBP/USD are correlated USD pairs. Per Global Risk Budget,
-    they count as 1.5 systems and share a combined drawdown limit.
+    Commodities (2 runners):
+      MGC vol_burst    clientId=21  Collecting data (Micro Gold)
+      MCL vol_burst    clientId=22  Collecting data (Micro Oil)
 
-## IBKR Execution Recovery
+    Other (1 runner):
+      NKD vol_burst    clientId=24  Collecting data (Nikkei, Asia session)
 
-  Needed (NOT YET BUILT for IBKR):
-    - State files (position, pending orders, trade context)
-    - Crash restart with position reconciliation
-    - Fill backfill on reconnect
-    - Stale order detection and cleanup
+    Crypto (2 runners — need Paxos subscription):
+      BTC range        clientId=25  Needs market data subscription
+      ETH range        clientId=26  Needs market data subscription
+
+  ### Cost models:
+    FX:         < 1bps round trip
+    Futures:    ~3bps round trip (~$0.62/micro contract)
+    Commodities: ~3bps round trip
+    Crypto:     12-18bps round trip (IBKR Paxos)
+
+  ### Correlation groups:
+    USD pairs: EUR/USD + GBP/USD + AUD/USD (count as 1.5 systems)
+    JPY crosses: EUR/JPY + AUD/JPY + CAD/JPY + GBP/JPY (yen-correlated)
+    US indices: MNQ + MES + MYM + M2K (highly correlated)
 
 ## IBKR Infrastructure
 
-  Account: DUP472829 (paper)
-  Gateway: TWS Gateway, port 4002
+  Live Account: U24860535 (real-time data, Read-Only API enabled for safety)
+  Paper Account: DUP472829 (backup)
+  Gateway: TWS Gateway, port 4001 (live), auto-restart 11:45 PM ET
+  Runners simulate positions internally (state.json) — no real orders placed
 
-  Runners:
-    runner_eurusd.py   (clientId=10)
-    runner_mnq.py      (clientId=11)
-    runner_gbpusd.py   (clientId=12)
+  Runner types:
+    runner_eurusd.py          (EUR/USD specific)
+    runner_gbpusd.py          (GBP/USD specific)
+    runner_mnq.py             (MNQ specific)
+    runner_fx_generic.py      (any FX pair via --pair + --config)
+    runner_futures_generic.py (any futures via --symbol + --exchange + --expiry)
+    runner_crypto_ibkr.py     (BTC/ETH via IBKR Paxos)
 
-  Configs: argus_flow/configs/*.json (versioned, per-strategy)
-  Logs:    argus_flow/logs/{eurusd,mnq,gbpusd}/
+  Configs: argus_flow/configs/*.json (17 versioned configs)
+  Logs:    argus_flow/logs/{symbol}/
 
-  Ops tools:
-    smoke_test.py    -- connection + order placement verification
-    health_check.py  -- runner liveness + position consistency
-    launch_all.ps1   -- start all runners with correct clientIds
-
-  MNQ data note:
-    Currently using delayed (15-minute) data. CME Level 1 subscription
-    pending. Strategy logic accounts for delay but live execution will
-    require real-time feed.
+  Ops tools (all built):
+    smoke_test.py        -- pre-launch 7-point verification
+    health_check.py      -- fleet status overview
+    heartbeat_monitor.py -- 17-runner alive/dead check
+    position_monitor.py  -- IBKR position reconciliation
+    divergence_guard.py  -- replay vs live comparison
+    correlation_guard.py -- USD pair exposure limit
+    daily_report.py      -- daily P&L and metrics
+    discord_alerts.py    -- trade notifications
+    config_check.py      -- config validation + hash
+    refresh_ibkr_data.py -- pull latest historical bars
+    launch_all.ps1       -- fleet launcher with pre/post checks
 
 ---
 
