@@ -8,111 +8,95 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Python venv:** `C:\Argus\.venv\Scripts\python.exe`
 - All commands must be run from `C:\Argus\repo` as the working directory.
 
-## Common Commands
+## Current Architecture: IBKR FX Unified Runner
 
-**Run backtest (single run):**
+The active trading system is `argus_flow/runner_unified.py` — a single-process, single-connection runner managing 3 FX pairs via Interactive Brokers TWS.
+
+**Active cohort (Class A):** GBP/USD, EUR/USD, EUR/JPY
+**Connection:** TWS port 7496, account U24860535, Read-Only API
+**Goal:** 30 valid trades per pair for promotion to micro-live
+
+### Common Commands
+
+**Launch unified runner (preferred — use PowerShell to avoid zombie processes):**
+```powershell
+Start-Process -FilePath 'C:\Argus\.venv\Scripts\python.exe' -ArgumentList '-m','argus_flow.runner_unified','--configs','argus_flow/configs/gbpusd_range_paper_v1.json','argus_flow/configs/eurusd_t4_paper_v1.json','argus_flow/configs/eurjpy_t4_paper_v1.json' -WorkingDirectory 'C:\Argus\repo' -WindowStyle Hidden
+```
+
+**Run cohort compliance report:**
+```
+C:\Argus\.venv\Scripts\python.exe -m argus_flow.ops.daily_report
+```
+
+**Run position monitor:**
+```
+C:\Argus\.venv\Scripts\python.exe -m argus_flow.ops.position_monitor
+```
+
+**Run fault injection tests:**
+```
+C:\Argus\.venv\Scripts\python.exe -m argus_flow.tests.test_unified_faults
+```
+
+### Key Files (IBKR FX System)
+
+| File | Purpose |
+|------|---------|
+| `argus_flow/runner_unified.py` | Unified multi-instrument runner (main entry point) |
+| `argus_flow/schemas.py` | Canonical signal/trade CSV column definitions |
+| `argus_flow/configs/*.json` | Per-instrument strategy configs |
+| `argus_flow/COHORT_SPEC.md` | Cohort governance rules |
+| `argus_flow/ops/daily_report.py` | Cohort compliance report |
+| `argus_flow/ops/position_monitor.py` | Broker vs runner state reconciliation |
+| `ops/dashboard.py` | Web dashboard (FastAPI) |
+| `ops/run_cohort_report.ps1` | Nightly Task Scheduler wrapper |
+
+### Artifact Locations
+
+Per-instrument logs: `argus_flow/logs/<symbol>/`
+- `state.json` — position persistence
+- `signals.csv` — all signal evaluations
+- `trades.csv` — closed trades with validity metadata
+- `heartbeat.json` — runner liveness (pid, mode, broker status)
+- `incidents/*.json` — reconciliation/quarantine incident artifacts
+
+### Cohort Rules (DO NOT VIOLATE)
+
+1. **Do not modify trade logic** while cohort is running — resets the 30-trade count
+2. **Do not modify config files** — frozen per COHORT_SPEC.md
+3. Every trade carries: `experiment_valid`, `invalid_reason`, `config_hash`, `session_id`, `runtime_epoch`, `git_sha`
+4. Dashboard metrics use valid trades only
+
+## Legacy Code (Archived)
+
+The following systems are **archived** in `archive/` — not actively used:
+
+- **Coinbase crypto** (`feed_coinbase.py`, `feed_ws.py`) — killed due to 60bps fees
+- **BTC/ETH correlation** (`btc_momentum_guard.py`, `correlation_guard.py`) — crypto multi-coin only
+- **Kraken research** (`argus_flow/capture/kraken_*.py`) — BTC spot research closed
+- **Coin rotation** (`ops/coin_rotation.py`, `ops/rotate_coin.py`) — crypto multi-coin only
+- **Batch builders** (`ops/_build_batch*.py`) — historical backtest queue definitions
+
+`engine.py` and `runner_live.py` still exist for the backtest system but are NOT used for live trading. The active live system is `argus_flow/runner_unified.py`.
+
+## Backtest System (Legacy Coinbase — still functional)
+
+**Run backtest:**
 ```
 C:\Argus\.venv\Scripts\python.exe -m backtest.runner
 ```
 
-**Run backtest with full validation + determinism check (preferred):**
+**With full validation:**
 ```powershell
 .\ops\run_backtest.ps1
 ```
 
-**Run Gate A Phase 8 acceptance harness:**
-```powershell
-.\ops\test_gate_a_phase8.ps1
-```
-
-**Run live loop:**
-```
-C:\Argus\.venv\Scripts\python.exe .\runner_live.py
-```
-
-**Debug single engine step:**
-```
-C:\Argus\.venv\Scripts\python.exe .\_debug_step.py
-```
-
-**Download candles data:**
-```
-C:\Argus\.venv\Scripts\python.exe -m backtest.download_candles
-```
-
-## Architecture
-
-### High-Level Call Graph
-
-**Backtest flow:**
-`backtest/runner.py` → `config.load_config()` → `state.BotState.from_config(cfg)` → `backtest/loader.py` (CSV) → `backtest/feed.py` (tick stream) → `engine.step()` per tick → `io_logs` (sandboxed artifact writes) → `backtest/results.py` (metrics + invariants)
-
-**Live flow:**
-`runner_live.py` → `feed_coinbase.py` (Coinbase HTTP) → `engine.step()` → `io_logs` (live artifact writes) → `notify.py` (Discord hooks)
-
-### Ownership Boundaries (critical — do not violate)
-
-| Module | Owns |
-|--------|------|
-| `config.py` | All config defaults + env overrides. Single call to `load_config()` at startup. |
-| `state.py` (`BotState`) | All sub-engine instances (strategy, confluence, regime, structure, liquidity, risk, ledger) and all caches (`last_st_*`, cooldown epoch, etc.) |
-| `engine.py` (`step()`) | Decision orchestration, TF snapshot assembly, event emission. Does NOT own execution or exchange state. |
-| `decisions.py` | `DecisionSnapshot` and `EngineEvent` schemas — the stable field contract for signals and events. |
-| `io_logs.py` | **Only allowed** CSV/artifact writer. Owns schema headers, row mapping, path resolution, sandbox enforcement, pause/kill switch checks. |
-| `backtest/results.py` | All attempt accounting, invariant checks, summary metrics. |
-
-### Subsystem modules (market logic — all owned by BotState)
-`strategy_phase2.py`, `confluence.py`, `adaptive_confluence.py`, `regime.py`, `structure.py`, `liquidity.py`, `session.py`, `risk.py`, `ledger.py`, `indicators.py`, `candles.py`
-
-### Artifact Contract
-
-All artifacts land in `C:\Argus\repo\ops\logs\` with run-scoped names:
-- `bt_events_<run_id>.csv`, `bt_signals_<run_id>.csv`, `equity_<run_id>.csv`, `trades_<run_id>.csv`, `bt_summary_<run_id>.json`
-- `bt_summary_latest.json` — pointer overwritten each run (must match newest `run_id`)
-
-Live artifacts (append-only, never touched by backtest):
-- `live_events.csv`, `live_signals.csv`
-
-### Backtest EXECUTION_MODE Rule (non-negotiable)
-
-`_ensure_bt_cfg()` in `backtest/runner.py` forces `cfg["EXECUTION_MODE"] = "ENGINE"` regardless of `.env`. This is intentional and must not be removed. In ADAPTER mode the engine emits intents but never calls `ledger.buy()` — the fill-back loop lives in `runner_live.py`, which doesn't run during backtest. Without this override, the ledger never updates and the engine re-enters on every eligible tick.
-
-Live mode uses `EXECUTION_MODE=ADAPTER` (set in `.env`). Backtest always uses ENGINE.
-
-### Sandbox Rule (non-negotiable)
-
-Backtest must never write to `live_events.csv` or `live_signals.csv`. Enforced by setting env vars before importing `io_logs`:
-```python
-LIVE_EVENTS_CSV  = .../bt_sandbox_live_events.csv
-LIVE_SIGNALS_CSV = .../bt_sandbox_live_signals.csv
-ARGUS_DISABLE_LIVE_ARTIFACTS = "1"
-```
-`backtest/runner.py` sets these at module load time before any other imports. Do not reorder those early-init blocks.
-
-### Attempt Accounting Invariants
-
-These must hold after every backtest run (enforced by `backtest/results.py`):
-- `entry_attempts == entry_filled + entry_blocked_total`
-- `entry_attempt_gap == 0`
-- `attempt_invariants_ok == True`
-- `ENTRY_ATTEMPT` and `ENTRY_METRICS` events are debug-only — must not be counted as attempt outcomes
-
-### Phase 8 Execution Layer
-
-Live loop uses `EXECUTION_MODE=ADAPTER` + `PaperAdapter`. Key artifacts written to `ops\logs\`:
-- `fills.csv`, `orders.csv`, `order_events.csv`, `positions.csv`, `account.csv` — adapter execution truth
-- `recovery_<run_id>.json` — startup reconciliation report (fields: `ok`, `bot_state`, `source_of_truth`, `position_qty`)
-- `state/runtime_state_ETH_USD.json` — crash-safe runtime snapshot (written on every loop + shutdown)
-
-Recovery precedence: `fills.csv` → `positions.csv` → snapshot. Canonical truth always wins over snapshot.
-
-Shell env hygiene: if `ARGUS_BT_ARTIFACT_DIR` is set in the shell from a prior run, backtest artifacts go to the wrong directory. Use `.\ops\run_backtest.ps1` (which calls `Reset-ArgusEnv`) for canonical validation, or `unset ARGUS_BT_ARTIFACT_DIR` before direct invocation.
-
-### Key Config Env Vars
-
-Config is loaded from `.env` in repo root (or path in `DOTENV_PATH`). Mode flag `ARGUS_MODE` controls backtest vs live behavior. `BACKTEST_LIMIT` controls how many candles to run (default `720`). `EXECUTION_MODE=ADAPTER` enables Phase 8 paper adapter for live; backtest ignores this.
+### Backtest Rules
+- `_ensure_bt_cfg()` forces `EXECUTION_MODE=ENGINE` (non-negotiable)
+- Backtest must never touch `live_events.csv` / `live_signals.csv` (sandbox enforced)
+- `ARGUS_BT_ARTIFACT_DIR` env var can override artifact dir — use `run_backtest.ps1` which cleans this
 
 ## Data
 
-Historical candle CSV: `C:\Argus\repo\data\eth_usd_1m.csv`
-Overridable via `BACKTEST_CSV` env var.
+- Historical crypto candles: `data/eth_usd_1m.csv`, `data/btc_usd_1m_90d.csv`
+- IBKR FX data: streamed live via TWS (no historical CSV needed)

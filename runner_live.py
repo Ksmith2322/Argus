@@ -31,7 +31,10 @@ if __package__ in (None, ""):
 # line above: from config import load_config
 from config import load_config
 from feed_coinbase import make_http, fetch_spot_price, preload_indicator_history
-from feed_ws import CoinbaseWsFeed
+try:
+    from feed_ws import CoinbaseWsFeed
+except ImportError:
+    CoinbaseWsFeed = None  # archived — IBKR unified runner is the active system
 from io_logs import (
     ensure_logs,
     ensure_signals_header_matches_file,

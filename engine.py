@@ -28,9 +28,18 @@ from session import classify_session, apply_session_to_score
 # ML Governor (Phase ML-1)
 import ml_governor
 
-# Cross-Coin Correlation Guard
-from correlation_guard import can_enter_cross_coin
-from btc_momentum_guard import check_btc_momentum, write_btc_trend_state, write_eth_trend_state, read_eth_lag_delta
+# Cross-Coin Correlation Guard (legacy crypto — archived, safe fallbacks)
+try:
+    from correlation_guard import can_enter_cross_coin
+except ImportError:
+    def can_enter_cross_coin(*a, **kw): return True
+try:
+    from btc_momentum_guard import check_btc_momentum, write_btc_trend_state, write_eth_trend_state, read_eth_lag_delta
+except ImportError:
+    def check_btc_momentum(*a, **kw): return "NEUTRAL"
+    def write_btc_trend_state(*a, **kw): pass
+    def write_eth_trend_state(*a, **kw): pass
+    def read_eth_lag_delta(*a, **kw): return 0.0
 
 
 def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
