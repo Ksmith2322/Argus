@@ -1,0 +1,241 @@
+"""Artifact Consistency & Staleness Checker.
+
+Checks intra-runner artifact consistency (state vs trades, config hashes)
+and liveness (signal/heartbeat freshness). Also checks governance-surface
+artifacts (evidence registry, promotion gate report).
+
+This is NOT a full truth-reconciliation system. It checks whether local
+artifacts agree with each other. It does not reconcile against broker truth
+(that is position_monitor.py's job).
+
+Exit codes:
+  0 = CLEAN (all checks pass)
+  1 = WARN (staleness or advisory issues)
+  2 = FAIL (divergence or corruption detected)
+
+Usage:
+    python -m argus_flow.ops.artifact_divergence
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+RUNNERS = [
+    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "pip_tolerance": 0.1},
+    {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "pip_tolerance": 0.1},
+    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "pip_tolerance": 0.5},
+]
+
+STALE_THRESHOLD_S = 300  # 5 minutes
+HEARTBEAT_STALE_S = 600  # 10 minutes
+
+# Severity levels (structured, not string-based)
+INFO = "INFO"
+WARN = "WARN"
+FAIL = "FAIL"
+
+
+def _check(name: str, passed: bool, detail: str, severity: str = FAIL) -> dict:
+    return {"name": name, "passed": passed, "detail": detail, "severity": severity}
+
+
+def check_runner(runner: dict) -> dict:
+    log_dir = REPO / runner["log_dir"]
+    result = {"name": runner["name"], "symbol": runner["symbol"], "status": "CLEAN", "checks": [], "max_severity": INFO}
+
+    state_file = log_dir / "state.json"
+    trade_file = log_dir / "trades.csv"
+    signal_file = log_dir / "signals.csv"
+    registry_file = log_dir / "evidence_registry.json"
+
+    state_pos = "UNKNOWN"
+    state_pnl = 0
+    state_trades = 0
+
+    # ── Consistency checks (FAIL severity) ────────────────────
+
+    # Check 1: State file readable
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text())
+            state_pos = state.get("position", "UNKNOWN")
+            state_pnl = state.get("pnl_pips", state.get("pnl_points", 0))
+            state_trades = state.get("trade_count", 0)
+            result["checks"].append(_check("state_readable", True, f"position={state_pos}", INFO))
+        except (json.JSONDecodeError, OSError) as e:
+            result["checks"].append(_check("state_readable", False, f"corrupt: {e}", FAIL))
+    else:
+        # Missing state is WARN if heartbeat exists (runner should have state), INFO otherwise
+        hb = log_dir / "heartbeat.json"
+        if hb.exists():
+            result["checks"].append(_check("state_readable", False, "state.json missing but runner has heartbeat", WARN))
+        else:
+            result["checks"].append(_check("state_readable", True, "no state file (runner not started)", INFO))
+
+    # Check 2: Trade count consistency
+    csv_trade_count = 0
+    csv_pnl = 0
+    if trade_file.exists():
+        try:
+            with open(trade_file) as f:
+                rows = list(csv.DictReader(f))
+            csv_trade_count = len(rows)
+            pnl_field = "pnl_pips" if rows and "pnl_pips" in rows[0] else "pnl_pts"
+            csv_pnl = sum(float(r.get(pnl_field, 0)) for r in rows)
+        except Exception as e:
+            result["checks"].append(_check("trade_file_readable", False, str(e), FAIL))
+
+    if state_file.exists() and trade_file.exists():
+        if state_trades != csv_trade_count:
+            result["checks"].append(_check("trade_count_match", False,
+                f"state={state_trades} vs csv={csv_trade_count}", FAIL))
+        else:
+            result["checks"].append(_check("trade_count_match", True, f"{state_trades} trades", INFO))
+
+    # Check 3: P&L consistency (instrument-specific tolerance)
+    pnl_tol = runner.get("pip_tolerance", 0.1)
+    if state_file.exists() and trade_file.exists() and csv_trade_count > 0:
+        pnl_diff = abs(state_pnl - csv_pnl)
+        if pnl_diff > pnl_tol:
+            result["checks"].append(_check("pnl_match", False,
+                f"state={state_pnl:.2f} vs csv_sum={csv_pnl:.2f} (diff={pnl_diff:.2f}, tol={pnl_tol})", FAIL))
+        else:
+            result["checks"].append(_check("pnl_match", True, f"diff={pnl_diff:.4f} (tol={pnl_tol})", INFO))
+
+    # Check 4: Config hash consistency
+    cfg_path = REPO / runner["config"]
+    hashes_path = REPO / "argus_flow" / "configs" / "hashes.json"
+    if cfg_path.exists() and hashes_path.exists():
+        try:
+            cfg_hash = hashlib.sha256(cfg_path.read_text().encode()).hexdigest()[:16]
+            hashes = json.loads(hashes_path.read_text())
+            expected = hashes.get(cfg_path.name, "")
+            if cfg_hash != expected:
+                result["checks"].append(_check("config_hash", False,
+                    f"computed={cfg_hash} vs hashes.json={expected}", FAIL))
+            else:
+                result["checks"].append(_check("config_hash", True, cfg_hash, INFO))
+        except Exception as e:
+            result["checks"].append(_check("config_hash", False, str(e), FAIL))
+
+    # ── Liveness checks (WARN severity) ──────────────────────
+
+    # Check 5: Signal freshness
+    now_utc = datetime.now(timezone.utc)
+    if signal_file.exists():
+        sig_age = time.time() - signal_file.stat().st_mtime
+        if sig_age > STALE_THRESHOLD_S:
+            result["checks"].append(_check("signal_freshness", False,
+                f"signal file {sig_age:.0f}s old (>{STALE_THRESHOLD_S}s)", WARN))
+        else:
+            result["checks"].append(_check("signal_freshness", True, f"{sig_age:.0f}s old", INFO))
+
+    # Check 6: Heartbeat freshness
+    hb_file = log_dir / "heartbeat.json"
+    if hb_file.exists():
+        hb_age = time.time() - hb_file.stat().st_mtime
+        if hb_age > HEARTBEAT_STALE_S:
+            result["checks"].append(_check("heartbeat_fresh", False,
+                f"heartbeat {hb_age:.0f}s old (>{HEARTBEAT_STALE_S}s)", WARN))
+        else:
+            result["checks"].append(_check("heartbeat_fresh", True, f"{hb_age:.0f}s old", INFO))
+
+    # ── Governance surface checks (WARN severity) ────────────
+
+    # Check 7: Evidence registry exists and is readable
+    if registry_file.exists():
+        try:
+            reg = json.loads(registry_file.read_text())
+            reg_trades = reg.get("cohort", {}).get("valid_trade_count", -1)
+            # Cross-check registry trade count vs trades.csv
+            if csv_trade_count > 0 and reg_trades >= 0:
+                valid_csv = sum(1 for r in rows if r.get("experiment_valid", "").lower() == "true") if trade_file.exists() else 0
+                if reg_trades != valid_csv:
+                    result["checks"].append(_check("registry_trade_count", False,
+                        f"registry={reg_trades} vs csv valid={valid_csv}", WARN))
+                else:
+                    result["checks"].append(_check("registry_trade_count", True,
+                        f"{reg_trades} valid trades", INFO))
+            result["checks"].append(_check("registry_readable", True, "evidence_registry.json valid", INFO))
+        except Exception as e:
+            result["checks"].append(_check("registry_readable", False, f"corrupt: {e}", WARN))
+    else:
+        result["checks"].append(_check("registry_readable", False,
+            "evidence_registry.json missing (run evidence_registry.py)", WARN))
+
+    # ── Determine overall status from structured severity ────
+    severities = [c["severity"] for c in result["checks"] if not c["passed"]]
+
+    if FAIL in severities:
+        result["status"] = "DIVERGENT"
+        result["max_severity"] = FAIL
+    elif WARN in severities:
+        result["status"] = "DEGRADED"
+        result["max_severity"] = WARN
+    else:
+        result["status"] = "CLEAN"
+        result["max_severity"] = INFO
+
+    return result
+
+
+def main():
+    print("=" * 65)
+    print(f"  Artifact Consistency Check -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+    print("=" * 65)
+
+    results = []
+    for runner in RUNNERS:
+        r = check_runner(runner)
+        results.append(r)
+
+        status_colors = {"CLEAN": "32", "DEGRADED": "33", "DIVERGENT": "31"}
+        color = status_colors.get(r["status"], "0")
+        print(f"\n  {r['name']:>10s}: \033[{color}m{r['status']}\033[0m")
+
+        for check in r["checks"]:
+            if check["passed"]:
+                icon = "\033[32mOK\033[0m"
+            elif check["severity"] == FAIL:
+                icon = "\033[31mFAIL\033[0m"
+            else:
+                icon = "\033[33mWARN\033[0m"
+            sev_tag = f" [{check['severity']}]" if check["severity"] != INFO else ""
+            print(f"    [{icon}] {check['name']}{sev_tag}: {check['detail']}")
+
+    # Overall
+    any_divergent = any(r["status"] == "DIVERGENT" for r in results)
+    any_degraded = any(r["status"] == "DEGRADED" for r in results)
+    overall = "DIVERGENT" if any_divergent else "DEGRADED" if any_degraded else "CLEAN"
+    oc = {"CLEAN": "32", "DEGRADED": "33", "DIVERGENT": "31"}.get(overall, "0")
+    print(f"\n  Overall: \033[{oc}m{overall}\033[0m")
+
+    # Save
+    out_path = REPO / "argus_flow" / "logs" / "artifact_divergence_report.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "overall": overall,
+        "runners": results,
+    }, indent=2, default=str))
+    print(f"  Saved: {out_path}")
+
+    # Exit code: 0=CLEAN, 1=DEGRADED, 2=DIVERGENT
+    if overall == "DIVERGENT":
+        sys.exit(2)
+    elif overall == "DEGRADED":
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

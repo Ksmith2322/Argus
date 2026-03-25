@@ -6,11 +6,62 @@ Set-Location "C:\Argus\repo"
 $logFile = "C:\Argus\repo\argus_flow\logs\cohort_report.log"
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
+# 1. Run cohort compliance report
 try {
-    $output = & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.daily_report 2>&1
-    $entry = "[$timestamp] $output"
+    $report = & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.daily_report 2>&1
+    Add-Content -Path $logFile -Value "[$timestamp] daily_report: $report"
 } catch {
-    $entry = "[$timestamp] ERROR: $_"
+    Add-Content -Path $logFile -Value "[$timestamp] daily_report ERROR: $_"
 }
 
-Add-Content -Path $logFile -Value $entry
+# 2. Run divergence guard
+try {
+    $div = & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.divergence_guard 2>&1
+    Add-Content -Path $logFile -Value "[$timestamp] divergence_guard: $div"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] divergence_guard ERROR: $_"
+}
+
+# 3. Run correlation guard
+try {
+    $corr = & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.correlation_guard 2>&1
+    Add-Content -Path $logFile -Value "[$timestamp] correlation_guard: $corr"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] correlation_guard ERROR: $_"
+}
+
+# 4. Run kill discipline + promotion gate + artifact divergence
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.kill_discipline 2>&1 | Out-Null
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.promotion_gate 2>&1 | Out-Null
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.artifact_divergence 2>&1 | Out-Null
+    Add-Content -Path $logFile -Value "[$timestamp] governance checks complete"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] governance checks ERROR: $_"
+}
+
+# 5. Generate canonical evidence registry (must run AFTER all governance reports)
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.evidence_registry 2>&1 | Out-Null
+    Add-Content -Path $logFile -Value "[$timestamp] evidence registry generated"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] evidence registry ERROR: $_"
+}
+
+# 6. Alert escalation (checks all reports, sends Discord if issues found)
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.alert_escalation 2>&1 | Out-Null
+    Add-Content -Path $logFile -Value "[$timestamp] alert escalation complete"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] alert escalation ERROR: $_"
+}
+
+# 7. Send Discord summary
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.discord_alerts --summary 2>&1
+    Add-Content -Path $logFile -Value "[$timestamp] Discord summary sent"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] Discord summary ERROR: $_"
+}
+
+Add-Content -Path $logFile -Value "[$timestamp] === Nightly cohort report complete ==="

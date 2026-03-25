@@ -100,6 +100,8 @@ class State:
         self.direction_str = ""  # "long" or "short" for logging
         self.restored_this_session = False  # True if loaded from file
         self.had_zero_stops = False  # True if stop/target were 0 at any point
+        self.pyramid_adds = 0        # Number of scale-in adds this trade
+        self.avg_entry_price = 0.0   # Volume-weighted average entry price
 
     def save(self) -> None:
         self.file.write_text(json.dumps({
@@ -112,6 +114,8 @@ class State:
             "trade_count": self.trade_count,
             "pnl_pips": self.pnl_pips,
             "pnl_points": self.pnl_points,
+            "pyramid_adds": self.pyramid_adds,
+            "avg_entry_price": self.avg_entry_price,
         }, indent=2))
 
     def load(self, sym_label: str) -> None:
@@ -129,6 +133,8 @@ class State:
         self.trade_count = d.get("trade_count", 0)
         self.pnl_pips = d.get("pnl_pips", 0.0)
         self.pnl_points = d.get("pnl_points", 0.0)
+        self.pyramid_adds = d.get("pyramid_adds", 0)
+        self.avg_entry_price = d.get("avg_entry_price", 0.0)
         if d.get("entry_time"):
             try:
                 self.entry_time = datetime.fromisoformat(d["entry_time"])
@@ -139,9 +145,16 @@ class State:
                 self.timeout_time = datetime.fromisoformat(d["timeout_time"])
             except (ValueError, TypeError):
                 pass
-        # Safety: if restored in-position but stops are zero, force FLAT
+        # Safety: if restored in-position but stops are zero, force FLAT locally.
+        # WARNING: This is a LOCAL-ONLY override. If broker has a real position,
+        # this creates a phantom mismatch that reconciliation MUST catch.
+        # The runner will log this as had_zero_stops=True for trade validity.
         if self.position != "FLAT" and (self.stop_price == 0 or self.target_price == 0):
-            log.warning(f"[{sym_label}] Restored {self.position} but stop/target=0 — forcing FLAT")
+            log.warning(
+                f"[{sym_label}] Restored {self.position} but stop/target=0 — forcing FLAT (LOCAL ONLY). "
+                f"If broker has a real position, reconciliation will flag PHANTOM mismatch."
+            )
+            self.had_zero_stops = True
             self.position = "FLAT"
         # Safety: if restored in-position but timeout missing, mark invalid
         if self.position != "FLAT" and self.timeout_time is None:
@@ -350,6 +363,14 @@ class InstrumentRunner:
         # Uses pips (FX) or bps (futures/crypto)?
         self.uses_pips = self.instrument_type == "forex" and self.stop_pips > 0
 
+        # Pyramiding / scale-in (opt-in, defaults OFF — does not affect cohort)
+        pyramid = config.get("pyramid", {})
+        self.pyramid_enabled = pyramid.get("enabled", False)
+        self.pyramid_trigger_pips = pyramid.get("trigger_pips", 0)   # FX: add when price moves N pips in our favor
+        self.pyramid_trigger_bps = pyramid.get("trigger_bps", 0)     # Futures: add when price moves N bps in our favor
+        self.pyramid_max_adds = pyramid.get("max_adds", 1)           # Max scale-in entries (1 = double position)
+        self.pyramid_move_stop_breakeven = pyramid.get("move_stop_breakeven", True)  # Move stop to avg entry on add
+
         # Futures multiplier
         self.multiplier = 1.0
         if hasattr(contract, "multiplier") and contract.multiplier:
@@ -516,6 +537,55 @@ class InstrumentRunner:
         else:
             return entry_px + stop_dist, entry_px - target_dist
 
+    # ── Pyramiding / scale-in ────────────────────────────────
+    def _check_pyramid(self, mid: float, now: datetime) -> None:
+        """Check if we should add to the current position (scale-in on strength)."""
+        if not self.pyramid_enabled:
+            return
+        s = self.state
+        if s.pyramid_adds >= self.pyramid_max_adds:
+            return
+
+        # Compute how far price has moved in our favor
+        if self.uses_pips:
+            trigger_dist = self.pyramid_trigger_pips * self.pip_size
+        else:
+            trigger_dist = s.entry_price * (self.pyramid_trigger_bps / 10000)
+
+        if trigger_dist <= 0:
+            return
+
+        if s.position == "LONG":
+            favorable_move = mid - s.entry_price
+        else:  # SHORT
+            favorable_move = s.entry_price - mid
+
+        if favorable_move < trigger_dist:
+            return
+
+        # Scale-in: add to position
+        old_entry = s.entry_price
+        # Average entry: equal-weight average of original + add
+        n_entries = s.pyramid_adds + 1  # entries so far (original + prior adds)
+        s.avg_entry_price = (old_entry * n_entries + mid) / (n_entries + 1)
+        s.pyramid_adds += 1
+
+        # Move stop to breakeven (avg entry) if configured
+        if self.pyramid_move_stop_breakeven and s.avg_entry_price > 0:
+            if s.position == "LONG":
+                new_stop = s.avg_entry_price - (1 * self.pip_size if self.uses_pips else 0)
+                s.stop_price = max(s.stop_price, new_stop)  # only tighten, never loosen
+            else:
+                new_stop = s.avg_entry_price + (1 * self.pip_size if self.uses_pips else 0)
+                s.stop_price = min(s.stop_price, new_stop)  # only tighten, never loosen
+
+        s.save()
+        self._log.info(
+            f"PYRAMID ADD #{s.pyramid_adds} {s.position} @ {mid:.5f} "
+            f"avg_entry={s.avg_entry_price:.5f} "
+            f"new_stop={s.stop_price:.5f}"
+        )
+
     # ── Main tick (called every second) ──────────────────────
     def tick(self, now: datetime) -> None:
         """Process one tick: update bar, check exits, evaluate signals."""
@@ -586,7 +656,12 @@ class InstrumentRunner:
                 s.position = "FLAT"
                 s.entry_time = None
                 s.timeout_time = None
+                s.pyramid_adds = 0
+                s.avg_entry_price = 0.0
                 s.save()
+            else:
+                # ── Pyramiding: scale-in on confirmed move ────
+                self._check_pyramid(mid, now)
             return  # don't evaluate new signals while in position
 
         # ── Signal evaluation (once per new bar, when FLAT) ──
@@ -621,6 +696,8 @@ class InstrumentRunner:
 
             s.position = direction.upper()
             s.entry_price = entry_px
+            s.avg_entry_price = entry_px
+            s.pyramid_adds = 0
             s.entry_time = now
             s.stop_price = stop_px
             s.target_price = target_px

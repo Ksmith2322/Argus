@@ -17,8 +17,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 RUNNERS = [
     {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "unit": "pips"},
-    {"name": "MNQ", "symbol": "MNQ", "log_dir": "argus_flow/logs/mnq", "config": "argus_flow/configs/mnq_vol_burst_paper_v1.json", "unit": "bps"},
     {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "unit": "pips"},
+    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "unit": "pips"},
 ]
 
 

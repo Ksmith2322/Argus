@@ -226,25 +226,23 @@ def generate_report() -> dict:
             r["wr_delta_vs_replay"] = round(wr_delta, 3)
             r["wr_within_15pp"] = wr_delta <= 0.15
 
-        # Promotion eligibility
-        r["promotion_eligible"] = (
-            r["valid_trades"] >= PROMOTION_THRESHOLD
-            and r["invalid_rate"] <= INVALIDITY_RATE_MAX
-            and r["config_hash_consistent"]
-            and r["git_sha_consistent"]
-            and r["valid_metrics"]["expectancy"] > 0
-            and not window_check["triggered"]
-        )
-        if r["valid_trades"] < PROMOTION_THRESHOLD:
-            r["promotion_blocker"] = f"need {PROMOTION_THRESHOLD - r['valid_trades']} more valid trades"
-        elif r["invalid_rate"] > INVALIDITY_RATE_MAX:
-            r["promotion_blocker"] = f"invalid rate {r['invalid_rate']:.1%} > {INVALIDITY_RATE_MAX:.0%}"
-        elif not r["config_hash_consistent"]:
-            r["promotion_blocker"] = "config hash changed mid-cohort"
-        elif r["valid_metrics"]["expectancy"] <= 0:
-            r["promotion_blocker"] = f"negative expectancy ({r['valid_metrics']['expectancy']})"
-        else:
-            r["promotion_blocker"] = None
+        # Promotion eligibility — deferred to promotion_gate.py (sole authority)
+        # daily_report only shows progress, not verdict
+        promo_report = REPO / "argus_flow" / "logs" / "promotion_gate_report.json"
+        r["promotion_eligible"] = False
+        remaining = max(0, PROMOTION_THRESHOLD - r["valid_trades"])
+        r["promotion_blocker"] = f"need {remaining} more valid trades" if remaining > 0 else "gate report missing — run promotion_gate.py"
+        if promo_report.exists():
+            try:
+                pg = json.loads(promo_report.read_text())
+                for pg_runner in pg.get("runners", []):
+                    if pg_runner.get("symbol") == r["symbol"]:
+                        r["promotion_eligible"] = pg_runner.get("verdict") == "PROMOTE"
+                        blockers = pg_runner.get("blockers", [])
+                        r["promotion_blocker"] = ", ".join(blockers[:3]) if blockers else None
+                        break
+            except Exception:
+                pass
 
         fleet_valid += r["valid_trades"]
         fleet_invalid += r["invalid_trades"]

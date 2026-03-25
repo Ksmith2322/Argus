@@ -1148,6 +1148,40 @@ async def stream(request: Request):
     return EventSourceResponse(status_stream(request, coin))
 
 
+@app.get("/api/ibkr_stream")
+async def ibkr_stream(request: Request):
+    """Push IBKR fleet updates every 10 seconds."""
+    return EventSourceResponse(ibkr_status_stream(request))
+
+async def ibkr_status_stream(request: Request):
+    import asyncio
+    while True:
+        if await request.is_disconnected():
+            break
+        try:
+            runners = [_read_ibkr_runner(r) for r in IBKR_RUNNERS]
+            total_trades = sum(r["closed_trades"] for r in runners)
+            total_signals = sum(r["signal_count"] for r in runners)
+
+            # Cohort status
+            any_promoted = any(r.get("promotion_eligible") for r in runners)
+            all_promoted = all(r.get("promotion_eligible") for r in runners)
+            cohort_status = "PROMOTED" if all_promoted else "REVIEW" if any_promoted else "COLLECTING"
+
+            data = json.dumps({
+                "runners": runners,
+                "total_trades": total_trades,
+                "total_signals": total_signals,
+                "cohort_status": cohort_status,
+                "fleet_valid_trades": sum(r.get("valid_trades", 0) for r in runners),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }, default=str)
+            yield {"event": "ibkr_status", "data": data}
+        except Exception:
+            log.warning("SSE ibkr_status error", exc_info=True)
+        await asyncio.sleep(10)
+
+
 # ---------------------------------------------------------------------------
 # Evolution API — serves backtest summary timeline + trade scatter data
 # ---------------------------------------------------------------------------
@@ -1936,6 +1970,12 @@ def _read_ibkr_runner(runner: dict) -> dict:
         except Exception:
             pass
 
+    # Cohort progress fields
+    vt = result["valid_trades"]
+    result["cohort_target"] = 30
+    result["cohort_progress_pct"] = min(100.0, round(vt / 30 * 100, 1))
+    result["promotion_eligible"] = (vt >= 30 and result["invalid_rate"] <= 0.10 and result["win_rate"] > 0)
+
     return result
 
 
@@ -1946,10 +1986,137 @@ async def api_ibkr_fleet():
     total_trades = sum(r["closed_trades"] for r in runners)
     total_signals = sum(r["signal_count"] for r in runners)
 
+    # Cohort status
+    fleet_valid = sum(r["valid_trades"] for r in runners)
+    any_at_30 = any(r["valid_trades"] >= 30 for r in runners)
+    all_promoted = all(r.get("promotion_eligible", False) for r in runners) and len(runners) > 0
+    if all_promoted:
+        cohort_status = "PROMOTED"
+    elif any_at_30:
+        cohort_status = "REVIEW"
+    else:
+        cohort_status = "COLLECTING"
+
     return JSONResponse({
         "runners": runners,
         "total_trades": total_trades,
         "total_signals": total_signals,
+        "cohort_status": cohort_status,
+        "fleet_valid_trades": fleet_valid,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.get("/api/divergence_status")
+async def api_divergence_status():
+    """Divergence guard report for IBKR fleet."""
+    report_path = REPO / "argus_flow" / "logs" / "divergence_report.json"
+    if not report_path.exists():
+        return JSONResponse({"status": "NOT_RUN", "runners": []})
+    try:
+        data = json.loads(report_path.read_text())
+        return JSONResponse(data)
+    except Exception:
+        return JSONResponse({"status": "ERROR", "runners": []})
+
+
+@app.get("/api/kill_discipline")
+async def api_kill_discipline():
+    """Kill discipline report."""
+    report_path = REPO / "argus_flow" / "logs" / "kill_discipline_report.json"
+    if not report_path.exists():
+        return JSONResponse({"status": "NOT_RUN", "runners": []})
+    try:
+        return JSONResponse(json.loads(report_path.read_text()))
+    except Exception:
+        return JSONResponse({"status": "ERROR", "runners": []})
+
+
+@app.get("/api/promotion_gate")
+async def api_promotion_gate():
+    """Promotion gate report."""
+    report_path = REPO / "argus_flow" / "logs" / "promotion_gate_report.json"
+    if not report_path.exists():
+        return JSONResponse({"status": "NOT_RUN", "runners": []})
+    try:
+        return JSONResponse(json.loads(report_path.read_text()))
+    except Exception:
+        return JSONResponse({"status": "ERROR", "runners": []})
+
+
+@app.get("/api/fx_analytics")
+async def api_fx_analytics():
+    """Per-pair equity curves, drawdown waterfall, expectancy tracking."""
+    analytics = []
+    for runner in IBKR_RUNNERS:
+        log_dir = REPO / runner["log_dir"]
+        trade_file = log_dir / "trades.csv"
+        result = {
+            "name": runner["name"],
+            "symbol": runner["symbol"],
+            "equity_curve": [],
+            "drawdown_curve": [],
+            "daily_pnl": {},
+            "cumulative_pnl": 0,
+            "max_drawdown": 0,
+            "current_drawdown": 0,
+            "expectancy_rolling": [],
+        }
+
+        if not trade_file.exists():
+            analytics.append(result)
+            continue
+
+        try:
+            with open(trade_file) as f:
+                rows = list(csv.DictReader(f))
+
+            valid = [r for r in rows if r.get("experiment_valid", "").lower() == "true"]
+            pnl_field = "pnl_pips" if valid and "pnl_pips" in valid[0] else "pnl_pts"
+
+            # Equity curve + drawdown
+            cum = 0
+            peak = 0
+            equity = []
+            dd_curve = []
+            daily = {}
+
+            for r in valid:
+                pnl = float(r.get(pnl_field, 0))
+                cum += pnl
+                peak = max(peak, cum)
+                dd = peak - cum
+
+                equity.append(round(cum, 2))
+                dd_curve.append(round(dd, 2))
+
+                # Daily aggregation
+                day = r.get("ts", "")[:10]
+                if day:
+                    daily[day] = round(daily.get(day, 0) + pnl, 2)
+
+            result["equity_curve"] = equity
+            result["drawdown_curve"] = dd_curve
+            result["daily_pnl"] = daily
+            result["cumulative_pnl"] = round(cum, 2)
+            result["max_drawdown"] = round(max(dd_curve) if dd_curve else 0, 2)
+            result["current_drawdown"] = round(dd_curve[-1] if dd_curve else 0, 2)
+
+            # Rolling expectancy (last 10 trades)
+            pnls = [float(r.get(pnl_field, 0)) for r in valid]
+            rolling = []
+            for i in range(len(pnls)):
+                window = pnls[max(0, i-9):i+1]
+                rolling.append(round(sum(window) / len(window), 3))
+            result["expectancy_rolling"] = rolling[-50:]
+
+        except Exception:
+            pass
+
+        analytics.append(result)
+
+    return JSONResponse({
+        "analytics": analytics,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -2507,6 +2674,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">3</span></div>
 </div>
 
+<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <span style="color:#00d4ff;font-weight:bold;font-size:0.85em;">Cohort Status</span>
+    <span id="ibkr-cohort-status" style="font-size:0.75em;font-weight:bold;"></span>
+  </div>
+  <div style="display:flex;gap:12px;margin-top:6px;" id="ibkr-cohort-bars"></div>
+</div>
+
+<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-divergence-section">
+  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Divergence Guard</div>
+  <div id="ibkr-divergence-body" style="color:#888;font-size:0.75em;">Loading...</div>
+</div>
+<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-kill-section">
+  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Kill Discipline</div>
+  <div id="ibkr-kill-body" style="color:#888;font-size:0.75em;">Loading...</div>
+</div>
+<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-promotion-section">
+  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Promotion Gate</div>
+  <div id="ibkr-promotion-body" style="color:#888;font-size:0.75em;">Loading...</div>
+</div>
+
 <!-- Runner cards -->
 <!-- Fleet P&L Chart -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
@@ -2760,6 +2948,90 @@ async function loadIBKRFleet() {
     document.getElementById('ibkr-active-count').textContent = activeCount;
     document.getElementById('ibkr-total-count').textContent = data.runners.length;
 
+    // Cohort summary
+    const csEl = document.getElementById('ibkr-cohort-status');
+    const cbEl = document.getElementById('ibkr-cohort-bars');
+    const cohortStatus = data.cohort_status || 'COLLECTING';
+    const csColors = {COLLECTING:'#ffaa00',REVIEW:'#00d4ff',PROMOTED:'#00ff88'};
+    csEl.textContent = cohortStatus;
+    csEl.style.color = csColors[cohortStatus] || '#888';
+    let cbHtml = '';
+    for (const r of data.runners) {
+      const vt = r.valid_trades || 0;
+      const tgt = r.cohort_target || 30;
+      const cpct = Math.min(100, (vt/tgt)*100);
+      const pc = cpct >= 100 ? '#00ff88' : cpct >= 50 ? '#ffaa00' : '#ff4444';
+      cbHtml += `<div style="flex:1;"><div style="font-size:0.65em;color:#888;margin-bottom:2px;">${r.name} (${vt}/${tgt})</div>
+        <div style="background:#0d1117;border-radius:3px;height:6px;overflow:hidden;">
+          <div style="width:${cpct}%;height:100%;background:${pc};border-radius:3px;"></div>
+        </div></div>`;
+    }
+    cbEl.innerHTML = cbHtml;
+
+    // Divergence guard
+    fetch('/api/divergence_status').then(r=>r.json()).then(dg=>{
+      const el = document.getElementById('ibkr-divergence-body');
+      if (!dg.runners || !dg.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.divergence_guard'; return; }
+      let html = '<div style="display:flex;gap:12px;">';
+      for (const r of dg.runners) {
+        const sc = {PASS:'#00ff88',WATCH:'#ffaa00',KILL:'#ff4444',COLLECTING:'#888',NO_DATA:'#555',NO_SIGNALS:'#555'};
+        const c = sc[r.status] || '#555';
+        html += `<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ${c};">
+          <div style="font-weight:bold;color:${c};">${r.name}: ${r.status}</div>`;
+        const m = r.metrics || {};
+        if (m.closed_trades) html += `<div style="font-size:0.85em;">Trades: ${m.closed_trades} | WR: ${((m.live_win_rate||0)*100).toFixed(0)}%</div>`;
+        if (r.flags && r.flags.length) html += `<div style="color:#ff4444;font-size:0.8em;">${r.flags.join('<br>')}</div>`;
+        html += '</div>';
+      }
+      html += '</div>';
+      if (dg.timestamp) html += `<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ${dg.timestamp.substring(0,19)}</div>`;
+      el.innerHTML = html;
+    }).catch(()=>{
+      document.getElementById('ibkr-divergence-body').textContent = 'Failed to load divergence data.';
+    });
+
+    // Kill discipline
+    fetch('/api/kill_discipline').then(r=>r.json()).then(kd=>{
+      const el = document.getElementById('ibkr-kill-body');
+      if (!kd.runners || !kd.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.kill_discipline'; return; }
+      let html = '<div style="display:flex;gap:12px;">';
+      for (const r of kd.runners) {
+        const sc = {PASS:'#00ff88',WATCH:'#ffaa00',KILL:'#ff4444',COLLECTING:'#888'};
+        const c = sc[r.status] || '#555';
+        html += '<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ' + c + ';">';
+        html += '<div style="font-weight:bold;color:' + c + ';">' + r.name + ': ' + r.status + '</div>';
+        const m = r.metrics || {};
+        if (m.valid_trades) html += '<div style="font-size:0.85em;">Trades: ' + m.valid_trades + ' | PnL: ' + (m.total_pnl||0).toFixed(1) + ' | DD: ' + (m.max_drawdown_pips||0).toFixed(1) + '</div>';
+        if (r.flags && r.flags.length) html += '<div style="color:#ff4444;font-size:0.8em;margin-top:2px;">' + r.flags.join('<br>') + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      if (kd.timestamp) html += '<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ' + kd.timestamp.substring(0,19) + '</div>';
+      el.innerHTML = html;
+    }).catch(()=>{ document.getElementById('ibkr-kill-body').textContent = 'Failed to load.'; });
+
+    // Promotion gate
+    fetch('/api/promotion_gate').then(r=>r.json()).then(pg=>{
+      const el = document.getElementById('ibkr-promotion-body');
+      if (!pg.runners || !pg.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.promotion_gate'; return; }
+      let html = '<div style="display:flex;gap:12px;">';
+      for (const r of pg.runners) {
+        const vc = {PROMOTE:'#00ff88',NOT_READY:'#ffaa00',BLOCKED:'#ff4444'};
+        const c = vc[r.verdict] || '#888';
+        const checks = r.checks || {};
+        const passed = Object.values(checks).filter(c=>c.passed).length;
+        const total = Object.values(checks).length;
+        html += '<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ' + c + ';">';
+        html += '<div style="font-weight:bold;color:' + c + ';">' + r.name + ': ' + r.verdict + '</div>';
+        html += '<div style="font-size:0.85em;">' + passed + '/' + total + ' checks passed | ' + (r.valid_trades||0) + ' valid trades</div>';
+        if (r.blockers && r.blockers.length) html += '<div style="color:#ff4444;font-size:0.75em;margin-top:2px;">Blockers: ' + r.blockers.slice(0,3).join(', ') + (r.blockers.length > 3 ? ' +' + (r.blockers.length-3) + ' more' : '') + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      if (pg.timestamp) html += '<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ' + pg.timestamp.substring(0,19) + '</div>';
+      el.innerHTML = html;
+    }).catch(()=>{ document.getElementById('ibkr-promotion-body').textContent = 'Failed to load.'; });
+
     // Runner cards
     const cardsDiv = document.getElementById('ibkr-runner-cards');
     cardsDiv.innerHTML = '';
@@ -2857,6 +3129,22 @@ async function loadIBKRFleet() {
           <span style="margin-left:6px;" title="Entries today">E:${r.entries_today}</span>
           <span style="margin-left:6px;" title="Closed trades">T:${r.closed_trades}</span>
         </div>
+      </div>`;
+
+      // Cohort progress
+      const target = r.cohort_target || 30;
+      const validT = r.valid_trades || 0;
+      const pct = Math.min(100, (validT / target) * 100);
+      const progColor = pct >= 100 ? '#00ff88' : pct >= 50 ? '#ffaa00' : '#ff4444';
+      card += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e2a42;">
+        <div style="display:flex;justify-content:space-between;font-size:0.65em;color:#888;">
+          <span>Cohort Progress</span>
+          <span style="color:${progColor}">${validT}/${target} valid trades</span>
+        </div>
+        <div style="background:#0d1117;border-radius:3px;height:8px;overflow:hidden;margin-top:2px;">
+          <div style="width:${pct}%;height:100%;background:${progColor};border-radius:3px;transition:width 0.5s;"></div>
+        </div>
+        ${r.promotion_eligible ? '<div style="text-align:center;color:#00ff88;font-size:0.6em;margin-top:2px;font-weight:bold;">ELIGIBLE FOR PROMOTION</div>' : ''}
       </div>`;
 
       // Performance stats (if trades exist)
@@ -3003,6 +3291,35 @@ async function loadIBKRFleet() {
       ctx.fillStyle = lastVal >= 0 ? '#00ff88' : '#ff4444';
       ctx.fillText((lastVal >= 0 ? '+' : '') + lastVal.toFixed(1), w - 60, 12);
     }
+
+    // Per-pair equity + drawdown section
+    fetch('/api/fx_analytics').then(r=>r.json()).then(fa=>{
+      let anaDiv = document.getElementById('ibkr-analytics');
+      if (!anaDiv) {
+        anaDiv = document.createElement('div');
+        anaDiv.id = 'ibkr-analytics';
+        anaDiv.style.cssText = 'margin-top:16px;';
+        document.getElementById('ibkr-pnl-chart').parentElement.after(anaDiv);
+      }
+      let html = '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:8px;">Per-Pair Analytics</div>';
+      html += '<div style="display:flex;gap:12px;">';
+      for (const a of fa.analytics) {
+        const ddColor = a.current_drawdown > 0 ? '#ff4444' : '#00ff88';
+        html += '<div style="flex:1;padding:8px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">';
+        html += '<div style="font-weight:bold;color:#00d4ff;font-size:0.8em;">' + a.name + '</div>';
+        html += '<div style="font-size:0.7em;margin-top:4px;">';
+        html += 'PnL: <span style="color:' + (a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '">' + (a.cumulative_pnl>=0?'+':'') + a.cumulative_pnl.toFixed(1) + '</span>';
+        html += ' | Max DD: <span style="color:#ff4444">' + a.max_drawdown.toFixed(1) + '</span>';
+        html += ' | Now: <span style="color:' + ddColor + '">' + a.current_drawdown.toFixed(1) + '</span>';
+        html += '</div>';
+        if (a.equity_curve && a.equity_curve.length > 1) {
+          html += '<div style="margin-top:4px;">' + ibkrMiniChart(a.equity_curve, 180, 25, a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+      anaDiv.innerHTML = html;
+    }).catch(()=>{});
 
   } catch (e) {
     console.error('IBKR fleet load error:', e);

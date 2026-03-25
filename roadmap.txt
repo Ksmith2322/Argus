@@ -1,8 +1,35 @@
 # ARGUS ROADMAP
-# Last updated: 2026-03-23
+# Last updated: 2026-03-25
 # Goal: Build multiple independent, automatable edge engines.
 # Each must have measurable EV, be automatable, and scale capital.
 # Strategy: narrow -> prove -> scale -> expand
+
+---
+
+# GOVERNING PRINCIPLES (read before every decision)
+
+  1. Built != Verified != Operational != Promotion-trusted.
+     Code existing is not the same as code trusted under failure.
+     A test suite existing is not the same as coverage being sufficient.
+     A dashboard panel existing is not the same as the data behind it being clean.
+
+  2. Operational completeness is not evidence of economic edge.
+     Infrastructure maturity must never be confused with strategy maturity.
+     You cannot build your way to profitability. You must trade your way there.
+
+  3. Only validation-lane runners may accumulate promotion evidence.
+     Observation-lane and exploration-lane runners collect data.
+     Data collection is not the same as cohort validation.
+
+  4. A killed deployment may preserve a dormant thesis.
+     Kill the deployment. Archive the thesis. Retire the config.
+     Do not resurrect under the same conditions.
+     But if venue, cost, or regime assumptions change materially,
+     the thesis may be re-evaluated from scratch with a new config.
+
+  5. Config hash freeze is mandatory once a cohort starts.
+     Any config change mid-cohort invalidates all prior trades.
+     No exceptions. No "I only changed one thing."
 
 ---
 
@@ -24,30 +51,95 @@ Rules:
   - higher layers never mutate lower layers
   - analytics must never become hidden runtime control state
   - every derived metric must be traceable to its source artifact
+  - machine-local artifacts (ops/logs/) are non-canonical analytical surfaces
+    unless explicitly promoted into git-tracked or shared truth
+
+---
+
+# MATURITY TAXONOMY (every component carries exactly one status)
+
+  BUILT:              Code exists, compiles, basic smoke test passes.
+  VERIFIED:           Tested under adversarial/edge-case conditions. Failure modes documented.
+                      A VERIFIED component must have:
+                        - named test set with case count
+                        - failure classes covered (enumerated)
+                        - last execution date
+                        - whether pass was deterministic or observational
+                        - known blind spots acknowledged
+  OPERATIONAL:        Running in production context. Monitored. Recovery tested.
+                      For execution-truth-adjacent components (reconciliation, state
+                      persistence, recovery): requires observed correct behavior under
+                      at least one real fault, not just simulated fault.
+                      For reporting/dashboard: requires running and monitored.
+  PROMOTION-TRUSTED:  Has earned the right to inform capital decisions.
+                      Requires: 30+ valid trades, divergence guard PASS,
+                      artifact divergence CLEAN, kill discipline PASS.
+
+  No component may borrow credibility from a higher-maturity sibling.
+  A BUILT dashboard does not make a BUILT strategy OPERATIONAL.
+
+  BUILT governance logic is advisory until it has observed at least one real
+  watch/kill/degrade event correctly. Implementation is not the same as
+  demonstrated correct behavior under real violation.
+
+---
+
+# STRATEGY STATUS LABELS (every runner carries exactly one)
+
+  HYPOTHESIS:         Idea stage. No backtest.
+  BACKTEST-PASS:      Positive expectancy in backtest. Payoff Contract defined.
+  PAPER-VALIDATING:   Live paper runner accumulating cohort trades.
+  PAPER-PASS:         30+ valid trades, all promotion criteria met.
+  LIVE-VALIDATING:    Real capital, micro size, accumulating live fills.
+  LIVE-PASS:          30+ live fills, slippage within model, expectancy holds.
+  SCALED:             Full position sizing, proven edge.
+  KILLED:             Deployment killed. Thesis archived. Config retired.
+  DORMANT:            Thesis preserved, deployment stopped. Awaiting venue/regime change.
+
+  "Collecting data" is not a status. Use one of:
+    HYPOTHESIS (no backtest yet, just telemetry)
+    BACKTEST-PASS (backtested, no valid cohort)
+    PAPER-VALIDATING (below minimum sample)
+    DORMANT (post-kill diagnostic shadow-run)
+
+  "Blocked" is not a status. Execution blockers are a separate field:
+    Status: HYPOTHESIS  |  Blocker: No Paxos subscription
+    Status: DORMANT     |  Reactivation: venue fees < 20bps
 
 ---
 
 # GLOBAL INVARIANTS (binding contracts -- every system, every strategy)
 
-## Payoff Contract
-  Every strategy must define before paper trading begins:
-    - Min target move (pips, bps, or USD)
-    - Target reach rate: % of trades that hit TP. Kill if < 25%.
-    - Timeout rate: % of trades that expire at max hold. Kill if > 60%.
-    - Stop rate: % of trades that hit SL. Kill if > 2x target rate.
-    - MFE tail check: median MFE must exceed 1.5x cost to confirm real edge.
+## Payoff Contract (strategy-specific, not universal)
+
+  Every strategy must define before paper trading begins.
+  Thresholds below are DEFAULT PRIORS. Strategy-specific contracts
+  may override if the economic case is documented and signed off.
+
+  Default priors:
+    - Target reach rate:  kill if < 25%  (override: fat-tail strategies may go lower)
+    - Timeout rate:       kill if > 60%  (override: time-decay strategies may go higher)
+    - Stop rate:          kill if > 2x target rate  (override: depends on payoff asymmetry)
+    - MFE tail check:     median MFE must exceed 1.5x cost
     - Costs from day one: all backtests and paper runs include realistic fees,
       spread, and slippage. No "add costs later" allowed.
+
+  If a strategy overrides a default prior, the override must state:
+    - which threshold is being relaxed
+    - what the strategy-specific threshold is
+    - why the relaxation is economically justified
+    - what alternative kill signal replaces the relaxed one
 
   Template:
     Strategy: _______________
     Venue/Pair: _______________
     Min target move: _______________
-    Expected target reach rate: _____ % (kill < 25%)
-    Expected timeout rate: _____ % (kill > 60%)
-    Expected stop rate: _____ % (kill > 2x target rate)
+    Expected target reach rate: _____ % (default kill < 25%)
+    Expected timeout rate: _____ % (default kill > 60%)
+    Expected stop rate: _____ % (default kill > 2x target rate)
     Median MFE vs cost: _____ x (kill < 1.5x)
     RT cost model: _____ bps/pips
+    Overrides: _______________
 
 ## Execution Contract
   Every strategy must define:
@@ -59,25 +151,40 @@ Rules:
     - Latency budget (signal-to-fill target)
 
 ## Kill Discipline
-  - Payoff Contract fail = kill. No exceptions, no "one more week".
-  - Execution delta > 25% vs model = kill.
-  - 3 consecutive weeks negative with >= 15 trades/week = kill.
-  - Drawdown > 3x model (paper) or > 2x model (live) = kill.
-  - Kill = archived permanently. Strategy name retired. No resurrection.
+  - Payoff Contract fail = kill deployment. No exceptions, no "one more week".
+  - Execution delta > 25% vs model = kill deployment.
+  - 3 consecutive weeks negative with >= 15 trades/week = kill deployment.
+  - Drawdown > 3x model (paper) or > 2x model (live) = kill deployment.
+  - Kill = deployment archived. Config retired. Name retired for that config.
+  - Thesis may be preserved as DORMANT if kill reason is venue/cost/regime specific.
+  - DORMANT thesis requires: documented kill reason, explicit reactivation conditions,
+    and a fresh config + cohort if ever revisited.
 
 ## Phase C Rollback Rules
   - ONE variable per cycle. Never two simultaneous experiments.
   - Minimum 5 days or 20 signals per cycle (whichever comes first).
   - Revert if EV drops > 20% vs baseline.
   - No simultaneous experiments across strategies within same system.
+  - Max active configs per strategy family: 1 (no silent config drift).
+  - New config invalidates previous cohort. Period.
+
+## Anti-Overfitting Rules
+  - Config hash freeze mandatory once cohort starts.
+  - No parameter reuse across OOS segments without disclosure.
+  - Walk-forward segmentation required: train on period A, validate on period B.
+  - Stress suite must include adversarial scenarios, not just historical replay.
+  - Regime coverage minimum: strategy must be tested across trending, ranging,
+    and volatile regimes before paper promotion.
+  - Data provenance: every backtest must record data source, date range,
+    and whether any filtering/cleaning was applied.
 
 ---
 
 # SYSTEM PORTFOLIO (think in systems, not markets)
 
-  System 1: Argus Crypto (Coinbase)    -- PASSIVE OBSERVATION (fee-killed, 0/41 configs profitable at 60bps)
-  System 2: IBKR Trading Engine        -- PRIMARY ACTIVE (3 viable strategies found)
-  System 3: Polymarket                  -- LOCKED (waitlisted, contingency: reassign slot if not off waitlist by 2026-06-01)
+  System 1: Argus Crypto (Coinbase)    -- DORMANT (signal real, venue kills it at 60bps)
+  System 2: IBKR Trading Engine        -- PRIMARY ACTIVE (3 validation-lane runners eligible for promotion)
+  System 3: Polymarket                  -- LOCKED (waitlisted)
   System 4: Equities                   -- NOT STARTED ($25K PDT constraint)
 
   Rules:
@@ -92,14 +199,24 @@ Rules:
 ## Research -> Paper gate:
   - Payoff Contract defined and passing in backtest
   - 7/7 stress suite pass (gap, spread spike, news, low liquidity, trending,
-    ranging, overnight)
+    ranging, overnight). Stress suite must be adversarially generated.
   - 14+ days of backtest data minimum
   - 100+ signals in backtest
+  - Walk-forward validation (no same-period train + test)
+  - Data provenance documented
+  - Regime coverage: trending, ranging, volatile all represented
 
 ## Paper -> Live gate:
-  - 30+ paper trades (acknowledge this is noisy evidence, not proof)
+  - 30+ valid paper trades (noisy evidence, not proof)
   - Expectancy within 20% of backtest expectancy
-  - Replay-Live Divergence Guard passes (see below)
+  - Replay-Live Divergence Guard passes (outcome + state-space)
+  - All promotion_gate.py checks PASS
+  - Kill discipline PASS
+  - Artifact divergence CLEAN
+  - Governance component trust rule: any BUILT component feeding promotion
+    decisions must have been manually cross-checked against source truth
+    at least once before its output is treated as gate-passing evidence.
+    Automated output from untested-by-reality components is advisory only.
 
 ## Live -> Scale gate:
   - 30+ live fills
@@ -116,14 +233,24 @@ Rules:
 
   Purpose: Detect when paper/live execution diverges from backtest assumptions.
 
-  Metrics monitored:
-    - Entry price delta (backtest vs paper/live)
-    - Signal timing delta (bar alignment)
-    - Expectancy delta: 20% = alert, 25% = kill
-    - Hit rate delta: 10pp = alert, 20pp = kill
-    - Timeout rate delta: 15pp = alert
+  Layer 1 — Outcome divergence (BUILT, OPERATIONAL):
+    - Signal frequency ratio (live vs replay): KILL < 0.5 or > 2.0, WATCH < 0.7 or > 1.5
+    - Win rate delta (10+ trades): KILL > 20pp, WATCH > 15pp
+    - Timeout rate (15+ trades): KILL > 60%
+    - Stop/target ratio (15+ trades): WATCH if stop > 2x target
 
-  Status: NOT YET BUILT. Required before any Paper -> Live promotion.
+  Layer 2 — State-space divergence (BUILT, needs validation):
+    - Feature distribution shift (range_pct, vol_z live vs replay means)
+    - Session participation mismatch (which hours are trades happening)
+    - Trigger composition by regime (are entries concentrated in one regime)
+    - Spread/volatility context mismatch
+
+  Implementation:
+    Layer 1: argus_flow/ops/divergence_guard.py (OPERATIONAL)
+    Layer 2: argus_flow/ops/signal_analyzer.py (BUILT, manual review)
+
+  Output: argus_flow/logs/divergence_report.json
+  Dashboard: /api/divergence_status endpoint + IBKR Fleet widget
 
 ---
 
@@ -135,6 +262,7 @@ Rules:
 
   Correlation budget:
     - EUR/USD + GBP/USD count as 1.5 systems, not 2 (correlated USD risk)
+    - JPY crosses share a combined drawdown limit
     - Correlated pairs share a combined drawdown limit
 
   Per-system drawdown limits:
@@ -146,52 +274,94 @@ Rules:
     - Never primary decision path. Advisory only.
     - LOG_ONLY until proven incremental over deterministic rules.
     - Retrain requires 30+ single-config trades. Mixed-config training forbidden.
+    - FX retrain pipeline: BUILT. Waiting for trade data. (retrain_governor_fx.py)
 
 ---
 
-# COMPLETED PHASES (collapsed -- see git history for details)
-#   Phase 7:  Backtest determinism + sandbox rule [DONE]
-#   Phase 8:  PaperAdapter + fill persistence + startup recovery, Gate A PASS [DONE 2026-03-10]
-#   Phase 9:  Trade journal on SELL->FLAT, crash-restart proof [DONE 2026-03-10]
-#   Phase 10: Adversarial restart -- 4 kill-point scenarios PASS [DONE 2026-03-10]
-#   Phase 11-16: Analytics, risk, attribution, reporting, ops infra [DONE 2026-03-11]
-#   Phase 16.5: Strategy optimization -- parameter sweep, 663 backtests [DONE 2026-03-17]
-#   Phase 20: WebSocket L2 feed + fast-exit + sub-minute candles [DONE 2026-03-18]
-#   ML-1: Governor trained (1,029 trades, ROC-AUC 0.944) [DONE 2026-03-15]
-#   Multi-coin: ETH+BTC parallel runners, per-coin isolation [DONE 2026-03-17]
-#   v1.1 Cleanup: decision_trace.csv, HOLD taxonomy, OB/vol dedup, governor LOG_ONLY [DONE 2026-03-18]
+# INFRASTRUCTURE MATURITY REGISTER
+
+  Each component carries a maturity status. BUILT means code exists.
+  It does NOT mean the component is trusted for promotion decisions.
+
+  ## Core Runtime
+  | Component | Maturity | Notes |
+  |-----------|----------|-------|
+  | runner_unified.py | OPERATIONAL | Running 24/7, 3 FX pairs, crash recovery observed |
+  | State persistence | VERIFIED | 3 fault tests (corrupt JSON, missing stops, zero prices). Blind spot: partial-write timing |
+  | Reconnect/recovery | VERIFIED | Session-scoped invalidation tested. Blind spot: backfill timing skew |
+  | Broker reconciliation | VERIFIED | Phantom/orphan logic tested. Not yet OPERATIONAL: no real mismatch observed in production |
+  | Pyramiding/scale-in | BUILT | Config-driven, defaults OFF, untested in production |
+
+  ## Monitoring & Governance
+  BUILT governance logic is advisory until it has correctly handled at least one
+  real watch/kill/degrade event. None of these have been tested by reality yet.
+
+  | Component | Maturity | Notes |
+  |-----------|----------|-------|
+  | Cohort compliance (daily_report) | OPERATIONAL | Running nightly. Not yet cross-checked against manual truth |
+  | Divergence guard (outcome) | OPERATIONAL | 3 pairs monitored. Not yet triggered on real divergence |
+  | Divergence guard (state-space) | BUILT | signal_analyzer.py, manual review only |
+  | Correlation guard | BUILT | USD + JPY groups defined, not yet stress-tested |
+  | Kill discipline | BUILT | 4 kill rules automated. Never triggered on real data. Advisory only. |
+  | Promotion gate | BUILT | 13 checks. All currently NOT_READY (expected at 1 trade) |
+  | Artifact divergence | BUILT | 6 checks. Currently clean — but clean is not evidence the checker is sufficient |
+  | Risk oversight | BUILT | Portfolio-level monitor, not yet tested under stress |
+  | Alert escalation | BUILT | Discord alerting for system events, untested by real alerts |
+
+  ## Testing
+  | Component | Maturity | Notes |
+  |-----------|----------|-------|
+  | Fault injection (5 tests) | VERIFIED | Deterministic. Covers: state corruption, missing stops, NaN, per-runner isolation. Blind spots: partial writes, cross-artifact inconsistency |
+  | FX system tests (14 tests) | VERIFIED | Deterministic. Covers: schema contract, config integrity, state roundtrip, divergence guard alignment. Last run: 2026-03-24 |
+  | Chaos tests (10 suites) | VERIFIED | Deterministic. Covers: flash crash, feed gap, zero vol/price, extreme spread, stale feed, timestamp anomalies, duplicates, spike recovery. Blind spots: same-session contamination, scheduler race conditions, symbol normalization drift |
+
+  ## Tooling
+  | Component | Maturity | Notes |
+  |-----------|----------|-------|
+  | FX backtest harness | BUILT | Replay through runner logic, pyramiding support |
+  | Governor retrain pipeline | BUILT | Waiting for 100+ FX trades |
+  | Pair onboarding pipeline | BUILT | Config validate + backtest + evaluate |
+  | Config experiment framework | BUILT | Phase C A/B testing with revert logic |
+  | Live config generator | BUILT | Paper-to-live converter with audit trail |
+  | IBKR data downloader | BUILT | Historical bar download for backtesting |
+  | Dual-model analysis | BUILT | Prompt generator for Claude + GPT parallel review |
+
+  ## Ops Automation
+  | Component | Maturity | Notes |
+  |-----------|----------|-------|
+  | Fleet launcher | BUILT | Runner + dashboard + discord in one command |
+  | Watchdog | BUILT | Heartbeat monitor, auto-restart, rate-limited |
+  | Task registration | BUILT | One-click scheduled task setup |
+  | Weekly digest | BUILT | Discord weekly FX performance report |
+  | Dashboard (IBKR Fleet) | OPERATIONAL | SSE auto-refresh, cohort/kill/promotion panels |
+  | DR runbook | BUILT | 6 recovery procedures documented |
 
 ---
 
 # ===================================================================
-# SYSTEM 1: ARGUS CRYPTO (Coinbase) -- PASSIVE OBSERVATION
+# SYSTEM 1: ARGUS CRYPTO (Coinbase) -- DORMANT
 # ===================================================================
 
-## Status: FEE-KILLED
+## Status: DORMANT (thesis preserved, deployment killed)
 
-  The signal is real. Score 90+ delivers 75% WR in backtest. The venue kills it.
-  Coinbase 60bps round-trip fees destroy all edge across every tested configuration.
+  Kill reason: Coinbase 60bps RT fees destroy all edge.
+  Thesis: Score 90+ delivers 75% WR in backtest. Signal is real.
+  The venue kills it, not the strategy.
 
-  Payoff Contract: FAILED. Strategy needs 15-20bps RT max to be viable.
+  Evidence of kill:
+    - 0/41 configs profitable across OOS, walk-forward, 30-config sweep
+    - 663-run parameter sweep exhausted all reasonable combinations
+    - Penalty analysis confirmed governor correctly blocking losing trades
 
-  Evidence:
-    - 0/41 configs profitable across OOS, walk-forward, and 30-config parameter sweep
-    - Penalty analysis (2026-03-20) confirmed governor correctly blocking losing trades
-    - TREND_UP underperformance anomaly discovered but irrelevant given fee structure
-    - 663-run parameter sweep exhausted all reasonable parameter combinations
+  Reactivation conditions (ALL must be met):
+    - Access to venue with < 20bps RT fees for BTC/ETH spot
+    - Fresh config, fresh cohort (no resurrection of old configs)
+    - Re-pass Research -> Paper gate with new venue cost model
 
-  Current state:
-    - ETH-USD and BTC-USD runners still live for data collection only
-    - Governor in LOG_ONLY mode, stamping all signals for future analysis
-    - No Phase C intervention work justified until venue cost changes
-    - SOL disabled (PF 0.53-0.64, consistently unprofitable even before fees)
-
-  Infrastructure preserved:
-    - Full engine, backtest harness, decision_trace pipeline, dashboard
-    - All reusable for future low-cost venue (Kraken, IBKR crypto, DEX)
-    - WebSocket feed, fast-exit, sub-minute candles all built and tested
-
-  Reactivation condition: access to venue with < 20bps RT fees for BTC/ETH spot.
+  Infrastructure preserved in archive/:
+    - Full engine, backtest harness, decision_trace pipeline
+    - WebSocket feed, fast-exit, sub-minute candles
+    - All reusable if venue economics change
 
 ---
 
@@ -199,50 +369,75 @@ Rules:
 # SYSTEM 2: IBKR TRADING ENGINE -- PRIMARY ACTIVE
 # ===================================================================
 
-## Research Status
+## Runner Lanes
 
-  ### Closed (killed):
-    - Kraken BTC perpetuals (Cascade engine): killed, precursors killed
-    - All crypto-venue strategies at current fee structures
+  ### VALIDATION LANE (eligible for promotion evidence)
+  Only these runners may accumulate trades toward paper->live promotion.
 
-  ### Active Fleet (17 runners, all PAPER phase, live data via U24860535):
+    EUR/USD T4       clientId=10  Status: PAPER-VALIDATING  Cohort: 0/30 valid trades
+    GBP/USD range    clientId=12  Status: PAPER-VALIDATING  Cohort: 1/30 valid trades
+    EUR/JPY T4       clientId=18  Status: PAPER-VALIDATING  Cohort: 0/30 valid trades
 
-    FX Majors (5 runners):
-      EUR/USD T4       clientId=10  +0.98 pip/trade  7/7 stress  Day1: +9.1pip
-      GBP/USD range    clientId=12  +0.97 pip/trade  7/7 stress  Day1: +53.4pip (star)
-      GBP/JPY T4       clientId=13  +3.22 bps/trade  backtested  Collecting data
-      AUD/USD NY       clientId=14  +1.08 bps/trade  backtested  Collecting data
-      USD/JPY NY       clientId=15  +0.65 bps/trade  backtested  Collecting data
+  ### OBSERVATION LANE (collecting data, not eligible for promotion)
+  Data collected here informs future decisions but cannot be used for
+  promotion claims. These runners must pass Research->Paper gate
+  and enter the validation lane before accumulating promotion evidence.
 
-    FX Crosses (3 runners):
-      EUR/JPY T4       clientId=18  Collecting data (no backtest yet)
-      AUD/JPY T4       clientId=19  Collecting data
-      CAD/JPY T4       clientId=20  Collecting data
+    GBP/JPY T4       clientId=13  Status: BACKTEST-PASS     Backtested, +3.22 bps/trade
+    AUD/USD NY       clientId=14  Status: BACKTEST-PASS     Backtested, +1.08 bps/trade
+    USD/JPY NY       clientId=15  Status: BACKTEST-PASS     Backtested, +0.65 bps/trade
+    AUD/JPY T4       clientId=19  Status: HYPOTHESIS        No backtest yet
+    CAD/JPY T4       clientId=20  Status: HYPOTHESIS        No backtest yet
+    MNQ vol_burst    clientId=11  Status: BACKTEST-PASS     Day1: -128pts (quarantined)
 
-    Index Futures (4 runners):
-      MNQ vol_burst    clientId=11  +6.41 bps/trade  7/7 stress  Day1: -128pts
-      MES vol_burst    clientId=16  +2.23 bps/trade  backtested  Collecting data
-      MYM vol_burst    clientId=17  Collecting data
-      M2K vol_burst    clientId=23  Collecting data (Russell 2000)
+  ### EXPLORATION LANE (new/weak hypotheses, explicitly non-promotable)
+  No expectation of near-term capital path.
 
-    Commodities (2 runners):
-      MGC vol_burst    clientId=21  Collecting data (Micro Gold)
-      MCL vol_burst    clientId=22  Collecting data (Micro Oil)
+    MES vol_burst    clientId=16  Status: HYPOTHESIS        Needs wider stops
+    MYM vol_burst    clientId=17  Status: HYPOTHESIS        No data
+    M2K vol_burst    clientId=23  Status: HYPOTHESIS        No data
+    MGC vol_burst    clientId=21  Status: HYPOTHESIS        No data
+    MCL vol_burst    clientId=22  Status: HYPOTHESIS        No data
+    NKD vol_burst    clientId=24  Status: KILLED            25% WR
+    BTC range        clientId=25  Status: HYPOTHESIS        Blocker: No Paxos subscription
+    ETH range        clientId=26  Status: HYPOTHESIS        Blocker: No Paxos subscription
 
-    Other (1 runner):
-      NKD vol_burst    clientId=24  Collecting data (Nikkei, Asia session)
+## Closed (killed deployments):
+    - Kraken BTC perpetuals (Cascade): KILLED. Thesis: DORMANT (payoff exists on perps, not spot)
+    - All Coinbase strategies: KILLED. Thesis: DORMANT (signal real, venue kills it)
 
-    Crypto (2 runners — need Paxos subscription):
-      BTC range        clientId=25  Needs market data subscription
-      ETH range        clientId=26  Needs market data subscription
+## Evidence Registry
 
-  ### Cost models:
+  Each validation-lane runner maintains:
+
+  | Field | Source |
+  |-------|--------|
+  | Current status | Manual assignment |
+  | Config hash | Frozen at cohort start, verified by promotion_gate.py |
+  | Cohort start date | First valid trade timestamp |
+  | Valid trades | trades.csv where experiment_valid=true |
+  | Invalid trades + reasons | trades.csv where experiment_valid=false |
+  | Current kill/watch status | kill_discipline.py output |
+  | Current divergence status | divergence_guard.py output |
+  | Last governance review | Manual log (weekly minimum) |
+  | Artifact integrity | artifact_divergence.py output |
+
+  Canonical artifact: argus_flow/logs/{symbol}/evidence_registry.json
+  Generated by: evidence_registry.py (consolidates all surfaces into one file)
+  Checked by: promotion_gate.py (automated, 13 checks)
+  Reported by: daily_report.py (nightly) + weekly_digest.py (Sunday)
+
+  The evidence registry is the SINGLE SOURCE OF TRUTH for governance state.
+  It is regenerated on every run, not accumulated. Governance decisions
+  should reference the registry, not the underlying surfaces directly.
+
+## Cost models:
     FX:         < 1bps round trip
     Futures:    ~3bps round trip (~$0.62/micro contract)
     Commodities: ~3bps round trip
     Crypto:     12-18bps round trip (IBKR Paxos)
 
-  ### Correlation groups:
+## Correlation groups:
     USD pairs: EUR/USD + GBP/USD + AUD/USD (count as 1.5 systems)
     JPY crosses: EUR/JPY + AUD/JPY + CAD/JPY + GBP/JPY (yen-correlated)
     US indices: MNQ + MES + MYM + M2K (highly correlated)
@@ -251,32 +446,12 @@ Rules:
 
   Live Account: U24860535 (real-time data, Read-Only API enabled for safety)
   Paper Account: DUP472829 (backup)
-  Gateway: TWS Gateway, port 4001 (live), auto-restart 11:45 PM ET
-  Runners simulate positions internally (state.json) — no real orders placed
+  Gateway: TWS Gateway, port 7496, auto-restart 11:45 PM ET
+  Runners simulate positions internally (state.json) -- no real orders placed
 
-  Runner types:
-    runner_eurusd.py          (EUR/USD specific)
-    runner_gbpusd.py          (GBP/USD specific)
-    runner_mnq.py             (MNQ specific)
-    runner_fx_generic.py      (any FX pair via --pair + --config)
-    runner_futures_generic.py (any futures via --symbol + --exchange + --expiry)
-    runner_crypto_ibkr.py     (BTC/ETH via IBKR Paxos)
-
-  Configs: argus_flow/configs/*.json (17 versioned configs)
-  Logs:    argus_flow/logs/{symbol}/
-
-  Ops tools (all built):
-    smoke_test.py        -- pre-launch 7-point verification
-    health_check.py      -- fleet status overview
-    heartbeat_monitor.py -- 17-runner alive/dead check
-    position_monitor.py  -- IBKR position reconciliation
-    divergence_guard.py  -- replay vs live comparison
-    correlation_guard.py -- USD pair exposure limit
-    daily_report.py      -- daily P&L and metrics
-    discord_alerts.py    -- trade notifications
-    config_check.py      -- config validation + hash
-    refresh_ibkr_data.py -- pull latest historical bars
-    launch_all.ps1       -- fleet launcher with pre/post checks
+  Primary runner: runner_unified.py (single process, 3 validation-lane pairs)
+  Configs: argus_flow/configs/*.json (17 versioned configs, 3 active)
+  Logs: argus_flow/logs/{symbol}/
 
 ---
 
@@ -285,27 +460,14 @@ Rules:
 # ===================================================================
 
   Status: LOCKED (waitlisted for account access)
-  Why: Inefficient pricing, retail-driven, slow reaction to info, bots proving edge
+  Strategy status: HYPOTHESIS
 
-  Contingency: If not off waitlist by 2026-06-01, reassign this slot to next
-  highest-priority system (likely IBKR options or additional FX pairs).
+  Contingency: If not off waitlist by 2026-06-01, reassign this slot.
 
-  Strategy types (planned):
-    A. News latency edge: event happens -> price lags -> buy before correction
-    B. Probability mispricing: model probability > market probability -> buy
-    C. Cross-market arb: related markets inconsistent -> exploit spread
-
-  Architecture (planned):
-    Data: news APIs, twitter/X scraping, event feeds
-    Model: probability estimator, sentiment + keyword scoring
-    Execution: Polymarket API, track odds vs model
-    Risk: cap exposure per event, decay positions near resolution
-
-  Build phases (when unlocked):
-    Phase 1: Scrape markets, track price changes, detect anomalies
-    Phase 2: Simple probability model, compare vs market
-    Phase 3: Paper trading
-    Phase 4: Live with micro-capital
+  Planned strategy types:
+    A. News latency edge
+    B. Probability mispricing
+    C. Cross-market arb
 
   Integration with Argus: NONE (separate system, separate codebase)
 
@@ -316,73 +478,70 @@ Rules:
 # ===================================================================
 
   Status: NOT STARTED
+  Strategy status: HYPOTHESIS
   Constraint: PDT rule (< $25K -> no frequent day trading)
-  Capital path: No accumulation path currently. Revisit when IBKR live
-  generates enough to cross $25K threshold.
-
   Best path: Swing trading (1-3 day holds, no PDT issues)
-  Broker: IBKR (better API than Robinhood)
-
-  Strategy:
-    Gap + momentum continuation
-    Earnings/news driven moves
-    Premarket movers, volume spikes, news catalysts
-
-  Partial reuse from Argus: confluence scoring concept, risk framework
-  Different: data, timing, volatility, hold periods
-
----
-
-# INFRASTRUCTURE (ALL DONE -- collapsed)
-
-## Ops & Analysis Tools  [ALL DONE 2026-03-13/14]
-  PC2 dispatch, run comparison, score/duration analyzer, post-backtest compare,
-  job queue (PC1+PC2), unified status, auto-compare leaderboard, artifact cleanup,
-  Discord alerts (backtest/trade/error/runner), equity overlay chart, trade export,
-  queue watcher, post-queue report, dashboard (FastAPI+SSE+Chart.js), architecture map,
-  backup verification, candle gap alerting, weekly digest, DR runbook,
-  dashboard queue panel, dashboard trade journal viewer.
-
-## Strategy Features Built  [ALL DONE]
-  Session filtering, multi-asset backtest, compounding rules, drawdown circuit breaker,
-  candle data validation, time-stop exit, 4hr candle aggregation.
-
-## Survivability & Recovery  [ALL DONE]
-  Git auto-backup (daily@02:00), USB nightly backup (daily@03:00),
-  backup verification drill (weekly Sunday@04:00), disaster recovery runbook.
+  Revisit when: IBKR live generates enough to cross $25K threshold.
 
 ---
 
 # TWO-MACHINE SETUP
 
-  PC1 (WINDOWS-5RCTEK3): runner_live.py 24/7, dev work, heavy backtests
+  PC1 (WINDOWS-5RCTEK3): runner_unified.py 24/7, dev work
   PC2 (DESKTOP-17CJMUP / 192.168.1.98): offloaded backtest jobs
-  GitHub: Ksmith2322/Argus, branch phase6-hardening
-  SSH: passwordless ED25519 key, dispatch via ops/dispatch_backtest_pc2.ps1
-  .env tracked in git (paper trading, no real keys)
-  ops/logs/ NOT in git -- artifacts are local to each machine
+
+  Coupling risks (acknowledged):
+    - ops/logs/ local to each machine (NOT in git, NOT canonical)
+    - Machine-specific environments may diverge
+    - Path/config differences can cause silent behavior changes
+    - Scheduler drift between machines
+    - Research contamination: results from PC2 are analytical truth,
+      not canonical truth, until explicitly promoted
+
+  Mitigation:
+    - GitHub sync is the canonical code source
+    - .env tracked in git (paper trading, no real keys)
+    - PC2 results must be compared against PC1 baseline before trusting
+    - Config hashes verified on both machines before cross-machine comparison
 
 ---
 
 # SCHEDULED TASKS (PC1)
 
   ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
-  Argus_Nightly_Backtest: daily@02:10 -> ops/run_backtest.ps1
+  ArgusCohortReport:    daily@23:00  -> ops/run_cohort_report.ps1
   ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1
-  ArgusRefreshCandles:  Sunday@03:00 -> ops/refresh_candles.ps1 (ETH+BTC+SOL, 30d)
-  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1 (weekly integrity check)
-  ArgusWeeklyDigest:    Sunday@06:00 -> ops/weekly_digest.py (Discord performance report)
-  Runner auto-start:    on login     -> Startup folder -> ops/autostart_runner.ps1
-  Dashboard auto-start: on login     -> Startup folder -> ops/autostart_dashboard.ps1
+  ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1
+  ArgusWeeklyDigest:    Sunday@06:00 -> ops/run_weekly_digest.ps1
+  ArgusWatchdog:        on startup   -> ops/watchdog.ps1
+  Runner auto-start:    on login     -> ops/autostart_runner.ps1
+  Dashboard auto-start: on login     -> ops/autostart_dashboard.ps1
+
+  Register all: powershell -ExecutionPolicy Bypass -File ops\register_tasks.ps1
 
 ---
 
 # THE SCALING PATH
 
-  Phase 1 (NOW): Prove EV (paper) -- IBKR runners live, accumulate 30+ trades each
-  Phase 2: Prove execution (micro live) -- real capital, real fills, real slippage
-  Phase 3: Prove stability -- N trades with bounded drawdown within model
-  Phase 4: Scale capital into proven edges
-  Phase 5: Add systems (only after current systems are profitable)
+  Phase 1 (NOW):  Prove EV (paper) -- validation-lane runners accumulating trades
+  Phase 2:        Prove execution (micro live) -- real capital, real fills, real slippage
+  Phase 3:        Prove stability -- N trades with bounded drawdown within model
+  Phase 4:        Scale capital into proven edges
+  Phase 5:        Add systems (only after current systems are profitable)
 
   Rule: stacking proven edges and scaling capital into them > adding more systems
+  Rule: no phase transition without explicit gate passage. No shortcuts.
+
+---
+
+# BUILD HISTORY (collapsed -- code exists, see git for details)
+
+  Phase 7-10:  Core engine, backtest, execution, recovery, adversarial tests
+  Phase 11-16: Analytics, risk, attribution, reporting, ops infra
+  Phase 16.5:  Parameter sweep (663 backtests)
+  Phase 20:    WebSocket L2 feed + fast-exit
+  ML-1:        Governor trained (1,029 trades, ROC-AUC 0.944)
+  Multi-coin:  ETH+BTC parallel runners
+  IBKR FX:     runner_unified.py, feed_ibkr.py, TWS integration
+  v1.1-v1.5:   FX infra, ops automation, hardening, full tooling build-out (2026-03-24)
+               See INFRASTRUCTURE MATURITY REGISTER above for component-level status.

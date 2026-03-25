@@ -15,19 +15,27 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 # Correlation groups: pairs in the same group share risk
+# Per roadmap: EUR/USD + GBP/USD count as 1.5 systems (correlated USD risk)
+# JPY crosses share a combined drawdown limit
 CORRELATION_GROUPS = {
-    "USD_pairs": ["eurusd", "gbpusd"],  # both move inverse to USD
+    "USD_majors": ["eurusd", "gbpusd"],          # both move inverse to USD
+    "JPY_crosses": ["eurjpy", "gbpjpy", "audjpy", "cadjpy", "usdjpy"],  # all yen-correlated
 }
 
 MAX_CORRELATED_POSITIONS = 1  # max simultaneous positions in same group
 
 
 def get_positions() -> dict:
+    # Class A (active cohort)
     runners = {
         "eurusd": {"name": "EUR/USD", "log_dir": "argus_flow/logs/eurusd"},
         "gbpusd": {"name": "GBP/USD", "log_dir": "argus_flow/logs/gbpusd"},
-        "mnq": {"name": "MNQ", "log_dir": "argus_flow/logs/mnq"},
+        "eurjpy": {"name": "EUR/JPY", "log_dir": "argus_flow/logs/eurjpy"},
     }
+    # Class B candidates (add when launched)
+    for sym, name in [("usdjpy", "USD/JPY"), ("audusd", "AUD/USD"), ("gbpjpy", "GBP/JPY"),
+                       ("cadjpy", "CAD/JPY"), ("audjpy", "AUD/JPY")]:
+        runners[sym] = {"name": name, "log_dir": f"argus_flow/logs/{sym}"}
 
     positions = {}
     for key, runner in runners.items():

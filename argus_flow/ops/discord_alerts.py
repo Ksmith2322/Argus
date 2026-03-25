@@ -26,8 +26,8 @@ WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 RUNNERS = [
     {"name": "EUR/USD", "log_dir": "argus_flow/logs/eurusd", "unit": "pips"},
-    {"name": "MNQ", "log_dir": "argus_flow/logs/mnq", "unit": "pts"},
     {"name": "GBP/USD", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips"},
+    {"name": "EUR/JPY", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips"},
 ]
 
 
