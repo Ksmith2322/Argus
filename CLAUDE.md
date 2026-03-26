@@ -90,7 +90,8 @@ python -m argus_flow.ops.experiment_runner --evaluate --name NAME
 | `argus_flow/schemas.py` | Canonical signal/trade CSV column definitions |
 | `argus_flow/configs/*.json` | Per-instrument strategy configs |
 | `argus_flow/COHORT_SPEC.md` | Cohort governance rules |
-| `argus_flow/DR_RUNBOOK.md` | Disaster recovery procedures |
+| `argus_flow/dr/DR_RUNBOOK.md` | Disaster recovery procedures |
+| `argus_flow/dr/PERFORMANCE_SUMMARY.md` | Cohort performance snapshot |
 | `argus_flow/ops/daily_report.py` | Cohort compliance report |
 | `argus_flow/ops/position_monitor.py` | Broker vs runner state reconciliation |
 | `argus_flow/ops/divergence_guard.py` | Replay-live divergence (KILL/WATCH/PASS) |

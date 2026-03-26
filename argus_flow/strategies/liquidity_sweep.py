@@ -53,12 +53,16 @@ def detect_sweeps(df: pd.DataFrame, swing_highs: list[dict], swing_lows: list[di
     for i in range(len(df)):
         row = df.iloc[i]
 
-        # Session filter
+        # Session filter (supports wraparound e.g. 22-08)
         if "ts" in df.columns:
             try:
                 hour = pd.Timestamp(row["ts"]).hour
-                if not (session_start <= hour <= session_end):
-                    continue
+                if session_start <= session_end:
+                    if not (session_start <= hour <= session_end):
+                        continue
+                else:
+                    if not (hour >= session_start or hour <= session_end):
+                        continue
             except Exception:
                 pass
 

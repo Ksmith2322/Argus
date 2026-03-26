@@ -18,9 +18,16 @@ from typing import NamedTuple
 REPO = Path(__file__).resolve().parents[2]
 
 RUNNERS = [
+    # London session
     {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd"},
     {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd"},
     {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy"},
+    {"name": "GBP/JPY", "symbol": "GBPJPY", "log_dir": "argus_flow/logs/gbpjpy"},
+    {"name": "CAD/JPY", "symbol": "CADJPY", "log_dir": "argus_flow/logs/cadjpy"},
+    # Asia session
+    {"name": "AUD/JPY", "symbol": "AUDJPY", "log_dir": "argus_flow/logs/audjpy"},
+    {"name": "USD/JPY", "symbol": "USDJPY", "log_dir": "argus_flow/logs/usdjpy"},
+    {"name": "AUD/USD", "symbol": "AUDUSD", "log_dir": "argus_flow/logs/audusd"},
 ]
 
 PROMOTION_THRESHOLD = 30
@@ -101,41 +108,66 @@ def check_no_runtime_anomalies(valid_trades: list[dict]) -> CheckResult:
 
 
 def check_positive_expectancy(valid_trades: list[dict]) -> CheckResult:
-    """Expectancy positive after modeled friction."""
+    """Expectancy positive after modeled friction.
+
+    Friction is only applied for FX (pips). For futures (points/bps),
+    friction modeling requires instrument-specific data — raw expectancy is used.
+    """
     pnl_field = _pnl_field(valid_trades)
     pnls = [float(t.get(pnl_field, 0)) for t in valid_trades]
     if not pnls:
         return CheckResult(False, "no P&L data")
     raw_exp = sum(pnls) / len(pnls)
-    adj_exp = raw_exp - MODELED_FRICTION_PIPS
+    # Only apply pip friction for FX trades (pnl_pips field)
+    if pnl_field == "pnl_pips":
+        adj_exp = raw_exp - MODELED_FRICTION_PIPS
+        detail = f"expectancy {adj_exp:+.3f} pips/trade (raw {raw_exp:+.3f} - {MODELED_FRICTION_PIPS} friction)"
+    else:
+        adj_exp = raw_exp  # no friction model for futures yet
+        detail = f"expectancy {adj_exp:+.3f} pts/trade (raw, no friction model for futures)"
     if adj_exp > 0:
-        return CheckResult(True, f"expectancy {adj_exp:+.3f} pips/trade (raw {raw_exp:+.3f} - {MODELED_FRICTION_PIPS} friction)")
-    return CheckResult(False, f"expectancy {adj_exp:+.3f} pips/trade (raw {raw_exp:+.3f} - {MODELED_FRICTION_PIPS} friction)")
+        return CheckResult(True, detail)
+    return CheckResult(False, detail)
 
 
 def check_session_concentration(valid_trades: list[dict]) -> CheckResult:
-    """No single-session concentration > 40% of total P&L."""
+    """No single market session (ASIA/LONDON/NY) contributes > 40% of total P&L.
+
+    Groups by UTC hour of trade entry into market sessions, NOT by runtime session_id.
+    """
     pnl_field = _pnl_field(valid_trades)
     total_pnl = sum(float(t.get(pnl_field, 0)) for t in valid_trades)
     if abs(total_pnl) < 1e-9:
         return CheckResult(True, "total P&L ~0, no concentration issue")
 
+    def _market_session(ts_str: str) -> str:
+        try:
+            hour = int(ts_str[11:13])
+        except (ValueError, IndexError):
+            return "UNKNOWN"
+        if 22 <= hour or hour < 8:
+            return "ASIA"
+        elif 8 <= hour < 13:
+            return "LONDON"
+        else:
+            return "NY"
+
     session_pnl: dict[str, float] = {}
     for t in valid_trades:
-        sid = t.get("session_id", "unknown")
-        session_pnl.setdefault(sid, 0.0)
-        session_pnl[sid] += float(t.get(pnl_field, 0))
+        mkt = _market_session(t.get("ts", ""))
+        session_pnl.setdefault(mkt, 0.0)
+        session_pnl[mkt] += float(t.get(pnl_field, 0))
 
-    for sid, spnl in session_pnl.items():
+    for mkt, spnl in session_pnl.items():
         concentration = abs(spnl) / abs(total_pnl)
         if concentration > 0.40:
             return CheckResult(
                 False,
-                f"session {sid[:16]} contributes {concentration:.0%} of total P&L "
+                f"market session {mkt} contributes {concentration:.0%} of total P&L "
                 f"({spnl:+.2f}/{total_pnl:+.2f})"
             )
     max_conc = max(abs(v) / abs(total_pnl) for v in session_pnl.values()) if session_pnl else 0
-    return CheckResult(True, f"max session concentration {max_conc:.0%} (<= 40%)")
+    return CheckResult(True, f"max market session concentration {max_conc:.0%} (<= 40%)")
 
 
 def check_outlier_trade(valid_trades: list[dict]) -> CheckResult:
@@ -184,17 +216,21 @@ def check_signal_frequency(log_dir: Path, valid_trades: list[dict], rexp: dict) 
         return CheckResult(False, "signals.csv not found")
 
     with open(sig_file, "r") as f:
-        signals = list(csv.DictReader(f))
+        all_signals = list(csv.DictReader(f))
 
-    if len(signals) < 2:
-        return CheckResult(False, f"only {len(signals)} signals recorded (insufficient)")
+    if len(all_signals) < 2:
+        return CheckResult(False, f"only {len(all_signals)} signals recorded (insufficient)")
 
-    # Calculate actual signals per day from timestamp range
+    # Only count ENTRY signals — NO_TRIGGER rows are periodic status logs
+    # and would inflate the count 4-20x vs replay expectations
+    entry_signals = [s for s in all_signals if s.get("action") == "ENTRY"]
+
+    # Calculate actual signals per day from full timestamp range
     try:
-        first_ts = datetime.fromisoformat(signals[0]["ts"].replace("Z", "+00:00"))
-        last_ts = datetime.fromisoformat(signals[-1]["ts"].replace("Z", "+00:00"))
+        first_ts = datetime.fromisoformat(all_signals[0]["ts"].replace("Z", "+00:00"))
+        last_ts = datetime.fromisoformat(all_signals[-1]["ts"].replace("Z", "+00:00"))
         days = max((last_ts - first_ts).total_seconds() / 86400, 1.0)
-        live_spd = len(signals) / days
+        live_spd = len(entry_signals) / days
     except Exception as e:
         return CheckResult(False, f"could not parse signal timestamps: {e}")
 
@@ -213,11 +249,16 @@ def check_signal_frequency(log_dir: Path, valid_trades: list[dict], rexp: dict) 
 
 
 def check_survived_disconnect(all_trades: list[dict]) -> CheckResult:
-    """Survived at least one forced disconnect/reconnect without data loss."""
-    # Evidence: at least one trade with invalid_reason containing 'reconnect'
-    # means a disconnect happened — and if valid trades exist after that session,
-    # the runner survived it.
+    """Survived at least one forced disconnect/reconnect without data loss.
+
+    Evidence: multiple session_ids means the runner reconnected and minted a
+    fresh session.  If valid trades exist after the first session, the runner
+    survived.  Also accepts legacy 'reconnect_during_session' invalid_reason.
+    """
     session_ids = set(t.get("session_id", "") for t in all_trades)
+    session_ids.discard("")
+
+    # Legacy check: explicit reconnect invalid_reason
     reconnect_trades = [
         t for t in all_trades
         if "reconnect" in (t.get("invalid_reason", "") or "").lower()
@@ -228,6 +269,12 @@ def check_survived_disconnect(all_trades: list[dict]) -> CheckResult:
         if post_sessions:
             return CheckResult(True, f"survived disconnect (reconnect in {len(reconnect_sessions)} session(s), continued in {len(post_sessions)})")
         return CheckResult(False, "reconnect observed but no subsequent clean sessions")
+
+    # Multiple session_ids suggests reconnection, but is not definitive proof.
+    # Downgrade to advisory — true proof requires incident artifact verification.
+    if len(session_ids) >= 2:
+        return _advisory(True, f"likely survived disconnect ({len(session_ids)} sessions observed, verify incident logs)")
+
     # If no reconnect evidence — not yet testable, not a hard failure
     return _unevidenced("no disconnect/reconnect event observed yet")
 
@@ -265,14 +312,15 @@ def _load_trades(log_dir: Path) -> list[dict]:
 
 
 def _load_replay_expectations(symbol: str) -> dict:
-    cfg_map = {
-        "EURUSD": "eurusd_t4_paper_v1.json",
-        "GBPUSD": "gbpusd_range_paper_v1.json",
-        "EURJPY": "eurjpy_t4_paper_v1.json",
-    }
-    cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(symbol, "")
-    if cfg_path.exists():
-        return json.loads(cfg_path.read_text()).get("replay_expectations", {})
+    """Load replay expectations from any config matching this symbol."""
+    configs_dir = REPO / "argus_flow" / "configs"
+    for cfg_path in configs_dir.glob("*_paper_v1.json"):
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            if cfg.get("symbol", "").upper() == symbol.upper():
+                return cfg.get("replay_expectations", {})
+        except (json.JSONDecodeError, OSError):
+            continue
     return {}
 
 

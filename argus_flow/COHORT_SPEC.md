@@ -32,7 +32,7 @@ Every trade must carry:
 ### A trade is INVALID if:
 - `restored_from_file`: state was restored from file (reconnect recovery trade)
 - `zero_stops_or_timeout_missing`: stop/target were 0 or timeout_time was missing on restore (forced FLAT)
-- `reconnect_during_session`: runner reconnected to IBKR during this session (session-scoped — ALL trades in a reconnected session are invalid, not just trades open during the disconnect)
+- `restored_from_file` after reconnect: runner mints a fresh session on reconnect; only the trade open during disconnect is tainted. Subsequent trades on rebuilt bar buffer are valid.
 - `repeated_tick_failures`: 3+ consecutive tick errors for this instrument
 - Manual intervention occurred
 - Config changed mid-trade
@@ -45,9 +45,11 @@ Every trade must carry:
 
 ## Reconnect Invalidation Policy
 
-**Session-scoped.** If the runner reconnects to IBKR at any point during a session, ALL subsequent trades in that session are marked `experiment_valid=false` with `invalid_reason=reconnect_during_session`. This is conservative by design — we cannot prove that bar data continuity was maintained across the disconnect, so we distrust the entire post-reconnect session.
+**Trade-scoped with session reset.** On reconnect, the runner mints a fresh `session_id` and rebuilds all `BarBuffer`s from scratch. Only the trade that was open during the disconnect is tainted (via `restored_from_file`). Subsequent entries are computed on a fully rebuilt bar window and are valid.
 
-Rationale: lifecycle-scoped invalidation (only invalidating the trade that was open during disconnect) is weaker because the bar buffer may have gaps that affect feature computation for future entries, not just the current trade.
+Previous policy (session-scoped) invalidated ALL trades after any single disconnect, making it nearly impossible to accumulate 30 valid trades in environments with occasional IBKR blips. Changed 2026-03-25.
+
+Evidence of survived disconnect: promotion gate detects multiple `session_id` values in the trade history.
 
 ## Dashboard/Artifact Divergence — Definition
 
@@ -105,12 +107,68 @@ If the runner is restarted from a different commit, the new `git_sha` will diffe
 - Dashboard truth matches artifact truth (no divergence per definition above)
 - No manual intervention during cohort
 
-## What happens after promotion:
+### Sample robustness requirements (added 2026-03-26):
+- Minimum 10 distinct trading days represented in valid trades
+- No more than 30% of valid trades from a single calendar day
+- Minimum 2 distinct runtime sessions (proves restart survivability)
+- No single regime (TRENDING/RANGING/CHOPPY) accounting for >70% of entries
 
-- Top 2-3 FX runners advance to micro-live consideration
-- Futures remain quarantined as separate hypothesis
-- Additional FX pairs can be added to the unified runner
-- Each new pair starts its own 30-trade cohort
+## Execution Reality Gate (REQUIRED before micro-live)
+
+Paper promotion alone is NOT sufficient for live deployment. Each promoted strategy must also pass:
+
+1. **Next-bar-open entry model**: backtest expectancy remains positive when entry executes at bar i+1 open (not signal bar close)
+2. **Spread/slippage model**: expectancy remains positive after modeled round-trip friction per instrument
+3. **Pessimistic same-bar sequencing**: stops checked before targets for position direction (worst case)
+4. **Trailing stop parity**: backtest trailing uses close-based logic matching live mid-based behavior
+
+Paper-only close-price backtest results are NOT promotable evidence.
+
+## Portfolio Capital Protection (REQUIRED before live)
+
+Before ANY real money deployment:
+
+1. **Broker truth is primary**: risk manager must consume broker positions/orders, not only local state
+2. **Max total open risk**: capped at 5% of account equity across all positions
+3. **Max per-trade dollar risk**: pool * risk_pct (default 2%)
+4. **Portfolio daily max loss**: 10R fleet-wide (currently implemented)
+5. **Per-instrument daily max loss**: 3R (currently implemented)
+6. **Correlated bucket risk cap**: max 3 same-currency-direction positions (currently implemented)
+7. **Unknown symbol fail-closed**: unmapped symbols blocked from entry (currently implemented)
+8. **No pyramiding without re-approval**: pyramid adds must re-check portfolio gate
+9. **Reconciliation drift blocks entries**: any unresolved broker/local mismatch pauses all new entries
+10. **Manual unlock after critical breaker**: auto-resume disabled for portfolio-level breakers in live mode
+
+## Micro-Live Admission Gate
+
+Transition from paper to micro-live requires ALL of:
+
+### Prerequisites:
+- Paper cohort PROMOTED (all gates passed)
+- Execution Reality Gate passed
+- Portfolio Capital Protection implemented and tested
+- Kill-switch tested (manual entry freeze)
+- Broker reconciliation tested under live-capable conditions
+
+### Constraints:
+- Smallest live size: 1 micro lot (FX) or 1 micro contract (futures)
+- Max 3 instruments initially (top performers from paper cohort)
+- No futures/crypto in first micro-live cohort (FX only)
+- Config loader must reject non-cohort live instruments
+
+### Operational requirements:
+- Kill-switch file or API endpoint that halts all entries immediately
+- Manual unlock required after any portfolio-level breaker trips
+- Incident runbook documenting: who can unlock, what constitutes manual intervention, broker disconnect procedures
+
+## Canonical Execution Truth (REQUIRED before live)
+
+Before live deployment:
+- Canonical orders/fills/positions/account artifacts must exist and reconcile
+- Trade journal is derived from fills, not primary truth
+- No unresolved order/fill lifecycle ambiguity
+- Duplicate/partial fill defense tested
+- Fill deduplication survives process restart
 
 ## Failure modes to test before trusting "stable":
 
@@ -118,18 +176,21 @@ If the runner is restarted from a different commit, the new `git_sha` will diffe
 2. Disconnect IBKR → reconnect → verify no duplicate or missing trades
 3. Inject an exception in one runner's tick() → verify others continue
 4. Verify dashboard reads the same data the runner writes
+5. Verify broker reconciliation catches phantom/orphan positions
+6. Verify portfolio risk manager blocks over-correlated entries
+7. Verify kill-switch halts all entries immediately
 
-## Fleet Classification
+## Fleet Classification (updated 2026-03-26)
 
 ### Cohort Active (Class A) — in active validation
-- GBP/USD (69% WR, PF 1.67 from pre-cohort data)
-- EUR/USD (needs cohort trades)
-- EUR/JPY (needs cohort trades)
+- GBP/USD, EUR/USD, EUR/JPY, GBP/JPY, CAD/JPY (London session)
+- AUD/JPY, USD/JPY, AUD/USD (Asia session)
 
-### Candidate (Class B) — not in cohort yet
-- USD/JPY, AUD/USD, GBP/JPY, CAD/JPY, AUD/JPY
+### Candidate (Class B) — collecting data, not yet at 30 valid trades
+- MES, MNQ, MYM, M2K (equity index futures)
+- MGC (gold), MCL (oil)
+- NKD (Nikkei, Asia)
 
-### Quarantined (Class C) — must re-earn inclusion
-- MNQ, MES, MYM, MGC, MCL, M2K (futures — separate hypothesis, wider stops needed)
-- NKD (killed — 25% WR)
-- BTC, ETH (no IBKR data subscription)
+### Retired (Class D) — no longer running
+- BTC, ETH (crypto — archived, pivot to IBKR FX/futures)
+- Legacy crypto runners (runner_live.py) — fully retired 2026-03-25

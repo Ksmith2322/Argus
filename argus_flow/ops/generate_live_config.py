@@ -22,6 +22,15 @@ GATE_REPORT = REPO / "argus_flow" / "ops" / "promotion_gate_report.json"
 DEFAULT_FX_LOT_SIZE = 1000       # 1 micro lot
 DEFAULT_FUTURES_CONTRACTS = 1    # 1 contract
 
+# Pip values per standard lot (100,000 units) for common pairs
+# Used for pool-based risk sizing: lot_size = (pool * risk_pct) / (stop_pips * pip_value_per_unit)
+PIP_VALUE_PER_UNIT = {
+    # Non-JPY pairs: 1 pip = 0.0001 per unit in quote currency (≈ $0.0001 for USD-quoted)
+    "default": 0.0001,
+    # JPY pairs: 1 pip = 0.01 per unit; need USD conversion (~0.000067 at ~150 JPY/USD)
+    "jpy": 0.000067,
+}
+
 
 def _sha256_file(path: Path) -> str:
     """Return full SHA-256 hex digest of a file's contents."""
@@ -65,11 +74,33 @@ def _check_promotion_gate(symbol: str, gate_report: dict | None) -> bool:
     return True  # allow but warn
 
 
+def _compute_lot_size_from_pool(pool: float, risk_pct: float, stop_pips: float, symbol: str) -> int:
+    """Compute FX lot size so that a stop-loss costs pool * risk_pct dollars.
+
+    Example: pool=$10,000, risk_pct=0.02, stop_pips=20, EURUSD
+    -> risk_amount = $200
+    -> lot_size = $200 / (20 pips * $0.0001/pip/unit) = 100,000 units
+    """
+    is_jpy = "JPY" in symbol.upper()
+    pip_val = PIP_VALUE_PER_UNIT["jpy"] if is_jpy else PIP_VALUE_PER_UNIT["default"]
+    risk_amount = pool * risk_pct
+    raw = risk_amount / (stop_pips * pip_val)
+    # Round down to nearest 1000 (IBKR minimum increment for FX)
+    # Cap at 100,000 units (1 standard lot) as safety ceiling
+    lot = max(1000, int(raw / 1000) * 1000)
+    MAX_LOT = 100_000
+    if lot > MAX_LOT:
+        lot = MAX_LOT
+    return lot
+
+
 def generate_live_config(
     paper_path: Path,
     lot_size: int = DEFAULT_FX_LOT_SIZE,
     contracts: int = DEFAULT_FUTURES_CONTRACTS,
     force: bool = False,
+    pool: float = 0,
+    risk_pct: float = 0,
 ) -> Path | None:
     """Read a paper config, produce a live config with reduced sizing.
 
@@ -90,9 +121,20 @@ def generate_live_config(
     symbol = paper.get("symbol", "unknown").lower()
     instrument_type = paper.get("instrument_type", "forex")
 
-    # --- Check promotion gate ---
+    # --- Check promotion gate (HARD GATE — not advisory) ---
     gate_report = _load_gate_report()
-    _check_promotion_gate(paper.get("symbol", ""), gate_report)
+    if not force:
+        promoted = _check_promotion_gate(paper.get("symbol", ""), gate_report)
+        if not promoted:
+            print(f"ERROR: {paper.get('symbol', '?')} is NOT promoted. Cannot generate live config.")
+            print(f"  Run promotion_gate.py first, or use --force to bypass (UNSAFE).")
+            return None
+
+    # --- Block non-FX unless explicitly allowed ---
+    if instrument_type != "forex" and not force:
+        print(f"ERROR: {instrument_type} instruments are not yet live-eligible per COHORT_SPEC.md.")
+        print(f"  Only FX instruments can be promoted. Use --force to bypass (UNSAFE).")
+        return None
 
     # --- Build live config ---
     live = json.loads(json.dumps(paper))  # deep copy
@@ -101,18 +143,27 @@ def generate_live_config(
     live["version"] = paper.get("version", "paper_v1").replace("paper_", "live_")
     live["live"] = True
 
-    # Sizing: reduce to minimum
+    # Sizing: pool-based (2% risk) or explicit lot_size
     if "risk" in live:
         if instrument_type == "forex":
-            paper_lot_size = live["risk"].get("lot_size", lot_size)
-            live["risk"]["lot_size"] = lot_size
+            if pool > 0 and risk_pct > 0:
+                stop_pips = live["risk"].get("stop_pips", 20)
+                computed_lot = _compute_lot_size_from_pool(pool, risk_pct, stop_pips, symbol)
+                live["risk"]["lot_size"] = computed_lot
+                live["risk"]["_sizing_method"] = "pool_based"
+                live["risk"]["_pool"] = pool
+                live["risk"]["_risk_pct"] = risk_pct
+                print(f"  Pool-based sizing: ${pool} x {risk_pct*100:.1f}% / {stop_pips}pip = {computed_lot:,} units")
+            else:
+                live["risk"]["lot_size"] = lot_size
         elif instrument_type == "future":
             live["risk"]["num_contracts"] = contracts
 
     # Traceability fields
     live["paper_source"] = paper_path.name
     live["promoted_at"] = datetime.now(timezone.utc).isoformat()
-    live["promotion_gate_hash"] = _sha256_file(paper_path)
+    live["paper_config_hash"] = _sha256_file(paper_path)
+    live["gate_report_hash"] = _sha256_file(GATE_REPORT) if GATE_REPORT.exists() else "none"
 
     # --- Determine output path ---
     out_name = f"{symbol}_live_v1.json"
@@ -158,7 +209,8 @@ def _print_diff(paper: dict, live: dict, instrument_type: str):
 
     print(f"    paper_source:        (absent) -> {live.get('paper_source')}")
     print(f"    promoted_at:         (absent) -> {live.get('promoted_at')}")
-    print(f"    promotion_gate_hash: (absent) -> {live.get('promotion_gate_hash')[:16]}...")
+    print(f"    paper_config_hash:   (absent) -> {live.get('paper_config_hash', '')[:16]}...")
+    print(f"    gate_report_hash:    (absent) -> {live.get('gate_report_hash', '')[:16]}...")
 
 
 def update_hashes(config_path: Path):
@@ -219,6 +271,18 @@ def main():
         help=f"Futures num_contracts (default: {DEFAULT_FUTURES_CONTRACTS})",
     )
     parser.add_argument(
+        "--pool",
+        type=float,
+        default=0,
+        help="Total trading pool in USD (e.g. 10000). Used with --risk-pct for dynamic sizing.",
+    )
+    parser.add_argument(
+        "--risk-pct",
+        type=float,
+        default=0.02,
+        help="Risk per trade as fraction of pool (default: 0.02 = 2%%)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing live config",
@@ -247,6 +311,8 @@ def main():
                 lot_size=args.lot_size,
                 contracts=args.contracts,
                 force=args.force,
+                pool=args.pool,
+                risk_pct=args.risk_pct,
             )
             results.append(result)
             print()
@@ -265,6 +331,8 @@ def main():
             lot_size=args.lot_size,
             contracts=args.contracts,
             force=args.force,
+            pool=args.pool,
+            risk_pct=args.risk_pct,
         )
         if result is None:
             sys.exit(1)

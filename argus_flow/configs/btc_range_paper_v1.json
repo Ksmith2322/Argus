@@ -7,7 +7,7 @@
     "trigger": {
         "range_pct_min": 0.002,
         "range_accel_min": 0.0,
-        "vol_z_min": -999,
+        "vol_z_min": null,
         "session_start_utc": 0,
         "session_end_utc": 23
     },

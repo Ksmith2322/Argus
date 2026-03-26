@@ -106,12 +106,16 @@ def find_vp_entries(df: pd.DataFrame, profile_lookback: int = 240,
 
         row = df.iloc[i]
 
-        # Session filter
+        # Session filter (supports wraparound e.g. 22-08)
         if "ts" in df.columns:
             try:
                 hour = pd.Timestamp(row["ts"]).hour
-                if not (session_start <= hour <= session_end):
-                    continue
+                if session_start <= session_end:
+                    if not (session_start <= hour <= session_end):
+                        continue
+                else:
+                    if not (hour >= session_start or hour <= session_end):
+                        continue
             except Exception:
                 pass
 

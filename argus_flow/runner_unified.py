@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -50,7 +51,7 @@ log = logging.getLogger("unified")
 # ── Global connection settings from .env ─────────────────────
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
-IBKR_CLIENT_ID = 1  # single shared connection
+IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
@@ -104,19 +105,23 @@ class State:
         self.avg_entry_price = 0.0   # Volume-weighted average entry price
 
     def save(self) -> None:
-        self.file.write_text(json.dumps({
+        """Atomic state write: write to temp file, flush, then rename."""
+        data = json.dumps({
             "position": self.position,
             "entry_price": self.entry_price,
-            "entry_time": str(self.entry_time) if self.entry_time else None,
+            "entry_time": self.entry_time.isoformat() if self.entry_time else None,
             "stop_price": self.stop_price,
             "target_price": self.target_price,
-            "timeout_time": str(self.timeout_time) if self.timeout_time else None,
+            "timeout_time": self.timeout_time.isoformat() if self.timeout_time else None,
             "trade_count": self.trade_count,
             "pnl_pips": self.pnl_pips,
             "pnl_points": self.pnl_points,
             "pyramid_adds": self.pyramid_adds,
             "avg_entry_price": self.avg_entry_price,
-        }, indent=2))
+        }, indent=2)
+        tmp = self.file.with_suffix(".tmp")
+        tmp.write_text(data)
+        tmp.replace(self.file)  # atomic on same filesystem
 
     def load(self, sym_label: str) -> None:
         if not self.file.exists():
@@ -206,6 +211,8 @@ def compute_features_fx(buf: BarBuffer) -> Optional[dict]:
     except (ValueError, IndexError):
         bar_hour = datetime.now(timezone.utc).hour
 
+    regime = classify_regime(buf)
+
     return {
         "range_pct": range_pct,
         "vol_z": vol_z,
@@ -213,6 +220,10 @@ def compute_features_fx(buf: BarBuffer) -> Optional[dict]:
         "dist_from_low": dist_from_low,
         "hour": bar_hour,
         "price": current_px,
+        "regime": regime["regime"],
+        "trend_strength": regime["trend_strength"],
+        "efficiency_ratio": regime["efficiency_ratio"],
+        "regime_confidence": regime["regime_confidence"],
     }
 
 
@@ -258,6 +269,8 @@ def compute_features_futures(buf: BarBuffer) -> Optional[dict]:
     except (ValueError, IndexError):
         bar_hour = datetime.now(timezone.utc).hour
 
+    regime = classify_regime(buf)
+
     return {
         "range_pct": range_pct,
         "vol_z": vol_z,
@@ -266,12 +279,96 @@ def compute_features_futures(buf: BarBuffer) -> Optional[dict]:
         "dist_from_low": dist_from_low,
         "hour": bar_hour,
         "price": current_px,
+        "regime": regime["regime"],
+        "trend_strength": regime["trend_strength"],
+        "efficiency_ratio": regime["efficiency_ratio"],
+        "regime_confidence": regime["regime_confidence"],
+    }
+
+
+# ═════════════════════════════════════════════════════════════
+# Regime classification
+# ═════════════════════════════════════════════════════════════
+def classify_regime(buf: BarBuffer) -> dict:
+    """Classify current market regime from bar buffer.
+
+    Returns dict with:
+        regime: TRENDING | RANGING | CHOPPY
+        trend_strength: float (-1 to +1, negative = downtrend)
+        volatility_rank: float (0 to 1, percentile of current vol vs history)
+        regime_confidence: float (0 to 1, how clearly the regime is defined)
+        regime_suitable_for: list of strategy types that fit this regime
+    """
+    df = buf.to_df()
+    if len(df) < 120:
+        return {"regime": "UNKNOWN", "trend_strength": 0, "volatility_rank": 0.5,
+                "efficiency_ratio": 0, "regime_confidence": 0, "regime_suitable_for": ["range_accel"]}
+
+    closes = df["close"].astype(float)
+    highs = df["high"].astype(float)
+    lows = df["low"].astype(float)
+
+    # ── Trend detection via linear regression slope ──
+    # Use last 60 bars (~1 hour) for trend
+    recent = closes.iloc[-60:]
+    x = np.arange(len(recent))
+    slope = np.polyfit(x, recent.values, 1)[0]
+    # Normalize slope by ATR to make it comparable across assets
+    atr = (highs.iloc[-60:] - lows.iloc[-60:]).mean()
+    trend_strength = (slope * 60) / atr if atr > 0 else 0  # slope over 60 bars, normalized
+    trend_strength = max(-1.0, min(1.0, trend_strength))   # clamp to [-1, 1]
+
+    # ── Volatility rank (current vs historical) ──
+    bar_ranges = highs - lows
+    recent_vol = bar_ranges.iloc[-30:].mean()
+    hist_vol = bar_ranges.mean()
+    vol_ratio = recent_vol / hist_vol if hist_vol > 0 else 1.0
+    volatility_rank = max(0.0, min(1.0, vol_ratio / 2.0))  # 0-1 scale, 0.5 = normal
+
+    # ── Choppiness index (Kaufman efficiency ratio) ──
+    # direction / total_path — high = trending, low = choppy
+    window = min(60, len(closes) - 1)
+    direction = abs(float(closes.iloc[-1]) - float(closes.iloc[-window - 1]))
+    total_path = closes.diff().abs().iloc[-window:].sum()
+    efficiency = direction / total_path if total_path > 0 else 0
+
+    # ── Classify ──
+    abs_trend = abs(trend_strength)
+    if efficiency > 0.35 and abs_trend > 0.3:
+        regime = "TRENDING"
+        confidence = min(1.0, efficiency * 1.5)
+        suitable = ["momentum", "breakout", "trend_follow"]
+    elif efficiency < 0.15 or volatility_rank > 0.7:
+        regime = "CHOPPY"
+        confidence = min(1.0, (1 - efficiency) * 0.8)
+        suitable = ["mean_revert", "scalp"]  # range_accel is risky here
+    else:
+        regime = "RANGING"
+        confidence = min(1.0, (0.35 - efficiency) / 0.2) if efficiency < 0.35 else 0.5
+        suitable = ["range_accel", "mean_revert"]
+
+    return {
+        "regime": regime,
+        "trend_strength": round(trend_strength, 4),
+        "volatility_rank": round(volatility_rank, 4),
+        "efficiency_ratio": round(efficiency, 4),
+        "regime_confidence": round(confidence, 3),
+        "regime_suitable_for": suitable,
     }
 
 
 # ═════════════════════════════════════════════════════════════
 # Trigger checks
 # ═════════════════════════════════════════════════════════════
+def _in_session(hour: int, start: int, end: int) -> bool:
+    """Check if hour is within session window, supporting wrap-around (e.g. 22-08)."""
+    if start <= end:
+        return start <= hour <= end
+    else:
+        # Wrap-around: e.g. 22-08 means 22,23,0,1,...,8
+        return hour >= start or hour <= end
+
+
 def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
     """FX trigger: range_pct + range_accel + vol_z + session."""
     trigger = cfg.get("trigger", {})
@@ -279,10 +376,11 @@ def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
         return None
     if features["range_accel"] <= trigger.get("range_accel_min", 0.0):
         return None
-    if features.get("vol_z", 0) <= trigger.get("vol_z_min", -999):
+    vol_z_min = trigger.get("vol_z_min")
+    if vol_z_min is not None and features.get("vol_z", 0) <= vol_z_min:
         return None
     h = features["hour"]
-    if not (trigger.get("session_start_utc", 0) <= h <= trigger.get("session_end_utc", 23)):
+    if not _in_session(h, trigger.get("session_start_utc", 0), trigger.get("session_end_utc", 23)):
         return None
 
     dist = features["dist_from_low"]
@@ -291,18 +389,26 @@ def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
         return "long"
     elif dist > direction_cfg.get("dist_short_threshold", 0.6):
         return "short"
-    return "long"
+    return None  # ambiguous zone — no trade (was: hidden long bias)
 
 
 def check_trigger_futures(features: dict, cfg: dict) -> Optional[str]:
-    """Futures trigger: vol_burst + range_accel + session."""
+    """Futures trigger — dispatches by strategy field in config."""
+    strategy = cfg.get("strategy", "vol_burst")
+    if strategy.startswith("range_accel"):
+        return _check_trigger_futures_range(features, cfg)
+    return _check_trigger_futures_vol_burst(features, cfg)
+
+
+def _check_trigger_futures_vol_burst(features: dict, cfg: dict) -> Optional[str]:
+    """Original vol_burst: volume spike + range accel + session."""
     trigger = cfg.get("trigger", {})
     if features.get("vol_burst_z", 0) <= trigger.get("vol_burst_z_min", 1.0):
         return None
     if features["range_accel"] <= trigger.get("range_accel_min", 0.0):
         return None
     h = features["hour"]
-    if not (trigger.get("session_start_utc", 13) <= h <= trigger.get("session_end_utc", 20)):
+    if not _in_session(h, trigger.get("session_start_utc", 13), trigger.get("session_end_utc", 20)):
         return None
 
     dist = features["dist_from_low"]
@@ -311,7 +417,30 @@ def check_trigger_futures(features: dict, cfg: dict) -> Optional[str]:
         return "long"
     elif dist > direction_cfg.get("dist_short_threshold", 0.6):
         return "short"
-    return "long"
+    return None  # ambiguous zone — no trade
+
+
+def _check_trigger_futures_range(features: dict, cfg: dict) -> Optional[str]:
+    """Range-accel for futures: same logic as FX but uses futures features."""
+    trigger = cfg.get("trigger", {})
+    if features["range_pct"] < trigger.get("range_pct_min", 0.0008):
+        return None
+    if features["range_accel"] <= trigger.get("range_accel_min", 0.0):
+        return None
+    vol_z_min = trigger.get("vol_z_min")
+    if vol_z_min is not None and features.get("vol_z", 0) <= vol_z_min:
+        return None
+    h = features["hour"]
+    if not _in_session(h, trigger.get("session_start_utc", 13), trigger.get("session_end_utc", 20)):
+        return None
+
+    dist = features["dist_from_low"]
+    direction_cfg = cfg.get("direction", {})
+    if dist < direction_cfg.get("dist_long_threshold", 0.4):
+        return "long"
+    elif dist > direction_cfg.get("dist_short_threshold", 0.6):
+        return "short"
+    return None  # ambiguous zone — no trade
 
 
 # ═════════════════════════════════════════════════════════════
@@ -410,9 +539,23 @@ class InstrumentRunner:
             return None
 
     def _get_volume(self) -> float:
+        """Get INCREMENTAL volume since last read (not cumulative session volume).
+
+        IBKR ticker.volume is cumulative for the session. We track the previous
+        value and return the delta, which gives per-bar volume when sampled once
+        per bar close.
+        """
         t = self.ticker
-        vol = getattr(t, "volume", None) or getattr(t, "delayedVolume", None)
-        return float(vol) if vol and vol > 0 else 0.0
+        raw_vol = getattr(t, "volume", None) or getattr(t, "delayedVolume", None)
+        raw_vol = float(raw_vol) if raw_vol and raw_vol > 0 else 0.0
+
+        prev = getattr(self, '_prev_cumulative_vol', 0.0)
+        self._prev_cumulative_vol = raw_vol
+
+        if prev <= 0 or raw_vol < prev:
+            # First read or session reset — can't compute delta
+            return 0.0
+        return raw_vol - prev
 
     # ── CSV helpers ──────────────────────────────────────────
     def _ensure_signal_header(self) -> None:
@@ -517,18 +660,142 @@ class InstrumentRunner:
         return compute_features_fx(self.buf)
 
     def _check_trigger(self, features: dict) -> Optional[str]:
+        strategy = self.cfg.get("strategy", "range_accel")
+        # Advanced strategies: FVG, liquidity sweep, volume profile
+        if strategy == "fvg":
+            return self._check_trigger_fvg(features)
+        elif strategy == "liquidity_sweep":
+            return self._check_trigger_sweep(features)
+        elif strategy == "volume_profile":
+            return self._check_trigger_vp(features)
+        # Default: range-based triggers
         if self.instrument_type in ("future", "crypto"):
             return check_trigger_futures(features, self.cfg)
         return check_trigger_fx(features, self.cfg)
 
+    def _check_trigger_fvg(self, features: dict) -> Optional[str]:
+        """Fair Value Gap strategy: enter on retrace to fill 3-candle imbalance."""
+        from argus_flow.strategies.fvg_detector import detect_fvgs, find_fvg_fill_entries
+        trigger = self.cfg.get("trigger", {})
+        h = features["hour"]
+        if not _in_session(h, trigger.get("session_start_utc", 8), trigger.get("session_end_utc", 20)):
+            return None
+        df = self.buf.to_df()
+        if len(df) < 60:
+            return None
+        df = df.reset_index(drop=True)
+        fvgs = detect_fvgs(df, min_displacement_mult=trigger.get("min_displacement_mult", 1.5))
+        entries = find_fvg_fill_entries(
+            df, fvgs, max_wait_bars=trigger.get("max_wait_bars", 60),
+            session_start=trigger.get("session_start_utc", 8),
+            session_end=trigger.get("session_end_utc", 20),
+        )
+        if entries:
+            return entries[-1]["direction"]  # latest signal
+        return None
+
+    def _check_trigger_sweep(self, features: dict) -> Optional[str]:
+        """Liquidity sweep: enter opposite direction after wick beyond swing point."""
+        from argus_flow.strategies.liquidity_sweep import find_swing_points, detect_sweeps
+        trigger = self.cfg.get("trigger", {})
+        h = features["hour"]
+        if not _in_session(h, trigger.get("session_start_utc", 8), trigger.get("session_end_utc", 20)):
+            return None
+        df = self.buf.to_df()
+        if len(df) < 60:
+            return None
+        df = df.reset_index(drop=True)
+        sh, sl = find_swing_points(df, lookback=trigger.get("swing_lookback", 20))
+        sweeps = detect_sweeps(
+            df, sh, sl, wick_ratio_min=trigger.get("wick_ratio_min", 0.3),
+            session_start=trigger.get("session_start_utc", 8),
+            session_end=trigger.get("session_end_utc", 20),
+        )
+        if sweeps:
+            return sweeps[-1]["direction"]
+        return None
+
+    def _check_trigger_vp(self, features: dict) -> Optional[str]:
+        """Volume profile: mean-revert from VAH/VAL toward POC."""
+        from argus_flow.strategies.volume_profile import calculate_volume_profile
+        trigger = self.cfg.get("trigger", {})
+        h = features["hour"]
+        if not _in_session(h, trigger.get("session_start_utc", 13), trigger.get("session_end_utc", 20)):
+            return None
+        df = self.buf.to_df()
+        lookback = trigger.get("vp_lookback", 240)
+        if len(df) < lookback:
+            return None
+        df = df.reset_index(drop=True)
+        profile = calculate_volume_profile(df, len(df) - lookback, len(df))
+        if not profile:
+            return None
+        price = features["price"]
+        buffer = trigger.get("entry_buffer_pct", 0.0002)
+        vah = profile["vah"]
+        val = profile["val"]
+        if price >= vah * (1 - buffer):
+            return "short"  # at value area high, mean-revert down
+        elif price <= val * (1 + buffer):
+            return "long"   # at value area low, mean-revert up
+        return None
+
+    @staticmethod
+    def _regime_compatible(regime: str, strategy: str) -> bool:
+        """Check if the current regime suits the strategy type."""
+        compatibility = {
+            "range_accel":      {"RANGING", "UNKNOWN"},
+            "T4_full_stack":    {"RANGING", "TRENDING", "UNKNOWN"},
+            "range_accel_NY":   {"RANGING", "UNKNOWN"},
+            "momentum":         {"TRENDING", "UNKNOWN"},
+            "vol_burst":        {"TRENDING", "CHOPPY", "UNKNOWN"},
+            "fvg":              {"RANGING", "TRENDING", "UNKNOWN"},
+            "liquidity_sweep":  {"RANGING", "CHOPPY", "UNKNOWN"},
+            "volume_profile":   {"RANGING", "UNKNOWN"},
+        }
+        allowed = compatibility.get(strategy, {"RANGING", "TRENDING", "UNKNOWN"})
+        return regime in allowed
+
     # ── Stop/target computation ──────────────────────────────
+    def _compute_atr(self) -> float:
+        """Compute 14-period ATR from bar buffer."""
+        df = self.buf.to_df()
+        if len(df) < 14:
+            return 0.0
+        highs = df["high"].astype(float).iloc[-14:]
+        lows = df["low"].astype(float).iloc[-14:]
+        closes = df["close"].astype(float).iloc[-15:-1]  # previous closes
+        if len(closes) < 14:
+            return float((highs - lows).mean())
+        tr = pd.concat([
+            highs - lows,
+            (highs - closes).abs(),
+            (lows - closes).abs(),
+        ], axis=1).max(axis=1)
+        return float(tr.mean())
+
     def _compute_stops(self, entry_px: float, direction: str) -> tuple[float, float]:
-        """Return (stop_price, target_price) for a new entry."""
-        if self.uses_pips:
+        """Return (stop_price, target_price) for a new entry.
+
+        Uses ATR-scaled stops if atr_stop_mult is in config, otherwise fixed pip/bps.
+        """
+        risk_cfg = self.cfg.get("risk", {})
+        atr_stop_mult = risk_cfg.get("atr_stop_mult", 0)
+        atr_target_mult = risk_cfg.get("atr_target_mult", 0)
+
+        if atr_stop_mult > 0:
+            atr = self._compute_atr()
+            if atr > 0:
+                stop_dist = atr * atr_stop_mult
+                target_dist = atr * (atr_target_mult if atr_target_mult > 0 else atr_stop_mult * 2)
+            else:
+                # Fallback to fixed if ATR can't be computed
+                stop_dist = self.stop_pips * self.pip_size if self.uses_pips else entry_px * (self.stop_bps / 10000)
+                target_dist = self.target_pips * self.pip_size if self.uses_pips else entry_px * (self.target_bps / 10000)
+        elif self.uses_pips:
             stop_dist = self.stop_pips * self.pip_size
             target_dist = self.target_pips * self.pip_size
         else:
-            # bps-based
             stop_dist = entry_px * (self.stop_bps / 10000)
             target_dist = entry_px * (self.target_bps / 10000)
 
@@ -536,6 +803,43 @@ class InstrumentRunner:
             return entry_px - stop_dist, entry_px + target_dist
         else:
             return entry_px + stop_dist, entry_px - target_dist
+
+    def _check_trailing_stop(self, mid: float) -> None:
+        """Move stop to breakeven after price moves 1R in our favor.
+
+        1R = original risk distance (entry to stop).
+        After 1.5R, trail at entry + 0.5R.
+        """
+        s = self.state
+        if s.entry_price == 0 or s.stop_price == 0:
+            return
+
+        risk_dist = abs(s.entry_price - s.stop_price)
+        if risk_dist == 0:
+            return
+
+        if s.position == "LONG":
+            favorable = mid - s.entry_price
+            if favorable >= risk_dist * 1.5:
+                # Trail at entry + 0.5R
+                new_stop = s.entry_price + risk_dist * 0.5
+                if new_stop > s.stop_price:
+                    s.stop_price = new_stop
+            elif favorable >= risk_dist:
+                # Move to breakeven
+                if s.stop_price < s.entry_price:
+                    self._log.info(f"TRAILING: stop moved to breakeven {s.entry_price:.5f}")
+                    s.stop_price = s.entry_price
+        elif s.position == "SHORT":
+            favorable = s.entry_price - mid
+            if favorable >= risk_dist * 1.5:
+                new_stop = s.entry_price - risk_dist * 0.5
+                if new_stop < s.stop_price:
+                    s.stop_price = new_stop
+            elif favorable >= risk_dist:
+                if s.stop_price > s.entry_price:
+                    self._log.info(f"TRAILING: stop moved to breakeven {s.entry_price:.5f}")
+                    s.stop_price = s.entry_price
 
     # ── Pyramiding / scale-in ────────────────────────────────
     def _check_pyramid(self, mid: float, now: datetime) -> None:
@@ -617,7 +921,7 @@ class InstrumentRunner:
             self.current_bar["low"] = min(self.current_bar["low"], mid)
             self.current_bar["close"] = mid
             if vol > 0:
-                self.current_bar["volume"] = vol
+                self.current_bar["volume"] = self.current_bar.get("volume", 0) + vol  # accumulate, not overwrite
 
         # ── Position management (every tick) ─────────────────
         s = self.state
@@ -638,6 +942,10 @@ class InstrumentRunner:
             if s.timeout_time and now >= s.timeout_time:
                 exit_reason = "timeout"
 
+            # ── Trailing stop: move stop to breakeven after 1R ──
+            if s.position != "FLAT" and not exit_reason:
+                self._check_trailing_stop(mid)
+
             if exit_reason:
                 pnl = self._log_trade(mid, exit_reason, now)
                 if self.uses_pips:
@@ -648,6 +956,11 @@ class InstrumentRunner:
                     s.pnl_points += pnl
                     unit = "pts"
                     total = s.pnl_points
+                # Record trade PnL in R-multiples for daily risk limits
+                if hasattr(self, '_risk_mgr'):
+                    stop_size = self.stop_pips if self.uses_pips else self.stop_bps
+                    pnl_r = pnl / stop_size if stop_size > 0 else pnl
+                    self._risk_mgr.record_trade_pnl(self.symbol, pnl_r)
                 self._log.info(
                     f"EXIT {s.position} @ {mid} reason={exit_reason} "
                     f"pnl={pnl:+.2f}{unit} total={total:+.2f}{unit} "
@@ -679,6 +992,23 @@ class InstrumentRunner:
 
         direction = self._check_trigger(features)
 
+        # ── Regime gate ──────────────────────────────────────
+        # Stamps every signal with regime. In GATE mode, blocks entries
+        # when regime doesn't match strategy type.
+        regime = features.get("regime", "UNKNOWN")
+        regime_mode = self.cfg.get("regime_gate", "LOG_ONLY")  # LOG_ONLY | GATE
+        if direction and regime_mode == "GATE":
+            strategy = self.cfg.get("strategy", "range_accel")
+            regime_ok = self._regime_compatible(regime, strategy)
+            if not regime_ok:
+                self._log.info(
+                    f"REGIME_BLOCK {direction.upper()} | regime={regime} "
+                    f"strategy={strategy} eff={features.get('efficiency_ratio', 0):.3f} "
+                    f"trend={features.get('trend_strength', 0):.3f}"
+                )
+                self._log_signal(features, direction, "REGIME_BLOCKED")
+                direction = None
+
         # Min gap between signals
         if direction and s.last_signal_time:
             gap = (now - s.last_signal_time).total_seconds() / 60
@@ -689,6 +1019,16 @@ class InstrumentRunner:
         if direction and getattr(self, '_entries_blocked', False):
             self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
             direction = None
+
+        # ── Portfolio risk gate ─────────────────────────────
+        if direction and hasattr(self, '_risk_mgr'):
+            allowed, reason = self._risk_mgr.can_enter(
+                self.symbol, direction, getattr(self, '_all_instruments', [])
+            )
+            if not allowed:
+                self._log.info(f"RISK_BLOCK {direction.upper()} | reason={reason}")
+                self._log_signal(features, direction, f"RISK_BLOCKED_{reason}")
+                direction = None
 
         if direction:
             entry_px = mid
@@ -716,6 +1056,7 @@ class InstrumentRunner:
                 f"ENTRY {direction.upper()} @ {entry_px} "
                 f"stop={stop_px} target={target_px} "
                 f"rng={features['range_pct']:.4f} accel={features['range_accel']:.3f}"
+                f" regime={features.get('regime', '?')} eff={features.get('efficiency_ratio', 0):.3f}"
                 f"{extra}"
             )
         else:
@@ -867,20 +1208,39 @@ def reconcile_instruments(ib, instruments: list) -> dict:
             result = ReconcileResult.CLEAN_FLAT
             detail = "Both local and broker flat"
         elif local_pos == broker_dir:
-            result = ReconcileResult.CLEAN_OPEN_MATCHED
-            detail = f"Both agree: {local_pos} qty={broker_info.get('qty', 0)}"
+            # Direction matches — also verify qty is nonzero and reasonable
+            broker_qty = abs(broker_info.get("qty", 0))
+            if broker_qty > 0:
+                result = ReconcileResult.CLEAN_OPEN_MATCHED
+                detail = f"Both agree: {local_pos} qty={broker_qty}"
+            else:
+                # Direction matches but qty is 0 — trust broker
+                result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
+                detail = f"Direction matches but broker qty=0 — forcing FLAT"
+                inst.state.position = "FLAT"
+                inst.state.entry_price = 0.0
+                inst.state.stop_price = 0.0
+                inst.state.target_price = 0.0
+                inst.state.timeout_time = None
+                inst.state.entry_time = None
+                inst.state.avg_entry_price = 0.0
+                inst.state.pyramid_adds = 0
+                inst.state.save()
         elif local_pos == "FLAT" and broker_dir in ("LONG", "SHORT"):
             result = ReconcileResult.LOCAL_FLAT_BROKER_OPEN
             detail = f"Orphan: broker has {broker_dir} qty={broker_info['qty']} but runner is FLAT"
         elif local_pos in ("LONG", "SHORT") and broker_dir == "FLAT":
             result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
             detail = f"Phantom: runner says {local_pos} but broker is FLAT -- forcing local FLAT"
-            # Auto-correct: trust broker truth
+            # Auto-correct: trust broker truth — clear ALL lifecycle state
             inst.state.position = "FLAT"
             inst.state.entry_price = 0.0
             inst.state.stop_price = 0.0
             inst.state.target_price = 0.0
             inst.state.timeout_time = None
+            inst.state.entry_time = None
+            inst.state.avg_entry_price = 0.0
+            inst.state.pyramid_adds = 0
             inst.state.save()
         else:
             result = ReconcileResult.UNRESOLVED
@@ -966,6 +1326,132 @@ def _determine_runtime_mode(recon_results: dict) -> str:
         return RuntimeMode.DEGRADED
 
     return RuntimeMode.READY
+
+
+# ═════════════════════════════════════════════════════════════
+# Portfolio Risk Manager
+# ═════════════════════════════════════════════════════════════
+class PortfolioRiskManager:
+    """Cross-instrument risk guards. Shared by all runners in a process."""
+
+    # Currency exposure map: which currencies each symbol exposes you to
+    CURRENCY_MAP = {
+        "EURUSD": {"EUR": +1, "USD": -1},
+        "GBPUSD": {"GBP": +1, "USD": -1},
+        "AUDUSD": {"AUD": +1, "USD": -1},
+        "USDJPY": {"USD": +1, "JPY": -1},
+        "EURJPY": {"EUR": +1, "JPY": -1},
+        "GBPJPY": {"GBP": +1, "JPY": -1},
+        "AUDJPY": {"AUD": +1, "JPY": -1},
+        "CADJPY": {"CAD": +1, "JPY": -1},
+        "MES": {"USD_EQUITY": +1}, "MNQ": {"USD_EQUITY": +1},
+        "MYM": {"USD_EQUITY": +1}, "M2K": {"USD_EQUITY": +1},
+        "MGC": {"GOLD": +1}, "MCL": {"OIL": +1}, "NKD": {"JPY_EQUITY": +1},
+    }
+
+    def __init__(self, max_same_currency: int = 3, max_drawdown_pct: float = 0.03,
+                 daily_max_loss: float = 3.0, portfolio_daily_max_loss: float = 10.0):
+        self.max_same_currency = max_same_currency
+        self.max_drawdown_pct = max_drawdown_pct
+        self.daily_max_loss = daily_max_loss  # per instrument, in R
+        self.portfolio_daily_max_loss = portfolio_daily_max_loss  # fleet-wide, in R
+        self._peak_pnl: float = 0.0
+        self._current_pnl: float = 0.0
+        self._drawdown_pause = False
+        self._daily_pnl: dict[str, float] = {}
+        self._daily_paused: set[str] = set()
+        self._portfolio_daily_paused: bool = False
+        self._current_day: str = ""
+
+    def update(self, instruments: list) -> None:
+        """Update portfolio PnL tracking.
+
+        Normalizes to R-multiples (multiples of initial risk) per instrument
+        to avoid mixing pips and points. 1R = one stop-loss distance of PnL.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_day:
+            self._current_day = today
+            self._daily_pnl.clear()
+            self._daily_paused.clear()
+            self._portfolio_daily_paused = False
+            log.info("RISK_MGR: daily limits reset")
+        # Normalize each instrument's PnL by its stop distance to get R-multiples
+        total_r = 0.0
+        for i in instruments:
+            s = i.state
+            raw_pnl = s.pnl_pips if i.uses_pips else s.pnl_points
+            # Normalize by stop size to get R-units
+            stop = i.stop_pips if i.uses_pips else i.stop_bps
+            if stop > 0:
+                total_r += raw_pnl / stop
+            elif raw_pnl != 0:
+                # Zero stop = broken config. Don't contaminate R-aggregate.
+                log.warning(f"RISK_MGR: {i.symbol} has stop=0, PnL={raw_pnl} excluded from R-total")
+                pass  # skip this instrument's contribution
+        self._current_pnl = total_r
+        self._peak_pnl = max(self._peak_pnl, total_r)
+
+    def record_trade_pnl(self, symbol: str, pnl_r: float) -> None:
+        """Record a completed trade's PnL in R-multiples for daily tracking."""
+        self._daily_pnl[symbol] = self._daily_pnl.get(symbol, 0.0) + pnl_r
+
+    def can_enter(self, symbol: str, direction: str, instruments: list) -> tuple[bool, str]:
+        """Master gate: check all portfolio-level risk guards."""
+        # 1. Drawdown breaker
+        if self._peak_pnl > 0:
+            dd = (self._peak_pnl - self._current_pnl) / abs(self._peak_pnl)
+            if dd >= self.max_drawdown_pct:
+                if not self._drawdown_pause:
+                    log.warning(f"DRAWDOWN BREAKER: {dd:.1%} from peak. ALL entries paused.")
+                    self._drawdown_pause = True
+                return False, "DRAWDOWN_PAUSE"
+            if self._drawdown_pause and dd < 0.01:
+                log.info("DRAWDOWN BREAKER: recovered. Entries resumed.")
+                self._drawdown_pause = False
+        if self._drawdown_pause:
+            return False, "DRAWDOWN_PAUSE"
+
+        # 2. Daily max loss per instrument
+        if symbol in self._daily_paused:
+            return False, "DAILY_LIMIT"
+        daily = self._daily_pnl.get(symbol, 0.0)
+        if daily <= -self.daily_max_loss:
+            log.warning(f"DAILY LIMIT: {symbol} lost {daily:+.1f} today. Paused.")
+            self._daily_paused.add(symbol)
+            return False, "DAILY_LIMIT"
+
+        # 3. Portfolio daily max loss (sum of all instrument daily losses)
+        total_daily_r = sum(self._daily_pnl.values())
+        if total_daily_r <= -self.portfolio_daily_max_loss:
+            if not self._portfolio_daily_paused:
+                log.warning(f"PORTFOLIO DAILY LIMIT: fleet lost {total_daily_r:+.1f}R today. ALL entries paused.")
+                self._portfolio_daily_paused = True
+            return False, "PORTFOLIO_DAILY_LIMIT"
+
+        # 4. Correlation / currency exposure
+        cmap = self.CURRENCY_MAP.get(symbol.upper(), {})
+        if not cmap:
+            # Unknown symbol — fail closed, do not silently skip correlation checks
+            log.warning(f"CORRELATION FAIL_CLOSED: {symbol} not in CURRENCY_MAP — entry blocked")
+            return False, "UNKNOWN_SYMBOL_EXPOSURE"
+
+        exposure: dict[str, int] = {}
+        for inst in instruments:
+            if inst.state.position == "FLAT":
+                continue
+            ic = self.CURRENCY_MAP.get(inst.symbol.upper(), {})
+            pm = 1 if inst.state.position == "LONG" else -1
+            for ccy, dm in ic.items():
+                exposure[ccy] = exposure.get(ccy, 0) + (dm * pm)
+        new_mult = 1 if direction == "long" else -1
+        for ccy, dm in cmap.items():
+            new_exp = exposure.get(ccy, 0) + (dm * new_mult)
+            if abs(new_exp) > self.max_same_currency:
+                log.info(f"CORRELATION BLOCK: {symbol} {direction} -> {ccy}={new_exp:+d} (max={self.max_same_currency})")
+                return False, "CORRELATION_LIMIT"
+
+        return True, ""
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1118,6 +1604,17 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         for inst in instruments:
             inst._entries_blocked = False
 
+    # -- Portfolio risk manager ----------------------------------------
+    risk_mgr = PortfolioRiskManager(
+        max_same_currency=3,
+        max_drawdown_pct=0.03,
+        daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
+        portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
+    )
+    for inst in instruments:
+        inst._risk_mgr = risk_mgr
+        inst._all_instruments = instruments  # reference for correlation checks
+
     # -- Seed historical data -----------------------------------------
     log.info("Seeding historical bars...")
     for inst in instruments:
@@ -1133,6 +1630,8 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         while True:
             ib.sleep(1)  # process all IB events for all instruments
             now = datetime.now(timezone.utc)
+
+            risk_mgr.update(instruments)
 
             for inst in instruments:
                 # Skip quarantined runners
@@ -1150,6 +1649,31 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         runtime_mode = RuntimeMode.DEGRADED
                         _write_incident(inst, "QUARANTINED", f"{inst._consecutive_errors} consecutive tick errors",
                                         inst.state.position, {"direction": "unknown", "qty": 0})
+
+            # Periodic broker reconciliation (every 5 min, same key logic as startup)
+            if time.time() - last_heartbeat > heartbeat_interval and ib.isConnected():
+                try:
+                    # Use same normalized key as startup reconciliation
+                    broker_positions = {}
+                    for p in ib.positions():
+                        key = _normalize_ib_key(p.contract)
+                        broker_positions[key] = float(p.position)
+                    for inst in instruments:
+                        ib_key = _runner_to_ib_key(inst)
+                        bp = broker_positions.get(ib_key, 0)
+                        local_pos = inst.state.position
+                        broker_flat = (bp == 0)
+                        local_flat = (local_pos == "FLAT")
+                        if broker_flat != local_flat:
+                            log.warning(
+                                f"RECON_DRIFT: {inst.symbol} local={local_pos} "
+                                f"broker_qty={bp} key={ib_key} — mismatch detected"
+                            )
+                            _write_incident(inst, "RECON_DRIFT",
+                                            f"local={local_pos} broker_qty={bp}",
+                                            local_pos, {"direction": "unknown", "qty": bp})
+                except Exception as e:
+                    log.warning(f"Periodic reconciliation failed: {e}")
 
             # Periodic heartbeat (log + per-instrument heartbeat files)
             if time.time() - last_heartbeat > heartbeat_interval:
@@ -1207,8 +1731,19 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             pass
         return True  # reconnect
 
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as e:
+        # Logic/programming errors — do NOT reconnect, fail loudly
+        log.critical(f"CODE DEFECT (not a connection issue): {type(e).__name__}: {e}", exc_info=True)
+        for inst in instruments:
+            inst.state.save()
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False  # do NOT reconnect — fix the bug
+
     except Exception as e:
-        log.error(f"Unexpected error: {e}", exc_info=True)
+        log.error(f"Unexpected error (will reconnect): {e}", exc_info=True)
         for inst in instruments:
             inst.state.save()
         try:
@@ -1264,7 +1799,17 @@ def run_with_reconnect(
             log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay:.0f}s...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 1.5, 120)  # cap at 2 min
-            main._is_reconnect = True  # mark subsequent attempts as reconnects
+            # DESIGN DOCTRINE (2026-03-25): _is_reconnect is intentionally False here.
+            # Bar buffer rebuilds from scratch on reconnect (300 bars seeded).
+            # Only the trade open DURING disconnect is tainted (via restored_from_file).
+            # Post-reconnect entries on fresh bar data are valid by design.
+            # Previous session-wide tainting killed ALL trades after any single blip,
+            # making it impossible to accumulate 30 valid trades for promotion.
+            # See COHORT_SPEC.md "Trade-scoped with session reset" for full rationale.
+            main._session_id = str(uuid.uuid4())[:8]
+            main._runtime_start = time.time()
+            main._is_reconnect = False
+            log.info(f"New session after reconnect: {main._session_id}")
         else:
             retry_delay = 10.0
 
@@ -1294,7 +1839,14 @@ def cli() -> None:
         "--exclude", nargs="*", default=None,
         help="Symbols or config stems to exclude (e.g., eth_range btc_range sol)",
     )
+    parser.add_argument(
+        "--client-id", type=int, default=None,
+        help="IBKR client ID (default: from IBKR_CLIENT_ID env or 1). Use different IDs for parallel runners.",
+    )
     args = parser.parse_args()
+    if args.client_id is not None:
+        global IBKR_CLIENT_ID
+        IBKR_CLIENT_ID = args.client_id
     run_with_reconnect(config_paths=args.configs, exclude=args.exclude)
 
 

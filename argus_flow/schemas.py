@@ -9,7 +9,7 @@ Rules:
 """
 
 # Schema version — bump when columns change
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── Signal CSV ─────────────────────────────────────────────────
 
@@ -17,12 +17,14 @@ SIGNAL_FIELDS_FX = [
     "ts", "price", "range_pct", "vol_z", "range_accel",
     "dist_from_low", "hour", "direction", "action",
     "config_hash", "session_id",
+    "regime", "trend_strength", "efficiency_ratio",
 ]
 
 SIGNAL_FIELDS_FUTURES = [
     "ts", "price", "range_pct", "vol_z", "range_accel",
     "vol_burst_z", "dist_from_low", "hour", "direction", "action",
     "config_hash", "session_id",
+    "regime", "trend_strength", "efficiency_ratio",
 ]
 
 
@@ -52,6 +54,9 @@ def build_signal_row(features: dict, direction: str | None, action: str,
         action,
         config_hash,
         session_id,
+        features.get("regime", ""),
+        f"{features.get('trend_strength', 0):.4f}",
+        f"{features.get('efficiency_ratio', 0):.4f}",
     ]
     return row
 

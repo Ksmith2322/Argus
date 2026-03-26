@@ -20,9 +20,16 @@ REPO = Path(__file__).resolve().parents[2]
 
 # -- Active Cohort (Class A) — must match runner_unified.py and dashboard.py --
 COHORT_RUNNERS = [
+    # London session
     {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "unit": "pips"},
     {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "unit": "pips"},
     {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "unit": "pips"},
+    {"name": "GBP/JPY", "symbol": "GBPJPY", "log_dir": "argus_flow/logs/gbpjpy", "config": "argus_flow/configs/gbpjpy_t4_paper_v1.json", "unit": "pips"},
+    {"name": "CAD/JPY", "symbol": "CADJPY", "log_dir": "argus_flow/logs/cadjpy", "config": "argus_flow/configs/cadjpy_t4_paper_v1.json", "unit": "pips"},
+    # Asia session
+    {"name": "AUD/JPY", "symbol": "AUDJPY", "log_dir": "argus_flow/logs/audjpy", "config": "argus_flow/configs/audjpy_t4_paper_v1.json", "unit": "pips"},
+    {"name": "USD/JPY", "symbol": "USDJPY", "log_dir": "argus_flow/logs/usdjpy", "config": "argus_flow/configs/usdjpy_ny_paper_v1.json", "unit": "pips"},
+    {"name": "AUD/USD", "symbol": "AUDUSD", "log_dir": "argus_flow/logs/audusd", "config": "argus_flow/configs/audusd_ny_paper_v1.json", "unit": "pips"},
 ]
 
 PROMOTION_THRESHOLD = 30   # valid trades needed
@@ -65,7 +72,12 @@ def _compute_metrics(trades: list[dict], pnl_field: str) -> dict:
     losses = [p for p in pnls if p <= 0]
 
     wr = len(wins) / len(pnls) if pnls else 0
-    pf = round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 0
+    if losses and sum(losses) != 0:
+        pf = round(sum(wins) / abs(sum(losses)), 2)
+    elif wins:
+        pf = 999.0  # all wins, no losses
+    else:
+        pf = 0
     exp = round(sum(pnls) / len(pnls), 3) if pnls else 0
 
     cum = 0
@@ -169,15 +181,26 @@ def generate_report() -> dict:
         r["invalid_rate"] = round(len(invalid_trades) / len(all_trades), 3) if all_trades else 0
 
         # Invalid reason breakdown
-        reasons = Counter(t.get("invalid_reason", "UNKNOWN") for t in invalid_trades)
+        # Normalize invalid reasons before counting
+        def _norm_reason(r: str) -> str:
+            r = (r or "").strip().lower()
+            if not r or r in ("null", "none", "unknown", ""):
+                return "UNKNOWN"
+            return r
+        reasons = Counter(_norm_reason(t.get("invalid_reason", "")) for t in invalid_trades)
         r["invalid_reasons"] = dict(reasons)
-        if "UNKNOWN" in reasons or "" in reasons:
+        if "UNKNOWN" in reasons:
             has_unknown_reason = True
 
         # Config hash consistency (all trades should have same hash)
         trade_hashes = set(t.get("config_hash", "") for t in all_trades if t.get("config_hash"))
         r["config_hash_consistent"] = len(trade_hashes) <= 1
         r["config_hashes_in_trades"] = list(trade_hashes)
+        # Does current on-disk config match the trade cohort?
+        r["current_config_matches_cohort"] = (
+            r["config_hash_current"] in trade_hashes if trade_hashes
+            else True  # no trades yet, no mismatch possible
+        )
         config_hashes_seen.update(trade_hashes)
 
         # Git sha consistency
@@ -255,10 +278,11 @@ def generate_report() -> dict:
         "valid_trades": fleet_valid,
         "invalid_trades": fleet_invalid,
         "invalid_rate": round(fleet_invalid / fleet_total, 3) if fleet_total else 0,
-        "progress_toward_30": f"{fleet_valid}/{PROMOTION_THRESHOLD}",
+        "pairs_at_threshold": sum(1 for r in report["runners"] if r["valid_trades"] >= PROMOTION_THRESHOLD),
+        "pairs_below_threshold": sum(1 for r in report["runners"] if r["valid_trades"] < PROMOTION_THRESHOLD),
         "has_unknown_invalid_reason": has_unknown_reason,
         "config_hashes_seen": list(config_hashes_seen),
-        "config_consistent": len(config_hashes_seen - {""}) <= len(COHORT_RUNNERS),
+        "config_consistent": all(r.get("config_hash_consistent", True) for r in report["runners"]),
         "git_shas_seen": list(git_shas_seen),
         "git_sha_consistent": len(git_shas_seen - {""}) <= 1,
         "quarantine_triggered": any_quarantine_triggered,
@@ -312,7 +336,7 @@ def print_report(report: dict):
 
         if r.get("signal_freq_ratio"):
             ratio = r["signal_freq_ratio"]
-            flag = " WATCH" if ratio < 0.5 or ratio > 2.0 else ""
+            flag = " WATCH" if ratio < 0.5 or ratio > 1.5 else ""  # matches promotion_gate.py band
             print(f"    Signal Freq: {r.get('live_signals_per_day', 0):.1f}/day (ratio={ratio:.2f}){flag}")
 
         promo = r.get("promotion_eligible", False)

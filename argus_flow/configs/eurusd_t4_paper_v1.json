@@ -12,9 +12,9 @@
         "session_end_utc": 19
     },
     "risk": {
-        "stop_pips": 20,
-        "target_pips": 40,
-        "timeout_minutes": 60,
+        "stop_pips": 30,
+        "target_pips": 30,
+        "timeout_minutes": 90,
         "min_signal_gap_minutes": 15,
         "lot_size": 20000
     },

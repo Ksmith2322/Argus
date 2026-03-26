@@ -1764,9 +1764,26 @@ async def api_evolution():
 
 # ── Active Cohort (Class A) — frozen per COHORT_SPEC.md ──
 IBKR_RUNNERS = [
+    # FX — London session
     {"name": "GBP/USD", "symbol": "GBPUSD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips", "mult": 10000},
     {"name": "EUR/USD", "symbol": "EURUSD", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurusd", "unit": "pips", "mult": 10000},
     {"name": "EUR/JPY", "symbol": "EURJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips", "mult": 100},
+    {"name": "GBP/JPY", "symbol": "GBPJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/gbpjpy", "unit": "pips", "mult": 100},
+    {"name": "CAD/JPY", "symbol": "CADJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/cadjpy", "unit": "pips", "mult": 100},
+    # FX — Asia session
+    {"name": "AUD/JPY", "symbol": "AUDJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/audjpy", "unit": "pips", "mult": 100},
+    {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
+    {"name": "AUD/USD", "symbol": "AUDUSD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/audusd", "unit": "pips", "mult": 10000},
+    # Futures — Equity Index Micros (US session)
+    {"name": "MES", "symbol": "MES", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mes", "unit": "bps", "mult": 1},
+    {"name": "MNQ", "symbol": "MNQ", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mnq", "unit": "bps", "mult": 1},
+    {"name": "MYM", "symbol": "MYM", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mym", "unit": "bps", "mult": 1},
+    {"name": "M2K", "symbol": "M2K", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/m2k", "unit": "bps", "mult": 1},
+    # Futures — Commodities
+    {"name": "MGC", "symbol": "MGC", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mgc", "unit": "bps", "mult": 1},
+    {"name": "MCL", "symbol": "MCL", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mcl", "unit": "bps", "mult": 1},
+    # Futures — Asia
+    {"name": "NKD", "symbol": "NKD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/nkd", "unit": "bps", "mult": 1},
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:
@@ -2335,31 +2352,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-running { background: #1b2a3a; color: #00d4ff; }
   .badge-error { background: #3a1b1b; color: #ff5252; }
   .footer { color: #3a4a6b; font-size: 0.7em; margin-top: 8px; text-align: center; }
-  .page-nav { display: flex; gap: 0; margin-bottom: 14px; border-bottom: 2px solid #1e2a42; }
-  .page-nav-btn { padding: 10px 24px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.95em; font-weight: bold; letter-spacing: 1px; transition: all 0.2s; margin-bottom: -2px; }
-  .page-nav-btn:hover { color: #00d4ff; }
-  .page-nav-btn.active { color: #00d4ff; border-bottom-color: #00d4ff; }
-  .page-content { display: none; }
-  .page-content.active { display: block; }
-  #evo-page .evo-stats { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 12px 0; }
-  #evo-page .evo-stat { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 8px 16px; text-align: center; }
-  #evo-page .evo-stat .val { font-size: 1.3em; font-weight: bold; }
-  #evo-page .evo-stat .lbl { font-size: 0.7em; color: #7b8ab8; }
-  #evo-page .evo-chart-wrap { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 8px; margin-bottom: 10px; position: relative; }
-  #evo-page canvas { width: 100%; height: 180px; display: block; }
-  #evo-page .evo-legend { display: flex; gap: 12px; justify-content: center; font-size: 0.7em; padding: 4px; flex-wrap: wrap; }
-  #evo-page .evo-legend .edot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; vertical-align: middle; }
-  #evo-page .evo-tip { position: absolute; background: #1a1a2e; border: 1px solid #00d4ff; border-radius: 4px; padding: 6px 10px; font-size: 0.72em; pointer-events: none; display: none; z-index: 100; max-width: 320px; line-height: 1.4; }
-  @media (max-width: 768px) {
-    #evo-page canvas { height: 140px !important; }
-    #evo-page .evo-chart-wrap { padding: 6px; margin-bottom: 8px; }
-    #evo-page h2 { font-size: 0.75em !important; margin: 4px 0 2px !important; }
-    #ml-network-canvas { height: 300px !important; }
-    #evo-page .evo-stats { gap: 6px; }
-    #evo-page .evo-stat { padding: 4px 8px; }
-    #evo-page .evo-stat .val { font-size: 1em; }
-    #projection-section { display: none; }
-  }
+  /* Legacy page-nav and evo-page styles removed 2026-03-25 */
   .coin-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
   .coin-tab { padding: 6px 16px; border-radius: 4px; border: 1px solid #1e2a42; background: #141b2d; color: #7b8ab8; cursor: pointer; font-family: inherit; font-size: 0.85em; font-weight: bold; transition: all 0.2s; }
   .coin-tab:hover { border-color: #00d4ff; color: #00d4ff; }
@@ -2411,14 +2404,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
 </div>
 
-<div class="page-nav">
-  <button class="page-nav-btn active" onclick="switchPage('ibkr')">FLEET DASHBOARD</button>
-  <button class="page-nav-btn" onclick="switchPage('evolution')">RESEARCH</button>
-</div>
+<!-- Single-page: IBKR Fleet Dashboard only -->
 
-<div id="live-page" class="page-content" style="display:none;">
-<!-- Coin cards rendered dynamically by buildCoinCard() in loadMultiOverview() -->
-<div class="multi-overview" id="multi-overview"></div>
+<!-- Legacy crypto live-page removed 2026-03-25 — IBKR fleet is the sole view -->
+<div id="live-page-removed" style="display:none;">
 
 <!-- portfolio aggregate bar -->
 <div id="portfolio-aggregate" style="background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
@@ -2658,9 +2647,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   Last update: <span id="last-update">—</span> |
   Run: <span id="run-id">—</span>
 </div>
-</div><!-- end live-page -->
+</div><!-- end live-page-removed -->
 
-<div id="ibkr-page" class="page-content active">
+<div id="ibkr-page"
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
   <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR PAPER TRADING FLEET</h2>
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
@@ -2718,7 +2707,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 </div><!-- end ibkr-page -->
 
-<div id="decision-page" class="page-content">
+<!-- Legacy decision-page and evo-page (RESEARCH) removed 2026-03-25 -->
+<div id="legacy-pages-removed" style="display:none;">
   <!-- DECISION WATERFALL: base score → modifiers → final score -->
   <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
@@ -2869,32 +2859,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="ml-network-stats" style="font-size:0.7em; color:#7b8ab8; text-align:center; padding:4px 0 8px; display:flex; gap:16px; justify-content:center; flex-wrap:wrap;"></div>
     <canvas id="ml-network-canvas" style="width:100%; height:200px;"></canvas>
   </div>
-</div><!-- end evo-page -->
+</div><!-- end legacy-pages-removed -->
 
 
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<!-- Three.js removed — was only used for ML neural network viz in RESEARCH tab -->
 <script>
 let equityChart = null;
 let currentCoin = 'ETH';
 let sseConnection = null;
-let evoLoaded = false;
 
-function switchPage(page) {
-  document.querySelectorAll('.page-nav-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
-  const btns = document.querySelectorAll('.page-nav-btn');
-  if (page === 'evolution') {
-    btns[1].classList.add('active');
-    document.getElementById('evo-page').classList.add('active');
-    if (!evoLoaded) { loadEvolution(); }
-  } else {
-    // Default: IBKR Fleet
-    btns[0].classList.add('active');
-    document.getElementById('ibkr-page').classList.add('active');
-    loadIBKRFleet();
-  }
-}
+// Single-page dashboard — no tab switching needed
+function switchPage(page) { loadIBKRFleet(); }
 
 function ibkrGaugeBar(label, value, min, max, thresholds, unit) {
   // thresholds: [{val, color}] sorted ascending

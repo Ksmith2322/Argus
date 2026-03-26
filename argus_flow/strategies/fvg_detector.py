@@ -40,8 +40,12 @@ def detect_fvgs(df: pd.DataFrame, min_displacement_mult: float = 1.5) -> list[di
         if ar <= 0 or c2_range < ar * min_displacement_mult:
             continue
 
-        # Bullish FVG
-        if c1_h < c3_l:
+        # Displacement direction: candle 2 must close in the direction of the gap
+        c2_bullish = c2_c > c2_o  # closes above open
+        c2_bearish = c2_c < c2_o  # closes below open
+
+        # Bullish FVG: requires bullish displacement candle
+        if c1_h < c3_l and c2_bullish:
             fvgs.append({
                 "type": "bullish",
                 "top": float(c3_l),
@@ -52,8 +56,8 @@ def detect_fvgs(df: pd.DataFrame, min_displacement_mult: float = 1.5) -> list[di
                 "ts": df.at[i, "ts"] if "ts" in df.columns else i,
             })
 
-        # Bearish FVG
-        if c1_l > c3_h:
+        # Bearish FVG: requires bearish displacement candle
+        if c1_l > c3_h and c2_bearish:
             fvgs.append({
                 "type": "bearish",
                 "top": float(c1_l),
@@ -81,12 +85,16 @@ def find_fvg_fill_entries(df: pd.DataFrame, fvgs: list[dict], max_wait_bars: int
         for j in range(fvg_idx + 1, min(fvg_idx + max_wait_bars, len(df))):
             row = df.iloc[j]
 
-            # Session filter
+            # Session filter (supports wraparound e.g. 22-08)
             if "ts" in df.columns:
                 try:
                     hour = pd.Timestamp(row["ts"]).hour
-                    if not (session_start <= hour <= session_end):
-                        continue
+                    if session_start <= session_end:
+                        if not (session_start <= hour <= session_end):
+                            continue
+                    else:  # wraparound
+                        if not (hour >= session_start or hour <= session_end):
+                            continue
                 except Exception:
                     pass
 

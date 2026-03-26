@@ -1,0 +1,54 @@
+
+======================================================================
+SWEEP: GBPUSD / range_accel (9192 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for GBPUSD (1828s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   3.196 60.0%   +9.450     30    36.55  stop_pips=30 target_pips=50 timeout_minutes=90
+   2.843 66.7%   +8.618     33    50.00  stop_pips=25 target_pips=40 timeout_minutes=90
+   2.617 64.5%   +8.508     31    50.00  stop_pips=25 target_pips=50 timeout_minutes=90
+   2.594 66.7%   +8.882     33    60.00  stop_pips=30 target_pips=40 timeout_minutes=90
+   2.530 64.7%   +7.322     34    47.50  stop_pips=20 target_pips=40 timeout_minutes=90
+
+======================================================================
+SWEEP: EURJPY / T4_full_stack (9210 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for EURJPY (2078s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   3.941 77.8%   +5.808     18    20.55  stop_pips=15 target_pips=40 timeout_minutes=30
+   3.775 77.8%   +5.481     18    20.55  stop_pips=15 target_pips=50 timeout_minutes=30
+   3.634 82.3%   +6.082     17    27.40  stop_pips=30 target_pips=40 timeout_minutes=30
+   3.484 82.3%   +5.735     17    27.40  stop_pips=30 target_pips=50 timeout_minutes=30
+   3.091 77.8%   +5.292     18    25.55  stop_pips=20 target_pips=40 timeout_minutes=30
+
+======================================================================
+SWEEP: GBPJPY / T4_full_stack (9228 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
