@@ -52,3 +52,133 @@ Running 80 parameter combinations...
   30/80 complete
   40/80 complete
   50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for GBPJPY (1931s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   2.424 58.6%   +7.371     29    45.00  stop_pips=15 target_pips=25 timeout_minutes=60
+   2.390 51.8%   +7.722     27    47.30  stop_pips=15 target_pips=40 timeout_minutes=90
+   2.367 58.6%   +7.776     29    45.00  stop_pips=15 target_pips=25 timeout_minutes=90
+   2.203 51.8%   +6.691     27    45.50  stop_pips=15 target_pips=40 timeout_minutes=60
+   2.198 58.6%   +6.202     29    45.00  stop_pips=15 target_pips=25 timeout_minutes=45
+
+======================================================================
+SWEEP: CADJPY / T4_full_stack (9264 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for CADJPY (1935s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   2.064 55.0%   +3.438     20    42.30  stop_pips=15 target_pips=25 timeout_minutes=30
+   1.988 47.1%   +4.909     17    39.75  stop_pips=15 target_pips=25 timeout_minutes=90
+   1.916 55.0%   +3.188     20    47.30  stop_pips=20 target_pips=25 timeout_minutes=30
+   1.728 55.0%   +2.810     20    54.85  stop_pips=25 target_pips=25 timeout_minutes=30
+   1.728 55.0%   +2.810     20    54.85  stop_pips=30 target_pips=25 timeout_minutes=30
+
+======================================================================
+SWEEP: AUDJPY / T4_full_stack (9282 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for AUDJPY (1589s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   1.563 63.8%   +4.234     58   202.25  stop_pips=20 target_pips=20 timeout_minutes=45
+   1.450 63.8%   +3.659     58   202.25  stop_pips=25 target_pips=20 timeout_minutes=45
+   1.244 65.5%   +1.878     55   223.60  stop_pips=30 target_pips=20 timeout_minutes=45
+   1.235 60.0%   +2.287     55   202.25  stop_pips=20 target_pips=30 timeout_minutes=45
+   1.224 61.8%   +2.179     55   202.25  stop_pips=20 target_pips=40 timeout_minutes=45
+
+======================================================================
+SWEEP: USDJPY / range_accel_NY (9300 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for USDJPY (1775s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   2.380 57.8%   +8.831     45    94.55  stop_pips=15 target_pips=30 timeout_minutes=30
+   2.344 57.8%   +8.600     45   106.20  stop_pips=15 target_pips=40 timeout_minutes=30
+   2.344 57.8%   +8.600     45   106.20  stop_pips=15 target_pips=50 timeout_minutes=30
+   2.313 57.8%   +8.398     45    99.55  stop_pips=15 target_pips=25 timeout_minutes=30
+   2.286 60.0%   +8.740     45    99.55  stop_pips=20 target_pips=30 timeout_minutes=30
+
+======================================================================
+SWEEP: AUDUSD / range_accel_NY (9336 bars, 80 combos)
+======================================================================
+Running 80 parameter combinations...
+  10/80 complete
+  20/80 complete
+  30/80 complete
+  40/80 complete
+  50/80 complete
+  60/80 complete
+  70/80 complete
+  80/80 complete
+
+Top 5 for AUDUSD (1604s):
+      PF     WR      Exp Trades       DD  Params
+----------------------------------------------------------------------
+   1.588 57.9%   +5.496     38   198.50  stop_pips=20 target_pips=50 timeout_minutes=90
+   1.565 56.4%   +5.436     39   198.50  stop_pips=20 target_pips=40 timeout_minutes=90
+   1.545 60.5%   +5.204     38   196.65  stop_pips=25 target_pips=50 timeout_minutes=90
+   1.533 56.4%   +5.127     39   198.50  stop_pips=20 target_pips=30 timeout_minutes=90
+   1.529 60.5%   +5.187     38   196.65  stop_pips=30 target_pips=50 timeout_minutes=90
+
+======================================================================
+SWEEP: MES / range_accel (19320 bars, 64 combos)
+======================================================================
+Running 64 parameter combinations...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Argus\repo\argus_flow\backtest\run_all_sweeps.py", line 110, in <module>
+    # Final summary
+    ^^^^^^
+  File "C:\Argus\repo\argus_flow\backtest\run_all_sweeps.py", line 63, in main
+    t0 = time.time()
+              ^^^^^^^
+  File "C:\Argus\repo\argus_flow\backtest\engine.py", line 479, in run_sweep
+    result = run_backtest(config, bars, override_params=override)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Argus\repo\argus_flow\backtest\engine.py", line 316, in run_backtest
+    direction = check_trigger_fn(features)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Argus\repo\argus_flow\backtest\engine.py", line 147, in check_trigger_fn
+    return check_trigger_futures(features, cfg)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Argus\repo\argus_flow\runner_unified.py", line 398, in check_trigger_futures
+    if strategy.startswith("range_accel"):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Argus\repo\argus_flow\runner_unified.py", line 429, in _check_trigger_futures_range
+    return None
+   ^^^^^^^^^^^^^
+TypeError: '<=' not supported between instances of 'float' and 'NoneType'

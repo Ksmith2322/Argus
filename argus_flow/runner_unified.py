@@ -1009,6 +1009,20 @@ class InstrumentRunner:
                 self._log_signal(features, direction, "REGIME_BLOCKED")
                 direction = None
 
+        # ── Maintenance blackout (TWS restart window) ────
+        # Block new entries during TWS restart period to avoid tainted trades.
+        # Conservative window: 01:30-04:30 UTC covers both CDT and CST restart times.
+        if direction:
+            h_utc = now.hour
+            m_utc = now.minute
+            utc_minutes = h_utc * 60 + m_utc
+            blackout_start = 1 * 60 + 30   # 01:30 UTC
+            blackout_end = 4 * 60 + 30     # 04:30 UTC
+            if blackout_start <= utc_minutes <= blackout_end:
+                self._log.info(f"MAINTENANCE_BLACKOUT: {direction.upper()} blocked during TWS restart window")
+                self._log_signal(features, direction, "MAINTENANCE_BLACKOUT")
+                direction = None
+
         # Min gap between signals
         if direction and s.last_signal_time:
             gap = (now - s.last_signal_time).total_seconds() / 60
@@ -1047,17 +1061,32 @@ class InstrumentRunner:
             s.direction_str = direction
             s.save()
 
+            # Capture spread at entry for toxicity analysis
+            t = self.ticker
+            bid = getattr(t, "bid", None) or getattr(t, "delayedBid", None)
+            ask = getattr(t, "ask", None) or getattr(t, "delayedAsk", None)
+            if bid and ask and bid > 0 and ask > 0:
+                spread_pips = (ask - bid) / self.pip_size if self.uses_pips else (ask - bid)
+                features["entry_spread"] = round(spread_pips, 2)
+                features["entry_bid"] = bid
+                features["entry_ask"] = ask
+            else:
+                features["entry_spread"] = 0
+                features["entry_bid"] = 0
+                features["entry_ask"] = 0
+
             self._log_signal(features, direction, "ENTRY")
 
             extra = ""
             if not self.uses_pips:
                 extra = f" vol_burst={features.get('vol_burst_z', 0):.2f}"
+            spread_str = f" spread={features.get('entry_spread', 0):.1f}pip" if self.uses_pips else ""
             self._log.info(
                 f"ENTRY {direction.upper()} @ {entry_px} "
                 f"stop={stop_px} target={target_px} "
                 f"rng={features['range_pct']:.4f} accel={features['range_accel']:.3f}"
                 f" regime={features.get('regime', '?')} eff={features.get('efficiency_ratio', 0):.3f}"
-                f"{extra}"
+                f"{spread_str}{extra}"
             )
         else:
             # Periodic NO_TRIGGER log every 5 minutes

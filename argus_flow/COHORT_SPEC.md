@@ -137,6 +137,7 @@ Before ANY real money deployment:
 7. **Unknown symbol fail-closed**: unmapped symbols blocked from entry (currently implemented)
 8. **No pyramiding without re-approval**: pyramid adds must re-check portfolio gate
 9. **Reconciliation drift blocks entries**: any unresolved broker/local mismatch pauses all new entries
+10. **Dynamic position sizing**: query account equity before each entry, compute lot_size as equity * risk_pct / (stop_distance * pip_value). Auto-scales with account balance.
 10. **Manual unlock after critical breaker**: auto-resume disabled for portfolio-level breakers in live mode
 
 ## Micro-Live Admission Gate

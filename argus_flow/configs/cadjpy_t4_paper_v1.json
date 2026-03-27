@@ -7,16 +7,16 @@
     "trigger": {
         "range_pct_min": 0.0012,
         "range_accel_min": 0.0,
-        "vol_z_min": 0.0,
+        "vol_z_min": null,
         "session_start_utc": 8,
         "session_end_utc": 19
     },
     "risk": {
-        "stop_pips": 20,
-        "target_pips": 40,
-        "timeout_minutes": 60,
+        "stop_pips": 15,
+        "target_pips": 25,
+        "timeout_minutes": 30,
         "min_signal_gap_minutes": 15,
-        "lot_size": 20000
+        "lot_size": 100000
     },
     "direction": {
         "dist_long_threshold": 0.4,

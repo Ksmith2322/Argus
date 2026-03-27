@@ -7,16 +7,16 @@
     "trigger": {
         "range_pct_min": 0.0012,
         "range_accel_min": 0.0,
-        "vol_z_min": 0.0,
+        "vol_z_min": null,
         "session_start_utc": 8,
-        "session_end_utc": 19
+        "session_end_utc": 14
     },
     "risk": {
-        "stop_pips": 30,
+        "stop_pips": 35,
         "target_pips": 30,
-        "timeout_minutes": 90,
+        "timeout_minutes": 75,
         "min_signal_gap_minutes": 15,
-        "lot_size": 20000
+        "lot_size": 57000
     },
     "direction": {
         "dist_long_threshold": 0.4,
@@ -24,9 +24,15 @@
     },
     "replay_expectations": {
         "signals_per_day": 8.0,
-        "signals_per_day_range": [3, 20],
+        "signals_per_day_range": [
+            3,
+            20
+        ],
         "win_rate": 0.542,
-        "win_rate_range": [0.40, 0.65],
+        "win_rate_range": [
+            0.4,
+            0.65
+        ],
         "stop_rate": 0.125,
         "target_rate": 0.015,
         "timeout_rate": 0.86,
