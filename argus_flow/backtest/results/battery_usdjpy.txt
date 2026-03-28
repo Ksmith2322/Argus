@@ -1,0 +1,56 @@
+======================================================================
+USD/JPY FULL BATTERY
+======================================================================
+
+1. BASELINE: 53 trades PF=1.619 Exp=+4.332 Net=+229.6 WR=53%
+   Exits: {'timeout': 41, 'stop': 10, 'target': 2}
+
+2. ABLATION
+   Full                        53 trades PF=1.619 Exp=+4.332
+   No range_pct               161 trades PF=1.575 Exp=+2.588
+   No range_pct/accel         185 trades PF=1.290 Exp=+1.467
+   Session+direction only     185 trades PF=1.290 Exp=+1.467
+
+3. WALK-FORWARD
+   Train1     23 PF=0.890 Exp=-0.848 Net=-19.5
+   Test1       9 PF=1.532 Exp=+4.939 Net=+44.5
+   Train2     14 PF=1.296 Exp=+2.518 Net=+35.2
+   Test2       6 PF=1.799 Exp=+7.758 Net=+46.5
+   Train3     11 PF=2.216 Exp=+6.973 Net=+76.7
+   Test3       9 PF=10.703 Exp=+17.628 Net=+158.7
+
+4. DIRECTION
+     LONG: 24 trades WR=13/24 net=+148.7 exp=+6.19
+    SHORT: 29 trades WR=15/29 net=+81.0 exp=+2.79
+
+5. SESSION
+   00-06: 29 trades exp=+9.79 net=+284.0
+   06-08: 4 trades exp=-1.99 net=-8.0
+   All: 53 trades exp=+4.33 net=+229.6
+
+6. REGIME
+   TRENDING: 8 trades exp=-2.49 net=-19.9
+   RANGING: 15 trades exp=+13.67 net=+205.1
+   CHOPPY: 30 trades exp=+1.48 net=+44.4
+
+7. FRICTION SENSITIVITY
+   +0.5pip: exp=+3.83 survives=YES
+   +1.0pip: exp=+3.33 survives=YES
+   +1.5pip: exp=+2.83 survives=YES
+   +2.0pip: exp=+2.33 survives=YES
+   +3.0pip: exp=+1.33 survives=YES
+
+8. CONCENTRATION
+   Remove best 1: net=+134.4 (lost 95pip = 41%)
+   Remove best 3: net=-37.0 (lost 267pip = 116%)
+   Remove best 5: net=-127.4 (lost 357pip = 155%)
+
+9. NEIGHBORHOOD STABILITY
+   27/27 neighbors profitable (100%)
+   PF range: 1.257 - 2.028 mean=1.672
+
+10. BOOTSTRAP
+   P(expectancy > 0): 86.7%
+   95% CI: [-3.37, +12.33]
+
+======================================================================

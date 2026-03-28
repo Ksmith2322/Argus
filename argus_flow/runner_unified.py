@@ -103,6 +103,11 @@ class State:
         self.had_zero_stops = False  # True if stop/target were 0 at any point
         self.pyramid_adds = 0        # Number of scale-in adds this trade
         self.avg_entry_price = 0.0   # Volume-weighted average entry price
+        # Profit floor state machine (BUILT but not deployed — behind config flag)
+        self.hard_stop_price = 0.0        # Original catastrophic stop (never changes)
+        self.profit_floor_price = 0.0     # Dynamic floor (0 = inactive)
+        self.profit_floor_state = "DISARMED"  # DISARMED | ARMED_10 | ARMED_15
+        self.max_favorable_pips = 0.0     # Running MFE for this trade
 
     def save(self) -> None:
         """Atomic state write: write to temp file, flush, then rename."""
@@ -571,6 +576,37 @@ class InstrumentRunner:
                 features, direction, action, self.instrument_type,
                 getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
             ))
+        # Log blocked signals as shadow opportunities for counterfactual analysis
+        if "BLOCKED" in action or action == "MAINTENANCE_BLACKOUT":
+            self._log_opportunity(features, direction, action)
+
+    def _log_opportunity(self, features: dict, direction: Optional[str], block_reason: str) -> None:
+        """Emit lightweight opportunity event for shadow accounting."""
+        opp_file = self.log_dir / "opportunities.jsonl"
+        try:
+            risk = self.cfg.get("risk", {})
+            opp = {
+                "opportunity_id": f"{self.symbol}_{features.get('ts', '')}_{direction}",
+                "ts": features.get("ts", ""),
+                "symbol": self.symbol,
+                "direction": direction or "",
+                "price": features.get("price", 0),
+                "block_reason": block_reason,
+                "regime": features.get("regime", ""),
+                "efficiency_ratio": features.get("efficiency_ratio", 0),
+                "range_pct": features.get("range_pct", 0),
+                "hour": features.get("hour", 0),
+                "stop_pips": risk.get("stop_pips", risk.get("stop_bps", 0)),
+                "target_pips": risk.get("target_pips", risk.get("target_bps", 0)),
+                "timeout_minutes": risk.get("timeout_minutes", 75),
+                "config_hash": getattr(self, '_config_hash', ''),
+                "session_id": getattr(self, '_session_id', ''),
+                "entry_spread": features.get("entry_spread", 0),
+            }
+            with open(opp_file, "a") as f:
+                f.write(json.dumps(opp) + "\n")
+        except Exception:
+            pass  # never let opportunity logging break the runner
 
     def _evaluate_validity(self) -> tuple[bool, str]:
         """Determine if this trade is experimentally valid.
@@ -617,6 +653,13 @@ class InstrumentRunner:
         # Evaluate experiment validity
         valid, invalid_reason = self._evaluate_validity()
         runtime_epoch = int(time.time() - self._runtime_start) if hasattr(self, '_runtime_start') else 0
+
+        # Policy/version tagging for attribution
+        strategy_version = self.cfg.get("version", "unknown")
+        exit_policy = "TO" + str(self.cfg.get("risk", {}).get("timeout_minutes", "?"))
+        sizing_policy = "fixed"  # will become "dynamic" when implemented
+        profit_floor_policy = "disabled"  # will become "armed_10" when deployed
+
         validity_fields = [
             str(valid).lower(), invalid_reason or "",
             getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
@@ -1636,7 +1679,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     # -- Portfolio risk manager ----------------------------------------
     risk_mgr = PortfolioRiskManager(
         max_same_currency=3,
-        max_drawdown_pct=0.03,
+        max_drawdown_pct=0.20,  # 20% of R-peak. Was 3% which triggered on any single loss in early cohorts
         daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
     )

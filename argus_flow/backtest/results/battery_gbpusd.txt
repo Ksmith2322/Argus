@@ -1,0 +1,55 @@
+======================================================================
+GBP/USD FULL BATTERY
+======================================================================
+
+1. BASELINE: 30 trades PF=3.196 Exp=+9.450 Net=+283.5 WR=60%
+   Exits: {'timeout': 22, 'target': 4, 'stop': 4}
+
+2. ABLATION
+   Full                        30 trades PF=3.196 Exp=+9.450
+   No range_pct                36 trades PF=1.698 Exp=+4.000
+   No range_pct/accel          37 trades PF=1.212 Exp=+1.377
+
+3. WALK-FORWARD
+   Train1      5 PF=736.000 Exp=+7.350 Net=+36.8
+   Test1       6 PF=1.800 Exp=+4.608 Net=+27.6
+   Train2     14 PF=2.160 Exp=+5.293 Net=+74.1
+   Train3      8 PF=2.585 Exp=+5.806 Net=+46.5
+   Test3       7 PF=3.868 Exp=+14.236 Net=+99.7
+
+4. DIRECTION
+     LONG: 16 trades WR=9/16 net=+73.6 exp=+4.60
+    SHORT: 14 trades WR=9/14 net=+209.9 exp=+14.99
+
+5. SESSION
+   08-11: 11 trades exp=+8.88 net=+97.6 short=+26.4 long=+2.3
+   12-14: 9 trades exp=+15.75 net=+141.8 short=+24.1 long=+5.3
+   15-19: 10 trades exp=+4.41 net=+44.1 short=+1.7 long=+8.4
+   08-14: 20 trades exp=+11.97 net=+239.4 short=+24.9 long=+3.3
+
+6. REGIME
+   TRENDING: 2 trades exp=+23.00 net=+46.0
+   RANGING: 9 trades exp=+5.43 net=+48.9
+   CHOPPY: 19 trades exp=+9.93 net=+188.7
+
+7. FRICTION SENSITIVITY
+   +0.5pip: exp=+8.95 survives=YES
+   +1.0pip: exp=+8.45 survives=YES
+   +1.5pip: exp=+7.95 survives=YES
+   +2.0pip: exp=+7.45 survives=YES
+   +3.0pip: exp=+6.45 survives=YES
+
+8. CONCENTRATION
+   Remove best 1: net=+233.5 (lost 50pip = 18%)
+   Remove best 3: net=+133.5 (lost 150pip = 53%)
+   Remove best 5: net=+50.7 (lost 233pip = 82%)
+
+9. NEIGHBORHOOD STABILITY
+   125/125 neighbors profitable (100%)
+   PF range: 1.038 - 3.275 mean=2.089
+
+10. BOOTSTRAP
+   P(expectancy > 0): 99.0%
+   95% CI: [+1.66, +17.38]
+
+======================================================================

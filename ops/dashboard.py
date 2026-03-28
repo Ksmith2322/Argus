@@ -1996,6 +1996,88 @@ def _read_ibkr_runner(runner: dict) -> dict:
     return result
 
 
+@app.get("/api/system_health")
+async def api_system_health():
+    """Quick system health check — blocked signals, degradation status, trade progress."""
+    import csv as _csv
+    health = {"status": "OK", "warnings": [], "blocked_total": 0, "valid_trades": 0, "target": 30, "broker_connected": False, "runners_alive": 0}
+
+    # Count blocked signals and valid trades across fleet
+    # Use OPS_LOGS parent to find argus_flow logs (handles different working dirs)
+    af_logs = REPO / "argus_flow" / "logs"
+    for runner in IBKR_RUNNERS:
+        log_dir = REPO / runner["log_dir"]
+        if not log_dir.exists():
+            log_dir = af_logs / runner.get("symbol", "").lower()
+        sig_file = log_dir / "signals.csv"
+        trade_file = log_dir / "trades.csv"
+
+        if sig_file.exists():
+            try:
+                with open(sig_file) as f:
+                    for row in _csv.DictReader(f):
+                        if "BLOCKED" in row.get("action", ""):
+                            health["blocked_total"] += 1
+            except Exception:
+                pass
+
+        if trade_file.exists():
+            try:
+                with open(trade_file) as f:
+                    for row in _csv.DictReader(f):
+                        if row.get("experiment_valid", "").lower() == "true":
+                            health["valid_trades"] += 1
+            except Exception:
+                pass
+
+    # Check degradation control
+    ctrl_file = REPO / "argus_flow" / "logs" / "degradation_control.json"
+    if ctrl_file.exists():
+        try:
+            ctrl = json.loads(ctrl_file.read_text())
+            for sym, v in ctrl.items():
+                if v.get("status") == "HARD_PAUSE":
+                    health["status"] = "PAUSED"
+                    health["warnings"].append(f"{sym}: HARD_PAUSE")
+                elif v.get("status") == "WARN":
+                    if health["status"] == "OK":
+                        health["status"] = "WARN"
+                    health["warnings"].append(f"{sym}: WARN")
+        except Exception:
+            pass
+
+    if health["blocked_total"] > 100:
+        health["warnings"].append(f"{health['blocked_total']} signals blocked by risk guards")
+        if health["status"] == "OK":
+            health["status"] = "WARN"
+
+    health["progress_pct"] = min(100, round(health["valid_trades"] / health["target"] * 100))
+
+    # Check broker connection from heartbeat files
+    import time as _time
+    connected = 0
+    total_runners = 0
+    for runner in IBKR_RUNNERS:
+        hb_file = REPO / runner["log_dir"] / "heartbeat.json"
+        if hb_file.exists():
+            try:
+                hb = json.loads(hb_file.read_text())
+                total_runners += 1
+                hb_age = _time.time() - datetime.fromisoformat(hb["ts"]).timestamp()
+                if hb.get("broker_connected") and hb_age < 600:
+                    connected += 1
+            except Exception:
+                pass
+    health["broker_connected"] = connected > 0
+    health["runners_alive"] = connected
+    health["runners_total"] = total_runners
+    if not health["broker_connected"]:
+        health["status"] = "WARN"
+        health["warnings"].append("Broker disconnected")
+
+    return JSONResponse(health)
+
+
 @app.get("/api/ibkr_fleet")
 async def api_ibkr_fleet():
     """IBKR fleet status for all runners."""
@@ -2396,6 +2478,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR PAPER</span>
 </div>
 
+<!-- SYSTEM HEALTH BAR -->
+<div id="health-bar" style="display:flex;gap:16px;align-items:center;padding:8px 14px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;margin-bottom:8px;font-size:0.78em;">
+  <div>System: <span id="health-status" style="font-weight:bold;color:#00e676;">OK</span></div>
+  <div>Valid Trades: <span id="health-valid" style="color:#00d4ff;font-weight:bold;">0</span> / <span id="health-target">30</span></div>
+  <div style="flex:1;max-width:200px;">
+    <div style="background:#0d1321;border-radius:3px;height:8px;overflow:hidden;">
+      <div id="health-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#00d4ff,#00e676);border-radius:3px;transition:width 0.5s;"></div>
+    </div>
+  </div>
+  <div>API: <span id="health-broker" style="font-weight:bold;color:#00e676;">--</span></div>
+  <div>Blocked: <span id="health-blocked" style="color:#7b8ab8;">0</span></div>
+  <div id="health-warnings" style="color:#ffc107;"></div>
+</div>
+
 <!-- CONTROL STRIP -->
 <div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
   <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
@@ -2417,6 +2513,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- Fleet summary bar -->
 <div id="ibkr-fleet-summary" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;gap:30px;font-size:0.8em;">
+  <div>Balance: <span id="ibkr-balance" style="color:#00d4ff;font-weight:bold;font-size:1.1em;">$10,000.00</span> <span id="ibkr-balance-delta" style="font-size:0.85em;"></span></div>
   <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
@@ -2528,6 +2625,30 @@ async function loadIBKRFleet() {
     fpEl.style.color = fleetPnl >= 0 ? '#00ff88' : '#ff4444';
     document.getElementById('ibkr-active-count').textContent = activeCount;
     document.getElementById('ibkr-total-count').textContent = data.runners.length;
+
+    // Simulated balance: $10K starting + dollar PnL
+    // Convert pip PnL to dollars using approximate pip values per lot
+    let dollarPnl = 0;
+    const pipToDollar = {
+      'EURUSD': 0.0001 * 57000, 'GBPUSD': 0.0001 * 66000, 'AUDUSD': 0.0001 * 100000,
+      'EURJPY': 0.000067 * 100000, 'GBPJPY': 0.000067 * 100000, 'CADJPY': 0.000067 * 100000,
+      'AUDJPY': 0.000067 * 100000, 'USDJPY': 0.000067 * 100000,
+      'MES': 5, 'MNQ': 2, 'MYM': 0.5, 'M2K': 5, 'MGC': 1, 'MCL': 1, 'NKD': 5,
+    };
+    for (const r of data.runners) {
+      const pnl = Number(r.pnl || 0);
+      const mult = pipToDollar[r.symbol] || 1;
+      dollarPnl += pnl * mult;
+    }
+    const startingBalance = 10000;
+    const balance = startingBalance + dollarPnl;
+    const balEl = document.getElementById('ibkr-balance');
+    balEl.textContent = '$' + balance.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    balEl.style.color = balance >= startingBalance ? '#00e676' : '#ff4444';
+    const deltaEl = document.getElementById('ibkr-balance-delta');
+    const sign = dollarPnl >= 0 ? '+' : '';
+    deltaEl.textContent = '(' + sign + '$' + dollarPnl.toFixed(2) + ')';
+    deltaEl.style.color = dollarPnl >= 0 ? '#00e676' : '#ff4444';
 
     // Cohort summary
     const csEl = document.getElementById('ibkr-cohort-status');
@@ -5155,6 +5276,35 @@ async function loadLeaderboard() {
 try {
   loadIBKRFleet();
   setInterval(loadIBKRFleet, 10000);
+
+  // Health check auto-poll
+  async function loadHealth() {
+    try {
+      const r = await fetch('/api/system_health');
+      const h = await r.json();
+      const statusEl = document.getElementById('health-status');
+      const statusColors = {OK: '#00e676', WARN: '#ffc107', PAUSED: '#ff4444'};
+      statusEl.textContent = h.status;
+      statusEl.style.color = statusColors[h.status] || '#888';
+      document.getElementById('health-valid').textContent = h.valid_trades;
+      document.getElementById('health-target').textContent = h.target;
+      document.getElementById('health-progress-bar').style.width = h.progress_pct + '%';
+      document.getElementById('health-blocked').textContent = h.blocked_total;
+      document.getElementById('health-blocked').style.color = h.blocked_total > 50 ? '#ff4444' : '#7b8ab8';
+      const brokerEl = document.getElementById('health-broker');
+      if (h.broker_connected) {
+        brokerEl.textContent = 'Connected (' + h.runners_alive + '/' + h.runners_total + ')';
+        brokerEl.style.color = '#00e676';
+      } else {
+        brokerEl.textContent = 'DISCONNECTED';
+        brokerEl.style.color = '#ff4444';
+      }
+      const warnEl = document.getElementById('health-warnings');
+      warnEl.textContent = h.warnings.length ? h.warnings.join(' | ') : '';
+    } catch(e) {}
+  }
+  loadHealth();
+  setInterval(loadHealth, 30000);
   console.log('IBKR Fleet initialized');
 } catch(e) {
   console.error('IBKR init error:', e);
