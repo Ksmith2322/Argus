@@ -42,8 +42,8 @@ $futuresConfigs = @(
     "argus_flow/configs/mym_range_paper_v1.json",
     "argus_flow/configs/m2k_range_paper_v1.json",
     "argus_flow/configs/mgc_range_paper_v1.json",
-    "argus_flow/configs/mcl_range_paper_v1.json",
-    "argus_flow/configs/nkd_range_paper_v1.json"
+    "argus_flow/configs/mcl_range_paper_v1.json"
+    # NKD KILLED 2026-03-29: 0/7 win rate, -550 pips, no edge with range_accel
 )
 
 function Log($msg) {
@@ -122,6 +122,12 @@ function Restart-Runner($type) {
 # Track restart count per hour
 $restartTimestamps = @()
 $lastHeartbeatFile = "argus_flow/logs/watchdog_last_heartbeat.txt"
+$wasDown = @{ "fx" = $false; "futures" = $false }  # Track for "back online" alerts
+$script:portWarnSent = $false      # Track API port warning state
+$script:staleWarnSent = $false     # Track stale heartbeat warning state
+$script:staleWarnTime = $null      # When stale warning was sent (for downtime tracking)
+$script:tradeCounts = @{}          # Track trade counts for new-trade detection
+$script:dailySummarySent = $false  # Track daily summary sent
 
 Log "=========================================="
 Log "Argus Watchdog started (full fleet)"
@@ -145,6 +151,7 @@ while ($true) {
 
     # FX runner check
     if (-not $fxAlive) {
+        $wasDown["fx"] = $true
         Log "ALERT: FX runner NOT FOUND!"
         Send-Discord "**FX runner is DOWN!** Attempting restart..." "red"
         if ($restartTimestamps.Count -lt $maxRestartsPerHour) {
@@ -154,10 +161,16 @@ while ($true) {
             Log "MAX RESTARTS reached ($maxRestartsPerHour/hour). Not restarting FX."
             Send-Discord "**CRITICAL: FX runner down, max restarts ($maxRestartsPerHour/hr) exhausted!** Manual intervention needed." "red"
         }
+    } elseif ($wasDown["fx"]) {
+        # Was down, now back — send confirmation
+        $wasDown["fx"] = $false
+        Log "FX runner BACK ONLINE"
+        Send-Discord "FX runner is **BACK ONLINE** and healthy." "green"
     }
 
     # Futures runner check
     if (-not $futuresAlive) {
+        $wasDown["futures"] = $true
         Log "ALERT: Futures runner NOT FOUND!"
         if ($restartTimestamps.Count -lt $maxRestartsPerHour) {
             Restart-Runner "futures"
@@ -165,12 +178,141 @@ while ($true) {
         } else {
             Log "MAX RESTARTS reached. Not restarting Futures."
         }
+    } elseif ($wasDown["futures"]) {
+        $wasDown["futures"] = $false
+        Log "Futures runner BACK ONLINE"
+        Send-Discord "Futures runner is **BACK ONLINE** and healthy." "green"
     }
+
+    # ── Gap Fix #1: API port check (detect TWS API disabled mid-session) ──
+    $portListening = $false
+    try {
+        $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -WarningAction SilentlyContinue
+        $portListening = $conn.TcpTestSucceeded
+    } catch {}
+
+    if (-not $portListening -and $fxAlive) {
+        if (-not $script:portWarnSent) {
+            Log "ALERT: API port 7496 NOT LISTENING but runners are alive!"
+            Send-Discord "**WARNING: IBKR API port 7496 not responding!** Runners alive but may not be receiving data. Check TWS API settings." "red"
+            $script:portWarnSent = $true
+        }
+    } elseif ($portListening -and $script:portWarnSent) {
+        Log "API port 7496 restored"
+        Send-Discord "API port 7496 is **BACK** and listening." "green"
+        $script:portWarnSent = $false
+    }
+
+    # ── Gap Fix #4: Stale heartbeat detection (runners alive but no data) ──
+    $staleCount = 0
+    $freshCount = 0
+    # Check ALL active instruments, not just FX
+    $hbDirs = @(
+        "argus_flow/logs/eurusd", "argus_flow/logs/gbpusd", "argus_flow/logs/gbpjpy",
+        "argus_flow/logs/eurjpy", "argus_flow/logs/usdjpy", "argus_flow/logs/audjpy",
+        "argus_flow/logs/audusd", "argus_flow/logs/cadjpy",
+        "argus_flow/logs/mes", "argus_flow/logs/mnq", "argus_flow/logs/mgc", "argus_flow/logs/mcl"
+    )
+    foreach ($dir in $hbDirs) {
+        $hbFile = Join-Path $dir "heartbeat.json"
+        if (Test-Path $hbFile) {
+            try {
+                $hb = Get-Content $hbFile -Raw | ConvertFrom-Json
+                $hbTime = [DateTime]::Parse($hb.ts)
+                $hbAge = ((Get-Date).ToUniversalTime() - $hbTime).TotalSeconds
+                if ($hbAge -lt $staleThresholdSeconds) { $freshCount++ } else { $staleCount++ }
+            } catch { $staleCount++ }
+        }
+    }
+
+    # Market hours check (Sun 9PM - Fri 5PM ET)
+    $utcHour = (Get-Date).ToUniversalTime().Hour
+    $dayOfWeek = (Get-Date).DayOfWeek
+    $marketExpected = -not (($dayOfWeek -eq "Saturday") -or ($dayOfWeek -eq "Sunday" -and $utcHour -lt 21) -or ($dayOfWeek -eq "Friday" -and $utcHour -ge 22))
+
+    # Stale alert — only during market hours
+    if ($marketExpected -and $fxAlive -and $freshCount -eq 0 -and $staleCount -gt 0) {
+        if (-not $script:staleWarnSent) {
+            Log "ALERT: All heartbeats STALE ($staleCount stale, $freshCount fresh) but runners alive!"
+            Send-Discord "**WARNING: Runners alive but ALL heartbeats stale!** Data may not be flowing. Possible API disconnect." "yellow"
+            $script:staleWarnSent = $true
+            $script:staleWarnTime = $now
+        }
+    }
+
+    # Recovery alert — fires anytime heartbeats come back after a stale warning, regardless of market hours
+    if ($freshCount -gt 0 -and $script:staleWarnSent) {
+        $downMinutes = if ($script:staleWarnTime) { [int](($now - $script:staleWarnTime).TotalMinutes) } else { 0 }
+        Log "Heartbeats RESTORED ($freshCount fresh, $staleCount stale) after ${downMinutes}min"
+        Send-Discord "Heartbeats **RESTORED**. Data flowing again ($freshCount/$($freshCount+$staleCount) instruments). Was stale for ~${downMinutes} min." "green"
+        $script:staleWarnSent = $false
+        $script:staleWarnTime = $null
+    }
+
+    # ── Gap Fix #2: Trade event notifications ──
+    # Check for new trades every 5 min
+    if ($now.Minute % 5 -eq 0 -and $now.Second -lt 65) {
+        foreach ($dir in $hbDirs) {
+            $tradeFile = Join-Path $dir "trades.csv"
+            if (Test-Path $tradeFile) {
+                $lineCount = (Get-Content $tradeFile | Measure-Object -Line).Lines - 1
+                $pair = Split-Path $dir -Leaf
+                $stateKey = "trades_$pair"
+                $prevCount = if ($script:tradeCounts.ContainsKey($stateKey)) { $script:tradeCounts[$stateKey] } else { $lineCount }
+
+                if ($lineCount -gt $prevCount) {
+                    $newTrades = $lineCount - $prevCount
+                    # Read last trade
+                    $lastLine = Get-Content $tradeFile | Select-Object -Last 1
+                    $fields = $lastLine -split ","
+                    $pnl = if ($fields.Count -gt 4) { $fields[4] } else { "?" }
+                    $direction = if ($fields.Count -gt 1) { $fields[1] } else { "?" }
+                    $exitReason = if ($fields.Count -gt 5) { $fields[5] } else { "?" }
+
+                    $pnlColor = if ([double]::TryParse($pnl, [ref]$null) -and [double]$pnl -gt 0) { "green" } else { "red" }
+                    Send-Discord "**Trade Closed:** $($pair.ToUpper()) $direction | PnL: $pnl pips | Exit: $exitReason" $pnlColor
+                    Log "TRADE: $pair $direction pnl=$pnl exit=$exitReason"
+                }
+                $script:tradeCounts[$stateKey] = $lineCount
+            }
+        }
+    }
+
+    # ── Gap Fix #3: Daily session summary (9 AM CT = 14:00 UTC) ──
+    if ($utcHour -eq 14 -and $now.Minute -ge 0 -and $now.Minute -lt 2 -and -not $script:dailySummarySent) {
+        $totalTrades = 0
+        $totalPnl = 0.0
+        $pairSummary = @()
+        foreach ($dir in $hbDirs) {
+            $tradeFile = Join-Path $dir "trades.csv"
+            $pair = Split-Path $dir -Leaf
+            if (Test-Path $tradeFile) {
+                $rows = Import-Csv $tradeFile
+                $todayTrades = $rows | Where-Object { $_.ts -like "$(Get-Date -Format 'yyyy-MM-dd')*" }
+                if ($todayTrades) {
+                    $count = ($todayTrades | Measure-Object).Count
+                    $pnlField = if ($todayTrades[0].PSObject.Properties.Name -contains "pnl_pips") { "pnl_pips" } else { "pnl_pts" }
+                    $pnl = ($todayTrades | ForEach-Object { [double]$_.$pnlField } | Measure-Object -Sum).Sum
+                    $totalTrades += $count
+                    $totalPnl += $pnl
+                    if ($count -gt 0) { $pairSummary += "$($pair.ToUpper()): $count trades ($([math]::Round($pnl,1)) pips)" }
+                }
+            }
+        }
+        if ($totalTrades -gt 0) {
+            $color = if ($totalPnl -ge 0) { "green" } else { "red" }
+            $details = $pairSummary -join "`n"
+            Send-Discord "**Daily Session Summary (London Close)**`nTrades: $totalTrades | Net PnL: $([math]::Round($totalPnl,1)) pips`n$details" $color
+            Log "DAILY SUMMARY: $totalTrades trades, $([math]::Round($totalPnl,1)) pips"
+        }
+        $script:dailySummarySent = $true
+    }
+    if ($utcHour -ne 14) { $script:dailySummarySent = $false }
 
     # Periodic heartbeat log (every 5 min)
     if ($now.Minute % 5 -eq 0 -and $now.Second -lt 65) {
         $fxStr = if ($fxAlive) { "UP" } else { "DOWN" }
         $futStr = if ($futuresAlive) { "UP" } else { "DOWN" }
-        Log "HEARTBEAT | FX=$fxStr | Futures=$futStr"
+        Log "HEARTBEAT | FX=$fxStr | Futures=$futStr | Port=$portListening | Fresh=$freshCount Stale=$staleCount"
     }
 }

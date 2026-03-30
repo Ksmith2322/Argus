@@ -23,6 +23,7 @@
 - Does NOT influence sizing logic or confidence scoring
 - Shadow/paper only unless explicitly collecting behavioral evidence
 - Current: USD/JPY (concentration fragility — 3 trades carry result)
+- Current: NKD (KILLED 2026-03-29: 0/7 WR, -550 pips, every trade stopped out)
 
 ## Pairs NOT in any status are UNLABELED INVENTORY
 - Not future contributors until they earn a label

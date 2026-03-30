@@ -1783,7 +1783,7 @@ IBKR_RUNNERS = [
     {"name": "MGC", "symbol": "MGC", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mgc", "unit": "bps", "mult": 1},
     {"name": "MCL", "symbol": "MCL", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/mcl", "unit": "bps", "mult": 1},
     # Futures — Asia
-    {"name": "NKD", "symbol": "NKD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/nkd", "unit": "bps", "mult": 1},
+    # NKD KILLED 2026-03-29 — 0/7 WR, -550 pips
 ]
 
 def _read_ibkr_runner(runner: dict) -> dict:
@@ -1860,6 +1860,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
             result["trade_count"] = state.get("trade_count", 0)
             result["pnl"] = state.get("pnl_pips", state.get("pnl_points", 0))
             result["entry_price"] = state.get("entry_price", 0)
+            result["direction"] = state.get("direction_str", state.get("position", "FLAT")).lower()
             mtime = state_file.stat().st_mtime
             age = time.time() - mtime
             result["state_age_s"] = int(age)
@@ -1925,6 +1926,25 @@ def _read_ibkr_runner(runner: dict) -> dict:
         except Exception:
             pass
 
+    # Compute unrealized PnL for open positions
+    if result["position"] != "FLAT" and result.get("entry_price", 0) > 0 and result.get("current_price", 0) > 0:
+        entry = result["entry_price"]
+        current = result["current_price"]
+        direction = result.get("direction", "long")
+        if runner["unit"] == "pips":
+            pip_size = 0.01 if "JPY" in runner["symbol"] else 0.0001
+            if direction == "long":
+                result["unrealized_pnl_pips"] = round((current - entry) / pip_size, 1)
+            else:
+                result["unrealized_pnl_pips"] = round((entry - current) / pip_size, 1)
+        else:
+            if direction == "long":
+                result["unrealized_pnl_pips"] = round(current - entry, 2)
+            else:
+                result["unrealized_pnl_pips"] = round(entry - current, 2)
+    else:
+        result["unrealized_pnl_pips"] = 0
+
     # Trades + performance metrics
     if trade_file.exists():
         try:
@@ -1942,6 +1962,10 @@ def _read_ibkr_runner(runner: dict) -> dict:
             result["valid_trades"] = len(valid_rows)
             result["invalid_trades"] = len(invalid_rows)
             result["invalid_rate"] = round(len(invalid_rows) / len(rows), 4) if rows else 0
+
+            # Realized PnL from ALL trades in trades.csv (single source of truth)
+            all_pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
+            result["realized_pnl_pips"] = round(sum(float(r.get(all_pnl_field, 0)) for r in rows), 2)
 
             # Performance metrics from VALID trades only
             metric_rows = valid_rows if valid_rows else []
@@ -2528,18 +2552,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div style="display:flex;gap:12px;margin-top:6px;" id="ibkr-cohort-bars"></div>
 </div>
 
-<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-divergence-section">
-  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Divergence Guard</div>
-  <div id="ibkr-divergence-body" style="color:#888;font-size:0.75em;">Loading...</div>
-</div>
-<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-kill-section">
-  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Kill Discipline</div>
-  <div id="ibkr-kill-body" style="color:#888;font-size:0.75em;">Loading...</div>
-</div>
-<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;" id="ibkr-promotion-section">
-  <div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:6px;">Promotion Gate</div>
-  <div id="ibkr-promotion-body" style="color:#888;font-size:0.75em;">Loading...</div>
-</div>
+<!-- Legacy sections removed 2026-03-29: Divergence Guard, Kill Discipline, Promotion Gate -->
+<!-- Replaced by: health bar, degradation_report.py, drift_report.py, trade_tracker.py, Discord alerts -->
 
 <!-- Runner cards -->
 <!-- Fleet P&L Chart -->
@@ -2614,10 +2628,10 @@ async function loadIBKRFleet() {
     document.getElementById('ibkr-total-signals').textContent = data.total_signals || 0;
     document.getElementById('ibkr-total-trades').textContent = data.total_trades || 0;
 
-    // Fleet PnL and active count
+    // Fleet PnL from trades.csv (single source of truth) and active count
     let fleetPnl = 0; let activeCount = 0;
     for (const r of data.runners) {
-      fleetPnl += Number(r.pnl || 0);
+      fleetPnl += Number(r.realized_pnl_pips || r.pnl || 0);
       if (r.status === 'RUNNING' || r.status === 'IDLE') activeCount++;
     }
     const fpEl = document.getElementById('ibkr-fleet-pnl');
@@ -2633,12 +2647,13 @@ async function loadIBKRFleet() {
       'EURUSD': 0.0001 * 57000, 'GBPUSD': 0.0001 * 66000, 'AUDUSD': 0.0001 * 100000,
       'EURJPY': 0.000067 * 100000, 'GBPJPY': 0.000067 * 100000, 'CADJPY': 0.000067 * 100000,
       'AUDJPY': 0.000067 * 100000, 'USDJPY': 0.000067 * 100000,
-      'MES': 5, 'MNQ': 2, 'MYM': 0.5, 'M2K': 5, 'MGC': 1, 'MCL': 1, 'NKD': 5,
+      'MES': 5, 'MNQ': 2, 'MYM': 0.5, 'M2K': 5, 'MGC': 1, 'MCL': 1,
     };
     for (const r of data.runners) {
-      const pnl = Number(r.pnl || 0);
+      const realizedPnl = Number(r.realized_pnl_pips || r.pnl || 0);
+      const unrealizedPnl = Number(r.unrealized_pnl_pips || 0);
       const mult = pipToDollar[r.symbol] || 1;
-      dollarPnl += pnl * mult;
+      dollarPnl += (realizedPnl + unrealizedPnl) * mult;
     }
     const startingBalance = 10000;
     const balance = startingBalance + dollarPnl;
