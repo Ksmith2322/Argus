@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from argus_flow.ops.broker_truth import file_age_s, load_runner_broker_state
+
 REPO = Path(__file__).resolve().parents[2]
 LOGS = REPO / "argus_flow" / "logs"
 CONFIGS = REPO / "argus_flow" / "configs"
@@ -295,11 +297,13 @@ def _build_governance(
     promo_entry = _find_runner_in_report(promotion_report, symbol)
     promo_verdict = "UNKNOWN"
     promo_blockers: list[str] = []
+    promo_evidence_gaps: list[str] = []
     promo_passed = 0
     promo_total = 0
     if promo_entry:
         promo_verdict = promo_entry.get("verdict", "UNKNOWN")
         promo_blockers = promo_entry.get("blockers", [])
+        promo_evidence_gaps = promo_entry.get("evidence_gaps", promo_entry.get("unevidenced", []))
         checks = promo_entry.get("checks", {})
         promo_total = len(checks)
         promo_passed = sum(1 for c in checks.values() if isinstance(c, dict) and c.get("passed", False))
@@ -313,6 +317,7 @@ def _build_governance(
         "artifact_alerts": art_alerts,
         "promotion_gate_verdict": promo_verdict,
         "promotion_gate_blockers": promo_blockers,
+        "promotion_gate_evidence_gaps": promo_evidence_gaps,
         "promotion_gate_checks_passed": promo_passed,
         "promotion_gate_checks_total": promo_total,
     }
@@ -361,7 +366,73 @@ def _build_runtime(log_dir: Path) -> dict:
     }
 
 
-def _build_eligibility(cohort: dict, performance: dict, governance: dict) -> dict:
+def _build_broker_truth(log_dir: Path) -> dict:
+    """Build broker/account truth section from broker_state.json."""
+    broker_state = load_runner_broker_state(log_dir)
+    broker_state_file = log_dir / "broker_state.json"
+
+    if not broker_state:
+        return {
+            "available": False,
+            "snapshot_age_s": file_age_s(broker_state_file),
+            "broker_connected": False,
+            "reconciliation_result": "MISSING",
+            "reconciliation_detail": "broker_state.json unavailable",
+            "account_equity_usd": 0.0,
+            "buying_power_usd": 0.0,
+            "broker_position": "UNKNOWN",
+            "broker_qty": 0.0,
+            "open_orders": 0,
+        }
+
+    account = broker_state.get("account", {})
+    broker = broker_state.get("broker", {})
+    reconciliation = broker_state.get("reconciliation", {})
+    return {
+        "available": True,
+        "snapshot_age_s": file_age_s(broker_state_file),
+        "broker_connected": bool(broker_state.get("broker_connected", False)),
+        "reconciliation_result": reconciliation.get("result", "UNKNOWN"),
+        "reconciliation_detail": reconciliation.get("detail", ""),
+        "account_equity_usd": float(account.get("net_liquidation_usd", 0.0) or 0.0),
+        "buying_power_usd": float(account.get("buying_power_usd", 0.0) or 0.0),
+        "broker_position": broker.get("position", "UNKNOWN"),
+        "broker_qty": float(broker.get("qty", 0.0) or 0.0),
+        "broker_avg_cost": float(broker.get("avg_cost", 0.0) or 0.0),
+        "open_orders": len(broker.get("open_orders", []) or []),
+    }
+
+
+def _build_research_validation(log_dir: Path) -> dict:
+    """Build research validation section from walkforward_report.json."""
+    report = _load_json(log_dir / "walkforward_report.json")
+    if not report:
+        return {
+            "available": False,
+            "status": "MISSING",
+            "rationale": "walkforward_report.json unavailable",
+            "folds_scored": 0,
+            "folds_total": 0,
+            "positive_ratio": 0.0,
+            "mean_expectancy": 0.0,
+            "max_fold_drawdown": 0.0,
+        }
+
+    summary = report.get("summary", {})
+    return {
+        "available": True,
+        "status": str(report.get("status", summary.get("status", "UNKNOWN"))).upper(),
+        "rationale": summary.get("rationale", ""),
+        "folds_scored": int(summary.get("folds_scored", 0) or 0),
+        "folds_total": int(summary.get("folds_total", 0) or 0),
+        "positive_ratio": float(summary.get("positive_ratio", 0.0) or 0.0),
+        "mean_expectancy": float(summary.get("mean_expectancy", 0.0) or 0.0),
+        "max_fold_drawdown": float(summary.get("max_fold_drawdown", 0.0) or 0.0),
+        "expectancy_vs_baseline_ratio": summary.get("expectancy_vs_baseline_ratio"),
+    }
+
+
+def _build_eligibility(cohort: dict, performance: dict, governance: dict, research_validation: dict) -> dict:
     """Build eligibility section — human-readable promotion status."""
     blockers = governance.get("promotion_gate_blockers", [])
     promo_verdict = governance.get("promotion_gate_verdict", "UNKNOWN")
@@ -392,6 +463,39 @@ def _build_eligibility(cohort: dict, performance: dict, governance: dict) -> dic
 # Main registry builder
 # ─────────────────────────────────────────────────────────────
 
+def _build_eligibility_v2(cohort: dict, governance: dict, research_validation: dict) -> dict:
+    blockers = governance.get("promotion_gate_blockers", [])
+    evidence_gaps = governance.get("promotion_gate_evidence_gaps", [])
+    promo_verdict = governance.get("promotion_gate_verdict", "UNKNOWN")
+    walkforward_status = research_validation.get("status", "UNKNOWN")
+
+    promotion_eligible = promo_verdict == "PROMOTE"
+    valid = cohort.get("valid_trade_count", 0)
+    target = cohort.get("promotion_target", PROMOTION_TARGET)
+    remaining = max(0, target - valid)
+
+    if promotion_eligible:
+        next_milestone = "Ready for promotion review"
+    elif walkforward_status in ("MISSING", "INSUFFICIENT_DATA", "UNKNOWN"):
+        next_milestone = "Generate fresh walk-forward evidence"
+    elif walkforward_status == "FAIL":
+        next_milestone = "Improve config and re-run walk-forward validation"
+    elif remaining > 0:
+        next_milestone = f"{remaining} more valid trade{'s' if remaining != 1 else ''} needed"
+    elif evidence_gaps:
+        next_milestone = "Close required evidence gaps before promotion"
+    else:
+        next_milestone = "Trade count met - clear remaining blockers"
+
+    blocker_parts = blockers + evidence_gaps
+    blockers_summary = ", ".join(blocker_parts) if blocker_parts else "none"
+    return {
+        "promotion_eligible": promotion_eligible,
+        "next_milestone": next_milestone,
+        "blockers_summary": blockers_summary,
+    }
+
+
 def build_registry(runner_def: dict) -> dict:
     """Build the complete evidence registry for one runner."""
     symbol = runner_def["symbol"]
@@ -408,19 +512,28 @@ def build_registry(runner_def: dict) -> dict:
     divergence_report = _load_json(LOGS / "divergence_report.json")
     artifact_report = _load_json(LOGS / "artifact_divergence_report.json")
     promotion_report = _load_json(LOGS / "promotion_gate_report.json")
+    broker_truth = _build_broker_truth(log_dir)
+    research_validation = _build_research_validation(log_dir)
 
     # Determine blocker (top-level concern if any)
     blocker = None
     kill_entry = _find_runner_in_report(kill_report, symbol)
     if kill_entry and kill_entry.get("status") == "KILL":
         blocker = "KILL_DISCIPLINE"
+    elif broker_truth.get("reconciliation_result") in ("LOCAL_FLAT_BROKER_OPEN", "UNRESOLVED", "RECON_DRIFT"):
+        blocker = "BROKER_RECONCILIATION"
+    elif is_validation and research_validation.get("status") == "FAIL":
+        blocker = "WALKFORWARD_FAILURE"
 
     # Build sections
     cohort = _build_cohort(trades, runner_def, hashes)
     performance = _build_performance(trades)
     governance = _build_governance(symbol, kill_report, divergence_report, artifact_report, promotion_report)
     runtime = _build_runtime(log_dir)
-    eligibility = _build_eligibility(cohort, performance, governance)
+    eligibility = _build_eligibility_v2(cohort, governance, research_validation)
+
+    if blocker is None and governance.get("promotion_gate_verdict") == "BLOCKED":
+        blocker = "PROMOTION_GATE"
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -434,6 +547,8 @@ def build_registry(runner_def: dict) -> dict:
         "performance": performance,
         "governance": governance,
         "runtime": runtime,
+        "broker_truth": broker_truth,
+        "research_validation": research_validation,
         "last_governance_review": None,
         "last_updated": now_iso,
         "eligibility": eligibility,
@@ -479,6 +594,8 @@ def _print_summary(reg: dict) -> None:
     gov = reg["governance"]
     elig = reg["eligibility"]
     runtime = reg["runtime"]
+    broker_truth = reg.get("broker_truth", {})
+    research_validation = reg.get("research_validation", {})
 
     alive_str = "ALIVE" if runtime["runner_alive"] else "DEAD"
     position = runtime["position"]
@@ -494,6 +611,8 @@ def _print_summary(reg: dict) -> None:
     promo = gov["promotion_gate_verdict"]
     passed = gov["promotion_gate_checks_passed"]
     total = gov["promotion_gate_checks_total"]
+    wf_status = research_validation.get("status", "UNKNOWN")
+    wf_ratio = research_validation.get("positive_ratio", 0.0)
 
     print(f"\n{'=' * 60}")
     print(f"  {symbol} ({reg['name']})  |  {lane}  |  {status}")
@@ -501,8 +620,14 @@ def _print_summary(reg: dict) -> None:
     print(f"  Runtime:      {alive_str}  |  {position}  |  heartbeat {hb_str}")
     if runtime["quarantined"]:
         print(f"  ** QUARANTINED **  errors={runtime['consecutive_errors']}")
+    if broker_truth.get("available"):
+        print(
+            f"  Broker:       {broker_truth['broker_position']} qty={broker_truth['broker_qty']:.0f}  "
+            f"|  recon={broker_truth['reconciliation_result']}"
+        )
     print(f"  Cohort:       {valid}/{target} valid trades  |  invalid rate {cohort['invalid_rate']:.1%}")
     print(f"  Performance:  PnL {pnl:+.2f} pips  |  WR {wr:.1f}%  |  PF {perf['profit_factor']}")
+    print(f"  Research:     walk-forward {wf_status}  |  positive folds {wf_ratio:.0%}")
     print(f"  Kill:         {kill}  |  Promotion: {promo} ({passed}/{total} checks)")
 
     if reg["blocker"]:

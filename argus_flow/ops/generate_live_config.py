@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = REPO / "argus_flow" / "configs"
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
-GATE_REPORT = REPO / "argus_flow" / "ops" / "promotion_gate_report.json"
+GATE_REPORT = REPO / "argus_flow" / "logs" / "promotion_gate_report.json"
 
 # Defaults
 DEFAULT_FX_LOT_SIZE = 1000       # 1 micro lot
@@ -59,16 +59,19 @@ def _check_promotion_gate(symbol: str, gate_report: dict | None) -> bool:
         print(f"  WARNING: promotion_gate_report.json not found — skipping gate check for {symbol}")
         return True  # allow but warn
 
-    # Try to find the symbol in the report (case-insensitive)
+    runners = gate_report.get("runners", []) if isinstance(gate_report, dict) else []
     symbol_upper = symbol.upper()
-    for key, entry in gate_report.items():
-        entry_symbol = entry.get("symbol", key).upper() if isinstance(entry, dict) else None
-        if entry_symbol == symbol_upper or key.upper() == symbol_upper:
-            status = entry.get("status", "UNKNOWN") if isinstance(entry, dict) else str(entry)
-            if status == "PROMOTE":
-                return True
-            print(f"  WARNING: {symbol} has status '{status}' in gate report (expected PROMOTE)")
-            return False
+    for entry in runners:
+        if not isinstance(entry, dict):
+            continue
+        entry_symbol = str(entry.get("symbol", "")).upper()
+        if entry_symbol != symbol_upper:
+            continue
+        status = str(entry.get("verdict", entry.get("status", "UNKNOWN"))).upper()
+        if status == "PROMOTE":
+            return True
+        print(f"  WARNING: {symbol} has status '{status}' in gate report (expected PROMOTE)")
+        return False
 
     print(f"  WARNING: {symbol} not found in promotion_gate_report.json")
     return True  # allow but warn

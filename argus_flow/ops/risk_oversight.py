@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from argus_flow.ops.broker_truth import load_runner_broker_state
+
 REPO = Path(__file__).resolve().parents[2]
 LOGS = REPO / "argus_flow" / "logs"
 
@@ -39,6 +41,8 @@ MAX_SIMULTANEOUS_POSITIONS = 3
 MAX_CORRELATED_POSITIONS = 1  # per group
 FLEET_DRAWDOWN_PAUSE_PIPS = 50.0
 INVALID_TRADE_RATE_THRESHOLD = 0.15  # 15%
+BROKER_STATE_FRESH_S = 600
+MAX_TOTAL_OPEN_RISK_PCT = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -59,24 +63,76 @@ def _read_state(log_dir: Path) -> dict | None:
     return _load_json(log_dir / "state.json")
 
 
-def _read_positions() -> list[dict]:
-    """Return list of pairs with open positions."""
+def _read_runtime_truth(runner: dict) -> dict:
+    """Return the best available runtime truth for a runner."""
+    broker_state = load_runner_broker_state(runner["log_dir"], max_age_s=BROKER_STATE_FRESH_S)
+    if broker_state:
+        broker = broker_state.get("broker", {})
+        runner_state = broker_state.get("runner", {})
+        account = broker_state.get("account", {})
+        return {
+            "status": broker.get("position", "FLAT"),
+            "source": "broker_state",
+            "open_risk_usd": float(runner_state.get("open_risk_usd", 0.0) or 0.0),
+            "unrealized_pnl_usd": float(runner_state.get("unrealized_pnl_usd", 0.0) or 0.0),
+            "account_equity_usd": float(account.get("net_liquidation_usd", 0.0) or 0.0),
+            "reconciliation": broker_state.get("reconciliation", {}).get("result", ""),
+            "broker_connected": bool(broker_state.get("broker_connected", False)),
+        }
+
+    state = _read_state(runner["log_dir"])
+    if state is None:
+        return {
+            "status": "UNKNOWN",
+            "source": "missing",
+            "open_risk_usd": 0.0,
+            "unrealized_pnl_usd": 0.0,
+            "account_equity_usd": 0.0,
+            "reconciliation": "",
+            "broker_connected": False,
+        }
+
+    return {
+        "status": str(state.get("position", state.get("status", "FLAT"))).upper(),
+        "source": "state",
+        "open_risk_usd": float(state.get("entry_risk_usd", 0.0) or 0.0),
+        "unrealized_pnl_usd": float(state.get("pnl_usd", 0.0) or 0.0),
+        "account_equity_usd": 0.0,
+        "reconciliation": "",
+        "broker_connected": False,
+    }
+
+
+def _read_positions() -> tuple[list[dict], dict]:
+    """Return list of pairs with open positions plus fleet broker-truth stats."""
     open_positions = []
+    fleet_open_risk_usd = 0.0
+    fleet_unrealized_pnl_usd = 0.0
+    account_equity_usd = 0.0
+    truth_sources = set()
     for r in RUNNERS:
-        state = _read_state(r["log_dir"])
-        if state is None:
-            continue
-        pos = state.get("position") or state.get("qty") or state.get("status")
-        # Heuristic: treat as open if status is not FLAT/flat/None
-        status = str(state.get("status", "FLAT")).upper()
+        truth = _read_runtime_truth(r)
+        status = str(truth.get("status", "FLAT")).upper()
+        truth_sources.add(truth.get("source", "unknown"))
+        if truth.get("account_equity_usd", 0.0) > 0:
+            account_equity_usd = max(account_equity_usd, truth["account_equity_usd"])
         if status not in ("FLAT", "NONE", ""):
+            fleet_open_risk_usd += float(truth.get("open_risk_usd", 0.0) or 0.0)
+            fleet_unrealized_pnl_usd += float(truth.get("unrealized_pnl_usd", 0.0) or 0.0)
             open_positions.append({
                 "pair": r["name"],
                 "symbol": r["symbol"],
                 "status": status,
-                "state": state,
+                "source": truth.get("source", "unknown"),
+                "reconciliation": truth.get("reconciliation", ""),
             })
-    return open_positions
+    meta = {
+        "fleet_open_risk_usd": round(fleet_open_risk_usd, 2),
+        "fleet_unrealized_pnl_usd": round(fleet_unrealized_pnl_usd, 2),
+        "account_equity_usd": round(account_equity_usd, 2),
+        "truth_sources": sorted(truth_sources),
+    }
+    return open_positions, meta
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +192,11 @@ def _check_artifact_divergence() -> dict | None:
     return _load_json(LOGS / "artifact_divergence_report.json")
 
 
+def _check_position_monitor() -> dict | None:
+    """Read position_monitor.json for broker reconciliation alerts."""
+    return _load_json(LOGS / "position_monitor.json")
+
+
 def _check_invalid_trade_rate() -> float:
     """Combined invalid trade rate across all pairs from daily report."""
     report = None
@@ -168,7 +229,7 @@ def assess_risk() -> dict:
     now = datetime.now(timezone.utc).isoformat()
 
     # Positions
-    open_positions = _read_positions()
+    open_positions, broker_meta = _read_positions()
     position_count = len(open_positions)
 
     # Correlation
@@ -183,6 +244,7 @@ def assess_risk() -> dict:
     # Divergence
     divergence = _check_divergence()
     artifact_div = _check_artifact_divergence()
+    position_monitor = _check_position_monitor()
 
     # Invalid trade rate
     invalid_rate = _check_invalid_trade_rate()
@@ -190,14 +252,14 @@ def assess_risk() -> dict:
     # Per-pair status
     per_pair = {}
     for r in RUNNERS:
-        state = _read_state(r["log_dir"])
-        status = "UNKNOWN"
-        if state:
-            status = str(state.get("status", "FLAT")).upper()
+        truth = _read_runtime_truth(r)
+        status = str(truth.get("status", "FLAT")).upper()
         per_pair[r["symbol"]] = {
             "name": r["name"],
             "status": status,
-            "has_state": state is not None,
+            "source": truth.get("source", "unknown"),
+            "has_state": _read_state(r["log_dir"]) is not None,
+            "reconciliation": truth.get("reconciliation", ""),
         }
 
     # ---------------------------------------------------------------------------
@@ -257,11 +319,42 @@ def assess_risk() -> dict:
         )
         risk_level = "RED"
 
+    account_equity_usd = broker_meta.get("account_equity_usd", 0.0)
+    fleet_open_risk_usd = broker_meta.get("fleet_open_risk_usd", 0.0)
+    open_risk_pct = (fleet_open_risk_usd / account_equity_usd) if account_equity_usd > 0 else 0.0
+    if account_equity_usd > 0 and open_risk_pct > MAX_TOTAL_OPEN_RISK_PCT:
+        recommendations.append(
+            f"REDUCE_RISK: open risk {open_risk_pct:.1%} > {MAX_TOTAL_OPEN_RISK_PCT:.0%} budget"
+        )
+        risk_level = "RED"
+    elif account_equity_usd > 0 and open_risk_pct > MAX_TOTAL_OPEN_RISK_PCT * 0.8 and risk_level == "GREEN":
+        risk_level = "YELLOW"
+
+    if position_monitor:
+        alerts = position_monitor.get("alerts", [])
+        if position_monitor.get("has_critical"):
+            recommendations.append("BROKER_RECONCILIATION: position_monitor reports CRITICAL mismatch")
+            risk_level = "RED"
+        elif alerts and risk_level == "GREEN":
+            recommendations.append("BROKER_RECONCILIATION: position_monitor has active alerts")
+            risk_level = "YELLOW"
+
     report = {
         "timestamp": now,
+        "level": risk_level,
+        "status": risk_level,
+        "metric": "fleet_risk",
+        "message": "; ".join(recommendations[:3]) if recommendations else "no action required",
         "fleet_positions": {
             "count": position_count,
             "list": [p["pair"] for p in open_positions],
+        },
+        "broker_truth": {
+            "account_equity_usd": account_equity_usd,
+            "fleet_open_risk_usd": fleet_open_risk_usd,
+            "fleet_open_risk_pct": round(open_risk_pct, 4),
+            "fleet_unrealized_pnl_usd": broker_meta.get("fleet_unrealized_pnl_usd", 0.0),
+            "sources": broker_meta.get("truth_sources", []),
         },
         "correlation_exposure": corr,
         "fleet_drawdown_pips": round(fleet_dd, 2),
@@ -289,6 +382,12 @@ def print_report(report: dict) -> None:
         print(f"                    {', '.join(report['fleet_positions']['list'])}")
     print(f"  Fleet Drawdown:   {report['fleet_drawdown_pips']:.1f} pips")
     print(f"  Invalid Rate:     {report['invalid_trade_rate']:.1%}")
+    broker_truth = report.get("broker_truth", {})
+    if broker_truth.get("account_equity_usd", 0) > 0:
+        print(f"  Open Risk:        ${broker_truth['fleet_open_risk_usd']:.2f} ({broker_truth['fleet_open_risk_pct']:.1%})")
+        print(f"  Equity:           ${broker_truth['account_equity_usd']:.2f}")
+    if broker_truth.get("sources"):
+        print(f"  Truth Source:     {', '.join(broker_truth['sources'])}")
 
     # Correlation
     corr = report["correlation_exposure"]

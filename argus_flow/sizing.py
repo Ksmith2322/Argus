@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+
+DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD = 0.000067
+
+
+def fx_pip_value_per_unit_usd(
+    symbol: str,
+    *,
+    quote_price: float | None = None,
+    usd_jpy_price: float | None = None,
+) -> float:
+    """Approximate USD value of one pip for one unit of FX."""
+
+    symbol = (symbol or "").upper()
+    if len(symbol) < 6:
+        return 0.0001
+
+    quote = symbol[3:6]
+    if quote == "USD":
+        return 0.0001
+    if quote == "JPY":
+        ref = usd_jpy_price or quote_price
+        if ref and ref > 0:
+            return 0.01 / ref
+        return DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD
+    return 0.0001
+
+
+def fx_units_for_risk(
+    *,
+    equity_usd: float,
+    risk_pct: float,
+    stop_pips: float,
+    symbol: str,
+    min_units: int = 1000,
+    max_units: int | None = None,
+    quote_price: float | None = None,
+    usd_jpy_price: float | None = None,
+) -> int:
+    """Size FX units so stop-loss risk is approximately equity * risk_pct."""
+
+    if equity_usd <= 0 or risk_pct <= 0 or stop_pips <= 0:
+        return 0
+
+    pip_value = fx_pip_value_per_unit_usd(
+        symbol,
+        quote_price=quote_price,
+        usd_jpy_price=usd_jpy_price,
+    )
+    if pip_value <= 0:
+        return 0
+
+    risk_amount = equity_usd * risk_pct
+    raw_units = risk_amount / (stop_pips * pip_value)
+    sized = int(raw_units // min_units) * min_units
+    if sized < min_units:
+        return 0
+    if max_units is not None:
+        sized = min(sized, max_units)
+    return sized
+
+
+def futures_contracts_for_risk(
+    *,
+    equity_usd: float,
+    risk_pct: float,
+    entry_price: float,
+    stop_bps: float,
+    multiplier: float,
+    min_contracts: int = 1,
+    max_contracts: int | None = None,
+) -> int:
+    """Size futures contracts so stop-loss risk is approximately equity * risk_pct."""
+
+    if equity_usd <= 0 or risk_pct <= 0 or entry_price <= 0 or stop_bps <= 0 or multiplier <= 0:
+        return 0
+
+    stop_distance = entry_price * (stop_bps / 10000.0)
+    risk_per_contract = stop_distance * multiplier
+    if risk_per_contract <= 0:
+        return 0
+
+    raw_contracts = int((equity_usd * risk_pct) // risk_per_contract)
+    if raw_contracts < min_contracts:
+        return 0
+    if max_contracts is not None:
+        raw_contracts = min(raw_contracts, max_contracts)
+    return raw_contracts

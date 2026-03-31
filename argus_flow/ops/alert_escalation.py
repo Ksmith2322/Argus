@@ -142,15 +142,22 @@ def _check_promotion_gate() -> list[tuple[str, str, int]]:
     except (json.JSONDecodeError, OSError):
         return []
     alerts: list[tuple[str, str, int]] = []
-    items = data if isinstance(data, list) else [data]
+    if isinstance(data, dict) and "runners" in data:
+        items = data.get("runners", [])
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = [data]
     for item in items:
-        verdict = item.get("verdict", "").upper()
+        if not isinstance(item, dict):
+            continue
+        verdict = str(item.get("verdict", item.get("status", ""))).upper()
         if verdict == "PROMOTE":
             pair = item.get("pair", item.get("symbol", "unknown"))
             alerts.append((
                 "promotion_gate",
                 f"PROMOTE eligible: **{pair}** passed all gates!",
-                0x00FF00,  # green
+                0x00FF00,
             ))
     return alerts
 

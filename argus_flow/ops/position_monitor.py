@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from argus_flow.ops.broker_truth import file_age_s, load_fleet_snapshot, load_runner_broker_state
 
 load_dotenv()
 
@@ -52,6 +53,7 @@ def get_runner_state(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     hb_file = log_dir / "heartbeat.json"
     state_file = log_dir / "state.json"
+    broker_state_file = log_dir / "broker_state.json"
 
     result = {
         "name": runner["name"],
@@ -87,11 +89,27 @@ def get_runner_state(runner: dict) -> dict:
         # Neither heartbeat nor state — runner never started
         result["runner_position"] = "NEVER_STARTED"
 
+    broker_state = load_runner_broker_state(log_dir)
+    if broker_state:
+        result["broker_state_age_s"] = file_age_s(broker_state_file)
+        result["broker_reconciliation"] = broker_state.get("reconciliation", {}).get("result", "")
+        result["broker_reconciliation_detail"] = broker_state.get("reconciliation", {}).get("detail", "")
+        result["broker_artifact_position"] = broker_state.get("broker", {}).get("position", "UNKNOWN")
+        result["broker_artifact_qty"] = broker_state.get("broker", {}).get("qty", 0.0)
+        result["broker_truth_source"] = broker_state.get("source", "runner_unified")
+
     return result
 
 
-def get_ibkr_positions() -> dict:
-    """Connect to IBKR and get actual positions, normalized to canonical keys."""
+def get_ibkr_positions() -> tuple[dict, bool, str, dict | None]:
+    """Get broker truth, preferring the live runner snapshot when it is fresh."""
+    snapshot = load_fleet_snapshot(max_age_s=HEARTBEAT_STALE_S)
+    if snapshot and snapshot.get("broker_connected"):
+        positions = snapshot.get("positions", {})
+        if isinstance(positions, dict):
+            return positions, True, "runner_snapshot", snapshot
+
+    # Fallback: connect directly to IBKR if the runner snapshot is unavailable.
     try:
         from ib_insync import IB
         ib = IB()
@@ -106,9 +124,9 @@ def get_ibkr_positions() -> dict:
             qty = float(p.position)
             direction = "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT")
             pos_map[key] = {"qty": qty, "avg_cost": float(p.avgCost), "direction": direction}
-        return pos_map
+        return pos_map, True, "direct_ibkr", None
     except Exception as e:
-        return {"_error": str(e)}
+        return {"_error": str(e)}, False, "direct_ibkr_failed", snapshot
 
 
 def _classify_severity(alive: bool, mismatch: bool, ibkr_dir: str, state_error: bool) -> str:
@@ -138,12 +156,17 @@ def main():
     print(f"  IBKR Position Monitor -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
     print("=" * 65)
 
-    ibkr_positions = get_ibkr_positions()
-    ibkr_ok = "_error" not in ibkr_positions
+    ibkr_positions, ibkr_ok, position_source, fleet_snapshot = get_ibkr_positions()
+    snapshot_age = file_age_s(REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json")
     if not ibkr_ok:
         print(f"\n  \033[31mIBKR connection failed: {ibkr_positions['_error']}\033[0m")
         print("  Cannot verify positions. Check TWS.")
         ibkr_positions = {}
+    else:
+        source_suffix = f" via {position_source}"
+        if position_source == "runner_snapshot" and snapshot_age is not None:
+            source_suffix += f" ({snapshot_age}s old)"
+        print(f"\n  Broker truth source: {source_suffix}")
 
     results = []
     alerts = []
@@ -190,6 +213,8 @@ def main():
             "severity": severity,
             "state_read_error": state_error,
             "heartbeat_age_s": state.get("heartbeat_age_s", 9999),
+            "broker_state_age_s": state.get("broker_state_age_s"),
+            "broker_reconciliation": state.get("broker_reconciliation", ""),
         })
 
     # Check for orphaned IBKR positions not tracked by any runner
@@ -209,13 +234,17 @@ def main():
     # Save
     out_path = REPO / "argus_flow" / "logs" / "position_monitor.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    overall_status = "CRITICAL" if has_critical else ("WARN" if alerts else "OK")
     out_path.write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": overall_status,
         "ibkr_connected": ibkr_ok,
+        "position_source": position_source,
         "runners": results,
         "alerts": alerts,
         "has_critical": has_critical,
         "ibkr_positions": {k: v for k, v in ibkr_positions.items() if k != "_error"},
+        "account": (fleet_snapshot or {}).get("account", {}),
     }, indent=2, default=str))
     print(f"\n  Saved: {out_path}")
 

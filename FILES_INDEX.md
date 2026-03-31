@@ -56,11 +56,11 @@ logger.py | IO (LEGACY) | duplicate/legacy writer (avoid) | unknown/legacy | uti
 
 feed_coinbase.py | INTEGRATION | Coinbase HTTP fetch + preload/history helpers | runner_live,backtest/download_candles | requests,candles | NO | network | none | network,rate-limit
 
-feed_ws.py | CORE (Phase 20) | Coinbase WebSocket L2 order book feed + ticker; CoinbaseWsFeed class: background asyncio task, auto-reconnect, thread-safe _OrderBook; provides get_imbalance/get_best_bid/get_best_ask/get_spread_bps/get_candle; ticker channel aggregates sub-minute candles | runner_live | websockets | YES | network (wss://ws-feed.exchange.coinbase.com) | none | network,real-time,state
+feed_ws.py | MISSING/ARCHIVED | optional legacy Coinbase websocket import; file is absent in current repo and runner_live falls back when import fails | runner_live | none | NO | none | none | archived,docs-drift
 
-feed_ibkr.py | INTEGRATION (stub) | IBKR feed stub for future live execution | runner_live | none | NO | network | none | network,future
+feed_ibkr.py | INTEGRATION | IBKR Client Portal market data + history preload helpers; session manager, conid lookup, live tick fetch, candle/history preload | runner_live,state | requests,feed_coinbase.PriceTick | NO | network,env | none | network,broker-integration
 
-ml_governor.py | CORE (ML-1) | ML governor: trained XGBoost model (26 features, ROC-AUC 0.944); GATE/STAMP modes; evaluates entry signals with win probability; threshold-based gating | engine | xgboost,pandas | NO | ml_model.json,cfg | none | ML,gating
+ml_governor.py | CORE (ML-1) | optional ML governor: loads sklearn pickle artifact (data/ml_governor.pkl), scores entry snapshots, supports LOG_ONLY/SCORE_MODIFY/GATE recommendations | engine | pickle,numpy | NO | data/ml_governor.pkl,cfg | none | ML,gating
 
 correlation_guard.py | CORE | cross-coin entry guard: reads sibling runtime_state JSONs; blocks entries when concurrent open positions >= CROSS_COIN_MAX_OPEN | engine | json | NO | state/runtime_state_*.json | none | risk,multi-coin
 
@@ -159,15 +159,13 @@ ops/dashboard.py | CORE (Phase 17) | FastAPI dashboard: multi-coin cards, signal
 
 ops/launch_multi.ps1 | OPS | launch parallel runners (ETH, BTC) in separate PowerShell windows with per-coin env (PRODUCT_ID, ARGUS_LOG_DIR, coin overlay) | manual | runner_live | NO | filesystem | none | multi-coin,launch
 
-ops/coin_rotation.py | OPS | passive coin health monitor: reads coin_pool.json, computes rolling PF/WR metrics per coin, flags degraded performers | dashboard | json | NO | coin_pool.json,trade_journal*.csv | none | multi-coin,monitoring
+ops/coin_rotation.py | OPS | passive coin ranking helper: reads coin_pool.json, scores stored per-coin metrics, returns operator-facing rotation candidates without mutating state | dashboard | json | NO | coin_pool.json | none | multi-coin,monitoring
 
 ops/coin_pool.json | CONFIG | coin pool registry: max_active, active coins, per-coin metrics | coin_rotation,dashboard | n/a | NO | filesystem | none | multi-coin,config
 
 ops/run_queue.ps1 | OPS | backtest queue runner: reads ops/backtest_queue.jsonl, refreshes candles, runs each job sequentially | manual,Task Scheduler | backtest.runner | NO | backtest_queue.jsonl | ops/logs/bt_summary*.json | backtest,automation
 
-ops/ml_retrain.py | TOOL | governor model retrain: extracts features from trade journals, trains XGBoost, saves model | manual | xgboost,pandas | NO | trade_journal*.csv | ml_model.json | ML,retrain
-
-ops/ml_train_governor.py | TOOL | initial governor model training script | manual | xgboost,pandas | NO | trade data | ml_model.json | ML,training
+ops/ml_train_governor.py | TOOL | governor model training pipeline: loads trade dataset, runs stratified CV + walk-forward validation, trains GradientBoostingClassifier, saves data/ml_governor.pkl + feature report | manual | sklearn,numpy | NO | data/ml_trades.csv or custom input | data/ml_governor.pkl,data/ml_governor_features.json | ML,training
 
 ops/ml_extract_features.py | TOOL | extract ML features from backtest/live trade data | manual | pandas | NO | trade_journal*.csv,signals*.csv | feature CSV | ML,data-prep
 
@@ -300,3 +298,14 @@ tests/test_kraken_connectivity.py | TEST | Kraken API test | CLI | kraken_client
 # Docs
 COHORT_SPEC.md | DOC | Cohort governance (valid/invalid, promotion gates) | n/a | n/a | NO | n/a | n/a | governance
 PAPER_GATES.md | DOC | Paper trading acceptance/kill gates | n/a | n/a | NO | n/a | n/a | governance
+
+--- 2026-03-31 DELTA ---
+
+ops/process_lock.py | OPS SUPPORT | OS-level singleton lock helper for runner/dashboard launch safety | ops/dashboard, runner entrypoints | win32/kernel mutex APIs | NO | runtime metadata | none | ops,singleton
+argus_flow/sizing.py | CORE SUPPORT | Risk-based FX/futures sizing math from equity/risk budget | runner_unified, tests | n/a | NO | equity,risk inputs | size outputs | sizing,risk
+argus_flow/ops/broker_truth.py | OPS CORE | Canonical broker/account truth helpers: broker_state, broker_snapshot merge/load, freshness checks | runner_unified,evidence_registry,position_monitor,dashboard | json filesystem | NO | argus_flow/logs/_broker, broker_state.json | merged truth artifacts | ops,broker-truth
+argus_flow/ops/artifact_divergence.py | OPS GOVERNANCE | Local artifact integrity checker: cohort row counts, trade journal serials, config hash drift, signal/heartbeat freshness, registry consistency | ops/run_cohort_report, alert escalation, risk oversight | trades,state,evidence_registry,hashes | NO | argus_flow/logs/*, configs/hashes.json | artifact_divergence_report.json | governance,artifact-integrity
+argus_flow/ops/walkforward_validation.py | OPS RESEARCH | Active-cohort walk-forward validator; writes per-runner walkforward_report.json | ops/run_cohort_report, manual | replay / configs | NO | configs, logs | walkforward_report.json | research,validation
+argus_flow/ops/promotion_gate_v2.py | OPS GOVERNANCE | Canonical paper-to-live promotion gate with walk-forward-aware hard checks and evidence gaps | ops/run_cohort_report, generate_live_config, dashboard/evidence surfaces | trades,walkforward,evidence | NO | argus_flow/logs/* | promotion_gate_report.json | governance,promotion
+argus_flow/ops/alert_escalation_v2.py | OPS GOVERNANCE | Canonical incident state builder + Discord alert escalation; writes alert_state.json and alert_events.jsonl with opened/resolved/manual-action flow | ops/run_cohort_report | discord_alerts, governance reports | NO | position_monitor,risk_oversight,divergence,artifact,promotion reports | alert_state.json, alert_events.jsonl | governance,alerting,ops
+ops/dashboard.py | CORE (Phase 17) | FastAPI dashboard with real broker equity, report freshness, active issues, manual-action queue, alert event history, per-runner governance/evidence surfaces, and 24h blocked-signal QA visibility | manual,autostart | fastapi,uvicorn,argus_flow logs | NO | broker_snapshot,alert_state,evidence_registry,signals,trades | none (HTTP only) | ops,monitoring,qa-visibility

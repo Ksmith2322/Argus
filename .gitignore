@@ -20,6 +20,8 @@ ops/logs/
 *.log
 *.csv
 *.json
+.pycache_verify/
+!ops/coin_pool.json
 
 # --- Candle data (keep in repo for PC2 sync) ---
 !data/eth_usd_1m.csv

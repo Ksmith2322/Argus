@@ -235,6 +235,12 @@ def load_config() -> dict:
 
     cfg["BACKTEST_LIMIT"] = _i("BACKTEST_LIMIT", "0")
     cfg["BT_LIQUIDITY_MODE"] = _s("BT_LIQUIDITY_MODE", "")
+    cfg["BT_TICK_MODE"] = _s("BT_TICK_MODE", "INTRABAR").upper()
+    if cfg["BT_TICK_MODE"] not in ("CLOSE", "INTRABAR"):
+        cfg["BT_TICK_MODE"] = "INTRABAR"
+    cfg["BT_INTRABAR_ORDER"] = _s("BT_INTRABAR_ORDER", "AUTO").upper()
+    if cfg["BT_INTRABAR_ORDER"] not in ("AUTO", "OHLC", "OLHC"):
+        cfg["BT_INTRABAR_ORDER"] = "AUTO"
 
     # -------------------------
     # Artifact roots / path doctrine
@@ -281,6 +287,15 @@ def load_config() -> dict:
     # Drawdown circuit breaker: pause entries if equity drops this % from peak (0 = disabled)
     cfg["DRAWDOWN_PAUSE_PCT"] = _d("DRAWDOWN_PAUSE_PCT", "0")
     cfg["DRAWDOWN_PAUSE_PCT"] = _clamp_decimal(cfg["DRAWDOWN_PAUSE_PCT"], Decimal("0"), Decimal("1"))
+    cfg["USE_DRAWDOWN_SIZE_THROTTLE"] = _b("USE_DRAWDOWN_SIZE_THROTTLE", "true")
+    cfg["DRAWDOWN_SIZE_THROTTLE_START_PCT"] = _d("DRAWDOWN_SIZE_THROTTLE_START_PCT", "0")
+    cfg["DRAWDOWN_SIZE_THROTTLE_MIN_MULT"] = _d("DRAWDOWN_SIZE_THROTTLE_MIN_MULT", "0.25")
+    cfg["DRAWDOWN_SIZE_THROTTLE_START_PCT"] = _clamp_decimal(
+        cfg["DRAWDOWN_SIZE_THROTTLE_START_PCT"], Decimal("0"), Decimal("1")
+    )
+    cfg["DRAWDOWN_SIZE_THROTTLE_MIN_MULT"] = _clamp_decimal(
+        cfg["DRAWDOWN_SIZE_THROTTLE_MIN_MULT"], Decimal("0"), Decimal("1")
+    )
 
     cfg["DAILY_MAX_LOSS_USD"] = _clamp_decimal(cfg["DAILY_MAX_LOSS_USD"], Decimal("0"), Decimal("1000000000"))
     cfg["MAX_TRADES_PER_DAY"] = _clamp_int(cfg["MAX_TRADES_PER_DAY"], 0, 1_000_000)

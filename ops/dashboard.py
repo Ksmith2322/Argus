@@ -22,6 +22,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+try:
+    from process_lock import ProcessLock, ProcessLockError, build_dashboard_lock_name
+except ImportError:
+    from ops.process_lock import ProcessLock, ProcessLockError, build_dashboard_lock_name
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("argus.dashboard")
 
@@ -1786,11 +1791,141 @@ IBKR_RUNNERS = [
     # NKD KILLED 2026-03-29 — 0/7 WR, -550 pips
 ]
 
+ALERT_STATE_FILE = REPO / "argus_flow" / "logs" / "alert_state.json"
+ALERT_EVENTS_FILE = REPO / "argus_flow" / "logs" / "alert_events.jsonl"
+FLEET_BROKER_FILE = REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json"
+VALIDATION_SYMBOLS = {"EURUSD", "GBPUSD", "EURJPY"}
+OPS_REPORT_SPECS = [
+    {"id": "position_monitor", "label": "Position Monitor", "path": REPO / "argus_flow" / "logs" / "position_monitor.json", "fresh_s": 900},
+    {"id": "risk_oversight", "label": "Risk Oversight", "path": REPO / "argus_flow" / "logs" / "risk_oversight_report.json", "fresh_s": 900},
+    {"id": "promotion_gate", "label": "Promotion Gate", "path": REPO / "argus_flow" / "logs" / "promotion_gate_report.json", "fresh_s": 36 * 3600},
+    {"id": "artifact_divergence", "label": "Artifact Divergence", "path": REPO / "argus_flow" / "logs" / "artifact_divergence_report.json", "fresh_s": 36 * 3600},
+    {"id": "divergence", "label": "Divergence Guard", "path": REPO / "argus_flow" / "logs" / "divergence_report.json", "fresh_s": 36 * 3600},
+    {"id": "kill_discipline", "label": "Kill Discipline", "path": REPO / "argus_flow" / "logs" / "kill_discipline_report.json", "fresh_s": 36 * 3600},
+]
+
+
+def _load_json_file(path: Path) -> dict | list | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _file_age_s(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        return int(max(0.0, time.time() - path.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def _load_recent_alert_events(limit: int = 12) -> list[dict]:
+    if not ALERT_EVENTS_FILE.exists():
+        return []
+    events = collections.deque(maxlen=limit)
+    try:
+        with open(ALERT_EVENTS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+    except Exception:
+        return []
+    return list(events)[::-1]
+
+
+def _report_freshness_rows() -> list[dict]:
+    rows = []
+    for spec in OPS_REPORT_SPECS:
+        age = _file_age_s(spec["path"])
+        if age is None:
+            status = "MISSING"
+        elif age <= spec["fresh_s"]:
+            status = "FRESH"
+        else:
+            status = "STALE"
+        rows.append(
+            {
+                "id": spec["id"],
+                "label": spec["label"],
+                "path": str(spec["path"]),
+                "age_s": age,
+                "fresh_s": spec["fresh_s"],
+                "status": status,
+            }
+        )
+    rows.sort(key=lambda item: (item["status"] == "FRESH", item["status"] == "MISSING", item["label"]))
+    return rows
+
+
+def _load_fleet_account_truth() -> dict:
+    snapshot = _load_json_file(FLEET_BROKER_FILE)
+    if not isinstance(snapshot, dict):
+        return {}
+    account = snapshot.get("account", {})
+    return {
+        "source": snapshot.get("source", ""),
+        "snapshot_age_s": _file_age_s(FLEET_BROKER_FILE),
+        "broker_connected": bool(snapshot.get("broker_connected", False)),
+        "account_id": account.get("account_id", ""),
+        "net_liquidation_usd": float(account.get("net_liquidation_usd", 0.0) or 0.0),
+        "buying_power_usd": float(account.get("buying_power_usd", 0.0) or 0.0),
+        "available_funds_usd": float(account.get("available_funds_usd", 0.0) or 0.0),
+        "total_cash_usd": float(account.get("total_cash_usd", 0.0) or 0.0),
+        "excess_liquidity_usd": float(account.get("excess_liquidity_usd", 0.0) or 0.0),
+    }
+
+
+def _build_ops_overview() -> dict:
+    alert_state = _load_json_file(ALERT_STATE_FILE)
+    if not isinstance(alert_state, dict):
+        alert_state = {}
+    active_issues = [issue for issue in alert_state.get("active_issues", []) if isinstance(issue, dict)]
+    manual_actions = [issue for issue in alert_state.get("manual_actions", []) if isinstance(issue, dict)]
+    freshness = _report_freshness_rows()
+    stale_reports = [row for row in freshness if row["status"] == "STALE"]
+    missing_reports = [row for row in freshness if row["status"] == "MISSING"]
+    severity_rank = {"INFO": 0, "WARNING": 1, "HIGH": 2, "CRITICAL": 3}
+    max_severity = "OK"
+    if active_issues:
+        max_issue = max(active_issues, key=lambda item: severity_rank.get(str(item.get("severity", "WARNING")).upper(), 1))
+        max_severity = str(max_issue.get("severity", "WARNING")).upper()
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "alert_state_ts": alert_state.get("timestamp"),
+        "alert_state_age_s": _file_age_s(ALERT_STATE_FILE),
+        "summary": {
+            "active_issues": len(active_issues),
+            "manual_actions": len(manual_actions),
+            "stale_reports": len(stale_reports),
+            "missing_reports": len(missing_reports),
+            "max_severity": max_severity,
+        },
+        "active_issues": active_issues,
+        "manual_actions": manual_actions,
+        "recent_events": _load_recent_alert_events(),
+        "report_freshness": freshness,
+        "account": _load_fleet_account_truth(),
+    }
+
 def _read_ibkr_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     state_file = log_dir / "state.json"
     signal_file = log_dir / "signals.csv"
     trade_file = log_dir / "trades.csv"
+    heartbeat_file = log_dir / "heartbeat.json"
+    evidence_file = log_dir / "evidence_registry.json"
+    broker_state_file = log_dir / "broker_state.json"
     mult = runner.get("mult", 10000)
 
     result = {
@@ -1802,6 +1937,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "position": "FLAT",
         "trade_count": 0,
         "pnl": 0.0,
+        "pnl_usd": 0.0,
         "entry_price": 0,
         "signal_count": 0,
         "closed_trades": 0,
@@ -1825,6 +1961,9 @@ def _read_ibkr_runner(runner: dict) -> dict:
         # Signals per day
         "signals_today": 0,
         "entries_today": 0,
+        "blocked_signals_total": 0,
+        "blocked_signals_24h": 0,
+        "blocked_top_reason": "",
         "last_signal_ts": "",
         "last_signal_age_s": 9999,
         # Replay expectations
@@ -1833,6 +1972,31 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "replay_exp": 0,
         # State age
         "state_age_s": 9999,
+        "realized_pnl_usd": 0.0,
+        "unrealized_pnl_usd": 0.0,
+        "lane": "validation" if runner["symbol"] in VALIDATION_SYMBOLS else "observation",
+        "runner_alive": False,
+        "heartbeat_age_s": None,
+        "broker_truth_age_s": None,
+        "broker_connected": False,
+        "broker_reconciliation": "",
+        "broker_reconciliation_detail": "",
+        "broker_requires_manual_review": False,
+        "broker_account_equity_usd": 0.0,
+        "open_risk_usd": 0.0,
+        "promotion_verdict": "",
+        "promotion_blockers": [],
+        "promotion_evidence_gaps": [],
+        "promotion_checks_passed": 0,
+        "promotion_checks_total": 0,
+        "artifact_integrity": "",
+        "artifact_alerts": [],
+        "research_status": "MISSING",
+        "research_positive_ratio": 0.0,
+        "research_mean_expectancy": 0.0,
+        "next_milestone": "",
+        "strategy_status": "",
+        "cohort_active": False,
     }
 
     # Load replay expectations from config
@@ -1859,14 +2023,72 @@ def _read_ibkr_runner(runner: dict) -> dict:
             result["position"] = state.get("position", "FLAT")
             result["trade_count"] = state.get("trade_count", 0)
             result["pnl"] = state.get("pnl_pips", state.get("pnl_points", 0))
+            result["pnl_usd"] = float(state.get("pnl_usd", 0) or 0)
             result["entry_price"] = state.get("entry_price", 0)
             result["direction"] = state.get("direction_str", state.get("position", "FLAT")).lower()
+            result["position_size"] = float(state.get("position_size", 0) or 0)
             mtime = state_file.stat().st_mtime
             age = time.time() - mtime
             result["state_age_s"] = int(age)
             result["status"] = "RUNNING" if age < 120 else ("IDLE" if age < 600 else "STALE")
         except Exception:
             result["status"] = "ERROR"
+
+    if heartbeat_file.exists():
+        try:
+            hb = json.loads(heartbeat_file.read_text())
+            hb_age = _file_age_s(heartbeat_file)
+            result["heartbeat_age_s"] = hb_age
+            result["runner_alive"] = hb_age is not None and hb_age < 600
+            result["broker_connected"] = bool(hb.get("broker_connected", False))
+            if hb_age is not None and result["status"] != "ERROR":
+                result["status"] = "RUNNING" if hb_age < 120 else ("IDLE" if hb_age < 600 else "STALE")
+        except Exception:
+            pass
+
+    broker_state = _load_json_file(broker_state_file)
+    if isinstance(broker_state, dict):
+        account = broker_state.get("account", {})
+        runner_state = broker_state.get("runner", {})
+        reconciliation = broker_state.get("reconciliation", {})
+        result["broker_truth_age_s"] = _file_age_s(broker_state_file)
+        result["broker_connected"] = bool(broker_state.get("broker_connected", result["broker_connected"]))
+        result["broker_reconciliation"] = reconciliation.get("result", "")
+        result["broker_reconciliation_detail"] = reconciliation.get("detail", "")
+        result["broker_requires_manual_review"] = bool(reconciliation.get("requires_manual_review", False))
+        result["broker_account_equity_usd"] = float(account.get("net_liquidation_usd", 0.0) or 0.0)
+        result["open_risk_usd"] = float(runner_state.get("open_risk_usd", 0.0) or 0.0)
+
+    evidence = _load_json_file(evidence_file)
+    if isinstance(evidence, dict):
+        governance = evidence.get("governance", {})
+        runtime = evidence.get("runtime", {})
+        broker_truth = evidence.get("broker_truth", {})
+        research = evidence.get("research_validation", {})
+        cohort = evidence.get("cohort", {})
+        eligibility = evidence.get("eligibility", {})
+        result["lane"] = evidence.get("lane", result["lane"])
+        result["strategy_status"] = evidence.get("strategy_status", "")
+        result["cohort_active"] = bool(cohort.get("active", False))
+        result["promotion_verdict"] = governance.get("promotion_gate_verdict", "")
+        result["promotion_blockers"] = governance.get("promotion_gate_blockers", []) or []
+        result["promotion_evidence_gaps"] = governance.get("promotion_gate_evidence_gaps", []) or []
+        result["promotion_checks_passed"] = governance.get("promotion_gate_checks_passed", 0) or 0
+        result["promotion_checks_total"] = governance.get("promotion_gate_checks_total", 0) or 0
+        result["artifact_integrity"] = governance.get("artifact_integrity", "")
+        result["artifact_alerts"] = governance.get("artifact_alerts", []) or []
+        result["research_status"] = research.get("status", "MISSING")
+        result["research_positive_ratio"] = float(research.get("positive_ratio", 0.0) or 0.0)
+        result["research_mean_expectancy"] = float(research.get("mean_expectancy", 0.0) or 0.0)
+        result["next_milestone"] = eligibility.get("next_milestone", "")
+        if result["heartbeat_age_s"] is None and runtime.get("heartbeat_age_s") is not None:
+            result["heartbeat_age_s"] = runtime.get("heartbeat_age_s")
+        result["runner_alive"] = bool(runtime.get("runner_alive", result["runner_alive"]))
+        if not result["broker_reconciliation"]:
+            result["broker_reconciliation"] = broker_truth.get("reconciliation_result", "")
+            result["broker_reconciliation_detail"] = broker_truth.get("reconciliation_detail", "")
+        if result["broker_account_equity_usd"] == 0.0:
+            result["broker_account_equity_usd"] = float(broker_truth.get("account_equity_usd", 0.0) or 0.0)
 
     # Signals
     if signal_file.exists():
@@ -1920,9 +2142,30 @@ def _read_ibkr_runner(runner: dict) -> dict:
             # Signals today and entries today
             now_utc = datetime.now(timezone.utc)
             today_str = now_utc.strftime("%Y-%m-%d")
+            blocked_window_start = now_utc - timedelta(hours=24)
             today_signals = [r for r in rows if r.get("ts", "").startswith(today_str)]
             result["signals_today"] = len(today_signals)
             result["entries_today"] = sum(1 for r in today_signals if r.get("action") == "ENTRY")
+            blocked_total = 0
+            blocked_24h = 0
+            blocked_reason_counts: dict[str, int] = collections.Counter()
+            for row in rows:
+                action = row.get("action", "") or ""
+                if "BLOCKED" not in action:
+                    continue
+                blocked_total += 1
+                ts_raw = row.get("ts", "")
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                except Exception:
+                    ts = None
+                if ts is not None and ts >= blocked_window_start:
+                    blocked_24h += 1
+                    blocked_reason_counts[action] += 1
+            result["blocked_signals_total"] = blocked_total
+            result["blocked_signals_24h"] = blocked_24h
+            if blocked_reason_counts:
+                result["blocked_top_reason"] = blocked_reason_counts.most_common(1)[0][0]
         except Exception:
             pass
 
@@ -1944,6 +2187,25 @@ def _read_ibkr_runner(runner: dict) -> dict:
                 result["unrealized_pnl_pips"] = round(entry - current, 2)
     else:
         result["unrealized_pnl_pips"] = 0
+    if result["position"] != "FLAT":
+        size = float(result.get("position_size", 0) or 0)
+        if runner["unit"] == "pips":
+            pip_to_dollar = {
+                "EURUSD": 0.0001,
+                "GBPUSD": 0.0001,
+                "AUDUSD": 0.0001,
+                "EURJPY": 0.000067,
+                "GBPJPY": 0.000067,
+                "CADJPY": 0.000067,
+                "AUDJPY": 0.000067,
+                "USDJPY": 0.000067,
+            }
+            result["unrealized_pnl_usd"] = round(result["unrealized_pnl_pips"] * pip_to_dollar.get(runner["symbol"], 0.0001) * size, 2)
+        else:
+            futures_mult = {"MES": 5, "MNQ": 2, "MYM": 0.5, "M2K": 5, "MGC": 1, "MCL": 1}
+            result["unrealized_pnl_usd"] = round(result["unrealized_pnl_pips"] * futures_mult.get(runner["symbol"], 1) * max(size, 1), 2)
+    else:
+        result["unrealized_pnl_usd"] = 0.0
 
     # Trades + performance metrics
     if trade_file.exists():
@@ -1952,6 +2214,13 @@ def _read_ibkr_runner(runner: dict) -> dict:
             with open(trade_file, "r") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    row["ts"] = (
+                        row.get("ts")
+                        or row.get("exit_ts")
+                        or row.get("close_ts")
+                        or row.get("entry_ts")
+                        or ""
+                    )
                     rows.append(row)
             result["closed_trades"] = len(rows)
             result["trades"] = rows[-20:]
@@ -1966,6 +2235,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
             # Realized PnL from ALL trades in trades.csv (single source of truth)
             all_pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
             result["realized_pnl_pips"] = round(sum(float(r.get(all_pnl_field, 0)) for r in rows), 2)
+            result["realized_pnl_usd"] = round(sum(float(r.get("pnl_usd", 0) or 0) for r in rows), 2)
 
             # Performance metrics from VALID trades only
             metric_rows = valid_rows if valid_rows else []
@@ -2024,11 +2294,25 @@ def _read_ibkr_runner(runner: dict) -> dict:
 async def api_system_health():
     """Quick system health check — blocked signals, degradation status, trade progress."""
     import csv as _csv
-    health = {"status": "OK", "warnings": [], "blocked_total": 0, "valid_trades": 0, "target": 30, "broker_connected": False, "runners_alive": 0}
+    health = {
+        "status": "OK",
+        "warnings": [],
+        "blocked_total": 0,
+        "blocked_24h": 0,
+        "valid_trades": 0,
+        "target": 30,
+        "broker_connected": False,
+        "runners_alive": 0,
+        "active_issues": 0,
+        "manual_actions": 0,
+        "stale_reports": 0,
+    }
 
     # Count blocked signals and valid trades across fleet
     # Use OPS_LOGS parent to find argus_flow logs (handles different working dirs)
     af_logs = REPO / "argus_flow" / "logs"
+    now_utc = datetime.now(timezone.utc)
+    blocked_window_start = now_utc - timedelta(hours=24)
     for runner in IBKR_RUNNERS:
         log_dir = REPO / runner["log_dir"]
         if not log_dir.exists():
@@ -2042,6 +2326,17 @@ async def api_system_health():
                     for row in _csv.DictReader(f):
                         if "BLOCKED" in row.get("action", ""):
                             health["blocked_total"] += 1
+                            ts_raw = row.get("ts")
+                            if not ts_raw:
+                                continue
+                            try:
+                                ts = datetime.fromisoformat(ts_raw)
+                            except ValueError:
+                                continue
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            if ts >= blocked_window_start:
+                                health["blocked_24h"] += 1
             except Exception:
                 pass
 
@@ -2070,11 +2365,6 @@ async def api_system_health():
         except Exception:
             pass
 
-    if health["blocked_total"] > 100:
-        health["warnings"].append(f"{health['blocked_total']} signals blocked by risk guards")
-        if health["status"] == "OK":
-            health["status"] = "WARN"
-
     health["progress_pct"] = min(100, round(health["valid_trades"] / health["target"] * 100))
 
     # Check broker connection from heartbeat files
@@ -2099,7 +2389,31 @@ async def api_system_health():
         health["status"] = "WARN"
         health["warnings"].append("Broker disconnected")
 
+    ops = _build_ops_overview()
+    health["active_issues"] = ops["summary"]["active_issues"]
+    health["manual_actions"] = ops["summary"]["manual_actions"]
+    health["stale_reports"] = ops["summary"]["stale_reports"] + ops["summary"]["missing_reports"]
+    health["ops_max_severity"] = ops["summary"]["max_severity"]
+    if health["active_issues"] > 0:
+        if health["status"] == "OK":
+            health["status"] = "WARN"
+        health["warnings"].append(f"{health['active_issues']} active issue(s)")
+    if health["manual_actions"] > 0:
+        if health["status"] == "OK":
+            health["status"] = "WARN"
+        health["warnings"].append(f"{health['manual_actions']} manual action item(s)")
+    if health["stale_reports"] > 0:
+        if health["status"] == "OK":
+            health["status"] = "WARN"
+        health["warnings"].append(f"{health['stale_reports']} stale/missing oversight report(s)")
+
     return JSONResponse(health)
+
+
+@app.get("/api/ops_overview")
+async def api_ops_overview():
+    """Canonical ops visibility surface for QA and production readiness checks."""
+    return JSONResponse(_build_ops_overview())
 
 
 @app.get("/api/ibkr_fleet")
@@ -2108,6 +2422,7 @@ async def api_ibkr_fleet():
     runners = [_read_ibkr_runner(r) for r in IBKR_RUNNERS]
     total_trades = sum(r["closed_trades"] for r in runners)
     total_signals = sum(r["signal_count"] for r in runners)
+    account = _load_fleet_account_truth()
 
     # Cohort status
     fleet_valid = sum(r["valid_trades"] for r in runners)
@@ -2126,8 +2441,94 @@ async def api_ibkr_fleet():
         "total_signals": total_signals,
         "cohort_status": cohort_status,
         "fleet_valid_trades": fleet_valid,
+        "account": account,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.get("/api/daily_performance")
+async def api_daily_performance():
+    """Daily performance journal — per-market and total breakdown by date."""
+    FX_SYMBOLS = {"EURUSD", "GBPUSD", "EURJPY", "GBPJPY", "CADJPY", "AUDJPY", "USDJPY", "AUDUSD"}
+    FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K", "MGC", "MCL"}
+    PIP_TO_DOLLAR = {
+        "EURUSD": 0.0001 * 57000, "GBPUSD": 0.0001 * 66000, "AUDUSD": 0.0001 * 100000,
+        "EURJPY": 0.000067 * 100000, "GBPJPY": 0.000067 * 100000, "CADJPY": 0.000067 * 100000,
+        "AUDJPY": 0.000067 * 100000, "USDJPY": 0.000067 * 100000,
+        "MES": 5, "MNQ": 2, "MYM": 0.5, "M2K": 5, "MGC": 1, "MCL": 1,
+    }
+
+    # Collect all trades from all runners
+    all_trades = []
+    for runner in IBKR_RUNNERS:
+        trade_file = REPO / runner["log_dir"] / "trades.csv"
+        if not trade_file.exists():
+            continue
+        try:
+            with open(trade_file, "r") as f:
+                for row in csv.DictReader(f):
+                    ts = row.get("ts") or row.get("exit_ts") or row.get("close_ts") or row.get("entry_ts") or ""
+                    date_str = ts[:10] if len(ts) >= 10 else ""
+                    if not date_str:
+                        continue
+                    pnl_raw = float(row.get("pnl_pips") or row.get("pnl_pts") or 0)
+                    if row.get("pnl_usd") not in (None, ""):
+                        pnl_usd = float(row.get("pnl_usd") or 0)
+                    else:
+                        mult = PIP_TO_DOLLAR.get(runner["symbol"], 1)
+                        pnl_usd = pnl_raw * mult
+                    all_trades.append({
+                        "date": date_str,
+                        "symbol": runner["symbol"],
+                        "market": "FX" if runner["symbol"] in FX_SYMBOLS else "Futures",
+                        "direction": row.get("direction", ""),
+                        "pnl_raw": pnl_raw,
+                        "pnl_usd": round(pnl_usd, 2),
+                        "exit_reason": row.get("exit_reason", ""),
+                        "win": pnl_raw > 0,
+                    })
+        except Exception:
+            continue
+
+    # Group by date
+    from collections import defaultdict
+    days = defaultdict(lambda: {"fx": [], "futures": [], "all": []})
+    for t in all_trades:
+        days[t["date"]]["all"].append(t)
+        if t["market"] == "FX":
+            days[t["date"]]["fx"].append(t)
+        else:
+            days[t["date"]]["futures"].append(t)
+
+    # Build daily summaries
+    def summarize(trades):
+        if not trades:
+            return {"trades": 0, "wins": 0, "losses": 0, "wr": 0, "pnl_usd": 0, "best": "", "worst": ""}
+        wins = [t for t in trades if t["win"]]
+        losses = [t for t in trades if not t["win"]]
+        best = max(trades, key=lambda t: t["pnl_usd"])
+        worst = min(trades, key=lambda t: t["pnl_usd"])
+        return {
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "wr": round(len(wins) / len(trades) * 100, 1) if trades else 0,
+            "pnl_usd": round(sum(t["pnl_usd"] for t in trades), 2),
+            "best": f"{best['symbol']} {'+' if best['pnl_usd']>=0 else ''}{best['pnl_usd']:.2f}",
+            "worst": f"{worst['symbol']} {'+' if worst['pnl_usd']>=0 else ''}{worst['pnl_usd']:.2f}",
+        }
+
+    result = []
+    for date_str in sorted(days.keys(), reverse=True):
+        d = days[date_str]
+        result.append({
+            "date": date_str,
+            "fx": summarize(d["fx"]),
+            "futures": summarize(d["futures"]),
+            "total": summarize(d["all"]),
+        })
+
+    return JSONResponse({"days": result})
 
 
 @app.get("/api/divergence_status")
@@ -2511,15 +2912,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="health-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#00d4ff,#00e676);border-radius:3px;transition:width 0.5s;"></div>
     </div>
   </div>
-  <div>API: <span id="health-broker" style="font-weight:bold;color:#00e676;">--</span></div>
-  <div>Blocked: <span id="health-blocked" style="color:#7b8ab8;">0</span></div>
+  <div>Broker Truth: <span id="health-broker" style="font-weight:bold;color:#00e676;">--</span></div>
+  <div title="Signals blocked by guards in the last 24 hours. Total history is shown on hover.">Blocked 24h: <span id="health-blocked" style="color:#7b8ab8;">0</span></div>
+  <div>Issues: <span id="health-issues" style="color:#7b8ab8;">0</span></div>
+  <div>Manual: <span id="health-manual" style="color:#7b8ab8;">0</span></div>
+  <div>Stale Reports: <span id="health-stale" style="color:#7b8ab8;">0</span></div>
   <div id="health-warnings" style="color:#ffc107;"></div>
 </div>
 
 <!-- CONTROL STRIP -->
 <div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
   <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
-  <div>ACCOUNT: <span style="color:#00d4ff;">U24860535 (Read-Only)</span></div>
+  <div>ACCOUNT: <span id="cs-account" style="color:#00d4ff;">Waiting for broker truth...</span></div>
   <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">GBP/USD, EUR/USD, EUR/JPY (FX Cohort)</span></div>
   <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
 </div>
@@ -2537,9 +2941,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- Fleet summary bar -->
 <div id="ibkr-fleet-summary" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;gap:30px;font-size:0.8em;">
-  <div>Balance: <span id="ibkr-balance" style="color:#00d4ff;font-weight:bold;font-size:1.1em;">$10,000.00</span> <span id="ibkr-balance-delta" style="font-size:0.85em;"></span></div>
+  <div>Broker Equity: <span id="ibkr-balance" style="color:#00d4ff;font-weight:bold;font-size:1.1em;">$0.00</span> <span id="ibkr-balance-source" style="font-size:0.75em;color:#7b8ab8;"></span></div>
+  <div>Buying Power: <span id="ibkr-buying-power" style="color:#e0e0e0;font-weight:bold;">$0.00</span></div>
   <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
   <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
+  <div>Strategy PnL: <span id="ibkr-balance-delta" style="font-weight:bold;">$0.00</span></div>
+  <div>Open Risk: <span id="ibkr-open-risk" style="font-weight:bold;color:#7b8ab8;">$0.00</span></div>
   <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
   <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">3</span></div>
 </div>
@@ -2552,13 +2959,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div style="display:flex;gap:12px;margin-top:6px;" id="ibkr-cohort-bars"></div>
 </div>
 
+<div id="ops-visibility" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">OPS VISIBILITY</h3>
+    <span id="ops-last-run" style="font-size:0.7em;color:#7b8ab8;">No alert state yet</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Active Issues</div>
+      <div id="ops-active-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Manual Actions</div>
+      <div id="ops-manual-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Stale Reports</div>
+      <div id="ops-stale-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Alert Severity</div>
+      <div id="ops-max-severity" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">OK</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1.4fr 1.1fr 1.2fr 1.1fr;gap:10px;">
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">ACTIVE ISSUES</div>
+      <div id="ops-active-issues" style="font-size:0.72em;color:#e0e0e0;">No active issues.</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">MANUAL ACTIONS</div>
+      <div id="ops-manual-actions" style="font-size:0.72em;color:#e0e0e0;">No manual actions.</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">RECENT ALERT EVENTS</div>
+      <div id="ops-events" style="font-size:0.72em;color:#e0e0e0;">No alert events yet.</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">REPORT FRESHNESS</div>
+      <div id="ops-report-freshness" style="font-size:0.72em;color:#e0e0e0;">Loading...</div>
+    </div>
+  </div>
+</div>
+
 <!-- Legacy sections removed 2026-03-29: Divergence Guard, Kill Discipline, Promotion Gate -->
 <!-- Replaced by: health bar, degradation_report.py, drift_report.py, trade_tracker.py, Discord alerts -->
 
-<!-- Runner cards -->
+<!-- Balance History Chart -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">STRATEGY EQUITY HISTORY (TRADE-DERIVED)</h3>
+    <span id="balance-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+  </div>
+  <canvas id="balance-history-chart" height="140" style="width:100%;display:block;"></canvas>
+</div>
+
 <!-- Fleet P&L Chart -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 8px 0;letter-spacing:1px;">FLEET P&L HISTORY</h3>
+  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 8px 0;letter-spacing:1px;">FLEET P&L HISTORY (pips)</h3>
   <canvas id="ibkr-pnl-chart" height="120"></canvas>
 </div>
 
@@ -2569,6 +3027,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
   <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">TRADE JOURNAL</h3>
   <div id="ibkr-trades-table" style="font-size:0.75em;"></div>
+</div>
+
+<!-- Daily Performance Journal -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">DAILY PERFORMANCE JOURNAL</h3>
+  <div id="daily-perf-body" style="font-size:0.75em;color:#7b8ab8;">Loading...</div>
 </div>
 
 <!-- Recent signals -->
@@ -2584,6 +3048,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 let equityChart = null;
 let currentCoin = 'ETH';
 let sseConnection = null;
+let balanceHistory = [];
+let balanceChart = null;
+const MAX_BALANCE_POINTS = 500;
 
 // Single-page dashboard — no tab switching needed
 function switchPage(page) { loadIBKRFleet(); }
@@ -2632,7 +3099,7 @@ async function loadIBKRFleet() {
     let fleetPnl = 0; let activeCount = 0;
     for (const r of data.runners) {
       fleetPnl += Number(r.realized_pnl_pips || r.pnl || 0);
-      if (r.status === 'RUNNING' || r.status === 'IDLE') activeCount++;
+      if (r.runner_alive || r.status === 'RUNNING' || r.status === 'IDLE') activeCount++;
     }
     const fpEl = document.getElementById('ibkr-fleet-pnl');
     fpEl.textContent = (fleetPnl >= 0 ? '+' : '') + fleetPnl.toFixed(1);
@@ -2640,9 +3107,9 @@ async function loadIBKRFleet() {
     document.getElementById('ibkr-active-count').textContent = activeCount;
     document.getElementById('ibkr-total-count').textContent = data.runners.length;
 
-    // Simulated balance: $10K starting + dollar PnL
-    // Convert pip PnL to dollars using approximate pip values per lot
+    // Strategy PnL in dollars from trade artifacts
     let dollarPnl = 0;
+    let openRiskUsd = 0;
     const pipToDollar = {
       'EURUSD': 0.0001 * 57000, 'GBPUSD': 0.0001 * 66000, 'AUDUSD': 0.0001 * 100000,
       'EURJPY': 0.000067 * 100000, 'GBPJPY': 0.000067 * 100000, 'CADJPY': 0.000067 * 100000,
@@ -2650,20 +3117,80 @@ async function loadIBKRFleet() {
       'MES': 5, 'MNQ': 2, 'MYM': 0.5, 'M2K': 5, 'MGC': 1, 'MCL': 1,
     };
     for (const r of data.runners) {
-      const realizedPnl = Number(r.realized_pnl_pips || r.pnl || 0);
-      const unrealizedPnl = Number(r.unrealized_pnl_pips || 0);
-      const mult = pipToDollar[r.symbol] || 1;
-      dollarPnl += (realizedPnl + unrealizedPnl) * mult;
+      const realizedUsd = Number(r.realized_pnl_usd ?? r.pnl_usd ?? 0);
+      const unrealizedUsd = Number(r.unrealized_pnl_usd ?? 0);
+      if (realizedUsd !== 0 || unrealizedUsd !== 0) {
+        dollarPnl += realizedUsd + unrealizedUsd;
+      } else {
+        const realizedPnl = Number(r.realized_pnl_pips || r.pnl || 0);
+        const unrealizedPnl = Number(r.unrealized_pnl_pips || 0);
+        const mult = pipToDollar[r.symbol] || 1;
+        dollarPnl += (realizedPnl + unrealizedPnl) * mult;
+      }
+      openRiskUsd += Number(r.open_risk_usd || 0);
     }
-    const startingBalance = 10000;
-    const balance = startingBalance + dollarPnl;
+    const account = data.account || {};
+    const balance = Number(account.net_liquidation_usd || 0) || dollarPnl;
     const balEl = document.getElementById('ibkr-balance');
     balEl.textContent = '$' + balance.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-    balEl.style.color = balance >= startingBalance ? '#00e676' : '#ff4444';
+    balEl.style.color = balance > 0 ? '#00d4ff' : '#ff4444';
+    const balanceSourceEl = document.getElementById('ibkr-balance-source');
+    if (balanceSourceEl) {
+      const age = account.snapshot_age_s != null ? account.snapshot_age_s + 's' : 'unknown age';
+      balanceSourceEl.textContent = account.account_id ? '(' + account.account_id + ' | ' + age + ')' : '';
+    }
+    const buyingPowerEl = document.getElementById('ibkr-buying-power');
+    if (buyingPowerEl) {
+      const bp = Number(account.buying_power_usd || 0);
+      buyingPowerEl.textContent = '$' + bp.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      buyingPowerEl.style.color = bp > 0 ? '#e0e0e0' : '#ff4444';
+    }
+    const accountStripEl = document.getElementById('cs-account');
+    if (accountStripEl) {
+      accountStripEl.textContent = account.account_id
+        ? account.account_id + (account.broker_connected === false ? ' (broker offline)' : '')
+        : 'No broker snapshot';
+      accountStripEl.style.color = account.account_id ? '#00d4ff' : '#ff9800';
+    }
     const deltaEl = document.getElementById('ibkr-balance-delta');
     const sign = dollarPnl >= 0 ? '+' : '';
-    deltaEl.textContent = '(' + sign + '$' + dollarPnl.toFixed(2) + ')';
+    deltaEl.textContent = sign + '$' + dollarPnl.toFixed(2);
     deltaEl.style.color = dollarPnl >= 0 ? '#00e676' : '#ff4444';
+    const openRiskEl = document.getElementById('ibkr-open-risk');
+    if (openRiskEl) {
+      openRiskEl.textContent = '$' + openRiskUsd.toFixed(2);
+      openRiskEl.style.color = openRiskUsd > 0 ? '#ff9800' : '#7b8ab8';
+    }
+
+    // Seed balance history from trade data on first load
+    if (balanceHistory.length === 0 && data.runners) {
+      let allTrades = [];
+      for (const r of data.runners) {
+        if (r.trades) {
+          for (const t of r.trades) {
+            const pnlUsd = parseFloat(t.pnl_usd || 0);
+            const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
+            const ts = t.ts || '';
+            const mult = pipToDollar[r.symbol] || 1;
+            allTrades.push({ts: ts, dollarPnl: pnlUsd || (pnl * mult)});
+          }
+        }
+      }
+      // Sort by timestamp
+      allTrades.sort((a, b) => a.ts.localeCompare(b.ts));
+      // Build cumulative balance history
+      let cumBalance = balance - dollarPnl;
+      for (const t of allTrades) {
+        cumBalance += t.dollarPnl;
+        const tsLabel = (t.ts && String(t.ts).length >= 16)
+          ? String(t.ts).substring(11, 16)
+          : '??:??';
+        balanceHistory.push({time: tsLabel, value: cumBalance});
+      }
+    }
+
+    // Update balance history chart with current value
+    updateBalanceChart(balance);
 
     // Cohort summary
     const csEl = document.getElementById('ibkr-cohort-status');
@@ -2684,70 +3211,6 @@ async function loadIBKRFleet() {
         </div></div>`;
     }
     cbEl.innerHTML = cbHtml;
-
-    // Divergence guard
-    fetch('/api/divergence_status').then(r=>r.json()).then(dg=>{
-      const el = document.getElementById('ibkr-divergence-body');
-      if (!dg.runners || !dg.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.divergence_guard'; return; }
-      let html = '<div style="display:flex;gap:12px;">';
-      for (const r of dg.runners) {
-        const sc = {PASS:'#00ff88',WATCH:'#ffaa00',KILL:'#ff4444',COLLECTING:'#888',NO_DATA:'#555',NO_SIGNALS:'#555'};
-        const c = sc[r.status] || '#555';
-        html += `<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ${c};">
-          <div style="font-weight:bold;color:${c};">${r.name}: ${r.status}</div>`;
-        const m = r.metrics || {};
-        if (m.closed_trades) html += `<div style="font-size:0.85em;">Trades: ${m.closed_trades} | WR: ${((m.live_win_rate||0)*100).toFixed(0)}%</div>`;
-        if (r.flags && r.flags.length) html += `<div style="color:#ff4444;font-size:0.8em;">${r.flags.join('<br>')}</div>`;
-        html += '</div>';
-      }
-      html += '</div>';
-      if (dg.timestamp) html += `<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ${dg.timestamp.substring(0,19)}</div>`;
-      el.innerHTML = html;
-    }).catch(()=>{
-      document.getElementById('ibkr-divergence-body').textContent = 'Failed to load divergence data.';
-    });
-
-    // Kill discipline
-    fetch('/api/kill_discipline').then(r=>r.json()).then(kd=>{
-      const el = document.getElementById('ibkr-kill-body');
-      if (!kd.runners || !kd.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.kill_discipline'; return; }
-      let html = '<div style="display:flex;gap:12px;">';
-      for (const r of kd.runners) {
-        const sc = {PASS:'#00ff88',WATCH:'#ffaa00',KILL:'#ff4444',COLLECTING:'#888'};
-        const c = sc[r.status] || '#555';
-        html += '<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ' + c + ';">';
-        html += '<div style="font-weight:bold;color:' + c + ';">' + r.name + ': ' + r.status + '</div>';
-        const m = r.metrics || {};
-        if (m.valid_trades) html += '<div style="font-size:0.85em;">Trades: ' + m.valid_trades + ' | PnL: ' + (m.total_pnl||0).toFixed(1) + ' | DD: ' + (m.max_drawdown_pips||0).toFixed(1) + '</div>';
-        if (r.flags && r.flags.length) html += '<div style="color:#ff4444;font-size:0.8em;margin-top:2px;">' + r.flags.join('<br>') + '</div>';
-        html += '</div>';
-      }
-      html += '</div>';
-      if (kd.timestamp) html += '<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ' + kd.timestamp.substring(0,19) + '</div>';
-      el.innerHTML = html;
-    }).catch(()=>{ document.getElementById('ibkr-kill-body').textContent = 'Failed to load.'; });
-
-    // Promotion gate
-    fetch('/api/promotion_gate').then(r=>r.json()).then(pg=>{
-      const el = document.getElementById('ibkr-promotion-body');
-      if (!pg.runners || !pg.runners.length) { el.innerHTML = 'Not yet run. Execute: python -m argus_flow.ops.promotion_gate'; return; }
-      let html = '<div style="display:flex;gap:12px;">';
-      for (const r of pg.runners) {
-        const vc = {PROMOTE:'#00ff88',NOT_READY:'#ffaa00',BLOCKED:'#ff4444'};
-        const c = vc[r.verdict] || '#888';
-        const checks = r.checks || {};
-        const passed = Object.values(checks).filter(c=>c.passed).length;
-        const total = Object.values(checks).length;
-        html += '<div style="flex:1;padding:6px;background:#0d1117;border-radius:4px;border-left:3px solid ' + c + ';">';
-        html += '<div style="font-weight:bold;color:' + c + ';">' + r.name + ': ' + r.verdict + '</div>';
-        html += '<div style="font-size:0.85em;">' + passed + '/' + total + ' checks passed | ' + (r.valid_trades||0) + ' valid trades</div>';
-        if (r.blockers && r.blockers.length) html += '<div style="color:#ff4444;font-size:0.75em;margin-top:2px;">Blockers: ' + r.blockers.slice(0,3).join(', ') + (r.blockers.length > 3 ? ' +' + (r.blockers.length-3) + ' more' : '') + '</div>';
-        html += '</div>';
-      }
-      html += '</div>';
-      if (pg.timestamp) html += '<div style="margin-top:4px;font-size:0.6em;color:#555;">Last run: ' + pg.timestamp.substring(0,19) + '</div>';
-      el.innerHTML = html;
-    }).catch(()=>{ document.getElementById('ibkr-promotion-body').textContent = 'Failed to load.'; });
 
     // Runner cards
     const cardsDiv = document.getElementById('ibkr-runner-cards');
@@ -2777,10 +3240,12 @@ async function loadIBKRFleet() {
       let card = `<div style="background:#141b2d;border:1px solid ${borderColor};border-radius:6px;padding:12px;${pulse}">`;
 
       // Header: name + status + health
+      const laneColor = r.lane === 'validation' ? '#00d4ff' : '#7b8ab8';
       card += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
         <div>
           <span style="color:#00d4ff;font-weight:bold;font-size:0.95em;">${r.name}</span>
           <span style="color:#555;font-size:0.65em;margin-left:6px;">${r.strategy}</span>
+          <span style="color:${laneColor};font-size:0.6em;font-weight:bold;margin-left:6px;text-transform:uppercase;">${r.lane || 'unknown'}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center;">
           <span style="color:${healthColor};font-size:0.6em;font-weight:bold;">&#9679; ${healthLabel}</span>
@@ -2804,6 +3269,10 @@ async function loadIBKRFleet() {
         <div>PnL: <span style="color:${pnlColor};font-weight:bold;">${pnl>=0?'+':''}${pnl.toFixed(1)} ${r.unit}</span></div>
         <div>WR: <span style="color:#e0e0e0;">${(wrLive*100).toFixed(0)}%</span>
           <span style="color:#555;font-size:0.8em;">(replay: ${(wrReplay*100).toFixed(0)}%)</span></div>
+      </div>`;
+      card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.68em;color:#7b8ab8;">
+        <div>Dollar PnL: <span style="color:${Number(r.realized_pnl_usd || 0) >= 0 ? '#00e676' : '#ff4444'};">${Number(r.realized_pnl_usd || 0) >= 0 ? '+' : ''}$${Number(r.realized_pnl_usd || 0).toFixed(2)}</span></div>
+        <div>Broker: <span style="color:${r.broker_connected ? '#00e676' : '#ff4444'};">${r.broker_connected ? 'CONNECTED' : 'OFFLINE'}</span></div>
       </div>`;
 
       // Equity mini chart
@@ -2845,6 +3314,7 @@ async function loadIBKRFleet() {
           <span title="Signals today">S:${r.signals_today}</span>
           <span style="margin-left:6px;" title="Entries today">E:${r.entries_today}</span>
           <span style="margin-left:6px;" title="Closed trades">T:${r.closed_trades}</span>
+          <span style="margin-left:6px;" title="Signals blocked by guards in the last 24 hours">B24:${r.blocked_signals_24h || 0}</span>
         </div>
       </div>`;
 
@@ -2862,6 +3332,25 @@ async function loadIBKRFleet() {
           <div style="width:${pct}%;height:100%;background:${progColor};border-radius:3px;transition:width 0.5s;"></div>
         </div>
         ${r.promotion_eligible ? '<div style="text-align:center;color:#00ff88;font-size:0.6em;margin-top:2px;font-weight:bold;">ELIGIBLE FOR PROMOTION</div>' : ''}
+      </div>`;
+
+      const researchColor = r.research_status === 'PASS' ? '#00e676' : r.research_status === 'WATCH' ? '#ffc107' : '#7b8ab8';
+      const gateColor = r.promotion_verdict === 'PROMOTE' ? '#00e676' : r.promotion_verdict === 'BLOCKED' ? '#ff4444' : r.promotion_verdict ? '#ffc107' : '#7b8ab8';
+      const brokerReconColor = (r.broker_reconciliation || '').startsWith('CLEAN') ? '#00e676' : (r.broker_reconciliation ? '#ff9800' : '#7b8ab8');
+      const artifactColor = r.artifact_integrity === 'CLEAN' ? '#00e676' : r.artifact_integrity === 'DIVERGENT' ? '#ff4444' : '#7b8ab8';
+      const blockerPreview = (r.promotion_blockers || []).slice(0, 3).join(', ');
+      const artifactPreview = (r.artifact_alerts || [])[0] || '';
+      card += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e2a42;font-size:0.65em;">
+        <div style="display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
+          <span style="color:${researchColor};font-weight:bold;">Research ${r.research_status || 'MISSING'}</span>
+          <span style="color:${gateColor};font-weight:bold;">Gate ${r.promotion_verdict || 'UNKNOWN'}</span>
+          <span style="color:${brokerReconColor};font-weight:bold;">Broker ${r.broker_reconciliation || 'UNKNOWN'}</span>
+          <span style="color:${artifactColor};font-weight:bold;">Artifacts ${r.artifact_integrity || 'UNKNOWN'}</span>
+        </div>
+        <div style="color:#7b8ab8;">Next: ${r.next_milestone || 'collect more evidence'}</div>
+        ${blockerPreview ? `<div style="color:#ffb74d;margin-top:3px;">Blockers: ${blockerPreview}</div>` : ''}
+        ${artifactPreview ? `<div style="color:#ff9800;margin-top:3px;">Artifact note: ${artifactPreview}</div>` : ''}
+        ${(r.blocked_signals_24h || 0) > 0 ? `<div style="color:#ffb74d;margin-top:3px;">Blocked 24h: ${r.blocked_signals_24h} (${(r.blocked_top_reason || '').replace('RISK_BLOCKED_', '')})</div>` : ''}
       </div>`;
 
       // Performance stats (if trades exist)
@@ -2985,8 +3474,9 @@ async function loadIBKRFleet() {
       ctx.strokeStyle = allPnlData[allPnlData.length - 1] >= 0 ? '#00ff88' : '#ff4444';
       ctx.lineWidth = 2;
       ctx.beginPath();
+      const denom = Math.max(1, allPnlData.length - 1);
       for (let i = 0; i < allPnlData.length; i++) {
-        const x = (i / (allPnlData.length - 1)) * w;
+        const x = (i / denom) * w;
         const y = h - pad - ((allPnlData[i] - mn) / range) * (h - pad * 2);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
@@ -5248,10 +5738,11 @@ async function loadJournal() {
   } catch(e) { console.error('journal fetch error', e); }
 }
 
-// Filter event listeners
-document.getElementById('jf-result').addEventListener('change', () => renderJournal(_allJournal));
-document.getElementById('jf-exit').addEventListener('change', () => renderJournal(_allJournal));
-document.getElementById('jf-regime').addEventListener('change', () => renderJournal(_allJournal));
+// Filter event listeners (guard against missing elements)
+['jf-result', 'jf-exit', 'jf-regime'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => renderJournal(_allJournal));
+});
 
 // --- Leaderboard ---
 async function loadLeaderboard() {
@@ -5287,12 +5778,146 @@ async function loadLeaderboard() {
   } catch(e) { console.error('leaderboard error', e); }
 }
 
+// (balanceHistory moved to top of script block)
+
+function updateBalanceChart(balance) {
+    const now = new Date();
+    const label = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+    // Only add a point when the balance actually changes
+    const last = balanceHistory.length > 0 ? balanceHistory[balanceHistory.length - 1] : null;
+    if (!last || Math.abs(last.value - balance) > 0.005) {
+      balanceHistory.push({time: label, value: balance});
+      if (balanceHistory.length > MAX_BALANCE_POINTS) balanceHistory = balanceHistory.slice(-MAX_BALANCE_POINTS);
+    }
+
+    const canvas = document.getElementById('balance-history-chart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width = canvas.offsetWidth;
+    const H = canvas.height;
+
+    ctx.clearRect(0, 0, W, H);
+
+    if (balanceHistory.length < 2) return;
+
+    const values = balanceHistory.map(b => b.value);
+    const minVal = Math.min(...values) - 10;
+    const maxVal = Math.max(...values) + 10;
+    const range = maxVal - minVal || 1;
+
+    // Draw $10K baseline
+    const baseY = H - ((10000 - minVal) / range) * H;
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, baseY);
+    ctx.lineTo(W, baseY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw balance line
+    const isProfit = values[values.length-1] >= 10000;
+    ctx.strokeStyle = isProfit ? '#00e676' : '#ff4444';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < values.length; i++) {
+      const x = (i / (values.length - 1)) * W;
+      const y = H - ((values[i] - minVal) / range) * H;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Fill under the line
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fillStyle = isProfit ? 'rgba(0,230,118,0.08)' : 'rgba(255,68,68,0.08)';
+    ctx.fill();
+
+    // Label
+    const current = values[values.length-1];
+    const delta = current - 10000;
+    const labelEl = document.getElementById('balance-chart-label');
+    if (labelEl) {
+      labelEl.textContent = '$' + current.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' (' + (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2) + ')';
+      labelEl.style.color = delta >= 0 ? '#00e676' : '#ff4444';
+    }
+  }
+
+// Daily Performance Journal
+async function loadDailyPerformance() {
+  try {
+    const resp = await fetch('/api/daily_performance');
+    const data = await resp.json();
+    const el = document.getElementById('daily-perf-body');
+    if (!data.days || !data.days.length) {
+      el.innerHTML = '<div style="color:#555;padding:10px;">No trades recorded yet.</div>';
+      return;
+    }
+
+    let html = '';
+    for (const day of data.days) {
+      const tc = day.total.pnl_usd >= 0 ? '#00e676' : '#ff4444';
+      const sign = day.total.pnl_usd >= 0 ? '+' : '';
+
+      html += `<div style="background:#0d1117;border-radius:6px;padding:12px;margin-bottom:8px;border-left:3px solid ${tc};">`;
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">`;
+      html += `<span style="color:#e0e0e0;font-weight:bold;font-size:1.1em;">${day.date}</span>`;
+      html += `<span style="color:${tc};font-weight:bold;font-size:1.2em;">${sign}$${day.total.pnl_usd.toFixed(2)}</span>`;
+      html += `</div>`;
+
+      // Market breakdown
+      html += `<div style="display:flex;gap:10px;margin-bottom:6px;">`;
+
+      // FX
+      if (day.fx.trades > 0) {
+        const fxc = day.fx.pnl_usd >= 0 ? '#00e676' : '#ff4444';
+        const fxs = day.fx.pnl_usd >= 0 ? '+' : '';
+        html += `<div style="flex:1;background:#141b2d;border-radius:4px;padding:8px;">`;
+        html += `<div style="color:#00d4ff;font-weight:bold;font-size:0.9em;margin-bottom:4px;">FX</div>`;
+        html += `<div style="color:${fxc};font-weight:bold;">${fxs}$${day.fx.pnl_usd.toFixed(2)}</div>`;
+        html += `<div style="color:#7b8ab8;margin-top:2px;">${day.fx.wins}W / ${day.fx.losses}L — ${day.fx.wr}% WR</div>`;
+        html += `<div style="color:#555;font-size:0.85em;margin-top:2px;">Best: ${day.fx.best}</div>`;
+        html += `<div style="color:#555;font-size:0.85em;">Worst: ${day.fx.worst}</div>`;
+        html += `</div>`;
+      }
+
+      // Futures
+      if (day.futures.trades > 0) {
+        const ftc = day.futures.pnl_usd >= 0 ? '#00e676' : '#ff4444';
+        const fts = day.futures.pnl_usd >= 0 ? '+' : '';
+        html += `<div style="flex:1;background:#141b2d;border-radius:4px;padding:8px;">`;
+        html += `<div style="color:#ffaa00;font-weight:bold;font-size:0.9em;margin-bottom:4px;">FUTURES</div>`;
+        html += `<div style="color:${ftc};font-weight:bold;">${fts}$${day.futures.pnl_usd.toFixed(2)}</div>`;
+        html += `<div style="color:#7b8ab8;margin-top:2px;">${day.futures.wins}W / ${day.futures.losses}L — ${day.futures.wr}% WR</div>`;
+        html += `<div style="color:#555;font-size:0.85em;margin-top:2px;">Best: ${day.futures.best}</div>`;
+        html += `<div style="color:#555;font-size:0.85em;">Worst: ${day.futures.worst}</div>`;
+        html += `</div>`;
+      }
+      html += `</div>`;
+
+      // Total summary bar
+      html += `<div style="display:flex;justify-content:space-between;color:#7b8ab8;font-size:0.9em;border-top:1px solid #1e2a42;padding-top:6px;">`;
+      html += `<span>${day.total.trades} trades</span>`;
+      html += `<span>${day.total.wins}W / ${day.total.losses}L</span>`;
+      html += `<span>${day.total.wr}% WR</span>`;
+      html += `<span style="color:${tc};font-weight:bold;">P&L: ${sign}$${day.total.pnl_usd.toFixed(2)}</span>`;
+      html += `</div>`;
+      html += `</div>`;
+    }
+    el.innerHTML = html;
+  } catch(e) { console.error('daily perf error', e); }
+}
+
 // Init — IBKR Fleet is the primary dashboard
 try {
   loadIBKRFleet();
   setInterval(loadIBKRFleet, 10000);
+  loadDailyPerformance();
+  setInterval(loadDailyPerformance, 60000); // refresh every 60s
 
-  // Health check auto-poll
   async function loadHealth() {
     try {
       const r = await fetch('/api/system_health');
@@ -5304,8 +5929,16 @@ try {
       document.getElementById('health-valid').textContent = h.valid_trades;
       document.getElementById('health-target').textContent = h.target;
       document.getElementById('health-progress-bar').style.width = h.progress_pct + '%';
-      document.getElementById('health-blocked').textContent = h.blocked_total;
-      document.getElementById('health-blocked').style.color = h.blocked_total > 50 ? '#ff4444' : '#7b8ab8';
+      const blockedEl = document.getElementById('health-blocked');
+      blockedEl.textContent = h.blocked_24h || 0;
+      blockedEl.style.color = (h.blocked_24h || 0) > 50 ? '#ff9800' : '#7b8ab8';
+      blockedEl.title = 'Total blocked signals on file: ' + (h.blocked_total || 0);
+      document.getElementById('health-issues').textContent = h.active_issues || 0;
+      document.getElementById('health-issues').style.color = (h.active_issues || 0) > 0 ? '#ff9800' : '#7b8ab8';
+      document.getElementById('health-manual').textContent = h.manual_actions || 0;
+      document.getElementById('health-manual').style.color = (h.manual_actions || 0) > 0 ? '#ff4444' : '#7b8ab8';
+      document.getElementById('health-stale').textContent = h.stale_reports || 0;
+      document.getElementById('health-stale').style.color = (h.stale_reports || 0) > 0 ? '#ffc107' : '#7b8ab8';
       const brokerEl = document.getElementById('health-broker');
       if (h.broker_connected) {
         brokerEl.textContent = 'Connected (' + h.runners_alive + '/' + h.runners_total + ')';
@@ -5320,10 +5953,86 @@ try {
   }
   loadHealth();
   setInterval(loadHealth, 30000);
+  loadOpsOverview();
+  setInterval(loadOpsOverview, 30000);
   console.log('IBKR Fleet initialized');
 } catch(e) {
   console.error('IBKR init error:', e);
   document.getElementById('ibkr-runner-cards').innerHTML = '<div style="color:red;padding:20px;">Dashboard JS error: ' + e.message + '</div>';
+}
+
+async function loadOpsOverview() {
+  try {
+    const resp = await fetch('/api/ops_overview');
+    const data = await resp.json();
+    const summary = data.summary || {};
+    const sev = summary.max_severity || 'OK';
+    const sevColor = sev === 'CRITICAL' ? '#ff4444' : sev === 'HIGH' ? '#ff9800' : sev === 'WARNING' ? '#ffc107' : '#00e676';
+    document.getElementById('ops-active-count').textContent = summary.active_issues || 0;
+    document.getElementById('ops-manual-count').textContent = summary.manual_actions || 0;
+    document.getElementById('ops-stale-count').textContent = (summary.stale_reports || 0) + (summary.missing_reports || 0);
+    document.getElementById('ops-max-severity').textContent = sev;
+    document.getElementById('ops-max-severity').style.color = sevColor;
+
+    const lastRun = document.getElementById('ops-last-run');
+    if (data.alert_state_ts) {
+      const age = data.alert_state_age_s != null ? data.alert_state_age_s + 's old' : 'age unknown';
+      lastRun.textContent = 'Alert state updated ' + age;
+      lastRun.style.color = (data.alert_state_age_s || 0) > 1800 ? '#ffc107' : '#7b8ab8';
+    } else {
+      lastRun.textContent = 'No alert state yet';
+      lastRun.style.color = '#ff9800';
+    }
+
+    const renderIssue = (issue) => {
+      const sev = issue.severity || 'WARNING';
+      const sevColor = sev === 'CRITICAL' ? '#ff4444' : sev === 'HIGH' ? '#ff9800' : sev === 'WARNING' ? '#ffc107' : '#00d4ff';
+      const manualTag = issue.requires_manual_action ? ' <span style="color:#ff4444;font-weight:bold;">MANUAL</span>' : '';
+      const age = issue.report_age_s != null ? ' <span style="color:#555;">(' + issue.report_age_s + 's)</span>' : '';
+      return '<div style="padding:6px 0;border-bottom:1px solid #141b2d;">'
+        + '<div style="color:' + sevColor + ';font-weight:bold;">' + sev + ' | ' + (issue.scope || issue.category || 'fleet') + manualTag + age + '</div>'
+        + '<div style="color:#e0e0e0;">' + (issue.message || '') + '</div>'
+        + '</div>';
+    };
+
+    const activeEl = document.getElementById('ops-active-issues');
+    const activeIssues = data.active_issues || [];
+    activeEl.innerHTML = activeIssues.length ? activeIssues.slice(0, 8).map(renderIssue).join('') : '<div style="color:#7b8ab8;">No active issues.</div>';
+
+    const manualEl = document.getElementById('ops-manual-actions');
+    const manualActions = data.manual_actions || [];
+    manualEl.innerHTML = manualActions.length
+      ? manualActions.slice(0, 8).map(issue => '<div style="padding:6px 0;border-bottom:1px solid #141b2d;color:#ffb74d;">' + (issue.message || '') + '</div>').join('')
+      : '<div style="color:#7b8ab8;">No manual actions.</div>';
+
+    const eventsEl = document.getElementById('ops-events');
+    const events = data.recent_events || [];
+    eventsEl.innerHTML = events.length
+      ? events.slice(0, 10).map(event => {
+          const kindColor = event.kind === 'resolved' ? '#00e676' : event.kind === 'opened' ? '#ff9800' : '#ffc107';
+          const ts = event.ts ? event.ts.substring(11, 19) + ' UTC' : '';
+          return '<div style="padding:6px 0;border-bottom:1px solid #141b2d;">'
+            + '<div style="color:' + kindColor + ';font-weight:bold;">' + (event.kind || '').toUpperCase() + ' | ' + ts + '</div>'
+            + '<div style="color:#e0e0e0;">' + (event.message || '') + '</div>'
+            + '</div>';
+        }).join('')
+      : '<div style="color:#7b8ab8;">No alert events yet.</div>';
+
+    const freshnessEl = document.getElementById('ops-report-freshness');
+    const freshness = data.report_freshness || [];
+    freshnessEl.innerHTML = freshness.length
+      ? freshness.map(item => {
+          const color = item.status === 'FRESH' ? '#00e676' : item.status === 'STALE' ? '#ffc107' : '#ff4444';
+          const age = item.age_s == null ? 'missing' : item.age_s + 's';
+          return '<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #141b2d;">'
+            + '<span style="color:#e0e0e0;">' + item.label + '</span>'
+            + '<span style="color:' + color + ';">' + item.status + ' | ' + age + '</span>'
+            + '</div>';
+        }).join('')
+      : '<div style="color:#7b8ab8;">No report freshness data.</div>';
+  } catch (e) {
+    console.error('ops overview error', e);
+  }
 }
 
 // PWA Service Worker registration
@@ -5368,7 +6077,21 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
 
+    lock = ProcessLock(build_dashboard_lock_name(host=args.host, port=args.port))
+    try:
+        lock.acquire({
+            "kind": "dashboard",
+            "host": args.host,
+            "port": args.port,
+        })
+    except ProcessLockError as exc:
+        print(f"Argus Dashboard duplicate blocked: {exc}")
+        sys.exit(1)
+
     print(f"Argus Dashboard: http://{args.host}:{args.port}")
     print(f"  Local:     http://localhost:{args.port}")
     print(f"  Tailscale: open Tailscale app to find your PC's Tailscale IP, then visit http://<tailscale-ip>:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    finally:
+        lock.release()

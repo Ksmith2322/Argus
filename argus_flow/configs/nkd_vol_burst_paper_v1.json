@@ -3,7 +3,7 @@
     "version": "paper_v1",
     "symbol": "NKD",
     "instrument_type": "future",
-    "ibkr_client_id": 24,
+    "ibkr_client_id": 33,
     "trigger": {
         "vol_burst_z_min": 1.0,
         "range_accel_min": 0.0,

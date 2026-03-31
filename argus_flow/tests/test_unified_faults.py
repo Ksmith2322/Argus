@@ -8,10 +8,13 @@ Usage:
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".tmp_tests"
 
 
 def _ok(label):
@@ -25,7 +28,8 @@ def test_state_corruption():
     """Write invalid JSON to state file, verify runner forces FLAT."""
     from argus_flow.runner_unified import State
 
-    test_dir = Path("argus_flow/logs/_test_fault")
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    test_dir = TEST_TMP_ROOT / "_test_fault"
     test_dir.mkdir(parents=True, exist_ok=True)
     state_file = test_dir / "state.json"
 
@@ -45,15 +49,19 @@ def test_state_corruption():
         _fail(f"Corrupt state: unexpected error: {e}")
 
     # Cleanup
-    state_file.unlink(missing_ok=True)
-    test_dir.rmdir()
+    try:
+        state_file.unlink(missing_ok=True)
+        test_dir.rmdir()
+    except Exception:
+        pass
 
 
 def test_missing_stop_target():
     """State file with position but no stop/target — should force FLAT."""
     from argus_flow.runner_unified import State
 
-    test_dir = Path("argus_flow/logs/_test_fault2")
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    test_dir = TEST_TMP_ROOT / "_test_fault2"
     test_dir.mkdir(parents=True, exist_ok=True)
     state_file = test_dir / "state.json"
 
@@ -75,18 +83,25 @@ def test_missing_stop_target():
     else:
         _fail(f"Missing stop/target: position={s.position} (should be forced FLAT)")
 
-    state_file.unlink(missing_ok=True)
-    test_dir.rmdir()
+    try:
+        state_file.unlink(missing_ok=True)
+        test_dir.rmdir()
+    except Exception:
+        pass
 
 
 def test_signal_log_recreation():
     """Delete signal log, verify runner would recreate it."""
-    test_dir = Path("argus_flow/logs/_test_fault3")
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    test_dir = TEST_TMP_ROOT / "_test_fault3"
     test_dir.mkdir(parents=True, exist_ok=True)
     sig_file = test_dir / "signals.csv"
 
     # Ensure file doesn't exist
-    sig_file.unlink(missing_ok=True)
+    try:
+        sig_file.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     if not sig_file.exists():
         _ok("Signal log deleted successfully")
@@ -97,12 +112,15 @@ def test_signal_log_recreation():
     # Just verify the path is writable
     try:
         sig_file.write_text("test")
-        sig_file.unlink()
+        sig_file.unlink(missing_ok=True)
         _ok("Signal log path is writable (runner will recreate)")
     except Exception as e:
         _fail(f"Signal log path not writable: {e}")
 
-    test_dir.rmdir()
+    try:
+        test_dir.rmdir()
+    except Exception:
+        pass
 
 
 def test_nan_features():
@@ -179,6 +197,28 @@ def test_per_runner_isolation():
         _fail("Per-runner isolation: could not verify error handling pattern")
 
 
+def test_process_lock_exclusive():
+    """Second process lock acquisition on same name should fail closed."""
+    from ops.process_lock import ProcessLock, ProcessLockError
+
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        first = ProcessLock("test_runner_lock", lock_dir=Path(tmpdir))
+        second = ProcessLock("test_runner_lock", lock_dir=Path(tmpdir))
+        first.acquire({"kind": "test"})
+        try:
+            try:
+                second.acquire({"kind": "test"})
+                _fail("Process lock should reject duplicate acquisition")
+            except ProcessLockError:
+                _ok("Process lock blocks duplicate acquisition")
+        finally:
+            first.release()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print("  Unified Runner Fault Injection Tests")
@@ -190,6 +230,7 @@ def main():
         ("3. Signal log recreation", test_signal_log_recreation),
         ("4. NaN/zero in features", test_nan_features),
         ("5. Per-runner error isolation", test_per_runner_isolation),
+        ("6. Process lock exclusivity", test_process_lock_exclusive),
     ]
 
     for name, fn in tests:

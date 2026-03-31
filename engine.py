@@ -42,6 +42,9 @@ except ImportError:
     def read_eth_lag_delta(*a, **kw): return 0.0
 
 
+QTY_QUANT = Decimal("0.00000001")
+
+
 def choose_poll_seconds(cfg, in_pos: bool, min_dist: Optional[Decimal]) -> float:
     if min_dist is None:
         return float(cfg["POLL_MED_SECONDS"])
@@ -81,6 +84,10 @@ def _as_decimal(v: Any, default: str = "0") -> Decimal:
         return Decimal(str(v))
     except Exception:
         return Decimal(default)
+
+
+def _q_qty(v: Any) -> Decimal:
+    return _as_decimal(v, "0").quantize(QTY_QUANT, rounding=ROUND_DOWN)
 
 
 def _normalize_epoch_seconds(e: int) -> int:
@@ -177,6 +184,10 @@ def _missed_buy_event_from_qty_reason(qty_reason: str) -> str:
     qr = (qty_reason or "").upper()
     if "NO_CASH" in qr:
         return "MISSED_BUY_NO_CASH"
+    if "DRAWDOWN" in qr:
+        return "MISSED_BUY_DRAWDOWN_THROTTLE"
+    if "SESSION" in qr:
+        return "MISSED_BUY_SESSION_RISK"
     if "EXPOSURE" in qr or "CAP" in qr:
         return "MISSED_BUY_EXPOSURE_CAP"
     if "MIN_ORDER" in qr:
@@ -404,6 +415,131 @@ def _apply_score_size_mult(qty: Decimal, eff_score: int, cfg: dict) -> Tuple[Dec
     else:
         mult, tier = mid_pct, "MID"
     return (qty * mult).quantize(Decimal("0.00000001")), f"SCORE_SIZE_{tier}(x{mult})"
+
+
+def _apply_session_size_mult(qty: Decimal, session_risk_mult: Any, cfg: dict) -> Tuple[Decimal, str]:
+    if not _bool_cfg(cfg, "USE_SESSION_MODIFIERS", False):
+        return _q_qty(qty), ""
+
+    rm = _as_decimal(session_risk_mult, "1")
+    if rm <= 0:
+        return Decimal("0"), "SESSION_SIZE_ZERO"
+    if rm == Decimal("1"):
+        return _q_qty(qty), ""
+    return _q_qty(qty * rm), f"SESSION_SIZE(x{rm.quantize(Decimal('0.001'), rounding=ROUND_DOWN)})"
+
+
+def _current_drawdown_fraction(state) -> Optional[Decimal]:
+    risk = getattr(state, "risk", None)
+    if risk is None:
+        return None
+
+    peak = _as_decimal(getattr(risk, "peak_equity_usd", None), "0")
+    current = _as_decimal(getattr(risk, "current_equity_usd", None), "0")
+    if peak <= 0 or current <= 0:
+        return None
+    if current >= peak:
+        return Decimal("0")
+
+    dd = (peak - current) / peak
+    return dd if dd > 0 else Decimal("0")
+
+
+def _apply_drawdown_size_throttle(state, qty: Decimal, cfg: dict) -> Tuple[Decimal, str]:
+    qty_d = _q_qty(qty)
+    if qty_d <= 0:
+        return Decimal("0"), ""
+    if not _bool_cfg(cfg, "USE_DRAWDOWN_SIZE_THROTTLE", True):
+        return qty_d, ""
+
+    dd = _current_drawdown_fraction(state)
+    if dd is None:
+        return qty_d, ""
+
+    start = _as_decimal(cfg.get("DRAWDOWN_SIZE_THROTTLE_START_PCT", "0"), "0")
+    pause = _as_decimal(cfg.get("DRAWDOWN_PAUSE_PCT", "0"), "0")
+    floor_mult = _as_decimal(cfg.get("DRAWDOWN_SIZE_THROTTLE_MIN_MULT", "0.25"), "0.25")
+
+    if start <= 0 and pause > 0:
+        start = pause / Decimal("2")
+    if start <= 0 or dd <= start:
+        return qty_d, ""
+
+    if pause > start:
+        progress = (dd - start) / (pause - start)
+        if progress < 0:
+            progress = Decimal("0")
+        if progress > 1:
+            progress = Decimal("1")
+    else:
+        progress = Decimal("1")
+
+    mult = Decimal("1") - ((Decimal("1") - floor_mult) * progress)
+    if mult < floor_mult:
+        mult = floor_mult
+    if mult > Decimal("1"):
+        mult = Decimal("1")
+
+    throttled = _q_qty(qty_d * mult)
+    if throttled <= 0:
+        return Decimal("0"), "DRAWDOWN_SIZE_ZERO"
+    if throttled == qty_d:
+        return qty_d, ""
+    return throttled, f"DRAWDOWN_SIZE(x{mult.quantize(Decimal('0.001'), rounding=ROUND_DOWN)})"
+
+
+def _clamp_entry_qty_to_cap(qty: Decimal, qty_cap: Decimal) -> Tuple[Decimal, str]:
+    qty_d = _q_qty(qty)
+    cap_d = _q_qty(qty_cap)
+    if qty_d <= 0:
+        return Decimal("0"), ""
+    if cap_d <= 0:
+        return Decimal("0"), "QTY_CAP_ZERO"
+    if qty_d <= cap_d:
+        return qty_d, ""
+    return cap_d, f"CAP_CLAMP(cap={cap_d})"
+
+
+def _enforce_post_size_min_order(qty: Decimal, px: Decimal, cfg: dict) -> Tuple[Decimal, str]:
+    qty_d = _q_qty(qty)
+    px_d = _as_decimal(px, "0")
+    if qty_d <= 0 or px_d <= 0:
+        return Decimal("0"), "BAD_POST_SIZE"
+
+    min_order_usd = _as_decimal(cfg.get("MIN_ORDER_USD", "0"), "0")
+    if min_order_usd <= 0:
+        return qty_d, ""
+
+    notional = qty_d * px_d
+    if notional < min_order_usd:
+        return Decimal("0"), "POST_SIZE_MIN_ORDER"
+    return qty_d, ""
+
+
+def _finalize_entry_qty(*, state, snap, qty: Decimal, qty_cap: Decimal, px: Decimal, cfg: dict) -> Tuple[Decimal, str]:
+    qty_d = _q_qty(qty)
+    if qty_d <= 0:
+        return Decimal("0"), ""
+
+    notes: List[str] = []
+
+    qty_d, note = _apply_session_size_mult(qty_d, getattr(snap, "session_risk_mult", None), cfg)
+    if note:
+        notes.append(note)
+
+    qty_d, note = _apply_drawdown_size_throttle(state, qty_d, cfg)
+    if note:
+        notes.append(note)
+
+    qty_d, note = _clamp_entry_qty_to_cap(qty_d, qty_cap)
+    if note:
+        notes.append(note)
+
+    qty_d, note = _enforce_post_size_min_order(qty_d, px, cfg)
+    if note:
+        notes.append(note)
+
+    return qty_d, "|".join(notes)
 
 
 def _vol_spike_ok(state, tick, cfg: dict) -> Tuple[bool, str]:
@@ -2005,11 +2141,12 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                             )
                         else:
                             qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+                            qty_cap_d = _as_decimal(qty_cap, "0")
 
                             qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
                                 state=state,
                                 px=px,
-                                qty_cap=_as_decimal(qty_cap, "0"),
+                                qty_cap=qty_cap_d,
                                 cfg=cfg,
                             )
 
@@ -2027,6 +2164,20 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                         watch_gated = True
                                 except Exception:
                                     pass
+
+                            if qty > 0:
+                                qty, final_qty_note = _finalize_entry_qty(
+                                    state=state,
+                                    snap=snap,
+                                    qty=qty,
+                                    qty_cap=qty_cap_d,
+                                    px=px,
+                                    cfg=cfg,
+                                )
+                                if final_qty_note:
+                                    sizing_note = f"{sizing_note}|{final_qty_note}" if sizing_note else final_qty_note
+                                    if qty <= 0:
+                                        qty_reason = final_qty_note
 
                             if qty <= 0:
                                 ev = "MISSED_BUY_WATCH_GATED" if watch_gated else _missed_buy_event_from_qty_reason(qty_reason)
@@ -2243,10 +2394,11 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                         )
                     else:
                         qty_cap, qty_reason = _compute_buy_qty_and_reason(state.ledger, px, cfg)
+                        qty_cap_d = _as_decimal(qty_cap, "0")
                         qty, sizing_note, vol_used, qty_vol = _apply_phase4_vol_sizing(
                             state=state,
                             px=px,
-                            qty_cap=_as_decimal(qty_cap, "0"),
+                            qty_cap=qty_cap_d,
                             cfg=cfg,
                         )
 
@@ -2264,6 +2416,20 @@ def step(state, tick, cfg: dict, *, paused: bool, http=None) -> DecisionSnapshot
                                     watch_gated2 = True
                             except Exception:
                                 pass
+
+                        if qty > 0:
+                            qty, final_qty_note2 = _finalize_entry_qty(
+                                state=state,
+                                snap=snap,
+                                qty=qty,
+                                qty_cap=qty_cap_d,
+                                px=px,
+                                cfg=cfg,
+                            )
+                            if final_qty_note2:
+                                sizing_note = f"{sizing_note}|{final_qty_note2}" if sizing_note else final_qty_note2
+                                if qty <= 0:
+                                    qty_reason = final_qty_note2
 
                         if qty <= 0:
                             ev = "MISSED_BUY_WATCH_GATED" if watch_gated2 else _missed_buy_event_from_qty_reason(qty_reason)

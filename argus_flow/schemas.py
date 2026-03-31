@@ -71,11 +71,13 @@ VALIDITY_FIELDS = [
 TRADE_FIELDS_PIPS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pips",
     "exit_reason", "duration_min", "trade_num",
+    "pnl_usd", "position_size", "risk_usd", "sizing_policy",
 ] + VALIDITY_FIELDS
 
 TRADE_FIELDS_POINTS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pts",
     "pnl_usd", "exit_reason", "duration_min", "trade_num",
+    "position_size", "risk_usd", "sizing_policy",
 ] + VALIDITY_FIELDS
 
 

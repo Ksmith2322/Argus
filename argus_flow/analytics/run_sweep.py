@@ -12,8 +12,9 @@ import argparse
 import itertools
 import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -27,12 +28,28 @@ from argus_flow.analytics.replay_breakout_flow import (
 )
 
 # 3x3 grid: compression_threshold_pct × flow_confirm_delta_z
-COMPRESSION_VALUES = [0.0025, 0.0035, 0.0050]
-DELTA_Z_VALUES = [0.8, 1.0, 1.5]
+DEFAULT_COMPRESSION_VALUES = [0.0025, 0.0035, 0.0050]
+DEFAULT_DELTA_Z_VALUES = [0.8, 1.0, 1.5]
 
 # Kraken taker fee (0.4%) + 5bps slippage = 45bps one-way
 DEFAULT_FEE_BPS = 20.0    # 0.4% / 2 sides → 20bps per side
 DEFAULT_SLIPPAGE_BPS = 5.0
+
+
+def _parse_float_list(raw: str | None, default: list[float]) -> list[float]:
+    if raw is None:
+        return list(default)
+
+    values = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        values.append(float(token))
+
+    if not values:
+        raise ValueError("expected at least one numeric value")
+    return values
 
 
 def run_sweep(
@@ -40,6 +57,8 @@ def run_sweep(
     outdir: str = "argus_flow/replay_out",
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    compression_values: list[float] | None = None,
+    delta_z_values: list[float] | None = None,
 ) -> dict:
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
@@ -47,8 +66,11 @@ def run_sweep(
     bars = load_bars(Path(bars_path))
     print(f"Loaded {len(bars):,} bars\n")
 
+    compression_values = list(compression_values or DEFAULT_COMPRESSION_VALUES)
+    delta_z_values = list(delta_z_values or DEFAULT_DELTA_Z_VALUES)
+
     results = []
-    combos = list(itertools.product(COMPRESSION_VALUES, DELTA_Z_VALUES))
+    combos = list(itertools.product(compression_values, delta_z_values))
 
     for i, (comp, dz) in enumerate(combos, 1):
         label = f"comp={comp}_dz={dz}"
@@ -95,8 +117,6 @@ def run_sweep(
         )
 
     # Save combined results
-    import pandas as pd
-
     df = pd.DataFrame(results)
     df.to_csv(outdir_path / "sweep_results.csv", index=False)
 
@@ -104,6 +124,10 @@ def run_sweep(
         "sweep_count": len(results),
         "fee_bps": fee_bps,
         "slippage_bps": slippage_bps,
+        "grid": {
+            "compression_values": compression_values,
+            "delta_z_values": delta_z_values,
+        },
         "runs": results,
     }
     (outdir_path / "sweep_summary.json").write_text(json.dumps(sweep_summary, indent=2))
@@ -145,9 +169,26 @@ def main() -> None:
     parser.add_argument("--outdir", default="argus_flow/replay_out", help="Output directory")
     parser.add_argument("--fee-bps", type=float, default=DEFAULT_FEE_BPS)
     parser.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
+    parser.add_argument(
+        "--compression-values",
+        default=None,
+        help="Comma-separated compression_threshold_pct values",
+    )
+    parser.add_argument(
+        "--delta-z-values",
+        default=None,
+        help="Comma-separated flow_confirm_delta_z values",
+    )
     args = parser.parse_args()
 
-    run_sweep(args.bars, args.outdir, args.fee_bps, args.slippage_bps)
+    run_sweep(
+        args.bars,
+        args.outdir,
+        args.fee_bps,
+        args.slippage_bps,
+        compression_values=_parse_float_list(args.compression_values, DEFAULT_COMPRESSION_VALUES),
+        delta_z_values=_parse_float_list(args.delta_z_values, DEFAULT_DELTA_Z_VALUES),
+    )
 
 
 if __name__ == "__main__":

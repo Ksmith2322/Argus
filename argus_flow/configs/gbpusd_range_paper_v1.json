@@ -15,7 +15,8 @@
         "target_pips": 50,
         "timeout_minutes": 90,
         "min_signal_gap_minutes": 15,
-        "lot_size": 66000
+        "lot_size": 66000,
+        "risk_pct": 0.02
     },
     "direction": {
         "dist_long_threshold": 0.4,

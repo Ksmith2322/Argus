@@ -3,7 +3,7 @@
     "version": "paper_v1",
     "symbol": "MGC",
     "instrument_type": "future",
-    "ibkr_client_id": 21,
+    "ibkr_client_id": 30,
     "trigger": {
         "vol_burst_z_min": 1.0,
         "range_accel_min": 0.0,

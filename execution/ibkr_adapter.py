@@ -13,7 +13,7 @@ Forex position sizing notes:
   as a safety net.
 
 Fill lifecycle:
-- place_order() submits a market order, handles the confirmation reply loop
+- place_order() submits a supported order type, handles the confirmation reply loop
   if IBKR prompts for one, and returns an OrderState immediately.
 - fetch_fills() polls GET /iserver/account/trades and returns FillState list.
 - Fills are persisted to artifact_dir/fills.csv in PaperAdapter-compatible
@@ -102,6 +102,32 @@ def _to_dec(x: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def _build_ibkr_order_payload(req: OrderRequest, conid: int, qty_int: int) -> Dict[str, Any]:
+    """Translate canonical order intent into IBKR Client Portal fields."""
+    order_type_map = {
+        "MARKET": "MKT",
+        "LIMIT": "LMT",
+        "STOP": "STP",
+        "STOP_LIMIT": "STP LMT",
+    }
+    ibkr_order_type = order_type_map[req.order_type]
+    payload: Dict[str, Any] = {
+        "conid": conid,
+        "orderType": ibkr_order_type,
+        "side": req.side.upper(),
+        "quantity": qty_int,
+        "tif": req.time_in_force or "GTC",
+        "cOID": req.client_order_id,
+    }
+
+    if req.limit_px is not None:
+        payload["price"] = str(req.limit_px)
+    if req.stop_px is not None:
+        payload["auxPrice"] = str(req.stop_px)
+
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # IBKRAdapter
 # ---------------------------------------------------------------------------
@@ -157,7 +183,7 @@ class IBKRAdapter(ExecutionAdapter):
     # ------------------------------------------------------------------
 
     def place_order(self, req: OrderRequest) -> OrderState:
-        """Submit a market order to IBKR via Client Portal API.
+        """Submit a supported order to IBKR via Client Portal API.
 
         Handles the IBKR confirmation reply loop automatically:
         if the response contains a reply ID, we POST /iserver/reply/{id}
@@ -176,18 +202,7 @@ class IBKRAdapter(ExecutionAdapter):
         # Forex qty must be integer units of base currency
         qty_int = max(1, int(Decimal(str(req.qty)).to_integral_value()))
 
-        order_body = {
-            "orders": [
-                {
-                    "conid": conid,
-                    "orderType": "MKT",
-                    "side": req.side.upper(),
-                    "quantity": qty_int,
-                    "tif": req.time_in_force or "GTC",
-                    "cOID": req.client_order_id,
-                }
-            ]
-        }
+        order_body = {"orders": [_build_ibkr_order_payload(req, conid, qty_int)]}
 
         try:
             path = f"/v1/api/iserver/account/{self._account_id}/orders"
@@ -239,7 +254,7 @@ class IBKRAdapter(ExecutionAdapter):
             remaining_qty=Decimal(str(qty_int)),
             avg_fill_px=None,
             ts=int(time.time()),
-            raw={"ibkr_response": resp},
+            raw={"ibkr_request": order_body, "ibkr_response": resp},
         )
 
         logger.info(

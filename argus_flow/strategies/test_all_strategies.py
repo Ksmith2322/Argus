@@ -4,9 +4,12 @@ Runs the full payoff-first analysis on each combination.
 
 Usage:
     python -m argus_flow.strategies.test_all_strategies
+    python -m argus_flow.strategies.test_all_strategies --json-out argus_flow/strategy_compare.json
 """
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -38,6 +41,77 @@ INSTRUMENTS = [
         "has_volume": False,
     },
 ]
+
+
+def _load_benchmarks(path: str | None) -> list[dict]:
+    """Load optional external benchmark rows for display-only comparison."""
+    if not path:
+        return []
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = payload.get("benchmarks", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise ValueError("benchmarks JSON must be a list or an object with a 'benchmarks' list")
+
+    benchmarks = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        benchmarks.append(
+            {
+                "strategy": str(row.get("strategy", "benchmark")),
+                "instrument": str(row.get("instrument", "")),
+                "exp_bps": row.get("exp_bps"),
+                "note": str(row.get("note", "")),
+            }
+        )
+    return benchmarks
+
+
+def _result_sort_key(row: dict) -> tuple[int, float, int]:
+    """Sort computed results with viable/high expectancy rows first."""
+    if row.get("status"):
+        return (0, float("-inf"), 0)
+    return (
+        2 if row.get("viable") else 1,
+        float(row.get("exp_bps", float("-inf"))),
+        int(row.get("signals", 0)),
+    )
+
+
+def _jsonable(value):
+    """Convert pandas/numpy scalars and nested containers into JSON-safe values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "item"):
+        return _jsonable(value.item())
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
+def _build_summary(all_results: list[dict], benchmarks: list[dict]) -> dict:
+    computed = [r for r in all_results if not r.get("status")]
+    viable = [r for r in computed if r.get("viable")]
+    sorted_results = sorted(all_results, key=_result_sort_key, reverse=True)
+
+    return _jsonable({
+        "result_count": len(all_results),
+        "computed_count": len(computed),
+        "viable_count": len(viable),
+        "viable_ratio": (len(viable) / len(computed)) if computed else 0.0,
+        "best_result": sorted(computed, key=lambda r: r.get("exp_bps", float("-inf")), reverse=True)[0]
+        if computed
+        else None,
+        "results": sorted_results,
+        "benchmarks": benchmarks,
+        "notes": [
+            "All computed rows are generated from the current in-sample run.",
+            "Benchmark rows are optional display-only context loaded from --benchmarks-json.",
+        ],
+    })
 
 
 def test_fvg(df, name, fee_rt, session_start, session_end, **kwargs):
@@ -135,9 +209,20 @@ def test_volume_profile(df, name, fee_rt, session_start, session_end, has_volume
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Compare argus_flow strategy variants on available instruments")
+    parser.add_argument("--json-out", default=None, help="Optional path to write machine-readable summary JSON")
+    parser.add_argument(
+        "--benchmarks-json",
+        default=None,
+        help="Optional JSON file with external benchmark rows to display for reference",
+    )
+    args = parser.parse_args()
+    benchmarks = _load_benchmarks(args.benchmarks_json)
+
     print("=" * 80)
     print("  STRATEGY COMPARISON: FVG vs Liquidity Sweep vs Volume Profile")
     print("  Testing on NQ (futures) and EUR/USD (forex)")
+    print("  Computed rows are in-sample probes, not walk-forward validation.")
     print("=" * 80)
 
     all_results = []
@@ -189,7 +274,7 @@ def main():
         print(f"\n  {'Strategy':>12s} {'Instrument':>10s} {'RR':>5s} {'Tmo':>4s} {'n':>5s} {'WR':>6s} {'Tgt%':>6s} {'Stp%':>6s} {'Exp':>8s} {'V':>5s}")
         print(f"  {'-' * 72}")
 
-        all_results.sort(key=lambda x: x.get("exp_bps", -999), reverse=True)
+        all_results.sort(key=_result_sort_key, reverse=True)
         for r in all_results:
             if r.get("status"):
                 print(f"  {r['strategy']:>12s} {r['instrument']:>10s}  {r.get('status', '?')}")
@@ -199,11 +284,24 @@ def main():
                       f"{r['signals']:>5} {r['wr']:>6.3f} {r['tgt_rate']:>5.1%} {r['stp_rate']:>5.1%} "
                       f"{r['exp_bps']:>+7.2f}b {v:>5}")
 
-    # Compare against existing strategies
-    print(f"\n  --- Existing strategies for reference ---")
-    print(f"  {'T4 Full':>12s} {'EUR/USD':>10s}                            +0.98b  (current runner)")
-    print(f"  {'Vol Burst':>12s} {'MNQ':>10s}                            +6.41b  (current runner)")
-    print(f"  {'Range+Accel':>12s} {'GBP/USD':>10s}                            +0.97b  (current runner)")
+    if benchmarks:
+        print(f"\n  --- External benchmarks (display only) ---")
+        for row in benchmarks:
+            exp = row.get("exp_bps")
+            exp_text = f"{float(exp):+7.2f}b" if exp is not None else "   n/a"
+            note = row.get("note", "")
+            print(f"  {row['strategy']:>12s} {row['instrument']:>10s} {exp_text:>12s}  {note}")
+    else:
+        print("\n  No external benchmark file supplied; only computed results are shown.")
+
+    if args.json_out:
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(_build_summary(all_results, benchmarks), indent=2),
+            encoding="utf-8",
+        )
+        print(f"\nSaved summary: {out_path}")
 
 
 if __name__ == "__main__":

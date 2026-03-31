@@ -13,6 +13,44 @@ import sys
 from pathlib import Path
 
 
+def _grid_metrics(valid_runs: list[dict]) -> dict:
+    comp_values = sorted({float(r["compression_threshold_pct"]) for r in valid_runs})
+    dz_values = sorted({float(r["flow_confirm_delta_z"]) for r in valid_runs})
+    comp_index = {value: idx for idx, value in enumerate(comp_values)}
+    dz_index = {value: idx for idx, value in enumerate(dz_values)}
+
+    positive_cells = {
+        (comp_index[float(r["compression_threshold_pct"])], dz_index[float(r["flow_confirm_delta_z"])])
+        for r in valid_runs
+        if float(r["expectancy_pct"]) > 0
+    }
+
+    cluster_sizes = []
+    visited = set()
+
+    for cell in positive_cells:
+        if cell in visited:
+            continue
+        stack = [cell]
+        visited.add(cell)
+        size = 0
+        while stack:
+            row, col = stack.pop()
+            size += 1
+            for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                if neighbor in positive_cells and neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        cluster_sizes.append(size)
+
+    return {
+        "grid_shape": [len(comp_values), len(dz_values)],
+        "positive_cluster_count": len(cluster_sizes),
+        "largest_positive_cluster": max(cluster_sizes, default=0),
+        "isolated_positive_configs": sum(1 for size in cluster_sizes if size == 1),
+    }
+
+
 def classify(sweep_path: str) -> dict:
     data = json.loads(Path(sweep_path).read_text())
     runs = data.get("runs", [])
@@ -39,6 +77,7 @@ def classify(sweep_path: str) -> dict:
     avg_exp = sum(exp_values) / len(exp_values) if exp_values else 0.0
     min_events = min(event_counts) if event_counts else 0
     median_events = sorted(event_counts)[len(event_counts) // 2] if event_counts else 0
+    grid = _grid_metrics(valid_runs)
 
     reasons = []
 
@@ -48,7 +87,7 @@ def classify(sweep_path: str) -> dict:
         return {
             "classification": "INSUFFICIENT_DATA",
             "reason": f"Median event count too low ({median_events}). Need 20+ for statistical validity.",
-            "metrics": {"median_events": median_events, "n_runs": n},
+            "metrics": {"median_events": median_events, "n_runs": n, **grid},
         }
 
     # 2. False breakout rate too high
@@ -72,6 +111,7 @@ def classify(sweep_path: str) -> dict:
                 "n_positive": 0,
                 "avg_expectancy": avg_exp,
                 "avg_false_breakout_rate": avg_fbr,
+                **grid,
             },
         }
 
@@ -85,20 +125,24 @@ def classify(sweep_path: str) -> dict:
                 "n_positive": n_positive,
                 "avg_expectancy": avg_exp,
                 "avg_false_breakout_rate": avg_fbr,
+                **grid,
             },
         }
 
     # ── Illusion check ──────────────────────────────────────
-    # Only 1-2 configs positive, neighbors collapse
-    if n_positive <= 2:
-        # Check if positive configs are isolated (neighbors negative)
+    # Only 1-2 configs positive, or all positives are isolated single cells.
+    if n_positive <= 2 or grid["largest_positive_cluster"] <= 1:
         return {
             "classification": "ILLUSION",
-            "reason": f"Only {n_positive}/{n} configs positive. Likely overfit to specific threshold.",
+            "reason": (
+                f"Only {n_positive}/{n} configs positive with largest positive cluster "
+                f"{grid['largest_positive_cluster']}. Likely overfit to specific thresholds."
+            ),
             "metrics": {
                 "n_runs": n,
                 "n_positive": n_positive,
                 "avg_expectancy": avg_exp,
+                **grid,
                 "positive_configs": [
                     {"comp": r["compression_threshold_pct"], "dz": r["flow_confirm_delta_z"],
                      "exp": r["expectancy_pct"]}
@@ -112,7 +156,7 @@ def classify(sweep_path: str) -> dict:
     exp_range = max(exp_values) - min(exp_values)
     avg_positive_exp = sum(r["expectancy_pct"] for r in positive_exp) / n_positive
 
-    if n_positive <= n * 0.5 or avg_positive_exp < 0.0005:
+    if n_positive <= n * 0.5 or avg_positive_exp < 0.0005 or grid["largest_positive_cluster"] < 3:
         return {
             "classification": "WEAK_BUT_REAL",
             "reason": (
@@ -125,6 +169,7 @@ def classify(sweep_path: str) -> dict:
                 "avg_positive_expectancy": avg_positive_exp,
                 "avg_false_breakout_rate": avg_fbr,
                 "expectancy_range": exp_range,
+                **grid,
             },
         }
 
@@ -141,6 +186,7 @@ def classify(sweep_path: str) -> dict:
             "avg_positive_expectancy": avg_positive_exp,
             "avg_false_breakout_rate": avg_fbr,
             "expectancy_range": exp_range,
+            **grid,
             "best_config": max(valid_runs, key=lambda r: r["expectancy_pct"]),
         },
     }

@@ -1,0 +1,25 @@
+ARGUS FILE TREE DELTA
+# Generated: 2026-03-31
+# Purpose: current additions since FILE_TREE.txt (2026-03-18 snapshot)
+
+repo\
+├── argus_flow\
+│   ├── sizing.py
+│   └── ops\
+│       ├── broker_truth.py
+│       ├── walkforward_validation.py
+│       ├── promotion_gate_v2.py
+│       └── alert_escalation_v2.py
+├── ops\
+│   ├── dashboard.py
+│   ├── process_lock.py
+│   └── run_cohort_report.ps1
+└── argus_flow\logs\
+    ├── _broker\broker_snapshot.json
+    ├── alert_state.json
+    └── alert_events.jsonl
+
+Notes
+- dashboard.py now exposes broker-truth, active issues, manual actions, recent alert events, and report freshness.
+- run_cohort_report.ps1 now calls alert_escalation_v2.
+- broker_snapshot.json is the fleet-level broker/account truth surface.

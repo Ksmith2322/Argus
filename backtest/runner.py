@@ -75,7 +75,7 @@ from feed_coinbase import make_http
 # - Provide fallback ABSOLUTE imports so `python backtest/runner.py` can still work.
 try:
     from .loader import load_candles_csv
-    from .feed import ticks_from_close_series, PriceTick
+    from .feed import ticks_from_candles, PriceTick
     from .results import (
         BacktestResults,
         Trade,
@@ -84,7 +84,7 @@ try:
     )
 except Exception:
     from backtest.loader import load_candles_csv
-    from backtest.feed import ticks_from_close_series, PriceTick
+    from backtest.feed import ticks_from_candles, PriceTick
     from backtest.results import (
         BacktestResults,
         Trade,
@@ -336,6 +336,21 @@ def _ensure_bt_cfg(cfg: dict) -> dict:
             synth = float(cfg.get("LIQ_SYNTH_SPREAD_FLOOR_BPS", 8) or 8)
 
     cfg["BT_SYNTH_SPREAD_BPS"] = float(synth)
+    bt_tick_mode = _as_str_env("BT_TICK_MODE", None)
+    if bt_tick_mode is None:
+        bt_tick_mode = str(cfg.get("BT_TICK_MODE", "INTRABAR"))
+    bt_tick_mode = str(bt_tick_mode or "INTRABAR").strip().upper()
+    if bt_tick_mode not in ("CLOSE", "INTRABAR"):
+        bt_tick_mode = "INTRABAR"
+    cfg["BT_TICK_MODE"] = bt_tick_mode
+
+    bt_intrabar_order = _as_str_env("BT_INTRABAR_ORDER", None)
+    if bt_intrabar_order is None:
+        bt_intrabar_order = str(cfg.get("BT_INTRABAR_ORDER", "AUTO"))
+    bt_intrabar_order = str(bt_intrabar_order or "AUTO").strip().upper()
+    if bt_intrabar_order not in ("AUTO", "OHLC", "OLHC"):
+        bt_intrabar_order = "AUTO"
+    cfg["BT_INTRABAR_ORDER"] = bt_intrabar_order
 
     # ── Phase 12: empirical friction injection ─────────────────────────────
     # FRICTION_MODE: off (default) | constant | conditional | monte_carlo
@@ -662,6 +677,8 @@ def _write_run_header(*, run_id: str, mode: str, cfg: Dict[str, Any], candles_cs
             "fee_bps": int(cfg.get("FEE_BPS", 60)),
             "take_profit_pct": float(cfg.get("TAKE_PROFIT_PCT", 0.03) or 0.03),
             "stop_loss_pct": float(cfg.get("STOP_LOSS_PCT", 0.02) or 0.02),
+            "bt_tick_mode": str(cfg.get("BT_TICK_MODE", "INTRABAR")),
+            "bt_intrabar_order": str(cfg.get("BT_INTRABAR_ORDER", "AUTO")),
         }
         path = os.path.join(out_dir, f"run_header_{run_id}.json")
         ok = _write_json_atomic(path, hdr)
@@ -719,6 +736,8 @@ def run_backtest(
 
     tf_1m_s = int(cfg.get("CANDLE_SECONDS", 60))
     synth_spread_bps = float(cfg.get("BT_SYNTH_SPREAD_BPS", 0.0) or 0.0)
+    bt_tick_mode = str(cfg.get("BT_TICK_MODE", "INTRABAR") or "INTRABAR").strip().upper()
+    bt_intrabar_order = str(cfg.get("BT_INTRABAR_ORDER", "AUTO") or "AUTO").strip().upper()
 
     # Phase 7: establish mode + run_id EARLY
     run_id = os.environ.get("ARGUS_RUN_ID") or _new_run_id("bt")
@@ -803,8 +822,15 @@ def run_backtest(
     if not candles:
         raise RuntimeError("No candles loaded. Check CSV format/path.")
 
-    close_series = _build_close_series_with_volume(candles)
-    base_ticks = ticks_from_close_series(close_series, as_candle_close=True, candle_seconds=tf_1m_s)
+    synth_spread_dec = Decimal(str(synth_spread_bps)) if synth_spread_bps > 0 else None
+    base_ticks = ticks_from_candles(
+        candles,
+        candle_seconds=tf_1m_s,
+        as_candle_close=True,
+        synth_spread_bps=synth_spread_dec,
+        tick_mode=bt_tick_mode,
+        intrabar_order=bt_intrabar_order,
+    )
     ticks = apply_damage_to_ticks(base_ticks, profile=damage, candle_seconds=tf_1m_s)
 
     start_epoch = int(candles[0].epoch)
@@ -1114,7 +1140,11 @@ def run_backtest(
 
         # Summary artifacts (run-scoped + latest)
         try:
-            _write_bt_summary(run_id=run_id, summary=out.summary(), out_dir=out_dir, paths=paths)
+            summary = out.summary()
+            summary["bt_tick_mode"] = bt_tick_mode
+            summary["bt_intrabar_order"] = bt_intrabar_order
+            summary["bt_synth_spread_bps"] = f"{Decimal(str(synth_spread_bps)):.4f}"
+            _write_bt_summary(run_id=run_id, summary=summary, out_dir=out_dir, paths=paths)
         except Exception:
             pass
 

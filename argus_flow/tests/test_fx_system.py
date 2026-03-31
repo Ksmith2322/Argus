@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
+TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".tmp_tests"
 
 _pass_count = 0
 _fail_count = 0
@@ -94,6 +96,12 @@ def test_schema_trade_headers():
     else:
         _fail("trade_header(False) mismatch", f"got {pts}")
 
+    required = {"pnl_usd", "position_size", "risk_usd", "sizing_policy"}
+    if required.issubset(set(pips)) and required.issubset(set(pts)):
+        _ok("trade headers include sizing/dollar PnL fields")
+    else:
+        _fail("trade headers missing sizing/dollar fields", f"missing from pips={required - set(pips)} pts={required - set(pts)}")
+
 
 # ═════════════════════════════════════════════════════════════
 # 3. build_signal_row length and order
@@ -120,16 +128,17 @@ def test_schema_build_signal_row():
     else:
         _fail(f"FX signal row length {len(row_fx)} != header {len(header_fx)}")
 
-    # Verify key positions: first field is ts, last is session_id
+    # Verify key positions by header name, not hard-coded offsets
     if row_fx[0] == features["ts"]:
         _ok("FX signal row[0] == ts")
     else:
         _fail("FX signal row[0] != ts", f"got {row_fx[0]}")
 
-    if row_fx[-1] == "sess1":
-        _ok("FX signal row[-1] == session_id")
+    session_idx = header_fx.index("session_id")
+    if row_fx[session_idx] == "sess1":
+        _ok("FX signal row[session_id] == session_id")
     else:
-        _fail("FX signal row[-1] != session_id", f"got {row_fx[-1]}")
+        _fail("FX signal row[session_id] != session_id", f"got {row_fx[session_idx]}")
 
     # Futures row has extra vol_burst_z field
     features["vol_burst_z"] = 2.1
@@ -162,6 +171,33 @@ def test_schema_validity_fields_present():
     else:
         missing = vset - set(TRADE_FIELDS_POINTS)
         _fail("VALIDITY_FIELDS not subset of TRADE_FIELDS_POINTS", f"missing: {missing}")
+
+
+def test_sizing_helpers():
+    from argus_flow.sizing import fx_units_for_risk, futures_contracts_for_risk
+
+    fx_units = fx_units_for_risk(
+        equity_usd=10000,
+        risk_pct=0.02,
+        stop_pips=35,
+        symbol="EURUSD",
+    )
+    if fx_units == 57000:
+        _ok("fx_units_for_risk matches EURUSD cohort baseline")
+    else:
+        _fail("fx_units_for_risk baseline mismatch", f"got {fx_units}")
+
+    fut_contracts = futures_contracts_for_risk(
+        equity_usd=10000,
+        risk_pct=0.02,
+        entry_price=20000,
+        stop_bps=30,
+        multiplier=2,
+    )
+    if fut_contracts == 1:
+        _ok("futures_contracts_for_risk sizes MNQ-like contract conservatively")
+    else:
+        _fail("futures_contracts_for_risk mismatch", f"got {fut_contracts}")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -367,8 +403,10 @@ def test_bar_buffer_overflow():
 def test_state_roundtrip():
     from argus_flow.runner_unified import State
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        state_file = Path(tmpdir) / "test_state.json"
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        state_file = tmpdir / "test_state.json"
 
         s = State(state_file)
         s.position = "LONG"
@@ -400,6 +438,8 @@ def test_state_roundtrip():
 
         if all_ok:
             _ok("State roundtrip: all fields match after save/load")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -409,8 +449,10 @@ def test_state_roundtrip():
 def test_state_missing_file():
     from argus_flow.runner_unified import State
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        state_file = Path(tmpdir) / "nonexistent_state.json"
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        state_file = tmpdir / "nonexistent_state.json"
 
         s = State(state_file)
         s.load("TEST")
@@ -424,11 +466,167 @@ def test_state_missing_file():
             _ok("State missing file: trade_count=0")
         else:
             _fail(f"State missing file: trade_count={s.trade_count}, expected 0")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ═════════════════════════════════════════════════════════════
 # 14. Divergence guard RUNNERS match Class A pairs
 # ═════════════════════════════════════════════════════════════
+
+def test_broker_truth_helpers():
+    from argus_flow.ops.broker_truth import atomic_write_json, is_fresh, read_json, runner_broker_state_path
+
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        log_dir = tmpdir / "eurusd"
+        path = runner_broker_state_path(log_dir)
+        payload = {"broker": {"position": "LONG", "qty": 1000}}
+        atomic_write_json(path, payload)
+
+        loaded = read_json(path)
+        if loaded == payload:
+            _ok("broker_truth atomic_write_json/read_json roundtrip")
+        else:
+            _fail("broker_truth roundtrip mismatch", f"got {loaded}")
+
+        if is_fresh(path, 60):
+            _ok("broker_truth freshness check passes for fresh file")
+        else:
+            _fail("broker_truth freshness check failed for fresh file")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_evidence_registry_broker_truth():
+    from argus_flow.ops.broker_truth import atomic_write_json
+    from argus_flow.ops.evidence_registry import _build_broker_truth
+
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        payload = {
+            "broker_connected": True,
+            "account": {"net_liquidation_usd": 12500.0, "buying_power_usd": 48000.0},
+            "broker": {"position": "LONG", "qty": 57000, "avg_cost": 1.085, "open_orders": [{}, {}]},
+            "reconciliation": {"result": "CLEAN_OPEN_MATCHED", "detail": "Both agree"},
+        }
+        atomic_write_json(tmpdir / "broker_state.json", payload)
+        section = _build_broker_truth(tmpdir)
+
+        checks = [
+            ("available", section.get("available"), True),
+            ("broker_connected", section.get("broker_connected"), True),
+            ("reconciliation_result", section.get("reconciliation_result"), "CLEAN_OPEN_MATCHED"),
+            ("broker_position", section.get("broker_position"), "LONG"),
+            ("open_orders", section.get("open_orders"), 2),
+        ]
+        all_ok = True
+        for field, got, expected in checks:
+            if got != expected:
+                _fail(f"evidence_registry broker truth: {field}={got}, expected {expected}")
+                all_ok = False
+        if all_ok:
+            _ok("evidence_registry broker truth section loads canonical broker_state.json")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_walkforward_summary_logic():
+    from argus_flow.ops.walkforward_validation import build_fold_ranges, summarize_folds
+
+    ranges = build_fold_ranges(total_bars=1500, folds=4, warmup_bars=300)
+    if len(ranges) == 4 and ranges[0][0] == 300 and ranges[-1][1] == 1500:
+        _ok("walkforward fold ranges partition data after warmup")
+    else:
+        _fail("walkforward fold range generation mismatch", f"got {ranges}")
+
+    pass_summary = summarize_folds(
+        [
+            {"trades": 5, "expectancy": 1.2, "max_drawdown": 2.0, "profit_factor": 1.4, "total_pnl": 6.0},
+            {"trades": 4, "expectancy": 0.8, "max_drawdown": 1.0, "profit_factor": 1.2, "total_pnl": 3.2},
+            {"trades": 6, "expectancy": -0.2, "max_drawdown": 3.0, "profit_factor": 0.9, "total_pnl": -1.2},
+            {"trades": 5, "expectancy": 0.4, "max_drawdown": 1.5, "profit_factor": 1.1, "total_pnl": 2.0},
+        ],
+        min_trades_per_fold=3,
+        baseline_expectancy=0.5,
+    )
+    if pass_summary["status"] == "PASS" and pass_summary["positive_folds"] == 3:
+        _ok("walkforward summary marks majority-positive folds as PASS")
+    else:
+        _fail("walkforward PASS classification mismatch", f"got {pass_summary}")
+
+    fail_summary = summarize_folds(
+        [
+            {"trades": 5, "expectancy": -0.8, "max_drawdown": 2.0, "profit_factor": 0.8, "total_pnl": -4.0},
+            {"trades": 5, "expectancy": -0.4, "max_drawdown": 1.5, "profit_factor": 0.7, "total_pnl": -2.0},
+        ],
+        min_trades_per_fold=3,
+    )
+    if fail_summary["status"] == "FAIL" and fail_summary["positive_folds"] == 0:
+        _ok("walkforward summary marks all-negative folds as FAIL")
+    else:
+        _fail("walkforward FAIL classification mismatch", f"got {fail_summary}")
+
+
+def test_promotion_gate_v2_walkforward_checks():
+    from argus_flow.ops.promotion_gate_v2 import check_live_drawdown_vs_walkforward, check_walk_forward_positive
+
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    try:
+        missing = check_walk_forward_positive(tmpdir)
+        if missing.classification == "unevidenced":
+            _ok("promotion_gate_v2 treats missing walkforward report as unevidenced")
+        else:
+            _fail("promotion_gate_v2 missing walkforward classification mismatch", f"got {missing}")
+
+        report = {
+            "status": "PASS",
+            "summary": {
+                "status": "PASS",
+                "rationale": "3/4 scored folds positive",
+                "folds_scored": 4,
+                "folds_total": 4,
+                "positive_ratio": 0.75,
+                "mean_expectancy": 0.8,
+                "max_fold_drawdown": 10.0,
+            },
+        }
+        (tmpdir / "walkforward_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+        passed = check_walk_forward_positive(tmpdir)
+        if passed.passed and passed.classification == "hard":
+            _ok("promotion_gate_v2 accepts PASS walkforward reports as hard-ready")
+        else:
+            _fail("promotion_gate_v2 PASS walkforward mismatch", f"got {passed}")
+
+        valid_trades = [{"pnl_pips": "1.0"} for _ in range(15)] + [{"pnl_pips": "-0.5"} for _ in range(15)]
+        dd_result = check_live_drawdown_vs_walkforward(valid_trades, tmpdir)
+        if dd_result.passed:
+            _ok("promotion_gate_v2 compares live drawdown against walkforward budget")
+        else:
+            _fail("promotion_gate_v2 live drawdown comparison failed unexpectedly", f"got {dd_result}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_generate_live_config_gate_report_reader():
+    from argus_flow.ops.generate_live_config import _check_promotion_gate
+
+    passing_report = {"runners": [{"symbol": "EURUSD", "verdict": "PROMOTE"}]}
+    if _check_promotion_gate("EURUSD", passing_report):
+        _ok("generate_live_config reads PROMOTE verdicts from runner-based gate report")
+    else:
+        _fail("generate_live_config failed to read PROMOTE verdict")
+
+    blocked_report = {"runners": [{"symbol": "EURUSD", "verdict": "BLOCKED"}]}
+    if not _check_promotion_gate("EURUSD", blocked_report):
+        _ok("generate_live_config blocks non-PROMOTE verdicts from runner-based gate report")
+    else:
+        _fail("generate_live_config allowed blocked verdict unexpectedly")
+
 
 def test_divergence_guard_runners_match_cohort():
     guard_path = Path(__file__).resolve().parents[1] / "ops" / "divergence_guard.py"
@@ -489,16 +687,22 @@ def main():
         ("2.  Trade header dispatch", test_schema_trade_headers),
         ("3.  build_signal_row length/order", test_schema_build_signal_row),
         ("4.  VALIDITY_FIELDS in trade headers", test_schema_validity_fields_present),
-        ("5.  Config required fields", test_config_required_fields),
-        ("6.  Config hash integrity", test_config_hash_integrity),
-        ("7.  Unique ibkr_client_ids", test_config_unique_client_ids),
-        ("8.  replay_expectations present", test_config_replay_expectations),
-        ("9.  Cohort validity flags", test_cohort_validity_flags),
-        ("10. BarBuffer basic", test_bar_buffer_basic),
-        ("11. BarBuffer overflow", test_bar_buffer_overflow),
-        ("12. State save/load roundtrip", test_state_roundtrip),
-        ("13. State missing file -> FLAT", test_state_missing_file),
-        ("14. Divergence guard RUNNERS", test_divergence_guard_runners_match_cohort),
+        ("5.  sizing helpers", test_sizing_helpers),
+        ("6.  Config required fields", test_config_required_fields),
+        ("7.  Config hash integrity", test_config_hash_integrity),
+        ("8.  Unique ibkr_client_ids", test_config_unique_client_ids),
+        ("9.  replay_expectations present", test_config_replay_expectations),
+        ("10. Cohort validity flags", test_cohort_validity_flags),
+        ("11. BarBuffer basic", test_bar_buffer_basic),
+        ("12. BarBuffer overflow", test_bar_buffer_overflow),
+        ("13. State save/load roundtrip", test_state_roundtrip),
+        ("14. State missing file -> FLAT", test_state_missing_file),
+        ("15. Broker truth helpers", test_broker_truth_helpers),
+        ("16. Evidence registry broker truth", test_evidence_registry_broker_truth),
+        ("17. Walkforward summary logic", test_walkforward_summary_logic),
+        ("18. Promotion gate v2 walkforward checks", test_promotion_gate_v2_walkforward_checks),
+        ("19. generate_live_config gate report reader", test_generate_live_config_gate_report_reader),
+        ("20. Divergence guard RUNNERS", test_divergence_guard_runners_match_cohort),
     ]
 
     for name, fn in tests:

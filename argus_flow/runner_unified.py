@@ -30,7 +30,22 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+from argus_flow.ops.broker_truth import (
+    atomic_write_json,
+    fleet_snapshot_path,
+    load_process_snapshots,
+    merge_fleet_snapshots,
+    process_snapshot_path,
+    runner_broker_state_path,
+)
 from argus_flow.schemas import signal_header, build_signal_row, trade_header
+from argus_flow.sizing import (
+    DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD,
+    fx_pip_value_per_unit_usd,
+    fx_units_for_risk,
+    futures_contracts_for_risk,
+)
+from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_name
 
 load_dotenv()
 
@@ -55,6 +70,8 @@ IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
+HASHES_FILE = CONFIGS_DIR / "hashes.json"
+DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
 
 
 # ═════════════════════════════════════════════════════════════
@@ -98,11 +115,16 @@ class State:
         self.trade_count = 0
         self.pnl_pips = 0.0    # FX
         self.pnl_points = 0.0  # Futures / bps-based
+        self.pnl_usd = 0.0
         self.direction_str = ""  # "long" or "short" for logging
         self.restored_this_session = False  # True if loaded from file
         self.had_zero_stops = False  # True if stop/target were 0 at any point
         self.pyramid_adds = 0        # Number of scale-in adds this trade
         self.avg_entry_price = 0.0   # Volume-weighted average entry price
+        self.position_size = 0.0
+        self.entry_risk_usd = 0.0
+        self.sizing_policy = ""
+        self.account_equity_at_entry = 0.0
         # Profit floor state machine (BUILT but not deployed — behind config flag)
         self.hard_stop_price = 0.0        # Original catastrophic stop (never changes)
         self.profit_floor_price = 0.0     # Dynamic floor (0 = inactive)
@@ -121,8 +143,13 @@ class State:
             "trade_count": self.trade_count,
             "pnl_pips": self.pnl_pips,
             "pnl_points": self.pnl_points,
+            "pnl_usd": self.pnl_usd,
             "pyramid_adds": self.pyramid_adds,
             "avg_entry_price": self.avg_entry_price,
+            "position_size": self.position_size,
+            "entry_risk_usd": self.entry_risk_usd,
+            "sizing_policy": self.sizing_policy,
+            "account_equity_at_entry": self.account_equity_at_entry,
         }, indent=2)
         tmp = self.file.with_suffix(".tmp")
         tmp.write_text(data)
@@ -143,8 +170,13 @@ class State:
         self.trade_count = d.get("trade_count", 0)
         self.pnl_pips = d.get("pnl_pips", 0.0)
         self.pnl_points = d.get("pnl_points", 0.0)
+        self.pnl_usd = d.get("pnl_usd", 0.0)
         self.pyramid_adds = d.get("pyramid_adds", 0)
         self.avg_entry_price = d.get("avg_entry_price", 0.0)
+        self.position_size = d.get("position_size", 0.0)
+        self.entry_risk_usd = d.get("entry_risk_usd", 0.0)
+        self.sizing_policy = d.get("sizing_policy", "")
+        self.account_equity_at_entry = d.get("account_equity_at_entry", 0.0)
         if d.get("entry_time"):
             try:
                 self.entry_time = datetime.fromisoformat(d["entry_time"])
@@ -177,6 +209,340 @@ class State:
                 f"stop={self.stop_price} target={self.target_price} "
                 f"trades={self.trade_count}"
             )
+
+
+class AccountEquityTracker:
+    """Caches account equity so sizing/risk checks don't spam the API."""
+
+    def __init__(self, ib: IB, account: str | None = None, refresh_sec: int = 60):
+        self.ib = ib
+        self.account = account
+        self.refresh_sec = refresh_sec
+        self._equity_usd = DEFAULT_ACCOUNT_EQUITY_USD
+        self._last_refresh = 0.0
+
+    @property
+    def equity_usd(self) -> float:
+        return self._equity_usd
+
+    def refresh(self, force: bool = False) -> float:
+        now = time.time()
+        if not force and now - self._last_refresh < self.refresh_sec:
+            return self._equity_usd
+
+        try:
+            rows = self.ib.accountSummary(account=self.account or "")
+        except Exception as exc:
+            log.warning(f"ACCOUNT_EQUITY refresh failed: {exc}")
+            self._last_refresh = now
+            return self._equity_usd
+
+        best = None
+        for row in rows:
+            if getattr(row, "tag", "") != "NetLiquidation":
+                continue
+            currency = getattr(row, "currency", "") or ""
+            if currency not in ("USD", "BASE", ""):
+                continue
+            try:
+                best = float(row.value)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        if best is None:
+            for row in rows:
+                if getattr(row, "tag", "") != "NetLiquidation":
+                    continue
+                try:
+                    best = float(row.value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        if best and best > 0:
+            self._equity_usd = best
+        self._last_refresh = now
+        return self._equity_usd
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_broker_positions(ib: IB) -> tuple[dict, bool, str | None]:
+    """Fetch normalized broker positions from IBKR."""
+    try:
+        positions = {}
+        for p in ib.positions():
+            key = _normalize_ib_key(p.contract)
+            qty = _safe_float(getattr(p, "position", 0))
+            positions[key] = {
+                "qty": qty,
+                "direction": "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"),
+                "avg_cost": _safe_float(getattr(p, "avgCost", 0)),
+                "account": getattr(p, "account", ""),
+            }
+        return positions, True, None
+    except Exception as exc:
+        return {}, False, str(exc)
+
+
+def _fetch_account_snapshot(
+    ib: IB,
+    account: str | None,
+    fallback_equity_usd: float,
+) -> dict:
+    """Fetch a compact USD-denominated account summary snapshot."""
+    snapshot = {
+        "account_id": account,
+        "net_liquidation_usd": fallback_equity_usd,
+        "buying_power_usd": 0.0,
+        "available_funds_usd": 0.0,
+        "total_cash_usd": 0.0,
+        "excess_liquidity_usd": 0.0,
+        "maint_margin_req_usd": 0.0,
+        "init_margin_req_usd": 0.0,
+    }
+    try:
+        rows = ib.accountSummary(account=account or "")
+    except Exception as exc:
+        snapshot["error"] = str(exc)
+        return snapshot
+
+    tags: dict[str, float] = {}
+    for row in rows:
+        currency = (getattr(row, "currency", "") or "").upper()
+        if currency not in ("", "USD", "BASE"):
+            continue
+        tag = getattr(row, "tag", "")
+        if not tag or tag in tags:
+            continue
+        try:
+            tags[tag] = float(row.value)
+        except (TypeError, ValueError):
+            continue
+
+    snapshot.update({
+        "net_liquidation_usd": tags.get("NetLiquidation", fallback_equity_usd),
+        "buying_power_usd": tags.get("BuyingPower", 0.0),
+        "available_funds_usd": tags.get("AvailableFunds", 0.0),
+        "total_cash_usd": tags.get("TotalCashValue", 0.0),
+        "excess_liquidity_usd": tags.get("ExcessLiquidity", 0.0),
+        "maint_margin_req_usd": tags.get("MaintMarginReq", tags.get("FullMaintMarginReq", 0.0)),
+        "init_margin_req_usd": tags.get("InitMarginReq", tags.get("FullInitMarginReq", 0.0)),
+    })
+    return snapshot
+
+
+def _fetch_open_orders(ib: IB) -> tuple[list[dict], str | None]:
+    """Fetch normalized open orders from IBKR."""
+    orders: list[dict] = []
+    try:
+        for trade in ib.openTrades():
+            contract = getattr(trade, "contract", None)
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "orderStatus", None)
+            if contract is None or order is None:
+                continue
+            orders.append({
+                "symbol_key": _normalize_ib_key(contract),
+                "action": getattr(order, "action", "") or "",
+                "order_type": getattr(order, "orderType", "") or "",
+                "quantity": _safe_float(getattr(order, "totalQuantity", 0)),
+                "status": getattr(status, "status", "") or "",
+                "filled": _safe_float(getattr(status, "filled", 0)),
+                "remaining": _safe_float(getattr(status, "remaining", 0)),
+                "limit_price": _safe_float(getattr(order, "lmtPrice", 0)),
+                "stop_price": _safe_float(getattr(order, "auxPrice", 0)),
+                "order_id": int(_safe_float(getattr(order, "orderId", 0))),
+                "perm_id": int(_safe_float(getattr(order, "permId", 0))),
+                "account": getattr(order, "account", "") or "",
+            })
+    except Exception as exc:
+        return [], str(exc)
+    return orders, None
+
+
+def _write_broker_truth_artifacts(
+    ib: IB,
+    account: str | None,
+    instruments: list,
+    runtime_mode: str,
+    equity_tracker: AccountEquityTracker | None,
+    recon_results: dict | None = None,
+    broker_positions: dict | None = None,
+    broker_ok: bool | None = None,
+    position_error: str | None = None,
+    account_snapshot: dict | None = None,
+    open_orders: list[dict] | None = None,
+    open_orders_error: str | None = None,
+) -> dict:
+    """Persist fleet and per-runner broker/account truth artifacts."""
+    if broker_positions is None or broker_ok is None:
+        broker_positions, broker_ok, position_error = _fetch_broker_positions(ib)
+    if account_snapshot is None:
+        fallback_equity = equity_tracker.equity_usd if equity_tracker else DEFAULT_ACCOUNT_EQUITY_USD
+        account_snapshot = _fetch_account_snapshot(ib, account, fallback_equity)
+    if open_orders is None and open_orders_error is None:
+        open_orders, open_orders_error = _fetch_open_orders(ib)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    broker_connected = bool(ib.isConnected() and broker_ok)
+
+    if recon_results is None:
+        recon_results = {}
+        for inst in instruments:
+            recon_results[inst.symbol] = {
+                "result": getattr(inst, "_reconciliation", ReconcileResult.BROKER_UNAVAILABLE),
+                "detail": getattr(inst, "_reconciliation_detail", ""),
+                "local_position": inst.state.position,
+                "broker_position": getattr(inst, "_broker_position", "FLAT"),
+                "broker_qty": getattr(inst, "_broker_qty", 0.0),
+                "ib_key": _runner_to_ib_key(inst),
+            }
+
+    fleet_snapshot = {
+        "timestamp": now_iso,
+        "source": "runner_unified",
+        "source_pid": os.getpid(),
+        "runtime_mode": runtime_mode,
+        "broker_connected": broker_connected,
+        "account": account_snapshot,
+        "positions": broker_positions,
+        "open_orders": open_orders or [],
+        "reconciliation": recon_results,
+    }
+    if position_error:
+        fleet_snapshot["position_error"] = position_error
+    if open_orders_error:
+        fleet_snapshot["open_orders_error"] = open_orders_error
+
+    atomic_write_json(process_snapshot_path(os.getpid()), fleet_snapshot)
+    merged_snapshot = merge_fleet_snapshots(load_process_snapshots(max_age_s=600))
+    if merged_snapshot:
+        atomic_write_json(fleet_snapshot_path(), merged_snapshot)
+
+    for inst in instruments:
+        ib_key = _runner_to_ib_key(inst)
+        broker_info = broker_positions.get(ib_key, {"qty": 0.0, "direction": "FLAT", "avg_cost": 0.0})
+        inst_orders = [o for o in (open_orders or []) if o.get("symbol_key") == ib_key]
+        local_open_risk = inst.current_open_risk_usd()
+        local_unrealized_pnl = inst.current_unrealized_pnl_usd()
+        runner_snapshot = {
+            "timestamp": now_iso,
+            "source": "runner_unified",
+            "source_pid": os.getpid(),
+            "runtime_mode": runtime_mode,
+            "broker_connected": broker_connected,
+            "account": account_snapshot,
+            "runner": {
+                "symbol": inst.symbol,
+                "ib_key": ib_key,
+                "local_position": inst.state.position,
+                "position_size": inst.state.position_size,
+                "entry_price": inst.state.entry_price,
+                "stop_price": inst.state.stop_price,
+                "target_price": inst.state.target_price,
+                "entry_risk_usd": inst.state.entry_risk_usd,
+                "open_risk_usd": local_open_risk,
+                "unrealized_pnl_usd": local_unrealized_pnl,
+                "trade_count": inst.state.trade_count,
+                "quarantined": getattr(inst, "_quarantined", False),
+                "entries_blocked": getattr(inst, "_entries_blocked", False),
+            },
+            "broker": {
+                "position": broker_info.get("direction", "FLAT"),
+                "qty": broker_info.get("qty", 0.0),
+                "avg_cost": broker_info.get("avg_cost", 0.0),
+                "open_orders": inst_orders,
+            },
+            "reconciliation": {
+                "result": getattr(inst, "_reconciliation", ReconcileResult.BROKER_UNAVAILABLE),
+                "detail": getattr(inst, "_reconciliation_detail", ""),
+                "requires_manual_review": getattr(inst, "_reconciliation", "") in (
+                    ReconcileResult.LOCAL_FLAT_BROKER_OPEN,
+                    ReconcileResult.UNRESOLVED,
+                    "RECON_DRIFT",
+                ),
+            },
+        }
+        atomic_write_json(runner_broker_state_path(inst.log_dir), runner_snapshot)
+
+    return fleet_snapshot
+
+
+def _write_heartbeat_files(
+    instruments: list,
+    runtime_mode: str,
+    ib: IB,
+    equity_tracker: AccountEquityTracker,
+    now: datetime,
+) -> None:
+    """Persist per-runner heartbeat files used by oversight surfaces."""
+    for inst in instruments:
+        hb_file = inst.log_dir / "heartbeat.json"
+        try:
+            hb_file.write_text(json.dumps({
+                "ts": now.isoformat(),
+                "pid": os.getpid(),
+                "session_id": getattr(inst, '_session_id', ''),
+                "instrument": inst.symbol,
+                "runtime_mode": runtime_mode,
+                "position": inst.state.position,
+                "broker_position": getattr(inst, '_broker_position', 'FLAT'),
+                "broker_qty": getattr(inst, '_broker_qty', 0.0),
+                "entries_blocked": getattr(inst, '_entries_blocked', False),
+                "quarantined": getattr(inst, '_quarantined', False),
+                "consecutive_errors": getattr(inst, '_consecutive_errors', 0),
+                "reconciliation": getattr(inst, '_reconciliation', ''),
+                "last_bar_ts": str(inst.current_bar_minute) if inst.current_bar_minute else None,
+                "broker_connected": ib.isConnected(),
+                "account_equity_usd": equity_tracker.equity_usd,
+                "open_risk_usd": inst.current_open_risk_usd(),
+                "unrealized_pnl_usd": inst.current_unrealized_pnl_usd(),
+            }))
+        except Exception:
+            pass
+
+
+def _config_short_hash(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8")
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _validate_config_registry(cfg_files: list[Path]) -> bool:
+    if not HASHES_FILE.exists():
+        log.error(f"FATAL: {HASHES_FILE} missing. Config hash freeze cannot be enforced.")
+        return False
+
+    try:
+        expected = json.loads(HASHES_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.error(f"FATAL: could not read config hash registry: {exc}")
+        return False
+
+    missing = []
+    mismatched = []
+    for cfg_path in cfg_files:
+        if cfg_path.name == HASHES_FILE.name:
+            continue
+        expected_hash = expected.get(cfg_path.name)
+        actual_hash = _config_short_hash(cfg_path)
+        if expected_hash is None:
+            missing.append(cfg_path.name)
+        elif expected_hash != actual_hash:
+            mismatched.append((cfg_path.name, expected_hash, actual_hash))
+
+    for name in missing:
+        log.error(f"FATAL: config '{name}' missing from hashes.json")
+    for name, exp, got in mismatched:
+        log.error(f"FATAL: config '{name}' hash mismatch expected={exp} actual={got}")
+
+    return not missing and not mismatched
 
 
 # ═════════════════════════════════════════════════════════════
@@ -485,11 +851,17 @@ class InstrumentRunner:
         self.stop_pips = risk.get("stop_pips", 0)
         self.target_pips = risk.get("target_pips", 0)
         self.lot_size = risk.get("lot_size", 20000)
+        self.min_lot_size = int(risk.get("min_lot_size", 1000))
+        self.max_lot_size = risk.get("max_lot_size")
 
         # Futures/bps-specific
         self.stop_bps = risk.get("stop_bps", 0)
         self.target_bps = risk.get("target_bps", 0)
         self.num_contracts = risk.get("num_contracts", 1)
+        self.min_contracts = int(risk.get("min_contracts", 1))
+        self.max_contracts = risk.get("max_contracts")
+        self.risk_pct = float(risk.get("risk_pct", 0) or 0)
+        self.dynamic_position_sizing = self.risk_pct > 0
 
         # Derived: pip size for FX
         self.pip_size = 0.01 if "JPY" in self.symbol.upper() else 0.0001
@@ -563,6 +935,110 @@ class InstrumentRunner:
         return raw_vol - prev
 
     # ── CSV helpers ──────────────────────────────────────────
+    def _get_account_equity(self) -> float:
+        tracker = getattr(self, "_equity_tracker", None)
+        if tracker is None:
+            return DEFAULT_ACCOUNT_EQUITY_USD
+        return tracker.equity_usd or DEFAULT_ACCOUNT_EQUITY_USD
+
+    def _reference_usd_jpy(self) -> float | None:
+        if self.symbol.upper() == "USDJPY":
+            mid = self._get_mid()
+            return float(mid) if mid and mid > 0 else None
+        for inst in getattr(self, "_all_instruments", []):
+            if inst.symbol.upper() != "USDJPY":
+                continue
+            mid = inst._get_mid()
+            if mid and mid > 0:
+                return float(mid)
+        return None
+
+    def _pip_value_per_unit_usd(self, reference_price: float | None = None) -> float:
+        return fx_pip_value_per_unit_usd(
+            self.symbol,
+            quote_price=reference_price,
+            usd_jpy_price=self._reference_usd_jpy(),
+        )
+
+    def _risk_usd_for_size(self, entry_price: float, stop_price: float, size: float) -> float:
+        if size <= 0:
+            return 0.0
+        if self.uses_pips:
+            stop_distance_pips = abs(entry_price - stop_price) / self.pip_size if self.pip_size > 0 else 0.0
+            return stop_distance_pips * self._pip_value_per_unit_usd(entry_price) * size
+        stop_distance_pts = abs(entry_price - stop_price)
+        return stop_distance_pts * self.multiplier * size
+
+    def _resolve_position_size(self, entry_price: float, stop_price: float) -> tuple[float, float, str]:
+        equity_usd = self._get_account_equity()
+
+        if self.dynamic_position_sizing and equity_usd > 0:
+            if self.uses_pips:
+                size = fx_units_for_risk(
+                    equity_usd=equity_usd,
+                    risk_pct=self.risk_pct,
+                    stop_pips=self.stop_pips,
+                    symbol=self.symbol,
+                    min_units=self.min_lot_size,
+                    max_units=self.max_lot_size,
+                    quote_price=entry_price,
+                    usd_jpy_price=self._reference_usd_jpy(),
+                )
+            else:
+                size = futures_contracts_for_risk(
+                    equity_usd=equity_usd,
+                    risk_pct=self.risk_pct,
+                    entry_price=entry_price,
+                    stop_bps=self.stop_bps,
+                    multiplier=self.multiplier,
+                    min_contracts=self.min_contracts,
+                    max_contracts=self.max_contracts,
+                )
+            policy = "dynamic"
+        else:
+            size = self.lot_size if self.uses_pips else self.num_contracts
+            policy = "fixed"
+
+        size = float(size or 0)
+        risk_usd = self._risk_usd_for_size(entry_price, stop_price, size)
+        return size, risk_usd, policy
+
+    def _hydrate_legacy_state_size(self) -> None:
+        s = self.state
+        if s.position == "FLAT" or s.position_size > 0:
+            return
+        fallback = float(self.lot_size if self.uses_pips else self.num_contracts)
+        s.position_size = fallback
+        s.entry_risk_usd = self._risk_usd_for_size(s.entry_price, s.stop_price, fallback)
+        s.sizing_policy = s.sizing_policy or "legacy_fixed"
+
+    def current_open_risk_usd(self) -> float:
+        s = self.state
+        if s.position == "FLAT":
+            return 0.0
+        self._hydrate_legacy_state_size()
+        return self._risk_usd_for_size(s.entry_price, s.stop_price, s.position_size)
+
+    def current_unrealized_pnl_usd(self, current_price: float | None = None) -> float:
+        s = self.state
+        if s.position == "FLAT":
+            return 0.0
+        self._hydrate_legacy_state_size()
+        px = current_price if current_price is not None else self._get_mid()
+        if px is None or px <= 0:
+            return 0.0
+        if self.uses_pips:
+            if s.position == "LONG":
+                pnl_units = (px - s.entry_price) / self.pip_size
+            else:
+                pnl_units = (s.entry_price - px) / self.pip_size
+            return pnl_units * self._pip_value_per_unit_usd(px) * s.position_size
+        if s.position == "LONG":
+            pnl_points = px - s.entry_price
+        else:
+            pnl_points = s.entry_price - px
+        return pnl_points * self.multiplier * s.position_size
+
     def _ensure_signal_header(self) -> None:
         if not self.signal_log.exists():
             with open(self.signal_log, "w", newline="") as f:
@@ -634,9 +1110,10 @@ class InstrumentRunner:
             with open(self.trade_log, "w", newline="") as f:
                 csv.writer(f).writerow(trade_header(self.uses_pips))
 
-    def _log_trade(self, exit_price: float, exit_reason: str, now: datetime) -> float:
-        """Log closed trade, return PnL in pips (FX) or points (futures)."""
+    def _log_trade(self, exit_price: float, exit_reason: str, now: datetime) -> tuple[float, float]:
+        """Log closed trade, return PnL in pips/points and USD."""
         s = self.state
+        self._hydrate_legacy_state_size()
         dur = (now - s.entry_time).total_seconds() / 60 if s.entry_time else 0
 
         if self.uses_pips:
@@ -654,11 +1131,10 @@ class InstrumentRunner:
         valid, invalid_reason = self._evaluate_validity()
         runtime_epoch = int(time.time() - self._runtime_start) if hasattr(self, '_runtime_start') else 0
 
-        # Policy/version tagging for attribution
-        strategy_version = self.cfg.get("version", "unknown")
-        exit_policy = "TO" + str(self.cfg.get("risk", {}).get("timeout_minutes", "?"))
-        sizing_policy = "fixed"  # will become "dynamic" when implemented
-        profit_floor_policy = "disabled"  # will become "armed_10" when deployed
+        if self.uses_pips:
+            pnl_usd = pnl * self._pip_value_per_unit_usd(exit_price) * s.position_size
+        else:
+            pnl_usd = pnl * self.multiplier * s.position_size
 
         validity_fields = [
             str(valid).lower(), invalid_reason or "",
@@ -675,9 +1151,10 @@ class InstrumentRunner:
                     f"{s.entry_price:.5f}",
                     f"{exit_price:.5f}", f"{pnl:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
+                    f"{pnl_usd:.2f}", f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}",
+                    s.sizing_policy or "fixed",
                 ] + validity_fields)
             else:
-                pnl_usd = pnl * self.multiplier
                 if self.instrument_type == "future":
                     ep = f"{s.entry_price:.2f}"
                     xp = f"{exit_price:.2f}"
@@ -688,13 +1165,14 @@ class InstrumentRunner:
                     now.isoformat(), s.position.lower(),
                     ep, xp, f"{pnl:.2f}", f"{pnl_usd:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
+                    f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}", s.sizing_policy or "fixed",
                 ] + validity_fields)
 
         # Reset validity flags after trade closes
         s.restored_this_session = False
         s.had_zero_stops = False
 
-        return pnl
+        return pnl, pnl_usd
 
     # ── Feature & trigger dispatch ───────────────────────────
     def _compute_features(self) -> Optional[dict]:
@@ -910,12 +1388,31 @@ class InstrumentRunner:
         if favorable_move < trigger_dist:
             return
 
+        self._hydrate_legacy_state_size()
+        existing_entries = s.pyramid_adds + 1
+        add_size = s.position_size / existing_entries if existing_entries > 0 else 0.0
+        if add_size <= 0:
+            return
+
+        if hasattr(self, "_risk_mgr"):
+            add_risk_usd = self._risk_usd_for_size(mid, s.stop_price, add_size)
+            allowed, reason = self._risk_mgr.can_enter(
+                self.symbol,
+                s.position.lower(),
+                getattr(self, "_all_instruments", []),
+                candidate_risk_usd=add_risk_usd,
+            )
+            if not allowed:
+                self._log.info(f"PYRAMID_BLOCK {s.position} | reason={reason}")
+                return
+
         # Scale-in: add to position
         old_entry = s.entry_price
         # Average entry: equal-weight average of original + add
         n_entries = s.pyramid_adds + 1  # entries so far (original + prior adds)
         s.avg_entry_price = (old_entry * n_entries + mid) / (n_entries + 1)
         s.pyramid_adds += 1
+        s.position_size += add_size
 
         # Move stop to breakeven (avg entry) if configured
         if self.pyramid_move_stop_breakeven and s.avg_entry_price > 0:
@@ -930,7 +1427,7 @@ class InstrumentRunner:
         self._log.info(
             f"PYRAMID ADD #{s.pyramid_adds} {s.position} @ {mid:.5f} "
             f"avg_entry={s.avg_entry_price:.5f} "
-            f"new_stop={s.stop_price:.5f}"
+            f"new_stop={s.stop_price:.5f} size={s.position_size:.0f}"
         )
 
     # ── Main tick (called every second) ──────────────────────
@@ -990,7 +1487,7 @@ class InstrumentRunner:
                 self._check_trailing_stop(mid)
 
             if exit_reason:
-                pnl = self._log_trade(mid, exit_reason, now)
+                pnl, pnl_usd = self._log_trade(mid, exit_reason, now)
                 if self.uses_pips:
                     s.pnl_pips += pnl
                     unit = "pip"
@@ -999,6 +1496,7 @@ class InstrumentRunner:
                     s.pnl_points += pnl
                     unit = "pts"
                     total = s.pnl_points
+                s.pnl_usd += pnl_usd
                 # Record trade PnL in R-multiples for daily risk limits
                 if hasattr(self, '_risk_mgr'):
                     stop_size = self.stop_pips if self.uses_pips else self.stop_bps
@@ -1006,7 +1504,7 @@ class InstrumentRunner:
                     self._risk_mgr.record_trade_pnl(self.symbol, pnl_r)
                 self._log.info(
                     f"EXIT {s.position} @ {mid} reason={exit_reason} "
-                    f"pnl={pnl:+.2f}{unit} total={total:+.2f}{unit} "
+                    f"pnl={pnl:+.2f}{unit} (${pnl_usd:+.2f}) total={total:+.2f}{unit} "
                     f"trades={s.trade_count}"
                 )
                 s.position = "FLAT"
@@ -1014,6 +1512,10 @@ class InstrumentRunner:
                 s.timeout_time = None
                 s.pyramid_adds = 0
                 s.avg_entry_price = 0.0
+                s.position_size = 0.0
+                s.entry_risk_usd = 0.0
+                s.sizing_policy = ""
+                s.account_equity_at_entry = 0.0
                 s.save()
             else:
                 # ── Pyramiding: scale-in on confirmed move ────
@@ -1077,10 +1579,32 @@ class InstrumentRunner:
             self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
             direction = None
 
+        entry_plan = None
+        if direction:
+            entry_px = mid
+            stop_px, target_px = self._compute_stops(entry_px, direction)
+            size, risk_usd, sizing_policy = self._resolve_position_size(entry_px, stop_px)
+            if size <= 0:
+                self._log.info(f"SIZE_BLOCK {direction.upper()} | size=0 policy={sizing_policy}")
+                self._log_signal(features, direction, "RISK_BLOCKED_SIZE_ZERO")
+                direction = None
+            else:
+                entry_plan = {
+                    "entry_px": entry_px,
+                    "stop_px": stop_px,
+                    "target_px": target_px,
+                    "size": size,
+                    "risk_usd": risk_usd,
+                    "sizing_policy": sizing_policy,
+                }
+
         # ── Portfolio risk gate ─────────────────────────────
         if direction and hasattr(self, '_risk_mgr'):
             allowed, reason = self._risk_mgr.can_enter(
-                self.symbol, direction, getattr(self, '_all_instruments', [])
+                self.symbol,
+                direction,
+                getattr(self, '_all_instruments', []),
+                candidate_risk_usd=entry_plan["risk_usd"] if entry_plan else 0.0,
             )
             if not allowed:
                 self._log.info(f"RISK_BLOCK {direction.upper()} | reason={reason}")
@@ -1088,8 +1612,9 @@ class InstrumentRunner:
                 direction = None
 
         if direction:
-            entry_px = mid
-            stop_px, target_px = self._compute_stops(entry_px, direction)
+            entry_px = entry_plan["entry_px"]
+            stop_px = entry_plan["stop_px"]
+            target_px = entry_plan["target_px"]
 
             s.position = direction.upper()
             s.entry_price = entry_px
@@ -1102,6 +1627,10 @@ class InstrumentRunner:
             s.last_signal_time = now
             s.trade_count += 1
             s.direction_str = direction
+            s.position_size = entry_plan["size"]
+            s.entry_risk_usd = entry_plan["risk_usd"]
+            s.sizing_policy = entry_plan["sizing_policy"]
+            s.account_equity_at_entry = self._get_account_equity()
             s.save()
 
             # Capture spread at entry for toxicity analysis
@@ -1127,6 +1656,7 @@ class InstrumentRunner:
             self._log.info(
                 f"ENTRY {direction.upper()} @ {entry_px} "
                 f"stop={stop_px} target={target_px} "
+                f"size={s.position_size:.0f} risk=${s.entry_risk_usd:.2f} policy={s.sizing_policy} "
                 f"rng={features['range_pct']:.4f} accel={features['range_accel']:.3f}"
                 f" regime={features.get('regime', '?')} eff={features.get('efficiency_ratio', 0):.3f}"
                 f"{spread_str}{extra}"
@@ -1250,22 +1780,9 @@ def reconcile_instruments(ib, instruments: list) -> dict:
     """
     results = {}
 
-    # Fetch broker positions
-    try:
-        broker_positions = {}
-        for p in ib.positions():
-            key = _normalize_ib_key(p.contract)
-            qty = float(p.position)
-            broker_positions[key] = {
-                "qty": qty,
-                "direction": "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"),
-                "avg_cost": float(p.avgCost),
-            }
-        broker_ok = True
-    except Exception as e:
-        log.error(f"Reconciliation: failed to fetch broker positions: {e}")
-        broker_ok = False
-        broker_positions = {}
+    broker_positions, broker_ok, broker_error = _fetch_broker_positions(ib)
+    if not broker_ok:
+        log.error(f"Reconciliation: failed to fetch broker positions: {broker_error}")
 
     for inst in instruments:
         ib_key = _runner_to_ib_key(inst)
@@ -1329,6 +1846,10 @@ def reconcile_instruments(ib, instruments: list) -> dict:
 
         # Store reconciliation result on the runner
         inst._reconciliation = result
+        inst._reconciliation_detail = detail
+        inst._broker_position = broker_dir
+        inst._broker_qty = broker_info.get("qty", 0)
+        inst._broker_avg_cost = broker_info.get("avg_cost", 0.0)
 
         if result not in (ReconcileResult.CLEAN_FLAT, ReconcileResult.CLEAN_OPEN_MATCHED):
             log.warning(f"[{inst.symbol}] RECONCILE: {result} -- {detail}")
@@ -1422,13 +1943,16 @@ class PortfolioRiskManager:
     }
 
     def __init__(self, max_same_currency: int = 3, max_drawdown_pct: float = 0.03,
-                 daily_max_loss: float = 3.0, portfolio_daily_max_loss: float = 10.0):
+                 daily_max_loss: float = 3.0, portfolio_daily_max_loss: float = 10.0,
+                 max_total_open_risk_pct: float = 0.05):
         self.max_same_currency = max_same_currency
         self.max_drawdown_pct = max_drawdown_pct
         self.daily_max_loss = daily_max_loss  # per instrument, in R
         self.portfolio_daily_max_loss = portfolio_daily_max_loss  # fleet-wide, in R
+        self.max_total_open_risk_pct = max_total_open_risk_pct
         self._peak_pnl: float = 0.0
         self._current_pnl: float = 0.0
+        self._account_equity_usd: float = DEFAULT_ACCOUNT_EQUITY_USD
         self._drawdown_pause = False
         self._daily_pnl: dict[str, float] = {}
         self._daily_paused: set[str] = set()
@@ -1468,7 +1992,11 @@ class PortfolioRiskManager:
         """Record a completed trade's PnL in R-multiples for daily tracking."""
         self._daily_pnl[symbol] = self._daily_pnl.get(symbol, 0.0) + pnl_r
 
-    def can_enter(self, symbol: str, direction: str, instruments: list) -> tuple[bool, str]:
+    def set_account_equity(self, equity_usd: float) -> None:
+        if equity_usd and equity_usd > 0:
+            self._account_equity_usd = equity_usd
+
+    def can_enter(self, symbol: str, direction: str, instruments: list, candidate_risk_usd: float = 0.0) -> tuple[bool, str]:
         """Master gate: check all portfolio-level risk guards."""
         # 1. Drawdown breaker
         if self._peak_pnl > 0:
@@ -1501,7 +2029,25 @@ class PortfolioRiskManager:
                 self._portfolio_daily_paused = True
             return False, "PORTFOLIO_DAILY_LIMIT"
 
-        # 4. Correlation / currency exposure
+        # 4. Total open-risk budget
+        if self._account_equity_usd > 0 and self.max_total_open_risk_pct > 0:
+            max_open_risk = self._account_equity_usd * self.max_total_open_risk_pct
+            current_open_risk = 0.0
+            for inst in instruments:
+                if getattr(inst.state, "position", "FLAT") == "FLAT":
+                    continue
+                try:
+                    current_open_risk += float(inst.current_open_risk_usd())
+                except Exception:
+                    pass
+            if current_open_risk + candidate_risk_usd > max_open_risk:
+                log.info(
+                    f"OPEN_RISK_BLOCK: current=${current_open_risk:.2f} "
+                    f"candidate=${candidate_risk_usd:.2f} limit=${max_open_risk:.2f}"
+                )
+                return False, "OPEN_RISK_LIMIT"
+
+        # 5. Correlation / currency exposure
         cmap = self.CURRENCY_MAP.get(symbol.upper(), {})
         if not cmap:
             # Unknown symbol — fail closed, do not silently skip correlation checks
@@ -1546,6 +2092,9 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     exclude_set = set(e.lower() for e in (exclude or []))
 
+    if not _validate_config_registry(cfg_files):
+        return False
+
     # ── Banner ───────────────────────────────────────────────
     log.info("=" * 70)
     log.info("ARGUS Unified Multi-Instrument Runner")
@@ -1563,6 +2112,10 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     accounts = ib.managedAccounts()
     log.info(f"Connected. Accounts: {accounts}")
+    account = accounts[0] if accounts else None
+    equity_tracker = AccountEquityTracker(ib, account=account)
+    equity_tracker.refresh(force=True)
+    log.info(f"Account equity baseline: ${equity_tracker.equity_usd:,.2f}")
 
     # Request delayed data fallback (needed for futures outside RTH)
     ib.reqMarketDataType(3)
@@ -1622,14 +2175,15 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         ldir = log_dir_for(cfg)
         runner = InstrumentRunner(cfg, contract, ticker, ldir, str(cfg_path))
         runner.state.load(runner.label)
+        runner._hydrate_legacy_state_size()
 
         # Cohort tracking fields
-        cfg_content = cfg_path.read_text()
-        runner._config_hash = hashlib.sha256(cfg_content.encode()).hexdigest()[:16]
+        runner._config_hash = _config_short_hash(cfg_path)
         runner._session_id = getattr(main, '_session_id', str(uuid.uuid4())[:8])
         runner._runtime_start = getattr(main, '_runtime_start', time.time())
         runner._reconnected = getattr(main, '_is_reconnect', False)
         runner._git_sha = getattr(main, '_git_sha', 'unknown')
+        runner._equity_tracker = equity_tracker
 
         instruments.append(runner)
 
@@ -1676,13 +2230,31 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         for inst in instruments:
             inst._entries_blocked = False
 
+    _write_broker_truth_artifacts(
+        ib,
+        account,
+        instruments,
+        runtime_mode,
+        equity_tracker,
+        recon_results=recon_results,
+    )
+    _write_heartbeat_files(
+        instruments,
+        runtime_mode,
+        ib,
+        equity_tracker,
+        datetime.now(timezone.utc),
+    )
+
     # -- Portfolio risk manager ----------------------------------------
     risk_mgr = PortfolioRiskManager(
         max_same_currency=3,
-        max_drawdown_pct=0.20,  # 20% of R-peak. Was 3% which triggered on any single loss in early cohorts
+        max_drawdown_pct=0.99,  # DISABLED for paper validation. Re-enable and calibrate before go-live.
         daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
+        max_total_open_risk_pct=0.05,
     )
+    risk_mgr.set_account_equity(equity_tracker.equity_usd)
     for inst in instruments:
         inst._risk_mgr = risk_mgr
         inst._all_instruments = instruments  # reference for correlation checks
@@ -1703,6 +2275,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             ib.sleep(1)  # process all IB events for all instruments
             now = datetime.now(timezone.utc)
 
+            risk_mgr.set_account_equity(equity_tracker.refresh())
             risk_mgr.update(instruments)
 
             for inst in instruments:
@@ -1723,7 +2296,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                                         inst.state.position, {"direction": "unknown", "qty": 0})
 
             # Periodic broker reconciliation (every 5 min, same key logic as startup)
-            if time.time() - last_heartbeat > heartbeat_interval and ib.isConnected():
+            if False:
                 try:
                     # Use same normalized key as startup reconciliation
                     broker_positions = {}
@@ -1750,6 +2323,57 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             # Periodic heartbeat (log + per-instrument heartbeat files)
             if time.time() - last_heartbeat > heartbeat_interval:
                 last_heartbeat = time.time()
+                broker_positions, broker_ok, broker_error = _fetch_broker_positions(ib) if ib.isConnected() else ({}, False, "ib_disconnected")
+                if not broker_ok and broker_error:
+                    log.warning(f"Periodic reconciliation failed: {broker_error}")
+
+                for inst in instruments:
+                    ib_key = _runner_to_ib_key(inst)
+                    broker_info = broker_positions.get(ib_key, {"qty": 0.0, "direction": "FLAT", "avg_cost": 0.0})
+                    local_pos = inst.state.position
+                    broker_dir = broker_info.get("direction", "FLAT")
+                    broker_qty = broker_info.get("qty", 0.0)
+
+                    inst._broker_position = broker_dir
+                    inst._broker_qty = broker_qty
+                    inst._broker_avg_cost = broker_info.get("avg_cost", 0.0)
+
+                    if not broker_ok:
+                        inst._reconciliation = ReconcileResult.BROKER_UNAVAILABLE
+                        inst._reconciliation_detail = broker_error or "Could not query broker positions"
+                    elif local_pos == "FLAT" and broker_dir == "FLAT":
+                        inst._reconciliation = ReconcileResult.CLEAN_FLAT
+                        inst._reconciliation_detail = "Both local and broker flat"
+                    elif local_pos == broker_dir:
+                        inst._reconciliation = ReconcileResult.CLEAN_OPEN_MATCHED
+                        inst._reconciliation_detail = f"Both agree: {local_pos} qty={broker_qty}"
+                    else:
+                        inst._reconciliation = "RECON_DRIFT"
+                        inst._reconciliation_detail = f"local={local_pos} broker={broker_dir} qty={broker_qty}"
+                        _write_incident(
+                            inst,
+                            "RECON_DRIFT",
+                            inst._reconciliation_detail,
+                            local_pos,
+                            broker_info,
+                        )
+
+                account_snapshot = _fetch_account_snapshot(ib, account, equity_tracker.equity_usd)
+                open_orders, open_orders_error = _fetch_open_orders(ib)
+                _write_broker_truth_artifacts(
+                    ib,
+                    account,
+                    instruments,
+                    runtime_mode,
+                    equity_tracker,
+                    broker_positions=broker_positions,
+                    broker_ok=broker_ok,
+                    position_error=broker_error,
+                    account_snapshot=account_snapshot,
+                    open_orders=open_orders,
+                    open_orders_error=open_orders_error,
+                )
+
                 positions = [
                     f"{i.symbol}={i.state.position}"
                     for i in instruments
@@ -1761,26 +2385,13 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     f"HEARTBEAT | {len(instruments)} instruments | "
                     f"{flat_count} flat | {pos_str}"
                 )
-                # Write per-instrument heartbeat files (used by position_monitor)
-                for inst in instruments:
-                    hb_file = inst.log_dir / "heartbeat.json"
-                    try:
-                        hb_file.write_text(json.dumps({
-                            "ts": now.isoformat(),
-                            "pid": os.getpid(),
-                            "session_id": getattr(inst, '_session_id', ''),
-                            "instrument": inst.symbol,
-                            "runtime_mode": runtime_mode,
-                            "position": inst.state.position,
-                            "entries_blocked": getattr(inst, '_entries_blocked', False),
-                            "quarantined": getattr(inst, '_quarantined', False),
-                            "consecutive_errors": getattr(inst, '_consecutive_errors', 0),
-                            "reconciliation": getattr(inst, '_reconciliation', ''),
-                            "last_bar_ts": str(inst.current_bar_minute) if inst.current_bar_minute else None,
-                            "broker_connected": ib.isConnected(),
-                        }))
-                    except Exception:
-                        pass
+                _write_heartbeat_files(
+                    instruments,
+                    runtime_mode,
+                    ib,
+                    equity_tracker,
+                    now,
+                )
 
     except KeyboardInterrupt:
         log.info("Shutting down (Ctrl+C)...")
@@ -1849,6 +2460,22 @@ def run_with_reconnect(
     exclude: Optional[list[str]] = None,
 ) -> None:
     """Outer loop: reconnect on connection failures with exponential backoff."""
+    lock = ProcessLock(build_runner_lock_name(
+        client_id=IBKR_CLIENT_ID,
+        config_paths=config_paths,
+        exclude=exclude,
+    ))
+    try:
+        lock.acquire({
+            "kind": "runner_unified",
+            "client_id": IBKR_CLIENT_ID,
+            "configs": sorted(Path(p).name for p in (config_paths or [])),
+            "exclude": sorted(exclude or []),
+        })
+    except ProcessLockError as exc:
+        log.error(f"DUPLICATE_RUNNER_BLOCKED: {exc}")
+        return
+
     max_retries = 200
     retry_delay = 10.0
 
@@ -1866,32 +2493,35 @@ def run_with_reconnect(
     except Exception:
         main._git_sha = "unknown"
 
-    for attempt in range(max_retries):
-        if attempt > 0:
-            log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay:.0f}s...")
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 1.5, 120)  # cap at 2 min
-            # DESIGN DOCTRINE (2026-03-25): _is_reconnect is intentionally False here.
-            # Bar buffer rebuilds from scratch on reconnect (300 bars seeded).
-            # Only the trade open DURING disconnect is tainted (via restored_from_file).
-            # Post-reconnect entries on fresh bar data are valid by design.
-            # Previous session-wide tainting killed ALL trades after any single blip,
-            # making it impossible to accumulate 30 valid trades for promotion.
-            # See COHORT_SPEC.md "Trade-scoped with session reset" for full rationale.
-            main._session_id = str(uuid.uuid4())[:8]
-            main._runtime_start = time.time()
-            main._is_reconnect = False
-            log.info(f"New session after reconnect: {main._session_id}")
-        else:
-            retry_delay = 10.0
+    try:
+        for attempt in range(max_retries):
+            if attempt > 0:
+                log.info(f"Reconnect attempt {attempt}/{max_retries} in {retry_delay:.0f}s...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 120)  # cap at 2 min
+                # DESIGN DOCTRINE (2026-03-25): _is_reconnect is intentionally False here.
+                # Bar buffer rebuilds from scratch on reconnect (300 bars seeded).
+                # Only the trade open DURING disconnect is tainted (via restored_from_file).
+                # Post-reconnect entries on fresh bar data are valid by design.
+                # Previous session-wide tainting killed ALL trades after any single blip,
+                # making it impossible to accumulate 30 valid trades for promotion.
+                # See COHORT_SPEC.md "Trade-scoped with session reset" for full rationale.
+                main._session_id = str(uuid.uuid4())[:8]
+                main._runtime_start = time.time()
+                main._is_reconnect = False
+                log.info(f"New session after reconnect: {main._session_id}")
+            else:
+                retry_delay = 10.0
 
-        should_reconnect = main(config_paths=config_paths, exclude=exclude)
+            should_reconnect = main(config_paths=config_paths, exclude=exclude)
 
-        if should_reconnect is False:
-            break  # clean exit
-        if should_reconnect is True:
-            log.info("Preparing to reconnect...")
-            continue
+            if should_reconnect is False:
+                break  # clean exit
+            if should_reconnect is True:
+                log.info("Preparing to reconnect...")
+                continue
+    finally:
+        lock.release()
 
     log.info("Unified runner stopped.")
 

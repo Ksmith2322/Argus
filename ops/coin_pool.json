@@ -1,0 +1,19 @@
+{
+  "max_active": 2,
+  "active": [
+    "ETH",
+    "BTC"
+  ],
+  "coins": {
+    "ETH": {
+      "status": "active",
+      "config": {},
+      "metrics": {}
+    },
+    "BTC": {
+      "status": "active",
+      "config": {},
+      "metrics": {}
+    }
+  }
+}

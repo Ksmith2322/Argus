@@ -5,7 +5,7 @@
     "instrument_type": "future",
     "exchange": "CME",
     "expiry": "20260618",
-    "ibkr_client_id": 22,
+    "ibkr_client_id": 32,
     "trigger": {
         "range_pct_min": 0.0008,
         "range_accel_min": 0.0,

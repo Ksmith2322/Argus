@@ -30,17 +30,25 @@ try {
     Add-Content -Path $logFile -Value "[$timestamp] correlation_guard ERROR: $_"
 }
 
-# 4. Run kill discipline + promotion gate + artifact divergence
+# 4. Refresh research validation for the active cohort
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.walkforward_validation --all-active 2>&1 | Out-Null
+    Add-Content -Path $logFile -Value "[$timestamp] walk-forward validation refreshed"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] walk-forward validation ERROR: $_"
+}
+
+# 5. Run kill discipline + promotion gate + artifact divergence
 try {
     & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.kill_discipline 2>&1 | Out-Null
-    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.promotion_gate 2>&1 | Out-Null
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.promotion_gate_v2 2>&1 | Out-Null
     & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.artifact_divergence 2>&1 | Out-Null
     Add-Content -Path $logFile -Value "[$timestamp] governance checks complete"
 } catch {
     Add-Content -Path $logFile -Value "[$timestamp] governance checks ERROR: $_"
 }
 
-# 5. Generate canonical evidence registry (must run AFTER all governance reports)
+# 6. Generate canonical evidence registry (must run AFTER all governance reports)
 try {
     & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.evidence_registry 2>&1 | Out-Null
     Add-Content -Path $logFile -Value "[$timestamp] evidence registry generated"
@@ -48,15 +56,24 @@ try {
     Add-Content -Path $logFile -Value "[$timestamp] evidence registry ERROR: $_"
 }
 
-# 6. Alert escalation (checks all reports, sends Discord if issues found)
+# 7. Broker and fleet oversight surfaces
 try {
-    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.alert_escalation 2>&1 | Out-Null
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.position_monitor 2>&1 | Out-Null
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.risk_oversight 2>&1 | Out-Null
+    Add-Content -Path $logFile -Value "[$timestamp] broker/risk oversight generated"
+} catch {
+    Add-Content -Path $logFile -Value "[$timestamp] broker/risk oversight ERROR: $_"
+}
+
+# 8. Alert escalation (checks all reports, writes alert_state/events, sends Discord if issues found)
+try {
+    & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.alert_escalation_v2 2>&1 | Out-Null
     Add-Content -Path $logFile -Value "[$timestamp] alert escalation complete"
 } catch {
     Add-Content -Path $logFile -Value "[$timestamp] alert escalation ERROR: $_"
 }
 
-# 7. Send Discord summary
+# 9. Send Discord summary
 try {
     & "C:\Argus\.venv\Scripts\python.exe" -m argus_flow.ops.discord_alerts --summary 2>&1
     Add-Content -Path $logFile -Value "[$timestamp] Discord summary sent"

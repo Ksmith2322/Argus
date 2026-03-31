@@ -47,6 +47,17 @@ def _check(name: str, passed: bool, detail: str, severity: str = FAIL) -> dict:
     return {"name": name, "passed": passed, "detail": detail, "severity": severity}
 
 
+def _max_trade_num(rows: list[dict]) -> int:
+    """Return the highest journal trade_num, falling back to row count."""
+    nums: list[int] = []
+    for row in rows:
+        try:
+            nums.append(int(float(row.get("trade_num", 0) or 0)))
+        except (TypeError, ValueError):
+            continue
+    return max(nums) if nums else len(rows)
+
+
 def check_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     result = {"name": runner["name"], "symbol": runner["symbol"], "status": "CLEAN", "checks": [], "max_severity": INFO}
@@ -81,24 +92,27 @@ def check_runner(runner: dict) -> dict:
             result["checks"].append(_check("state_readable", True, "no state file (runner not started)", INFO))
 
     # Check 2: Trade count consistency
+    rows: list[dict] = []
     csv_trade_count = 0
     csv_pnl = 0
+    csv_trade_serial = 0
     if trade_file.exists():
         try:
             with open(trade_file) as f:
                 rows = list(csv.DictReader(f))
             csv_trade_count = len(rows)
+            csv_trade_serial = _max_trade_num(rows)
             pnl_field = "pnl_pips" if rows and "pnl_pips" in rows[0] else "pnl_pts"
             csv_pnl = sum(float(r.get(pnl_field, 0)) for r in rows)
         except Exception as e:
             result["checks"].append(_check("trade_file_readable", False, str(e), FAIL))
 
     if state_file.exists() and trade_file.exists():
-        if state_trades != csv_trade_count:
-            result["checks"].append(_check("trade_count_match", False,
-                f"state={state_trades} vs csv={csv_trade_count}", FAIL))
+        if state_trades != csv_trade_serial:
+            result["checks"].append(_check("trade_serial_match", False,
+                f"state={state_trades} vs csv_last_trade_num={csv_trade_serial}", FAIL))
         else:
-            result["checks"].append(_check("trade_count_match", True, f"{state_trades} trades", INFO))
+            result["checks"].append(_check("trade_serial_match", True, f"serial={state_trades}", INFO))
 
     # Check 3: P&L consistency (instrument-specific tolerance)
     pnl_tol = runner.get("pip_tolerance", 0.1)
@@ -154,13 +168,22 @@ def check_runner(runner: dict) -> dict:
     if registry_file.exists():
         try:
             reg = json.loads(registry_file.read_text())
-            reg_trades = reg.get("cohort", {}).get("valid_trade_count", -1)
+            cohort = reg.get("cohort", {}) if isinstance(reg.get("cohort", {}), dict) else {}
+            reg_trades = cohort.get("valid_trade_count", -1)
+            reg_total = cohort.get("total_trade_count", -1)
+            if csv_trade_count >= 0 and reg_total >= 0:
+                if reg_total != csv_trade_count:
+                    result["checks"].append(_check("registry_total_trade_count", False,
+                        f"registry total={reg_total} vs csv rows={csv_trade_count}", FAIL))
+                else:
+                    result["checks"].append(_check("registry_total_trade_count", True,
+                        f"{reg_total} total trades", INFO))
             # Cross-check registry trade count vs trades.csv
             if csv_trade_count > 0 and reg_trades >= 0:
-                valid_csv = sum(1 for r in rows if r.get("experiment_valid", "").lower() == "true") if trade_file.exists() else 0
+                valid_csv = sum(1 for r in rows if r.get("experiment_valid", "").lower() == "true")
                 if reg_trades != valid_csv:
                     result["checks"].append(_check("registry_trade_count", False,
-                        f"registry={reg_trades} vs csv valid={valid_csv}", WARN))
+                        f"registry valid={reg_trades} vs csv valid={valid_csv}", FAIL))
                 else:
                     result["checks"].append(_check("registry_trade_count", True,
                         f"{reg_trades} valid trades", INFO))
@@ -224,6 +247,7 @@ def main():
     out_path.write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall": overall,
+        "status": overall,
         "runners": results,
     }, indent=2, default=str))
     print(f"  Saved: {out_path}")
