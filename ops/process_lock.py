@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import time
+import hashlib
 from pathlib import Path
 
 if os.name == "nt":
@@ -38,8 +39,25 @@ def build_runner_lock_name(
         stems.append(Path(path).stem.lower())
     stems = sorted(set(stems))
     excl = sorted(set((exclude or [])))
-    stem_part = "__".join(stems) if stems else "auto_discovery"
-    excl_part = "__".join(excl) if excl else "none"
+    if stems:
+        joined = "__".join(stems)
+        if len(joined) > 64:
+            digest = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
+            stem_part = f"{len(stems)}cfg_{digest}"
+        else:
+            stem_part = joined
+    else:
+        stem_part = "auto_discovery"
+
+    if excl:
+        excl_joined = "__".join(excl)
+        if len(excl_joined) > 32:
+            excl_digest = hashlib.sha1(excl_joined.encode("utf-8")).hexdigest()[:10]
+            excl_part = f"{len(excl)}x_{excl_digest}"
+        else:
+            excl_part = excl_joined
+    else:
+        excl_part = "none"
     return _sanitize_lock_name(f"runner_c{client_id}_{stem_part}_exclude_{excl_part}")
 
 

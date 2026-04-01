@@ -22,6 +22,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
 try:
     from process_lock import ProcessLock, ProcessLockError, build_dashboard_lock_name
 except ImportError:
@@ -34,10 +38,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
-
-REPO = Path(__file__).resolve().parent.parent
+from argus_flow.ops.fleet_registry import (
+    RISK_POLICY_DEFAULTS,
+    STAGE_PAPER,
+    STAGE_QUARANTINE,
+    STAGE_REAL,
+    STAGE_WATCHER,
+    discover_managed_runners,
+)
 OPS_LOGS = REPO / "ops" / "logs"
 STATE_DIR = REPO / "state"
+DASHBOARD_SIGNAL_TAIL_ROWS = 150
+DASHBOARD_TRADE_TAIL_ROWS = 100
 
 app = FastAPI(title="Argus Dashboard")
 
@@ -1164,13 +1176,14 @@ async def ibkr_status_stream(request: Request):
         if await request.is_disconnected():
             break
         try:
-            runners = [_read_ibkr_runner(r) for r in IBKR_RUNNERS]
+            runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
             total_trades = sum(r["closed_trades"] for r in runners)
             total_signals = sum(r["signal_count"] for r in runners)
 
             # Cohort status
-            any_promoted = any(r.get("promotion_eligible") for r in runners)
-            all_promoted = all(r.get("promotion_eligible") for r in runners)
+            paper_runners = [r for r in runners if r.get("current_stage") == STAGE_PAPER]
+            any_promoted = any(r.get("promotion_eligible") for r in paper_runners)
+            all_promoted = all(r.get("promotion_eligible") for r in paper_runners) if paper_runners else False
             cohort_status = "PROMOTED" if all_promoted else "REVIEW" if any_promoted else "COLLECTING"
 
             data = json.dumps({
@@ -1794,15 +1807,29 @@ IBKR_RUNNERS = [
 ALERT_STATE_FILE = REPO / "argus_flow" / "logs" / "alert_state.json"
 ALERT_EVENTS_FILE = REPO / "argus_flow" / "logs" / "alert_events.jsonl"
 FLEET_BROKER_FILE = REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json"
-VALIDATION_SYMBOLS = {"EURUSD", "GBPUSD", "EURJPY"}
+DEPLOYMENT_REGISTRY_FILE = REPO / "argus_flow" / "logs" / "deployment_registry.json"
+PAPER_MODEL_START_USD = 10000.0
+PAPER_MODEL_BASE_RISK_PCT = 0.005
+PAPER_MODEL_CAP_RISK_PCT = 0.03
+MANAGED_GOVERNANCE_FRESH_S = 30 * 60
 OPS_REPORT_SPECS = [
     {"id": "position_monitor", "label": "Position Monitor", "path": REPO / "argus_flow" / "logs" / "position_monitor.json", "fresh_s": 900},
     {"id": "risk_oversight", "label": "Risk Oversight", "path": REPO / "argus_flow" / "logs" / "risk_oversight_report.json", "fresh_s": 900},
-    {"id": "promotion_gate", "label": "Promotion Gate", "path": REPO / "argus_flow" / "logs" / "promotion_gate_report.json", "fresh_s": 36 * 3600},
-    {"id": "artifact_divergence", "label": "Artifact Divergence", "path": REPO / "argus_flow" / "logs" / "artifact_divergence_report.json", "fresh_s": 36 * 3600},
-    {"id": "divergence", "label": "Divergence Guard", "path": REPO / "argus_flow" / "logs" / "divergence_report.json", "fresh_s": 36 * 3600},
-    {"id": "kill_discipline", "label": "Kill Discipline", "path": REPO / "argus_flow" / "logs" / "kill_discipline_report.json", "fresh_s": 36 * 3600},
+    {"id": "promotion_gate", "label": "Promotion Gate", "path": REPO / "argus_flow" / "logs" / "promotion_gate_report.json", "fresh_s": MANAGED_GOVERNANCE_FRESH_S},
+    {"id": "artifact_divergence", "label": "Artifact Divergence", "path": REPO / "argus_flow" / "logs" / "artifact_divergence_report.json", "fresh_s": MANAGED_GOVERNANCE_FRESH_S},
+    {"id": "divergence", "label": "Divergence Guard", "path": REPO / "argus_flow" / "logs" / "divergence_report.json", "fresh_s": MANAGED_GOVERNANCE_FRESH_S},
+    {"id": "kill_discipline", "label": "Kill Discipline", "path": REPO / "argus_flow" / "logs" / "kill_discipline_report.json", "fresh_s": MANAGED_GOVERNANCE_FRESH_S},
 ]
+
+
+def _managed_ibkr_runners() -> list[dict]:
+    runners = discover_managed_runners()
+    return runners or IBKR_RUNNERS
+
+
+def _load_deployment_registry() -> dict:
+    data = _load_json_file(DEPLOYMENT_REGISTRY_FILE)
+    return data if isinstance(data, dict) else {}
 
 
 def _load_json_file(path: Path) -> dict | list | None:
@@ -1918,6 +1945,132 @@ def _build_ops_overview() -> dict:
         "account": _load_fleet_account_truth(),
     }
 
+
+def _build_paper_model_summary() -> dict:
+    """Build a clearly labeled hypothetical validation account model."""
+    deployment = _load_deployment_registry()
+    policy = deployment.get("risk_policy", {}) if isinstance(deployment.get("risk_policy", {}), dict) else {}
+    start_equity = float(policy.get("model_start_equity_usd", PAPER_MODEL_START_USD) or PAPER_MODEL_START_USD)
+    base_risk_pct = float(policy.get("base_risk_pct", PAPER_MODEL_BASE_RISK_PCT) or PAPER_MODEL_BASE_RISK_PCT)
+    cap_risk_pct = float(policy.get("earned_cap_pct", PAPER_MODEL_CAP_RISK_PCT) or PAPER_MODEL_CAP_RISK_PCT)
+    manual_step_up_required = bool(policy.get("manual_step_up_required", False))
+
+    equity = start_equity
+    modeled_trades: list[dict] = []
+    coverage_gaps: list[str] = []
+
+    for runner in sorted(
+        [r for r in _managed_ibkr_runners() if r.get("current_stage") == STAGE_PAPER and not r.get("live")],
+        key=lambda item: item.get("symbol", ""),
+    ):
+        symbol = runner["symbol"]
+        cfg_path = REPO / runner["config_path"]
+        trade_dir = REPO / runner["log_dir"]
+        trade_file = trade_dir / "trades.csv"
+        if not cfg_path.exists() or not trade_file.exists():
+            continue
+
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            risk = cfg.get("risk", {})
+            stop_distance = float(risk.get("stop_pips", risk.get("stop_points", 0)) or 0)
+        except Exception:
+            coverage_gaps.append(f"{symbol}: unreadable config")
+            continue
+
+        if stop_distance <= 0:
+            coverage_gaps.append(f"{symbol}: missing stop distance")
+            continue
+
+        try:
+            with open(trade_file, "r", newline="") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            coverage_gaps.append(f"{symbol}: unreadable trades")
+            continue
+
+        for row in rows:
+            if row.get("experiment_valid", "").lower() != "true":
+                continue
+            ts = (
+                row.get("ts")
+                or row.get("exit_ts")
+                or row.get("close_ts")
+                or row.get("entry_ts")
+                or ""
+            )
+            if not ts:
+                continue
+            try:
+                pnl_raw = float(row.get("pnl_pips") or row.get("pnl_pts") or 0)
+            except (TypeError, ValueError):
+                continue
+            modeled_trades.append(
+                {
+                    "ts": ts,
+                    "symbol": symbol,
+                    "name": next((r["name"] for r in _managed_ibkr_runners() if r["symbol"] == symbol), symbol),
+                    "pnl_raw": pnl_raw,
+                    "stop_distance": stop_distance,
+                }
+            )
+
+    modeled_trades.sort(key=lambda row: row.get("ts", ""))
+
+    wins = 0
+    losses = 0
+    peak = equity
+    max_drawdown_usd = 0.0
+    history: list[dict] = []
+
+    for trade in modeled_trades:
+        equity_before = equity
+        r_multiple = trade["pnl_raw"] / trade["stop_distance"] if trade["stop_distance"] else 0.0
+        risk_usd = equity_before * base_risk_pct
+        modeled_pnl_usd = r_multiple * risk_usd
+        equity = round(equity_before + modeled_pnl_usd, 2)
+        peak = max(peak, equity)
+        max_drawdown_usd = max(max_drawdown_usd, peak - equity)
+        if modeled_pnl_usd > 0:
+            wins += 1
+        else:
+            losses += 1
+        history.append(
+            {
+                "ts": trade["ts"],
+                "symbol": trade["symbol"],
+                "name": trade["name"],
+                "r_multiple": round(r_multiple, 4),
+                "risk_usd": round(risk_usd, 2),
+                "modeled_pnl_usd": round(modeled_pnl_usd, 2),
+                "equity_after": equity,
+            }
+        )
+
+    current_risk_budget = round(equity * base_risk_pct, 2)
+    cap_risk_budget = round(equity * cap_risk_pct, 2)
+    return {
+        "label": "Promotion Model",
+        "mode": "hypothetical_validation_only",
+        "start_equity_usd": start_equity,
+        "current_equity_usd": round(equity, 2),
+        "return_pct": round(((equity / start_equity) - 1.0) * 100.0, 2) if start_equity else 0.0,
+        "per_trade_risk_pct": base_risk_pct,
+        "risk_cap_pct": cap_risk_pct,
+        "current_risk_budget_usd": current_risk_budget,
+        "current_cap_budget_usd": cap_risk_budget,
+        "modeled_trade_count": len(history),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / len(history) * 100.0, 1) if history else 0.0,
+        "max_drawdown_usd": round(max_drawdown_usd, 2),
+        "manual_step_up_required": manual_step_up_required,
+        "coverage_gaps": coverage_gaps,
+        "history": history,
+        "recent_trades": history[-8:],
+    }
+
+
 def _read_ibkr_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     state_file = log_dir / "state.json"
@@ -1944,6 +2097,10 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "valid_trades": 0,
         "invalid_trades": 0,
         "invalid_rate": 0,
+        "journal_total_trades": 0,
+        "journal_usd_trade_count": 0,
+        "journal_usd_complete": False,
+        "realized_pnl_usd_available": False,
         "trades": [],
         "recent_signals": [],
         # Feature gauges (latest values)
@@ -1970,11 +2127,13 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "replay_signals_per_day": 0,
         "replay_win_rate": 0,
         "replay_exp": 0,
+        "replay_available": False,
         # State age
         "state_age_s": 9999,
-        "realized_pnl_usd": 0.0,
-        "unrealized_pnl_usd": 0.0,
-        "lane": "validation" if runner["symbol"] in VALIDATION_SYMBOLS else "observation",
+        "realized_pnl_usd": None,
+        "unrealized_pnl_usd": None,
+        "lane": runner.get("current_stage", "watcher"),
+        "current_stage": runner.get("current_stage", "watcher"),
         "runner_alive": False,
         "heartbeat_age_s": None,
         "broker_truth_age_s": None,
@@ -1997,15 +2156,11 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "next_milestone": "",
         "strategy_status": "",
         "cohort_active": False,
+        "risk_policy": runner.get("risk_policy", {}),
     }
 
     # Load replay expectations from config
-    cfg_map = {
-        "EURUSD": "eurusd_t4_paper_v1.json",
-        "GBPUSD": "gbpusd_range_paper_v1.json",
-        "EURJPY": "eurjpy_t4_paper_v1.json",
-    }
-    cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(runner["symbol"], "")
+    cfg_path = REPO / runner.get("config_path", "")
     if cfg_path.exists():
         try:
             cfg = json.loads(cfg_path.read_text())
@@ -2013,6 +2168,13 @@ def _read_ibkr_runner(runner: dict) -> dict:
             result["replay_signals_per_day"] = rexp.get("signals_per_day", 0)
             result["replay_win_rate"] = rexp.get("win_rate", 0)
             result["replay_exp"] = rexp.get("exp_pips_per_trade", rexp.get("exp_bps_per_trade", 0))
+            result["replay_available"] = any(
+                float(rexp.get(key, 0) or 0) > 0
+                for key in ("signals_per_day", "win_rate", "exp_pips_per_trade", "exp_bps_per_trade")
+            )
+            deployment = cfg.get("deployment", {}) if isinstance(cfg.get("deployment", {}), dict) else {}
+            if isinstance(deployment.get("risk_policy", {}), dict):
+                result["risk_policy"] = deployment.get("risk_policy", result["risk_policy"])
         except Exception:
             pass
 
@@ -2058,6 +2220,11 @@ def _read_ibkr_runner(runner: dict) -> dict:
         result["broker_requires_manual_review"] = bool(reconciliation.get("requires_manual_review", False))
         result["broker_account_equity_usd"] = float(account.get("net_liquidation_usd", 0.0) or 0.0)
         result["open_risk_usd"] = float(runner_state.get("open_risk_usd", 0.0) or 0.0)
+        if "unrealized_pnl_usd" in runner_state:
+            try:
+                result["unrealized_pnl_usd"] = float(runner_state.get("unrealized_pnl_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                result["unrealized_pnl_usd"] = None
 
     evidence = _load_json_file(evidence_file)
     if isinstance(evidence, dict):
@@ -2068,6 +2235,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
         cohort = evidence.get("cohort", {})
         eligibility = evidence.get("eligibility", {})
         result["lane"] = evidence.get("lane", result["lane"])
+        result["current_stage"] = result["lane"]
         result["strategy_status"] = evidence.get("strategy_status", "")
         result["cohort_active"] = bool(cohort.get("active", False))
         result["promotion_verdict"] = governance.get("promotion_gate_verdict", "")
@@ -2099,7 +2267,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
                 for row in reader:
                     rows.append(row)
             result["signal_count"] = len(rows)
-            result["recent_signals"] = rows[-20:]
+            result["recent_signals"] = rows[-DASHBOARD_SIGNAL_TAIL_ROWS:]
 
             # Latest features
             if rows:
@@ -2187,24 +2355,7 @@ def _read_ibkr_runner(runner: dict) -> dict:
                 result["unrealized_pnl_pips"] = round(entry - current, 2)
     else:
         result["unrealized_pnl_pips"] = 0
-    if result["position"] != "FLAT":
-        size = float(result.get("position_size", 0) or 0)
-        if runner["unit"] == "pips":
-            pip_to_dollar = {
-                "EURUSD": 0.0001,
-                "GBPUSD": 0.0001,
-                "AUDUSD": 0.0001,
-                "EURJPY": 0.000067,
-                "GBPJPY": 0.000067,
-                "CADJPY": 0.000067,
-                "AUDJPY": 0.000067,
-                "USDJPY": 0.000067,
-            }
-            result["unrealized_pnl_usd"] = round(result["unrealized_pnl_pips"] * pip_to_dollar.get(runner["symbol"], 0.0001) * size, 2)
-        else:
-            futures_mult = {"MES": 5, "MNQ": 2, "MYM": 0.5, "M2K": 5, "MGC": 1, "MCL": 1}
-            result["unrealized_pnl_usd"] = round(result["unrealized_pnl_pips"] * futures_mult.get(runner["symbol"], 1) * max(size, 1), 2)
-    else:
+    if result["position"] == "FLAT" and result["unrealized_pnl_usd"] is None:
         result["unrealized_pnl_usd"] = 0.0
 
     # Trades + performance metrics
@@ -2223,69 +2374,87 @@ def _read_ibkr_runner(runner: dict) -> dict:
                     )
                     rows.append(row)
             result["closed_trades"] = len(rows)
-            result["trades"] = rows[-20:]
+            result["journal_total_trades"] = len(rows)
+            result["trades"] = rows[-DASHBOARD_TRADE_TAIL_ROWS:]
 
-            # Split valid vs invalid trades
-            valid_rows = [r for r in rows if r.get("experiment_valid", "").lower() == "true"]
-            invalid_rows = [r for r in rows if r.get("experiment_valid", "").lower() != "true"]
-            result["valid_trades"] = len(valid_rows)
-            result["invalid_trades"] = len(invalid_rows)
-            result["invalid_rate"] = round(len(invalid_rows) / len(rows), 4) if rows else 0
+            if not rows:
+                # Empty trades.csv (header only, no data rows) — skip all perf metrics
+                pass
+            else:
+                # Split valid vs invalid trades
+                valid_rows = [r for r in rows if r.get("experiment_valid", "").lower() == "true"]
+                invalid_rows = [r for r in rows if r.get("experiment_valid", "").lower() != "true"]
+                result["valid_trades"] = len(valid_rows)
+                result["invalid_trades"] = len(invalid_rows)
+                result["invalid_rate"] = round(len(invalid_rows) / len(rows), 4) if rows else 0
 
-            # Realized PnL from ALL trades in trades.csv (single source of truth)
-            all_pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
-            result["realized_pnl_pips"] = round(sum(float(r.get(all_pnl_field, 0)) for r in rows), 2)
-            result["realized_pnl_usd"] = round(sum(float(r.get("pnl_usd", 0) or 0) for r in rows), 2)
-
-            # Performance metrics from VALID trades only
-            metric_rows = valid_rows if valid_rows else []
-            if metric_rows:
-                pnl_field = "pnl_pips" if "pnl_pips" in metric_rows[0] else "pnl_pts"
-                pnls = []
-                for r in metric_rows:
+                # Realized PnL from ALL trades in trades.csv (single source of truth)
+                all_pnl_field = "pnl_pips" if "pnl_pips" in rows[0] else "pnl_pts"
+                result["realized_pnl_pips"] = round(sum(float(r.get(all_pnl_field, 0)) for r in rows), 2)
+                usd_rows = []
+                for r in rows:
+                    raw = r.get("pnl_usd")
+                    if raw in (None, ""):
+                        continue
                     try:
-                        pnls.append(float(r.get(pnl_field, 0)))
-                    except (ValueError, TypeError):
-                        pnls.append(0)
+                        usd_rows.append(float(raw or 0))
+                    except (TypeError, ValueError):
+                        continue
+                result["journal_usd_trade_count"] = len(usd_rows)
+                result["journal_usd_complete"] = len(rows) > 0 and len(usd_rows) == len(rows)
+                result["realized_pnl_usd_available"] = len(usd_rows) > 0
+                if usd_rows:
+                    result["realized_pnl_usd"] = round(sum(usd_rows), 2)
 
-                wins = [p for p in pnls if p > 0]
-                losses = [p for p in pnls if p <= 0]
-                result["win_rate"] = len(wins) / len(pnls) if pnls else 0
-                result["avg_win"] = sum(wins) / len(wins) if wins else 0
-                result["avg_loss"] = sum(losses) / len(losses) if losses else 0
-                sum_wins = sum(wins)
-                sum_losses = abs(sum(losses))
-                result["profit_factor"] = round(sum_wins / sum_losses, 2) if sum_losses > 0 else 0
+                # Performance metrics from VALID trades only
+                metric_rows = valid_rows if valid_rows else []
+                if metric_rows:
+                    pnl_field = "pnl_pips" if "pnl_pips" in metric_rows[0] else "pnl_pts"
+                    pnls = []
+                    for r in metric_rows:
+                        try:
+                            pnls.append(float(r.get(pnl_field, 0)))
+                        except (ValueError, TypeError):
+                            pnls.append(0)
 
-                # Max consecutive losses (valid only)
-                max_cl = 0
-                cl = 0
-                for p in pnls:
-                    if p <= 0:
-                        cl += 1
-                        max_cl = max(max_cl, cl)
-                    else:
-                        cl = 0
-                result["max_consec_loss"] = max_cl
+                    wins = [p for p in pnls if p > 0]
+                    losses = [p for p in pnls if p <= 0]
+                    result["win_rate"] = len(wins) / len(pnls) if pnls else 0
+                    result["avg_win"] = sum(wins) / len(wins) if wins else 0
+                    result["avg_loss"] = sum(losses) / len(losses) if losses else 0
+                    sum_wins = sum(wins)
+                    sum_losses = abs(sum(losses))
+                    result["profit_factor"] = round(sum_wins / sum_losses, 2) if sum_losses > 0 else 0
 
-                # Equity curve from valid trades only
-                cum = 0
-                curve = []
-                for r in metric_rows:
-                    try:
-                        cum += float(r.get(pnl_field, 0))
-                    except (ValueError, TypeError):
-                        pass
-                    curve.append(round(cum, 2))
-                result["equity_curve"] = curve[-50:]
+                    # Max consecutive losses (valid only)
+                    max_cl = 0
+                    cl = 0
+                    for p in pnls:
+                        if p <= 0:
+                            cl += 1
+                            max_cl = max(max_cl, cl)
+                        else:
+                            cl = 0
+                    result["max_consec_loss"] = max_cl
+
+                    # Equity curve from valid trades only
+                    cum = 0
+                    curve = []
+                    for r in metric_rows:
+                        try:
+                            cum += float(r.get(pnl_field, 0))
+                        except (ValueError, TypeError):
+                            pass
+                        curve.append(round(cum, 2))
+                    result["equity_curve"] = curve[-50:]
         except Exception:
             pass
 
     # Cohort progress fields
     vt = result["valid_trades"]
-    result["cohort_target"] = 30
-    result["cohort_progress_pct"] = min(100.0, round(vt / 30 * 100, 1))
-    result["promotion_eligible"] = (vt >= 30 and result["invalid_rate"] <= 0.10 and result["win_rate"] > 0)
+    result["cohort_target"] = 60
+    result["cohort_progress_pct"] = min(100.0, round(vt / 60 * 100, 1))
+    result["promotion_eligible"] = (vt >= 60 and result["invalid_rate"] <= 0.10 and result["win_rate"] > 0)
 
     return result
 
@@ -2300,7 +2469,10 @@ async def api_system_health():
         "blocked_total": 0,
         "blocked_24h": 0,
         "valid_trades": 0,
-        "target": 30,
+        "validation_total_valid_trades": 0,
+        "best_candidate_symbol": "",
+        "best_candidate_name": "",
+        "target": 60,
         "broker_connected": False,
         "runners_alive": 0,
         "active_issues": 0,
@@ -2313,7 +2485,8 @@ async def api_system_health():
     af_logs = REPO / "argus_flow" / "logs"
     now_utc = datetime.now(timezone.utc)
     blocked_window_start = now_utc - timedelta(hours=24)
-    for runner in IBKR_RUNNERS:
+    validation_counts: dict[str, dict[str, int | str]] = {}
+    for runner in _managed_ibkr_runners():
         log_dir = REPO / runner["log_dir"]
         if not log_dir.exists():
             log_dir = af_logs / runner.get("symbol", "").lower()
@@ -2342,10 +2515,17 @@ async def api_system_health():
 
         if trade_file.exists():
             try:
+                runner_valid = 0
                 with open(trade_file) as f:
                     for row in _csv.DictReader(f):
                         if row.get("experiment_valid", "").lower() == "true":
-                            health["valid_trades"] += 1
+                            runner_valid += 1
+                if runner.get("current_stage") == STAGE_PAPER:
+                    validation_counts[runner["symbol"]] = {
+                        "count": runner_valid,
+                        "name": runner["name"],
+                    }
+                    health["validation_total_valid_trades"] += runner_valid
             except Exception:
                 pass
 
@@ -2365,13 +2545,22 @@ async def api_system_health():
         except Exception:
             pass
 
+    if validation_counts:
+        best_symbol, best_meta = max(
+            validation_counts.items(),
+            key=lambda item: int(item[1].get("count", 0)),
+        )
+        health["valid_trades"] = int(best_meta.get("count", 0))
+        health["best_candidate_symbol"] = best_symbol
+        health["best_candidate_name"] = str(best_meta.get("name", ""))
+
     health["progress_pct"] = min(100, round(health["valid_trades"] / health["target"] * 100))
 
     # Check broker connection from heartbeat files
     import time as _time
     connected = 0
     total_runners = 0
-    for runner in IBKR_RUNNERS:
+    for runner in _managed_ibkr_runners():
         hb_file = REPO / runner["log_dir"] / "heartbeat.json"
         if hb_file.exists():
             try:
@@ -2419,18 +2608,20 @@ async def api_ops_overview():
 @app.get("/api/ibkr_fleet")
 async def api_ibkr_fleet():
     """IBKR fleet status for all runners."""
-    runners = [_read_ibkr_runner(r) for r in IBKR_RUNNERS]
+    deployment = _load_deployment_registry()
+    runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
     total_trades = sum(r["closed_trades"] for r in runners)
     total_signals = sum(r["signal_count"] for r in runners)
     account = _load_fleet_account_truth()
 
     # Cohort status
-    fleet_valid = sum(r["valid_trades"] for r in runners)
-    any_at_30 = any(r["valid_trades"] >= 30 for r in runners)
-    all_promoted = all(r.get("promotion_eligible", False) for r in runners) and len(runners) > 0
+    paper_runners = [r for r in runners if r.get("current_stage") == STAGE_PAPER]
+    fleet_valid = sum(r["valid_trades"] for r in paper_runners)
+    any_at_60 = any(r["valid_trades"] >= 60 for r in paper_runners)
+    all_promoted = all(r.get("promotion_eligible", False) for r in paper_runners) and len(paper_runners) > 0
     if all_promoted:
         cohort_status = "PROMOTED"
-    elif any_at_30:
+    elif any_at_60:
         cohort_status = "REVIEW"
     else:
         cohort_status = "COLLECTING"
@@ -2442,15 +2633,20 @@ async def api_ibkr_fleet():
         "cohort_status": cohort_status,
         "fleet_valid_trades": fleet_valid,
         "account": account,
+        "paper_model": _build_paper_model_summary(),
+        "deployment": deployment,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
 
 @app.get("/api/daily_performance")
 async def api_daily_performance():
-    """Daily performance journal — per-market and total breakdown by date."""
-    FX_SYMBOLS = {"EURUSD", "GBPUSD", "EURJPY", "GBPJPY", "CADJPY", "AUDJPY", "USDJPY", "AUDUSD"}
-    FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K", "MGC", "MCL"}
+    """Daily performance journal — split by stage, with compact per-day rows."""
+    FX_SYMBOLS = {
+        runner["symbol"]
+        for runner in _managed_ibkr_runners()
+        if runner.get("instrument_type", "") == "forex"
+    }
     PIP_TO_DOLLAR = {
         "EURUSD": 0.0001 * 57000, "GBPUSD": 0.0001 * 66000, "AUDUSD": 0.0001 * 100000,
         "EURJPY": 0.000067 * 100000, "GBPJPY": 0.000067 * 100000, "CADJPY": 0.000067 * 100000,
@@ -2460,7 +2656,7 @@ async def api_daily_performance():
 
     # Collect all trades from all runners
     all_trades = []
-    for runner in IBKR_RUNNERS:
+    for runner in _managed_ibkr_runners():
         trade_file = REPO / runner["log_dir"] / "trades.csv"
         if not trade_file.exists():
             continue
@@ -2472,6 +2668,8 @@ async def api_daily_performance():
                     if not date_str:
                         continue
                     pnl_raw = float(row.get("pnl_pips") or row.get("pnl_pts") or 0)
+                    # Use pnl_usd from CSV if available, otherwise convert from pips
+                    pnl_usd = None
                     if row.get("pnl_usd") not in (None, ""):
                         pnl_usd = float(row.get("pnl_usd") or 0)
                     else:
@@ -2480,10 +2678,12 @@ async def api_daily_performance():
                     all_trades.append({
                         "date": date_str,
                         "symbol": runner["symbol"],
+                        "stage": runner.get("current_stage", ""),
                         "market": "FX" if runner["symbol"] in FX_SYMBOLS else "Futures",
                         "direction": row.get("direction", ""),
                         "pnl_raw": pnl_raw,
-                        "pnl_usd": round(pnl_usd, 2),
+                        "pnl_usd": round(pnl_usd, 2) if pnl_usd is not None else None,
+                        "pnl_usd_available": pnl_usd is not None,
                         "exit_reason": row.get("exit_reason", ""),
                         "win": pnl_raw > 0,
                     })
@@ -2493,86 +2693,88 @@ async def api_daily_performance():
     # Group by date
     from collections import defaultdict
     days = defaultdict(lambda: {"fx": [], "futures": [], "all": []})
+    stage_days: dict[str, defaultdict] = {
+        STAGE_WATCHER: defaultdict(lambda: {"fx": [], "futures": [], "all": []}),
+        STAGE_PAPER: defaultdict(lambda: {"fx": [], "futures": [], "all": []}),
+        STAGE_REAL: defaultdict(lambda: {"fx": [], "futures": [], "all": []}),
+        STAGE_QUARANTINE: defaultdict(lambda: {"fx": [], "futures": [], "all": []}),
+    }
     for t in all_trades:
         days[t["date"]]["all"].append(t)
         if t["market"] == "FX":
             days[t["date"]]["fx"].append(t)
         else:
             days[t["date"]]["futures"].append(t)
+        stage_key = str(t.get("stage", "") or "")
+        if stage_key == STAGE_QUARANTINE:
+            stage_key = STAGE_REAL
+        stage_bucket = stage_days.setdefault(stage_key, defaultdict(lambda: {"fx": [], "futures": [], "all": []}))
+        stage_bucket[t["date"]]["all"].append(t)
+        if t["market"] == "FX":
+            stage_bucket[t["date"]]["fx"].append(t)
+        else:
+            stage_bucket[t["date"]]["futures"].append(t)
 
     # Build daily summaries
     def summarize(trades):
         if not trades:
-            return {"trades": 0, "wins": 0, "losses": 0, "wr": 0, "pnl_usd": 0, "best": "", "worst": ""}
+            return {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "wr": 0,
+                "pnl_usd": None,
+                "journal_usd_trades": 0,
+                "journal_usd_complete": False,
+                "best": "",
+                "worst": "",
+            }
         wins = [t for t in trades if t["win"]]
         losses = [t for t in trades if not t["win"]]
-        best = max(trades, key=lambda t: t["pnl_usd"])
-        worst = min(trades, key=lambda t: t["pnl_usd"])
+        usd_trades = [t for t in trades if t.get("pnl_usd_available")]
+        best = max(usd_trades, key=lambda t: t["pnl_usd"]) if usd_trades else None
+        worst = min(usd_trades, key=lambda t: t["pnl_usd"]) if usd_trades else None
         return {
             "trades": len(trades),
             "wins": len(wins),
             "losses": len(losses),
             "wr": round(len(wins) / len(trades) * 100, 1) if trades else 0,
-            "pnl_usd": round(sum(t["pnl_usd"] for t in trades), 2),
-            "best": f"{best['symbol']} {'+' if best['pnl_usd']>=0 else ''}{best['pnl_usd']:.2f}",
-            "worst": f"{worst['symbol']} {'+' if worst['pnl_usd']>=0 else ''}{worst['pnl_usd']:.2f}",
+            "pnl_usd": round(sum(t["pnl_usd"] for t in usd_trades), 2) if usd_trades else None,
+            "journal_usd_trades": len(usd_trades),
+            "journal_usd_complete": len(usd_trades) == len(trades) and len(trades) > 0,
+            "best": f"{best['symbol']} {'+' if best['pnl_usd']>=0 else ''}{best['pnl_usd']:.2f}" if best else "",
+            "worst": f"{worst['symbol']} {'+' if worst['pnl_usd']>=0 else ''}{worst['pnl_usd']:.2f}" if worst else "",
         }
 
-    result = []
-    for date_str in sorted(days.keys(), reverse=True):
-        d = days[date_str]
-        result.append({
-            "date": date_str,
-            "fx": summarize(d["fx"]),
-            "futures": summarize(d["futures"]),
-            "total": summarize(d["all"]),
-        })
+    def build_rows(day_map):
+        result = []
+        for date_str in sorted(day_map.keys(), reverse=True):
+            d = day_map[date_str]
+            result.append({
+                "date": date_str,
+                "fx": summarize(d["fx"]),
+                "futures": summarize(d["futures"]),
+                "total": summarize(d["all"]),
+            })
+        return result
 
-    return JSONResponse({"days": result})
-
-
-@app.get("/api/divergence_status")
-async def api_divergence_status():
-    """Divergence guard report for IBKR fleet."""
-    report_path = REPO / "argus_flow" / "logs" / "divergence_report.json"
-    if not report_path.exists():
-        return JSONResponse({"status": "NOT_RUN", "runners": []})
-    try:
-        data = json.loads(report_path.read_text())
-        return JSONResponse(data)
-    except Exception:
-        return JSONResponse({"status": "ERROR", "runners": []})
-
-
-@app.get("/api/kill_discipline")
-async def api_kill_discipline():
-    """Kill discipline report."""
-    report_path = REPO / "argus_flow" / "logs" / "kill_discipline_report.json"
-    if not report_path.exists():
-        return JSONResponse({"status": "NOT_RUN", "runners": []})
-    try:
-        return JSONResponse(json.loads(report_path.read_text()))
-    except Exception:
-        return JSONResponse({"status": "ERROR", "runners": []})
-
-
-@app.get("/api/promotion_gate")
-async def api_promotion_gate():
-    """Promotion gate report."""
-    report_path = REPO / "argus_flow" / "logs" / "promotion_gate_report.json"
-    if not report_path.exists():
-        return JSONResponse({"status": "NOT_RUN", "runners": []})
-    try:
-        return JSONResponse(json.loads(report_path.read_text()))
-    except Exception:
-        return JSONResponse({"status": "ERROR", "runners": []})
+    return JSONResponse(
+        {
+            "days": build_rows(days),
+            "by_stage": {
+                STAGE_WATCHER: build_rows(stage_days.get(STAGE_WATCHER, {})),
+                STAGE_PAPER: build_rows(stage_days.get(STAGE_PAPER, {})),
+                STAGE_REAL: build_rows(stage_days.get(STAGE_REAL, {})),
+            },
+        }
+    )
 
 
 @app.get("/api/fx_analytics")
 async def api_fx_analytics():
     """Per-pair equity curves, drawdown waterfall, expectancy tracking."""
     analytics = []
-    for runner in IBKR_RUNNERS:
+    for runner in _managed_ibkr_runners():
         log_dir = REPO / runner["log_dir"]
         trade_file = log_dir / "trades.csv"
         result = {
@@ -2900,13 +3102,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div style="display:flex; justify-content:space-between; align-items:center;">
   <h1>ARGUS TRADING DASHBOARD</h1>
-  <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR PAPER</span>
+  <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR STAGED</span>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px 0;">
+  <h2 style="font-size:0.95em;color:#00e676;margin:0;letter-spacing:2px;">SYSTEM HEALTH</h2>
+  <span style="font-size:0.7em;color:#7b8ab8;">Runtime health, alert state, report freshness, and manual-action visibility.</span>
 </div>
 
 <!-- SYSTEM HEALTH BAR -->
 <div id="health-bar" style="display:flex;gap:16px;align-items:center;padding:8px 14px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;margin-bottom:8px;font-size:0.78em;">
   <div>System: <span id="health-status" style="font-weight:bold;color:#00e676;">OK</span></div>
-  <div>Valid Trades: <span id="health-valid" style="color:#00d4ff;font-weight:bold;">0</span> / <span id="health-target">30</span></div>
+  <div title="Best current paper-QA candidate toward promotion.">
+    Best Candidate:
+    <span id="health-valid" style="color:#00d4ff;font-weight:bold;">0</span> / <span id="health-target">60</span>
+    <span id="health-candidate" style="color:#7b8ab8;"></span>
+  </div>
   <div style="flex:1;max-width:200px;">
     <div style="background:#0d1321;border-radius:3px;height:8px;overflow:hidden;">
       <div id="health-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#00d4ff,#00e676);border-radius:3px;transition:width 0.5s;"></div>
@@ -2920,48 +3131,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="health-warnings" style="color:#ffc107;"></div>
 </div>
 
-<!-- CONTROL STRIP -->
-<div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
-  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
-  <div>ACCOUNT: <span id="cs-account" style="color:#00d4ff;">Waiting for broker truth...</span></div>
-  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">GBP/USD, EUR/USD, EUR/JPY (FX Cohort)</span></div>
-  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
-</div>
-
-<!-- Single-page: IBKR Fleet Dashboard only -->
-
-<!-- Legacy pages fully removed 2026-03-26 -->
-
-
-<div id="ibkr-page">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-  <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR PAPER TRADING FLEET</h2>
-  <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
-</div>
-
-<!-- Fleet summary bar -->
-<div id="ibkr-fleet-summary" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;gap:30px;font-size:0.8em;">
-  <div>Broker Equity: <span id="ibkr-balance" style="color:#00d4ff;font-weight:bold;font-size:1.1em;">$0.00</span> <span id="ibkr-balance-source" style="font-size:0.75em;color:#7b8ab8;"></span></div>
-  <div>Buying Power: <span id="ibkr-buying-power" style="color:#e0e0e0;font-weight:bold;">$0.00</span></div>
-  <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
-  <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
-  <div>Strategy PnL: <span id="ibkr-balance-delta" style="font-weight:bold;">$0.00</span></div>
-  <div>Open Risk: <span id="ibkr-open-risk" style="font-weight:bold;color:#7b8ab8;">$0.00</span></div>
-  <div>Fleet PnL: <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
-  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">3</span></div>
-</div>
-
-<div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;">
-    <span style="color:#00d4ff;font-weight:bold;font-size:0.85em;">Cohort Status</span>
-    <span id="ibkr-cohort-status" style="font-size:0.75em;font-weight:bold;"></span>
-  </div>
-  <div style="display:flex;gap:12px;margin-top:6px;" id="ibkr-cohort-bars"></div>
-</div>
-
 <div id="ops-visibility" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">OPS VISIBILITY</h3>
+    <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">OPS VISIBILITY</h3>
     <span id="ops-last-run" style="font-size:0.7em;color:#7b8ab8;">No alert state yet</span>
   </div>
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
@@ -3002,43 +3174,223 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px 0;">
+  <h2 style="font-size:0.95em;color:#7b8ab8;margin:0;letter-spacing:2px;">CONFIG / SOURCE OF TRUTH</h2>
+  <span style="font-size:0.7em;color:#7b8ab8;">One control page. Broker truth stays separate from QA model truth.</span>
+</div>
+
+<!-- CONTROL STRIP -->
+<div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
+  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
+  <div>ACCOUNT: <span id="cs-account" style="color:#00d4ff;">Waiting for broker truth...</span></div>
+  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">GBP/USD, EUR/USD, EUR/JPY (FX Cohort)</span></div>
+  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
+</div>
+
+<!-- Single-page: IBKR Fleet Dashboard only -->
+
+<!-- Legacy pages fully removed 2026-03-26 -->
+
+
+<div id="ibkr-page">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+  <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR STAGED TRADING FLEET</h2>
+  <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
+</div>
+
+<!-- Fleet summary bar -->
+<div id="ibkr-fleet-summary" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin-bottom:10px;display:flex;gap:30px;font-size:0.8em;">
+  <div>Broker Equity: <span id="ibkr-balance" style="color:#00d4ff;font-weight:bold;font-size:1.1em;">$0.00</span> <span id="ibkr-balance-source" style="font-size:0.75em;color:#7b8ab8;"></span></div>
+  <div>Buying Power: <span id="ibkr-buying-power" style="color:#e0e0e0;font-weight:bold;">$0.00</span></div>
+  <div>Signals: <span id="ibkr-total-signals" style="color:#e0e0e0;font-weight:bold;">0</span></div>
+  <div>Trades: <span id="ibkr-total-trades" style="color:#e0e0e0;font-weight:bold;">0</span></div>
+  <div>Journal USD PnL: <span id="ibkr-balance-delta" style="font-weight:bold;">n/a</span> <span id="ibkr-pnl-source" style="font-size:0.75em;color:#7b8ab8;"></span></div>
+  <div>Open Risk: <span id="ibkr-open-risk" style="font-weight:bold;color:#7b8ab8;">$0.00</span></div>
+  <div>Fleet PnL (journal pips): <span id="ibkr-fleet-pnl" style="font-weight:bold;">0</span></div>
+  <div>Active: <span id="ibkr-active-count" style="color:#00ff88;font-weight:bold;">0</span>/<span id="ibkr-total-count">3</span></div>
+</div>
+
+<div id="truth-ledger" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">SINGLE-SOURCE TRUTH</h3>
+    <span style="font-size:0.7em;color:#7b8ab8;">Broker USD only from broker snapshots. Strategy USD only from journal rows with pnl_usd.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;">
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Broker Snapshot</div>
+      <div id="truth-broker-line" style="font-size:0.9em;color:#e0e0e0;margin-top:4px;">Loading...</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Journal USD Coverage</div>
+      <div id="truth-usd-coverage" style="font-size:0.9em;color:#e0e0e0;margin-top:4px;">Loading...</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Watcher Lane</div>
+      <div id="truth-watcher-line" style="font-size:0.9em;color:#e0e0e0;margin-top:4px;">Loading...</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Paper QA Lane</div>
+      <div id="truth-paper-line" style="font-size:0.9em;color:#e0e0e0;margin-top:4px;">Loading...</div>
+    </div>
+    <div style="background:#0d1117;border-radius:6px;padding:10px;">
+      <div style="font-size:0.7em;color:#7b8ab8;">Real Money Lane</div>
+      <div id="truth-real-line" style="font-size:0.9em;color:#e0e0e0;margin-top:4px;">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<!-- QA paper-model account and cohort status moved below the production section -->
+
 <!-- Legacy sections removed 2026-03-29: Divergence Guard, Kill Discipline, Promotion Gate -->
 <!-- Replaced by: health bar, degradation_report.py, drift_report.py, trade_tracker.py, Discord alerts -->
 
-<!-- Balance History Chart -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+<!-- Production section -->
+<div style="margin:16px 0 10px 0;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">STRATEGY EQUITY HISTORY (TRADE-DERIVED)</h3>
-    <span id="balance-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+    <h2 style="font-size:0.95em;color:#00e676;margin:0;letter-spacing:2px;">PROD PAIRS</h2>
+    <span style="font-size:0.72em;color:#7b8ab8;">Real broker truth, real runner state, real journal rows.</span>
   </div>
-  <canvas id="balance-history-chart" height="140" style="width:100%;display:block;"></canvas>
+
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">REAL MONEY RUNNERS</h3>
+    <span style="font-size:0.7em;color:#7b8ab8;">Production lane. Same runner surface as QA, but capital-backed.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-real-cards"></div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD EQUITY TRACE</h3>
+        <span id="prod-equity-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+      </div>
+      <canvas id="balance-history-chart" height="140" style="width:100%;display:block;"></canvas>
+    </div>
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD FLEET HISTORY</h3>
+        <span id="prod-fleet-history-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+      </div>
+      <canvas id="prod-fleet-pnl-chart" height="120"></canvas>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:10px;margin-bottom:14px;">
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <h3 style="font-size:0.8em;color:#00e676;margin:0 0 10px 0;letter-spacing:1px;">PROD TRADE JOURNAL</h3>
+      <div id="prod-trades-table" style="font-size:0.75em;max-height:380px;overflow:auto;padding-right:4px;"></div>
+    </div>
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <h3 style="font-size:0.8em;color:#00e676;margin:0 0 10px 0;letter-spacing:1px;">PROD DAILY PERFORMANCE</h3>
+      <div id="prod-daily-perf-body" style="font-size:0.75em;color:#7b8ab8;max-height:380px;overflow:auto;padding-right:4px;">Loading...</div>
+    </div>
+  </div>
 </div>
 
-<!-- Fleet P&L Chart -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 8px 0;letter-spacing:1px;">FLEET P&L HISTORY (pips)</h3>
-  <canvas id="ibkr-pnl-chart" height="120"></canvas>
+<!-- QA section -->
+<div style="margin:16px 0 10px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2 style="font-size:0.95em;color:#00d4ff;margin:0;letter-spacing:2px;">QA PAIRS</h2>
+    <span style="font-size:0.72em;color:#7b8ab8;">Promotion lane. Same method as prod, isolated from broker capital.</span>
+  </div>
+
+  <div id="paper-model" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA MODEL ACCOUNT</h3>
+      <span style="font-size:0.7em;color:#7b8ab8;">Separate from broker truth. Hypothetical promotion account only.</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px;">
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.7em;color:#7b8ab8;">Start Equity</div>
+        <div id="paper-model-start" style="font-size:1.1em;font-weight:bold;color:#e0e0e0;">$10,000.00</div>
+      </div>
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.7em;color:#7b8ab8;">Current Equity</div>
+        <div id="paper-model-equity" style="font-size:1.1em;font-weight:bold;color:#e0e0e0;">Loading...</div>
+      </div>
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.7em;color:#7b8ab8;">Risk Per Trade</div>
+        <div id="paper-model-risk" style="font-size:1.1em;font-weight:bold;color:#00d4ff;">0.50%</div>
+      </div>
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.7em;color:#7b8ab8;">Current Risk Budget</div>
+        <div id="paper-model-budget" style="font-size:1.1em;font-weight:bold;color:#e0e0e0;">Loading...</div>
+      </div>
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.7em;color:#7b8ab8;">Earned Cap (Manual)</div>
+        <div id="paper-model-cap" style="font-size:1.1em;font-weight:bold;color:#ffaa00;">3.00%</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:10px;">
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">MODEL STATUS</div>
+        <div id="paper-model-status" style="font-size:0.8em;color:#e0e0e0;">Loading...</div>
+      </div>
+      <div style="background:#0d1117;border-radius:6px;padding:10px;">
+        <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">RECENT MODELED TRADES</div>
+        <div id="paper-model-trades" style="font-size:0.76em;color:#e0e0e0;">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin:12px 0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:#00d4ff;font-weight:bold;font-size:0.85em;">QA Cohort Status</span>
+      <span id="ibkr-cohort-status" style="font-size:0.75em;font-weight:bold;"></span>
+    </div>
+    <div style="display:flex;gap:12px;margin-top:6px;" id="ibkr-cohort-bars"></div>
+  </div>
+
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">PAPER QA RUNNERS</h3>
+    <span style="font-size:0.7em;color:#7b8ab8;">These runners earn the right to real-money configs.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-paper-cards"></div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA EQUITY TRACE</h3>
+        <span id="qa-equity-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+      </div>
+      <canvas id="qa-model-equity-chart" height="140"></canvas>
+    </div>
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA FLEET HISTORY</h3>
+        <span id="qa-fleet-history-label" style="font-size:0.7em;color:#7b8ab8;"></span>
+      </div>
+      <canvas id="ibkr-pnl-chart" height="120"></canvas>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:10px;margin-bottom:14px;">
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">QA TRADE JOURNAL</h3>
+      <div id="qa-trades-table" style="font-size:0.75em;max-height:380px;overflow:auto;padding-right:4px;"></div>
+    </div>
+    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
+      <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">QA DAILY PERFORMANCE</h3>
+      <div id="qa-daily-perf-body" style="font-size:0.75em;color:#7b8ab8;max-height:380px;overflow:auto;padding-right:4px;">Loading...</div>
+    </div>
+  </div>
 </div>
 
-<!-- Runner cards -->
-<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px;" id="ibkr-runner-cards"></div>
-
-<!-- Trade journal -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">TRADE JOURNAL</h3>
-  <div id="ibkr-trades-table" style="font-size:0.75em;"></div>
-</div>
-
-<!-- Daily Performance Journal -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">DAILY PERFORMANCE JOURNAL</h3>
-  <div id="daily-perf-body" style="font-size:0.75em;color:#7b8ab8;">Loading...</div>
+<!-- Watcher section -->
+<div style="margin:16px 0 14px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2 style="font-size:0.95em;color:#7b8ab8;margin:0;letter-spacing:2px;">WATCHERS</h2>
+    <span style="font-size:0.72em;color:#7b8ab8;">Research lane. New managed pairs start here and must earn paper QA.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-watcher-cards"></div>
 </div>
 
 <!-- Recent signals -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-  <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">SIGNAL FEED</h3>
-  <div id="ibkr-signals-table" style="font-size:0.75em;"></div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">SIGNAL FEED</h3>
+    <span style="font-size:0.7em;color:#7b8ab8;">Watcher, QA, and prod signal rows in one feed.</span>
+  </div>
+  <div id="ibkr-signals-table" style="font-size:0.75em;max-height:520px;overflow:auto;padding-right:4px;"></div>
 </div>
 </div><!-- end ibkr-page -->
 
@@ -3107,30 +3459,22 @@ async function loadIBKRFleet() {
     document.getElementById('ibkr-active-count').textContent = activeCount;
     document.getElementById('ibkr-total-count').textContent = data.runners.length;
 
-    // Strategy PnL in dollars from trade artifacts
+    // Strategy USD PnL is only valid when every closed trade has journal-backed pnl_usd.
     let dollarPnl = 0;
     let openRiskUsd = 0;
-    const pipToDollar = {
-      'EURUSD': 0.0001 * 57000, 'GBPUSD': 0.0001 * 66000, 'AUDUSD': 0.0001 * 100000,
-      'EURJPY': 0.000067 * 100000, 'GBPJPY': 0.000067 * 100000, 'CADJPY': 0.000067 * 100000,
-      'AUDJPY': 0.000067 * 100000, 'USDJPY': 0.000067 * 100000,
-      'MES': 5, 'MNQ': 2, 'MYM': 0.5, 'M2K': 5, 'MGC': 1, 'MCL': 1,
-    };
+    let journalTradeCount = 0;
+    let journalUsdTradeCount = 0;
     for (const r of data.runners) {
-      const realizedUsd = Number(r.realized_pnl_usd ?? r.pnl_usd ?? 0);
-      const unrealizedUsd = Number(r.unrealized_pnl_usd ?? 0);
-      if (realizedUsd !== 0 || unrealizedUsd !== 0) {
-        dollarPnl += realizedUsd + unrealizedUsd;
-      } else {
-        const realizedPnl = Number(r.realized_pnl_pips || r.pnl || 0);
-        const unrealizedPnl = Number(r.unrealized_pnl_pips || 0);
-        const mult = pipToDollar[r.symbol] || 1;
-        dollarPnl += (realizedPnl + unrealizedPnl) * mult;
+      journalTradeCount += Number(r.journal_total_trades || 0);
+      journalUsdTradeCount += Number(r.journal_usd_trade_count || 0);
+      if (r.realized_pnl_usd_available && r.realized_pnl_usd != null) {
+        dollarPnl += Number(r.realized_pnl_usd || 0);
       }
       openRiskUsd += Number(r.open_risk_usd || 0);
     }
+    const journalUsdComplete = journalTradeCount > 0 && journalTradeCount === journalUsdTradeCount;
     const account = data.account || {};
-    const balance = Number(account.net_liquidation_usd || 0) || dollarPnl;
+    const balance = Number(account.net_liquidation_usd || 0);
     const balEl = document.getElementById('ibkr-balance');
     balEl.textContent = '$' + balance.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
     balEl.style.color = balance > 0 ? '#00d4ff' : '#ff4444';
@@ -3152,45 +3496,138 @@ async function loadIBKRFleet() {
         : 'No broker snapshot';
       accountStripEl.style.color = account.account_id ? '#00d4ff' : '#ff9800';
     }
+    const csCoinsEl = document.getElementById('cs-active-coins');
+    if (csCoinsEl) {
+      const watcherCount = data.runners.filter(r => r.current_stage === 'watcher').length;
+      const paperCount = data.runners.filter(r => r.current_stage === 'paper').length;
+      const realCount = data.runners.filter(r => r.current_stage === 'real' || r.current_stage === 'quarantine').length;
+      csCoinsEl.textContent = watcherCount + ' watcher | ' + paperCount + ' QA | ' + realCount + ' prod';
+    }
+    const csPhaseEl = document.getElementById('cs-phase');
+    if (csPhaseEl) {
+      const deploymentSummary = (data.deployment && data.deployment.summary) ? data.deployment.summary : {};
+      const readyForReal = Number(deploymentSummary.ready_for_real || 0);
+      csPhaseEl.textContent = readyForReal > 0 ? 'Promotion Ready' : 'Watcher -> QA -> Prod';
+      csPhaseEl.style.color = readyForReal > 0 ? '#00e676' : '#e040fb';
+    }
     const deltaEl = document.getElementById('ibkr-balance-delta');
-    const sign = dollarPnl >= 0 ? '+' : '';
-    deltaEl.textContent = sign + '$' + dollarPnl.toFixed(2);
-    deltaEl.style.color = dollarPnl >= 0 ? '#00e676' : '#ff4444';
+    const pnlSourceEl = document.getElementById('ibkr-pnl-source');
+    if (journalUsdComplete) {
+      const sign = dollarPnl >= 0 ? '+' : '';
+      deltaEl.textContent = sign + '$' + dollarPnl.toFixed(2);
+      deltaEl.style.color = dollarPnl >= 0 ? '#00e676' : '#ff4444';
+      if (pnlSourceEl) pnlSourceEl.textContent = '(' + journalUsdTradeCount + '/' + journalTradeCount + ' trades)';
+    } else {
+      deltaEl.textContent = 'n/a';
+      deltaEl.style.color = '#7b8ab8';
+      if (pnlSourceEl) pnlSourceEl.textContent = '(' + journalUsdTradeCount + '/' + journalTradeCount + ' trades journal-backed)';
+    }
     const openRiskEl = document.getElementById('ibkr-open-risk');
     if (openRiskEl) {
       openRiskEl.textContent = '$' + openRiskUsd.toFixed(2);
       openRiskEl.style.color = openRiskUsd > 0 ? '#ff9800' : '#7b8ab8';
     }
 
-    // Seed balance history from trade data on first load
-    if (balanceHistory.length === 0 && data.runners) {
-      let allTrades = [];
-      for (const r of data.runners) {
-        if (r.trades) {
-          for (const t of r.trades) {
-            const pnlUsd = parseFloat(t.pnl_usd || 0);
-            const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
-            const ts = t.ts || '';
-            const mult = pipToDollar[r.symbol] || 1;
-            allTrades.push({ts: ts, dollarPnl: pnlUsd || (pnl * mult)});
-          }
-        }
-      }
-      // Sort by timestamp
-      allTrades.sort((a, b) => a.ts.localeCompare(b.ts));
-      // Build cumulative balance history
-      let cumBalance = balance - dollarPnl;
-      for (const t of allTrades) {
-        cumBalance += t.dollarPnl;
-        const tsLabel = (t.ts && String(t.ts).length >= 16)
-          ? String(t.ts).substring(11, 16)
-          : '??:??';
-        balanceHistory.push({time: tsLabel, value: cumBalance});
-      }
-    }
-
     // Update balance history chart with current value
     updateBalanceChart(balance);
+
+    // Single-source truth summary
+    const deployment = data.deployment || {};
+    const deploymentSummary = deployment.summary || {};
+    const watcherRunners = data.runners.filter(r => r.current_stage === 'watcher');
+    const paperRunners = data.runners.filter(r => r.current_stage === 'paper');
+    const realRunners = data.runners.filter(r => r.current_stage === 'real' || r.current_stage === 'quarantine');
+    const paperValidTrades = paperRunners.reduce((acc, r) => acc + Number(r.valid_trades || 0), 0);
+    const topWatcherBlocked = watcherRunners
+      .slice()
+      .sort((a, b) => Number(b.blocked_signals_24h || 0) - Number(a.blocked_signals_24h || 0))[0];
+    const brokerLineEl = document.getElementById('truth-broker-line');
+    if (brokerLineEl) {
+      const age = account.snapshot_age_s != null ? account.snapshot_age_s + 's old' : 'age unknown';
+      brokerLineEl.textContent = account.account_id
+        ? account.account_id + ' | $' + balance.toFixed(2) + ' | ' + age
+        : 'No broker snapshot';
+    }
+    const usdCoverageEl = document.getElementById('truth-usd-coverage');
+    if (usdCoverageEl) {
+      usdCoverageEl.textContent = journalUsdTradeCount + '/' + journalTradeCount + ' trades with pnl_usd'
+        + (journalUsdComplete ? ' | COMPLETE' : ' | INCOMPLETE');
+      usdCoverageEl.style.color = journalUsdComplete ? '#00e676' : '#ffb74d';
+    }
+    const watcherLineEl = document.getElementById('truth-watcher-line');
+    if (watcherLineEl) {
+      watcherLineEl.textContent = topWatcherBlocked && Number(topWatcherBlocked.blocked_signals_24h || 0) > 0
+        ? topWatcherBlocked.name + ' blocked ' + topWatcherBlocked.blocked_signals_24h + ' in 24h'
+            + ' | ' + (topWatcherBlocked.blocked_top_reason || '').replace('RISK_BLOCKED_', '')
+        : 'No elevated watcher guard pressure';
+    }
+    const paperLineEl = document.getElementById('truth-paper-line');
+    if (paperLineEl) {
+      const bestPaper = paperRunners
+        .slice()
+        .sort((a, b) => Number(b.valid_trades || 0) - Number(a.valid_trades || 0))[0];
+      paperLineEl.textContent = bestPaper
+        ? bestPaper.name + ' leads | ' + bestPaper.valid_trades + '/60 | total valid=' + paperValidTrades
+        : 'No paper QA runners found';
+    }
+    const realLineEl = document.getElementById('truth-real-line');
+    if (realLineEl) {
+      const realReady = Number(deploymentSummary.ready_for_real || 0);
+      realLineEl.textContent = realRunners.length
+        ? realRunners.length + ' real runner(s) deployed | broker $' + balance.toFixed(2)
+        : (realReady > 0 ? realReady + ' paper runner(s) ready for real config generation' : 'No real-money configs deployed yet');
+    }
+
+    // Paper model account
+    const paperModel = data.paper_model || {};
+    const modelStartEl = document.getElementById('paper-model-start');
+    const modelEquityEl = document.getElementById('paper-model-equity');
+    const modelRiskEl = document.getElementById('paper-model-risk');
+    const modelBudgetEl = document.getElementById('paper-model-budget');
+    const modelCapEl = document.getElementById('paper-model-cap');
+    const modelStatusEl = document.getElementById('paper-model-status');
+    const modelTradesEl = document.getElementById('paper-model-trades');
+    if (modelStartEl) modelStartEl.textContent = '$' + Number(paperModel.start_equity_usd || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+    if (modelEquityEl) {
+      const ret = Number(paperModel.return_pct || 0);
+      modelEquityEl.textContent = '$' + Number(paperModel.current_equity_usd || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+      modelEquityEl.style.color = ret >= 0 ? '#00e676' : '#ff4444';
+    }
+    if (modelRiskEl) modelRiskEl.textContent = (Number(paperModel.per_trade_risk_pct || 0) * 100).toFixed(2) + '%';
+    if (modelBudgetEl) modelBudgetEl.textContent = '$' + Number(paperModel.current_risk_budget_usd || 0).toFixed(2);
+    if (modelCapEl) modelCapEl.textContent = (Number(paperModel.risk_cap_pct || 0) * 100).toFixed(2) + '% | $' + Number(paperModel.current_cap_budget_usd || 0).toFixed(2);
+    if (modelStatusEl) {
+      const ret = Number(paperModel.return_pct || 0);
+      const retText = (ret >= 0 ? '+' : '') + ret.toFixed(2) + '%';
+      const coverage = (paperModel.coverage_gaps || []).length ? ' | gaps: ' + paperModel.coverage_gaps.join(', ') : '';
+      modelStatusEl.innerHTML =
+        '<div style="color:' + (ret >= 0 ? '#00e676' : '#ff4444') + ';font-weight:bold;">'
+          + retText + ' modeled return | ' + (paperModel.modeled_trade_count || 0) + ' valid trades'
+          + '</div>'
+        + '<div style="color:#7b8ab8;margin-top:4px;">'
+          + 'Win rate ' + Number(paperModel.win_rate || 0).toFixed(1) + '% | '
+          + 'Max DD $' + Number(paperModel.max_drawdown_usd || 0).toFixed(2) + ' | '
+          + 'shared risk ladder auto-steps toward the 3% cap'
+          + coverage
+          + '</div>';
+    }
+    if (modelTradesEl) {
+      const trades = paperModel.recent_trades || [];
+      modelTradesEl.innerHTML = trades.length
+        ? trades.slice().reverse().map(t => {
+            const pnl = Number(t.modeled_pnl_usd || 0);
+            const pnlColor = pnl >= 0 ? '#00e676' : '#ff4444';
+            return '<div style="padding:4px 0;border-bottom:1px solid #141b2d;">'
+              + '<span style="color:#00d4ff;">' + (t.name || t.symbol || '') + '</span>'
+              + ' <span style="color:#7b8ab8;">R=' + Number(t.r_multiple || 0).toFixed(2) + '</span>'
+              + ' <span style="color:' + pnlColor + ';font-weight:bold;">'
+              + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2)
+              + '</span>'
+              + ' <span style="color:#555;">→ $' + Number(t.equity_after || 0).toFixed(2) + '</span>'
+              + '</div>';
+          }).join('')
+        : '<div style="color:#7b8ab8;">No modeled paper-QA trades yet.</div>';
+    }
 
     // Cohort summary
     const csEl = document.getElementById('ibkr-cohort-status');
@@ -3200,9 +3637,9 @@ async function loadIBKRFleet() {
     csEl.textContent = cohortStatus;
     csEl.style.color = csColors[cohortStatus] || '#888';
     let cbHtml = '';
-    for (const r of data.runners) {
+    for (const r of paperRunners) {
       const vt = r.valid_trades || 0;
-      const tgt = r.cohort_target || 30;
+      const tgt = r.cohort_target || 60;
       const cpct = Math.min(100, (vt/tgt)*100);
       const pc = cpct >= 100 ? '#00ff88' : cpct >= 50 ? '#ffaa00' : '#ff4444';
       cbHtml += `<div style="flex:1;"><div style="font-size:0.65em;color:#888;margin-bottom:2px;">${r.name} (${vt}/${tgt})</div>
@@ -3213,8 +3650,12 @@ async function loadIBKRFleet() {
     cbEl.innerHTML = cbHtml;
 
     // Runner cards
-    const cardsDiv = document.getElementById('ibkr-runner-cards');
-    cardsDiv.innerHTML = '';
+    const watcherCardsDiv = document.getElementById('ibkr-watcher-cards');
+    const paperCardsDiv = document.getElementById('ibkr-paper-cards');
+    const realCardsDiv = document.getElementById('ibkr-real-cards');
+    watcherCardsDiv.innerHTML = '';
+    paperCardsDiv.innerHTML = '';
+    realCardsDiv.innerHTML = '';
 
     for (const r of data.runners) {
       const statusColors = {RUNNING:'#00ff88',IDLE:'#ffaa00',STALE:'#ff4444',ERROR:'#ff4444',NOT_STARTED:'#555'};
@@ -3235,17 +3676,32 @@ async function loadIBKRFleet() {
       // Win rate comparison to replay
       const wrLive = r.win_rate || 0;
       const wrReplay = r.replay_win_rate || 0;
-      const wrDelta = r.closed_trades >= 5 ? ((wrLive - wrReplay) * 100).toFixed(0) : '—';
+      const replayLine = r.replay_available
+        ? '(replay: ' + (wrReplay * 100).toFixed(0) + '%)'
+        : '(replay n/a)';
+      const journalUsdText = r.realized_pnl_usd_available && r.journal_usd_complete
+        ? ((Number(r.realized_pnl_usd || 0) >= 0 ? '+' : '') + '$' + Number(r.realized_pnl_usd || 0).toFixed(2))
+        : 'n/a';
+      const journalUsdColor = r.realized_pnl_usd_available && r.journal_usd_complete
+        ? (Number(r.realized_pnl_usd || 0) >= 0 ? '#00e676' : '#ff4444')
+        : '#7b8ab8';
+      const journalUsdDetail = r.realized_pnl_usd_available
+        ? (r.journal_usd_complete ? 'journal-backed' : 'partial ' + (r.journal_usd_trade_count || 0) + '/' + (r.journal_total_trades || 0))
+        : 'missing pnl_usd';
 
       let card = `<div style="background:#141b2d;border:1px solid ${borderColor};border-radius:6px;padding:12px;${pulse}">`;
 
       // Header: name + status + health
-      const laneColor = r.lane === 'validation' ? '#00d4ff' : '#7b8ab8';
+      const isProdLane = r.current_stage === 'real' || r.current_stage === 'quarantine';
+      const stageColor = isProdLane ? '#00e676' : r.current_stage === 'paper' ? '#00d4ff' : '#7b8ab8';
+      const riskPolicy = r.risk_policy || {};
+      const activeRiskPct = Number(riskPolicy.active_risk_pct || 0) * 100;
+      const capRiskPct = Number(riskPolicy.earned_cap_pct || 0) * 100;
       card += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
         <div>
           <span style="color:#00d4ff;font-weight:bold;font-size:0.95em;">${r.name}</span>
           <span style="color:#555;font-size:0.65em;margin-left:6px;">${r.strategy}</span>
-          <span style="color:${laneColor};font-size:0.6em;font-weight:bold;margin-left:6px;text-transform:uppercase;">${r.lane || 'unknown'}</span>
+          <span style="color:${stageColor};font-size:0.6em;font-weight:bold;margin-left:6px;text-transform:uppercase;">${r.current_stage || r.lane || 'unknown'}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center;">
           <span style="color:${healthColor};font-size:0.6em;font-weight:bold;">&#9679; ${healthLabel}</span>
@@ -3268,11 +3724,16 @@ async function loadIBKRFleet() {
       card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.75em;">
         <div>PnL: <span style="color:${pnlColor};font-weight:bold;">${pnl>=0?'+':''}${pnl.toFixed(1)} ${r.unit}</span></div>
         <div>WR: <span style="color:#e0e0e0;">${(wrLive*100).toFixed(0)}%</span>
-          <span style="color:#555;font-size:0.8em;">(replay: ${(wrReplay*100).toFixed(0)}%)</span></div>
+          <span style="color:#555;font-size:0.8em;">${replayLine}</span></div>
       </div>`;
       card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.68em;color:#7b8ab8;">
-        <div>Dollar PnL: <span style="color:${Number(r.realized_pnl_usd || 0) >= 0 ? '#00e676' : '#ff4444'};">${Number(r.realized_pnl_usd || 0) >= 0 ? '+' : ''}$${Number(r.realized_pnl_usd || 0).toFixed(2)}</span></div>
+        <div>Journal USD: <span style="color:${journalUsdColor};">${journalUsdText}</span>
+          <span style="color:#555;">(${journalUsdDetail})</span></div>
         <div>Broker: <span style="color:${r.broker_connected ? '#00e676' : '#ff4444'};">${r.broker_connected ? 'CONNECTED' : 'OFFLINE'}</span></div>
+      </div>`;
+      card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.68em;color:#7b8ab8;">
+        <div>Risk Policy: <span style="color:#00d4ff;">${activeRiskPct.toFixed(2)}%</span></div>
+        <div>Earned Cap: <span style="color:#ffaa00;">${capRiskPct.toFixed(2)}%</span></div>
       </div>`;
 
       // Equity mini chart
@@ -3319,7 +3780,7 @@ async function loadIBKRFleet() {
       </div>`;
 
       // Cohort progress
-      const target = r.cohort_target || 30;
+      const target = r.cohort_target || 60;
       const validT = r.valid_trades || 0;
       const pct = Math.min(100, (validT / target) * 100);
       const progColor = pct >= 100 ? '#00ff88' : pct >= 50 ? '#ffaa00' : '#ff4444';
@@ -3364,44 +3825,72 @@ async function loadIBKRFleet() {
       }
 
       card += `</div>`;
-      cardsDiv.innerHTML += card;
+      if (r.current_stage === 'real' || r.current_stage === 'quarantine') realCardsDiv.innerHTML += card;
+      else if (r.current_stage === 'paper') paperCardsDiv.innerHTML += card;
+      else watcherCardsDiv.innerHTML += card;
     }
+    if (!watcherCardsDiv.innerHTML) watcherCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No watcher runners staged right now.</div>';
+    if (!paperCardsDiv.innerHTML) paperCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No paper QA runners staged right now.</div>';
+    if (!realCardsDiv.innerHTML) realCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No real-money runners deployed yet.</div>';
 
-    // Trades table
-    const tradesDiv = document.getElementById('ibkr-trades-table');
+    // Stage-specific trade journals
     let tradeRows = [];
     for (const r of data.runners) {
-      for (const t of (r.trades || [])) { tradeRows.push({...t, runner: r.name, unit: r.unit}); }
+      for (const t of (r.trades || [])) { tradeRows.push({...t, runner: r.name, unit: r.unit, stage: r.current_stage}); }
     }
     tradeRows.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+    const prodTradeRows = tradeRows.filter(t => t.stage === 'real' || t.stage === 'quarantine');
+    const qaTradeRows = tradeRows.filter(t => t.stage === 'paper');
+    renderStageTradeJournal('prod-trades-table', prodTradeRows, 'No real-money trades yet.', '#00e676');
+    renderStageTradeJournal('qa-trades-table', qaTradeRows, 'No paper-QA trades yet.', '#00d4ff');
 
-    if (tradeRows.length === 0) {
-      tradesDiv.innerHTML = '<div style="color:#666;">No trades yet. Waiting for triggers during active sessions.</div>';
-    } else {
-      let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;font-size:0.9em;">' +
-        '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Dur</th></tr>';
-      for (const t of tradeRows.slice(0, 25)) {
-        const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
-        const pc = pnl >= 0 ? '#00ff88' : '#ff4444';
-        const dc = t.direction === 'long' ? '#00ff88' : '#ff4444';
-        html += `<tr style="border-bottom:1px solid #0d1117;">
-          <td style="padding:2px 3px;">${(t.ts || '').substring(11,19)}</td>
-          <td>${t.runner}</td>
-          <td style="color:${dc};font-weight:bold;">${(t.direction||'').toUpperCase()}</td>
-          <td>${t.entry_px}</td><td>${t.exit_px}</td>
-          <td style="color:${pc};font-weight:bold;">${pnl>=0?'+':''}${pnl.toFixed(1)}</td>
-          <td style="color:#888;">${t.exit_reason || ''}</td>
-          <td style="color:#888;">${t.duration_min ? Number(t.duration_min).toFixed(0)+'m' : ''}</td></tr>`;
-      }
-      html += '</table>';
-      tradesDiv.innerHTML = html;
+    // Stage history charts
+    const paperHistory = (paperModel.history || []);
+    const qaEquitySeries = [];
+    if (paperModel.start_equity_usd != null) qaEquitySeries.push(Number(paperModel.start_equity_usd));
+    for (const item of paperHistory) {
+      const equityAfter = Number(item.equity_after || 0);
+      if (isFinite(equityAfter)) qaEquitySeries.push(equityAfter);
     }
+    renderSeriesChart('qa-model-equity-chart', 'qa-equity-chart-label', qaEquitySeries, {
+      formatter: (v) => '$' + Number(v).toFixed(2),
+      emptyText: 'No modeled QA equity history yet.',
+    });
 
-    // Signals table (entries only + recent NO_TRIGGER)
+    const qaFleetSeries = [0];
+    if (paperModel.start_equity_usd != null) {
+      for (const item of paperHistory) {
+        const equityAfter = Number(item.equity_after || 0);
+        if (!isFinite(equityAfter)) continue;
+        qaFleetSeries.push(equityAfter - Number(paperModel.start_equity_usd));
+      }
+    }
+    renderSeriesChart('ibkr-pnl-chart', 'qa-fleet-history-label', qaFleetSeries, {
+      formatter: (v) => '$' + Number(v).toFixed(2),
+      emptyText: 'No QA fleet history yet.',
+    });
+
+    const prodUsdTrades = prodTradeRows
+      .filter(t => t.pnl_usd !== undefined && t.pnl_usd !== null && t.pnl_usd !== '')
+      .sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
+    const prodFleetSeries = [0];
+    let prodCum = 0;
+    for (const t of prodUsdTrades) {
+      const pnlUsd = Number(t.pnl_usd || 0);
+      if (!isFinite(pnlUsd)) continue;
+      prodCum += pnlUsd;
+      prodFleetSeries.push(Number(prodCum.toFixed(2)));
+    }
+    renderSeriesChart('prod-fleet-pnl-chart', 'prod-fleet-history-label', prodFleetSeries, {
+      formatter: (v) => '$' + Number(v).toFixed(2),
+      emptyText: 'No real-money journal USD history yet.',
+    });
+
+    // Signals table — all signal feeds across watcher, QA, and prod
     const sigsDiv = document.getElementById('ibkr-signals-table');
     let allSigs = [];
     for (const r of data.runners) {
-      for (const s of (r.recent_signals || [])) { allSigs.push({...s, runner: r.name}); }
+      for (const s of (r.recent_signals || [])) { allSigs.push({...s, runner: r.name, stage: r.current_stage}); }
     }
     allSigs.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
@@ -3409,13 +3898,15 @@ async function loadIBKRFleet() {
       sigsDiv.innerHTML = '<div style="color:#666;">No signals yet.</div>';
     } else {
       let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:#00d4ff;border-bottom:1px solid #1e2a42;font-size:0.9em;">' +
-        '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Action</th><th>Dir</th><th>Price</th><th>Range%</th><th>Vol Z</th><th>Accel</th><th>Dist</th></tr>';
-      for (const s of allSigs.slice(0, 30)) {
+        '<th style="text-align:left;padding:3px;">Timestamp</th><th>Stage</th><th>Runner</th><th>Action</th><th>Dir</th><th>Price</th><th>Range%</th><th>Vol Z</th><th>Accel</th><th>Dist</th></tr>';
+      for (const s of allSigs) {
         const isEntry = s.action === 'ENTRY';
         const ac = isEntry ? '#00ff88' : '#555';
         const bg = isEntry ? 'background:#00ff8811;' : '';
+        const stageLabel = (s.stage || '').toUpperCase() || '-';
         html += `<tr style="border-bottom:1px solid #0d1117;${bg}">
-          <td style="padding:2px 3px;">${(s.ts || '').substring(11,19)}</td>
+          <td style="padding:2px 3px;">${formatTsShort(s.ts)}</td>
+          <td style="color:#7b8ab8;">${stageLabel}</td>
           <td>${s.runner}</td>
           <td style="color:${ac};font-weight:${isEntry?'bold':'normal'};">${s.action}</td>
           <td style="color:${s.direction==='long'?'#00ff88':s.direction==='short'?'#ff4444':'#555'}">${s.direction||'-'}</td>
@@ -3427,76 +3918,6 @@ async function loadIBKRFleet() {
       }
       html += '</table>';
       sigsDiv.innerHTML = html;
-    }
-
-    // Fleet P&L Chart
-    // Build fleet equity curve: start at 0, add each trade's PnL
-    const allPnlData = [0]; // always start with zero baseline
-    const allTrades = [];
-    for (const r of data.runners) {
-      for (const t of (r.trades || [])) {
-        const pnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
-        allTrades.push({ts: t.ts, pnl: pnl, runner: r.name});
-      }
-    }
-    allTrades.sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
-    let cumPnl = 0;
-    for (const t of allTrades) {
-      cumPnl += t.pnl;
-      allPnlData.push(cumPnl);
-    }
-
-    const canvas = document.getElementById('ibkr-pnl-chart');
-    if (canvas && allPnlData.length >= 1) {
-      const ctx = canvas.getContext('2d');
-      const w = canvas.parentElement.clientWidth - 28;
-      canvas.width = w;
-      const h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
-
-      const mn = Math.min(0, ...allPnlData);
-      const mx = Math.max(0, ...allPnlData);
-      const range = (mx - mn) || 1;
-      const pad = 5;
-
-      // Zero line
-      const zeroY = h - pad - ((0 - mn) / range) * (h - pad * 2);
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(0, zeroY);
-      ctx.lineTo(w, zeroY);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // PnL line
-      ctx.strokeStyle = allPnlData[allPnlData.length - 1] >= 0 ? '#00ff88' : '#ff4444';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      const denom = Math.max(1, allPnlData.length - 1);
-      for (let i = 0; i < allPnlData.length; i++) {
-        const x = (i / denom) * w;
-        const y = h - pad - ((allPnlData[i] - mn) / range) * (h - pad * 2);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-
-      // Fill under curve
-      ctx.lineTo(w, zeroY);
-      ctx.lineTo(0, zeroY);
-      ctx.closePath();
-      ctx.fillStyle = allPnlData[allPnlData.length - 1] >= 0 ? 'rgba(0,255,136,0.08)' : 'rgba(255,68,68,0.08)';
-      ctx.fill();
-
-      // Labels
-      ctx.fillStyle = '#888';
-      ctx.font = '10px monospace';
-      ctx.fillText(mx.toFixed(1), 2, 12);
-      ctx.fillText(mn.toFixed(1), 2, h - 2);
-      const lastVal = allPnlData[allPnlData.length - 1];
-      ctx.fillStyle = lastVal >= 0 ? '#00ff88' : '#ff4444';
-      ctx.fillText((lastVal >= 0 ? '+' : '') + lastVal.toFixed(1), w - 60, 12);
     }
 
     // Per-pair equity + drawdown section
@@ -5783,7 +6204,7 @@ async function loadLeaderboard() {
 function updateBalanceChart(balance) {
     const now = new Date();
     const label = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
-    // Only add a point when the balance actually changes
+    // Only add a point when broker-reported equity actually changes.
     const last = balanceHistory.length > 0 ? balanceHistory[balanceHistory.length - 1] : null;
     if (!last || Math.abs(last.value - balance) > 0.005) {
       balanceHistory.push({time: label, value: balance});
@@ -5801,24 +6222,13 @@ function updateBalanceChart(balance) {
     if (balanceHistory.length < 2) return;
 
     const values = balanceHistory.map(b => b.value);
-    const minVal = Math.min(...values) - 10;
-    const maxVal = Math.max(...values) + 10;
+    const minVal = Math.min(...values) - 1;
+    const maxVal = Math.max(...values) + 1;
     const range = maxVal - minVal || 1;
 
-    // Draw $10K baseline
-    const baseY = H - ((10000 - minVal) / range) * H;
-    ctx.strokeStyle = '#333';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(0, baseY);
-    ctx.lineTo(W, baseY);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
     // Draw balance line
-    const isProfit = values[values.length-1] >= 10000;
-    ctx.strokeStyle = isProfit ? '#00e676' : '#ff4444';
+    const isUp = values[values.length-1] >= values[0];
+    ctx.strokeStyle = isUp ? '#00e676' : '#ff4444';
     ctx.lineWidth = 2;
     ctx.beginPath();
     for (let i = 0; i < values.length; i++) {
@@ -5833,85 +6243,178 @@ function updateBalanceChart(balance) {
     ctx.lineTo(W, H);
     ctx.lineTo(0, H);
     ctx.closePath();
-    ctx.fillStyle = isProfit ? 'rgba(0,230,118,0.08)' : 'rgba(255,68,68,0.08)';
+    ctx.fillStyle = isUp ? 'rgba(0,230,118,0.08)' : 'rgba(255,68,68,0.08)';
     ctx.fill();
 
     // Label
     const current = values[values.length-1];
-    const delta = current - 10000;
-    const labelEl = document.getElementById('balance-chart-label');
+    const delta = current - values[0];
+    const labelEl = document.getElementById('prod-equity-chart-label') || document.getElementById('balance-chart-label');
     if (labelEl) {
-      labelEl.textContent = '$' + current.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' (' + (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2) + ')';
+      labelEl.textContent = '$' + current.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' (' + (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2) + ' since page load)';
       labelEl.style.color = delta >= 0 ? '#00e676' : '#ff4444';
     }
   }
 
-// Daily Performance Journal
+function renderSeriesChart(canvasId, labelId, values, opts = {}) {
+    const canvas = document.getElementById(canvasId);
+    const labelEl = document.getElementById(labelId);
+    if (!canvas) return;
+
+    const points = Array.isArray(values) ? values.filter(v => typeof v === 'number' && isFinite(v)) : [];
+    const emptyText = opts.emptyText || 'No history yet.';
+    if (labelEl && points.length < 2) {
+      labelEl.textContent = emptyText;
+      labelEl.style.color = '#7b8ab8';
+    }
+
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width = canvas.offsetWidth;
+    const H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    if (points.length < 2) return;
+
+    const minVal = Math.min(...points);
+    const maxVal = Math.max(...points);
+    const pad = 6;
+    const range = (maxVal - minVal) || 1;
+    const start = points[0];
+    const end = points[points.length - 1];
+    const isUp = end >= start;
+    const stroke = isUp ? (opts.positiveColor || '#00e676') : (opts.negativeColor || '#ff4444');
+    const fill = isUp ? (opts.positiveFill || 'rgba(0,230,118,0.08)') : (opts.negativeFill || 'rgba(255,68,68,0.08)');
+
+    let zeroY = null;
+    if (opts.showZeroLine !== false && minVal <= 0 && maxVal >= 0) {
+      zeroY = H - pad - ((0 - minVal) / range) * (H - pad * 2);
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, zeroY);
+      ctx.lineTo(W, zeroY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < points.length; i++) {
+      const x = (i / (points.length - 1)) * W;
+      const y = H - pad - ((points[i] - minVal) / range) * (H - pad * 2);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    const baselineY = zeroY != null ? zeroY : H - pad;
+    ctx.lineTo(W, baselineY);
+    ctx.lineTo(0, baselineY);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+
+    if (labelEl) {
+      const fmt = opts.formatter || ((v) => Number(v).toFixed(2));
+      const delta = end - start;
+      labelEl.textContent = `${fmt(end)} (${delta >= 0 ? '+' : ''}${fmt(delta)} vs start)`;
+      labelEl.style.color = stroke;
+    }
+}
+
+function formatTsShort(ts) {
+    const clean = String(ts || '').replace('T', ' ');
+    if (!clean) return '';
+    return clean.length >= 19 ? clean.substring(5, 19) : clean;
+}
+
+function renderStageTradeJournal(targetId, rows, emptyMessage, accentColor) {
+    const el = document.getElementById(targetId);
+    if (!el) return;
+    if (!rows || !rows.length) {
+        el.innerHTML = `<div style="color:#7b8ab8;">${emptyMessage}</div>`;
+      return;
+    }
+
+    let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:' + accentColor + ';border-bottom:1px solid #1e2a42;font-size:0.9em;">'
+      + '<th style="text-align:left;padding:3px;">Time</th><th>Runner</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Dur</th></tr>';
+
+    for (const t of rows) {
+      const rawPnl = parseFloat(t.pnl_pips || t.pnl_pts || 0);
+      const hasUsd = t.pnl_usd !== undefined && t.pnl_usd !== null && t.pnl_usd !== '';
+      const usdPnl = hasUsd ? parseFloat(t.pnl_usd || 0) : null;
+      const pnlColor = hasUsd ? (usdPnl >= 0 ? '#00ff88' : '#ff4444') : (rawPnl >= 0 ? '#00ff88' : '#ff4444');
+      const pnlText = hasUsd
+        ? `${usdPnl >= 0 ? '+' : ''}$${usdPnl.toFixed(2)}`
+        : `${rawPnl >= 0 ? '+' : ''}${rawPnl.toFixed(1)} ${t.unit || ''}`.trim();
+      const dirColor = t.direction === 'long' ? '#00ff88' : t.direction === 'short' ? '#ff4444' : '#7b8ab8';
+      html += `<tr style="border-bottom:1px solid #0d1117;">
+        <td style="padding:2px 3px;">${formatTsShort(t.ts || t.exit_ts || t.close_ts || t.entry_ts)}</td>
+        <td>${t.runner}</td>
+        <td style="color:${dirColor};font-weight:bold;">${(t.direction || '').toUpperCase()}</td>
+        <td>${t.entry_px || ''}</td>
+        <td>${t.exit_px || ''}</td>
+        <td style="color:${pnlColor};font-weight:bold;">${pnlText}</td>
+        <td style="color:#888;">${t.exit_reason || ''}</td>
+        <td style="color:#888;">${t.duration_min ? Number(t.duration_min).toFixed(0) + 'm' : ''}</td>
+      </tr>`;
+    }
+    html += '</table>';
+    el.innerHTML = html;
+}
+
+function renderStageDailyJournal(targetId, days, emptyMessage, accentColor) {
+    const el = document.getElementById(targetId);
+    if (!el) return;
+    if (!days || !days.length) {
+      el.innerHTML = `<div style="color:#7b8ab8;">${emptyMessage}</div>`;
+      return;
+    }
+
+    let html = '<table style="width:100%;border-collapse:collapse;"><tr style="color:' + accentColor + ';border-bottom:1px solid #1e2a42;font-size:0.9em;">'
+      + '<th style="text-align:left;padding:3px;">Date</th><th>Trades</th><th>W/L</th><th>WR</th><th>Total</th><th>FX</th><th>Fut</th><th>Coverage</th></tr>';
+    for (const day of days) {
+      const total = day.total || {};
+      const fx = day.fx || {};
+      const futures = day.futures || {};
+      const usdComplete = !!total.journal_usd_complete;
+      const pnlUsd = total.pnl_usd;
+      const pnlColor = !usdComplete ? '#7b8ab8' : (pnlUsd >= 0 ? '#00e676' : '#ff4444');
+      const pnlText = usdComplete && pnlUsd != null ? `${pnlUsd >= 0 ? '+' : ''}$${Number(pnlUsd).toFixed(2)}` : 'USD n/a';
+      const fxText = fx.trades
+        ? (fx.journal_usd_complete && fx.pnl_usd != null ? `${fx.pnl_usd >= 0 ? '+' : ''}$${Number(fx.pnl_usd).toFixed(2)}` : 'USD n/a')
+        : '-';
+      const futuresText = futures.trades
+        ? (futures.journal_usd_complete && futures.pnl_usd != null ? `${futures.pnl_usd >= 0 ? '+' : ''}$${Number(futures.pnl_usd).toFixed(2)}` : 'USD n/a')
+        : '-';
+      html += `<tr style="border-bottom:1px solid #0d1117;">
+        <td style="padding:2px 3px;">${day.date}</td>
+        <td>${total.trades || 0}</td>
+        <td>${total.wins || 0}/${total.losses || 0}</td>
+        <td>${Number(total.wr || 0).toFixed(1)}%</td>
+        <td style="color:${pnlColor};font-weight:bold;">${pnlText}</td>
+        <td style="color:#7b8ab8;">${fxText}</td>
+        <td style="color:#7b8ab8;">${futuresText}</td>
+        <td style="color:#888;">${total.journal_usd_trades || 0}/${total.trades || 0}</td>
+      </tr>`;
+    }
+    html += '</table>';
+    el.innerHTML = html;
+}
+
+// Init — IBKR Fleet is the primary dashboard
 async function loadDailyPerformance() {
   try {
     const resp = await fetch('/api/daily_performance');
     const data = await resp.json();
-    const el = document.getElementById('daily-perf-body');
-    if (!data.days || !data.days.length) {
-      el.innerHTML = '<div style="color:#555;padding:10px;">No trades recorded yet.</div>';
-      return;
-    }
-
-    let html = '';
-    for (const day of data.days) {
-      const tc = day.total.pnl_usd >= 0 ? '#00e676' : '#ff4444';
-      const sign = day.total.pnl_usd >= 0 ? '+' : '';
-
-      html += `<div style="background:#0d1117;border-radius:6px;padding:12px;margin-bottom:8px;border-left:3px solid ${tc};">`;
-      html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">`;
-      html += `<span style="color:#e0e0e0;font-weight:bold;font-size:1.1em;">${day.date}</span>`;
-      html += `<span style="color:${tc};font-weight:bold;font-size:1.2em;">${sign}$${day.total.pnl_usd.toFixed(2)}</span>`;
-      html += `</div>`;
-
-      // Market breakdown
-      html += `<div style="display:flex;gap:10px;margin-bottom:6px;">`;
-
-      // FX
-      if (day.fx.trades > 0) {
-        const fxc = day.fx.pnl_usd >= 0 ? '#00e676' : '#ff4444';
-        const fxs = day.fx.pnl_usd >= 0 ? '+' : '';
-        html += `<div style="flex:1;background:#141b2d;border-radius:4px;padding:8px;">`;
-        html += `<div style="color:#00d4ff;font-weight:bold;font-size:0.9em;margin-bottom:4px;">FX</div>`;
-        html += `<div style="color:${fxc};font-weight:bold;">${fxs}$${day.fx.pnl_usd.toFixed(2)}</div>`;
-        html += `<div style="color:#7b8ab8;margin-top:2px;">${day.fx.wins}W / ${day.fx.losses}L — ${day.fx.wr}% WR</div>`;
-        html += `<div style="color:#555;font-size:0.85em;margin-top:2px;">Best: ${day.fx.best}</div>`;
-        html += `<div style="color:#555;font-size:0.85em;">Worst: ${day.fx.worst}</div>`;
-        html += `</div>`;
-      }
-
-      // Futures
-      if (day.futures.trades > 0) {
-        const ftc = day.futures.pnl_usd >= 0 ? '#00e676' : '#ff4444';
-        const fts = day.futures.pnl_usd >= 0 ? '+' : '';
-        html += `<div style="flex:1;background:#141b2d;border-radius:4px;padding:8px;">`;
-        html += `<div style="color:#ffaa00;font-weight:bold;font-size:0.9em;margin-bottom:4px;">FUTURES</div>`;
-        html += `<div style="color:${ftc};font-weight:bold;">${fts}$${day.futures.pnl_usd.toFixed(2)}</div>`;
-        html += `<div style="color:#7b8ab8;margin-top:2px;">${day.futures.wins}W / ${day.futures.losses}L — ${day.futures.wr}% WR</div>`;
-        html += `<div style="color:#555;font-size:0.85em;margin-top:2px;">Best: ${day.futures.best}</div>`;
-        html += `<div style="color:#555;font-size:0.85em;">Worst: ${day.futures.worst}</div>`;
-        html += `</div>`;
-      }
-      html += `</div>`;
-
-      // Total summary bar
-      html += `<div style="display:flex;justify-content:space-between;color:#7b8ab8;font-size:0.9em;border-top:1px solid #1e2a42;padding-top:6px;">`;
-      html += `<span>${day.total.trades} trades</span>`;
-      html += `<span>${day.total.wins}W / ${day.total.losses}L</span>`;
-      html += `<span>${day.total.wr}% WR</span>`;
-      html += `<span style="color:${tc};font-weight:bold;">P&L: ${sign}$${day.total.pnl_usd.toFixed(2)}</span>`;
-      html += `</div>`;
-      html += `</div>`;
-    }
-    el.innerHTML = html;
+    const byStage = data.by_stage || {};
+    renderStageDailyJournal('prod-daily-perf-body', byStage.real || [], 'No real-money trading days yet.', '#00e676');
+    renderStageDailyJournal('qa-daily-perf-body', byStage.paper || [], 'No paper-QA trading days yet.', '#00d4ff');
   } catch(e) { console.error('daily perf error', e); }
 }
 
-// Init — IBKR Fleet is the primary dashboard
 try {
   loadIBKRFleet();
   setInterval(loadIBKRFleet, 10000);
@@ -5928,6 +6431,7 @@ try {
       statusEl.style.color = statusColors[h.status] || '#888';
       document.getElementById('health-valid').textContent = h.valid_trades;
       document.getElementById('health-target').textContent = h.target;
+      document.getElementById('health-candidate').textContent = h.best_candidate_name ? '(' + h.best_candidate_name + ')' : '';
       document.getElementById('health-progress-bar').style.width = h.progress_pct + '%';
       const blockedEl = document.getElementById('health-blocked');
       blockedEl.textContent = h.blocked_24h || 0;
@@ -5958,7 +6462,8 @@ try {
   console.log('IBKR Fleet initialized');
 } catch(e) {
   console.error('IBKR init error:', e);
-  document.getElementById('ibkr-runner-cards').innerHTML = '<div style="color:red;padding:20px;">Dashboard JS error: ' + e.message + '</div>';
+  const target = document.getElementById('ibkr-paper-cards') || document.getElementById('ibkr-watcher-cards') || document.getElementById('ibkr-real-cards');
+  if (target) target.innerHTML = '<div style="color:red;padding:20px;">Dashboard JS error: ' + e.message + '</div>';
 }
 
 async function loadOpsOverview() {
@@ -6049,7 +6554,7 @@ window.addEventListener('load', function() {
     try { loadIBKRFleet(); } catch(e) { console.error('Fleet load error:', e); }
   } else {
     // loadIBKRFleet not defined — main script failed to parse
-    var cards = document.getElementById('ibkr-runner-cards');
+    var cards = document.getElementById('ibkr-paper-cards') || document.getElementById('ibkr-watcher-cards') || document.getElementById('ibkr-real-cards');
     if (cards) cards.innerHTML = '<div style="color:#ff4444;padding:20px;">Dashboard script error — check browser console (F12)</div>';
   }
 });

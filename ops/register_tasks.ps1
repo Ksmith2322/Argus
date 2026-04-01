@@ -17,6 +17,13 @@ $tasks = @(
         Description = "Daily git backup"
     },
     @{
+        Name = "ArgusManagedTruth"
+        Script = "C:\Argus\repo\ops\refresh_managed_truth.ps1"
+        Schedule = "MINUTE"
+        Modifier = 10
+        Description = "Refresh staged governance and oversight truth every 10 minutes"
+    },
+    @{
         Name = "ArgusCohortReport"
         Script = "C:\Argus\repo\ops\run_cohort_report.ps1"
         Schedule = "DAILY"
@@ -48,14 +55,14 @@ $tasks = @(
     },
     @{
         Name = "ArgusWatchdog"
-        Script = "C:\Argus\repo\ops\watchdog.ps1"
+        Script = "C:\Argus\repo\ops\watchdog_managed.ps1"
         Schedule = "ONSTART"
-        Description = "Runner watchdog — auto-restart on crash"
+        Description = "Runner watchdog - auto-restart on crash"
     }
 )
 
 foreach ($task in $tasks) {
-    Write-Host "  Registering: $($task.Name) — $($task.Description)" -ForegroundColor White
+    Write-Host "  Registering: $($task.Name) - $($task.Description)" -ForegroundColor White
 
     $tr = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$($task.Script)`""
 
@@ -63,6 +70,9 @@ foreach ($task in $tasks) {
 
     if ($task.Schedule -eq "DAILY") {
         $args += @("/SC", "DAILY", "/ST", $task.Time)
+    }
+    elseif ($task.Schedule -eq "MINUTE") {
+        $args += @("/SC", "MINUTE", "/MO", "$($task.Modifier)")
     }
     elseif ($task.Schedule -eq "WEEKLY") {
         $args += @("/SC", "WEEKLY", "/D", $task.Day, "/ST", $task.Time)

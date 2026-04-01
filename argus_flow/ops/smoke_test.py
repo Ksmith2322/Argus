@@ -6,6 +6,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -19,42 +20,82 @@ except ImportError:
     sys.exit(1)
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
+logging.getLogger("ib_insync").setLevel(logging.CRITICAL)
 
-def test_gateway():
-    """Test IBKR gateway connectivity."""
-    print("TEST 1: Gateway connectivity")
-    try:
+IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
+SMOKE_BASE_CLIENT_ID = int(os.getenv("IBKR_SMOKE_TEST_CLIENT_ID", "18000"))
+
+
+def connect_readonly(label: str, base_client_id: int, attempts: int = 20) -> IB | None:
+    """Connect in read-only mode and avoid client-id collisions with the live fleet."""
+    last_error: Exception | None = None
+
+    for offset in range(attempts):
+        client_id = base_client_id + offset
         ib = IB()
-        ib.connect("127.0.0.1", int(os.getenv("IBKR_PORT", "4002")), clientId=80, timeout=5)
+        try:
+            ib.connect(
+                IBKR_HOST,
+                IBKR_PORT,
+                clientId=client_id,
+                timeout=5,
+                readonly=True,
+            )
+            print(f"  [OK] {label}: connected with clientId={client_id} (readonly)")
+            return ib
+        except Exception as exc:
+            last_error = exc
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            if "client id is already in use" in str(exc).lower():
+                continue
+            break
+
+    print(f"  [FAIL] {label}: {last_error}")
+    return None
+
+
+def test_gateway() -> tuple[bool, IB | None]:
+    """Test IBKR gateway connectivity and account summary."""
+    print("TEST 1: Gateway connectivity")
+    ib = connect_readonly("gateway", SMOKE_BASE_CLIENT_ID)
+    if not ib:
+        return False, None
+
+    try:
         accounts = ib.managedAccounts()
         print(f"  [OK] Connected. Account: {accounts}")
 
         for item in ib.accountSummary():
             if item.tag in ["TotalCashValue", "NetLiquidation"]:
                 print(f"  [OK] {item.tag}: {item.value} {item.currency}")
+        return True, ib
+    except Exception as exc:
+        print(f"  [FAIL] Gateway summary: {exc}")
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        return False, None
 
-        ib.disconnect()
-        return True
-    except Exception as e:
-        print(f"  [FAIL] {e}")
-        return False
 
-
-def test_instrument(ib, name, contract, what_to_show="BID"):
+def test_instrument(ib: IB, name, contract, what_to_show: str = "BID") -> bool:
     """Test one instrument: qualify, subscribe, get data."""
     print(f"\nTEST: {name}")
 
-    # Qualify
     qualified = ib.qualifyContracts(contract)
     if not qualified:
-        print(f"  [FAIL] Could not qualify contract")
+        print("  [FAIL] Could not qualify contract")
         return False
     contract = qualified[0]
     print(f"  [OK] Qualified: conId={contract.conId}")
 
-    # Historical data
     try:
         bars = ib.reqHistoricalData(
             contract, endDateTime="", durationStr="1 D",
@@ -64,19 +105,18 @@ def test_instrument(ib, name, contract, what_to_show="BID"):
         if bars:
             print(f"  [OK] Historical: {len(bars)} bars, last={bars[-1].close}")
         else:
-            print(f"  [WARN] No historical bars (market may be closed)")
-    except Exception as e:
-        print(f"  [WARN] Historical data: {e}")
+            print("  [WARN] No historical bars (market may be closed)")
+    except Exception as exc:
+        print(f"  [WARN] Historical data: {exc}")
 
-    # Live data
     try:
         ticker = ib.reqMktData(contract, snapshot=False)
         ib.sleep(2)
         bid = ticker.bid if ticker.bid and ticker.bid > 0 else "closed"
         ask = ticker.ask if ticker.ask and ticker.ask > 0 else "closed"
         print(f"  [OK] Live data: bid={bid} ask={ask}")
-    except Exception as e:
-        print(f"  [WARN] Live data: {e}")
+    except Exception as exc:
+        print(f"  [WARN] Live data: {exc}")
 
     return True
 
@@ -86,13 +126,13 @@ def test_configs():
     print("\nTEST: Config validation")
     config_dir = Path("argus_flow/configs")
     if not config_dir.exists():
-        print(f"  [FAIL] Config directory not found")
+        print("  [FAIL] Config directory not found")
         return False
 
     all_ok = True
     for cfg_file in sorted(config_dir.glob("*_paper_v1.json")):
         try:
-            cfg = json.loads(cfg_file.read_text())
+            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
             required = ["strategy", "version", "symbol", "trigger", "risk", "replay_expectations"]
             missing = [k for k in required if k not in cfg]
             if missing:
@@ -100,54 +140,43 @@ def test_configs():
                 all_ok = False
             else:
                 print(f"  [OK] {cfg_file.name}: {cfg['strategy']} {cfg['symbol']}")
-        except Exception as e:
-            print(f"  [FAIL] {cfg_file.name}: {e}")
+        except Exception as exc:
+            print(f"  [FAIL] {cfg_file.name}: {exc}")
             all_ok = False
 
     return all_ok
 
 
 def test_log_dirs():
-    """Verify log directories exist and are writable."""
+    """Verify representative live log directories exist and are readable."""
     print("\nTEST: Log directories")
-    dirs = ["argus_flow/logs/eurusd", "argus_flow/logs/mnq", "argus_flow/logs/gbpusd"]
     all_ok = True
-    for d in dirs:
-        p = Path(d)
-        p.mkdir(parents=True, exist_ok=True)
-        test_file = p / ".write_test"
+    dirs = [Path("argus_flow/logs") / name for name in ("eurusd", "mnq", "gbpusd")]
+    for p in dirs:
         try:
-            test_file.write_text("test")
-            test_file.unlink()
-            print(f"  [OK] {d}")
-        except Exception as e:
-            print(f"  [FAIL] {d}: {e}")
+            if not p.exists():
+                raise FileNotFoundError("log dir missing")
+            _ = [child.name for child in p.iterdir()]
+            print(f"  [OK] {p}")
+        except Exception as exc:
+            print(f"  [FAIL] {p}: {exc}")
             all_ok = False
     return all_ok
 
 
 def test_restart_safety():
-    """Verify state files can be written and read back."""
-    print("\nTEST: State file read/write")
-    dirs = ["argus_flow/logs/eurusd", "argus_flow/logs/mnq", "argus_flow/logs/gbpusd"]
+    """Verify representative live state files are readable JSON."""
+    print("\nTEST: State file read")
     all_ok = True
+    dirs = [Path("argus_flow/logs") / name for name in ("eurusd", "mnq", "gbpusd")]
     for d in dirs:
-        state_file = Path(d) / "state.json"
-        test_state = {
-            "position": "FLAT",
-            "entry_price": 0.0,
-            "trade_count": 0,
-            "pnl_pips": 0.0,
-            "test": True,
-        }
+        state_file = d / "state.json"
         try:
-            state_file.write_text(json.dumps(test_state))
-            loaded = json.loads(state_file.read_text())
-            assert loaded["position"] == "FLAT"
-            state_file.unlink()
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
+            assert "position" in loaded
             print(f"  [OK] {d}")
-        except Exception as e:
-            print(f"  [FAIL] {d}: {e}")
+        except Exception as exc:
+            print(f"  [FAIL] {d}: {exc}")
             all_ok = False
     return all_ok
 
@@ -158,34 +187,28 @@ def main():
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print("=" * 60)
 
-    results = {}
+    results: dict[str, bool] = {}
 
-    # Gateway
-    results["gateway"] = test_gateway()
-
-    # Configs
+    gateway_ok, ib = test_gateway()
+    results["gateway"] = gateway_ok
     results["configs"] = test_configs()
-
-    # Log dirs
     results["log_dirs"] = test_log_dirs()
-
-    # State files
     results["restart"] = test_restart_safety()
 
-    # Instruments (only if gateway connected)
-    if results["gateway"]:
-        ib = IB()
-        ib.connect("127.0.0.1", int(os.getenv("IBKR_PORT", "4002")), clientId=81, timeout=5)
-
-        results["eurusd"] = test_instrument(ib, "EUR/USD", Forex("EURUSD"), "BID")
-        time.sleep(1)
-        results["gbpusd"] = test_instrument(ib, "GBP/USD", Forex("GBPUSD"), "BID")
-        time.sleep(1)
-        results["mnq"] = test_instrument(
-            ib, "MNQ", Future(symbol="MNQ", exchange="CME", lastTradeDateOrContractMonth="20260618"), "TRADES"
-        )
-
-        ib.disconnect()
+    if gateway_ok and ib is not None:
+        try:
+            results["eurusd"] = test_instrument(ib, "EUR/USD", Forex("EURUSD"), "BID")
+            time.sleep(1)
+            results["gbpusd"] = test_instrument(ib, "GBP/USD", Forex("GBPUSD"), "BID")
+            time.sleep(1)
+            results["mnq"] = test_instrument(
+                ib,
+                "MNQ",
+                Future(symbol="MNQ", exchange="CME", lastTradeDateOrContractMonth="20260618"),
+                "TRADES",
+            )
+        finally:
+            ib.disconnect()
 
     # Summary
     print(f"\n{'='*60}")

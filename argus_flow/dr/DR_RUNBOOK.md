@@ -77,8 +77,8 @@ python -m argus_flow.ops.artifact_divergence
 # 1. Note the git_sha that changed
 # 2. Existing trades remain but won't count toward promotion
 # 3. New trades will have new git_sha
-# 4. promotion_gate.py will flag git_sha_consistent as FAIL
-# 5. Once 30 new valid trades accumulate with same git_sha, promotion re-eligible
+# 4. promotion_gate_v2.py will flag git_sha_consistent as FAIL
+# 5. Once 60 new valid trades accumulate with same git_sha, promotion re-eligible
 ```
 
 ### 6. Data Loss Recovery

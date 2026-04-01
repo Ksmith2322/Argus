@@ -12,13 +12,14 @@ import hashlib
 import json
 import shutil
 import sys
-import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
-TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".tmp_tests"
+TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".tmp_fx_tests"
 
 _pass_count = 0
 _fail_count = 0
@@ -46,6 +47,13 @@ def _load_configs() -> list[tuple[str, dict]]:
             continue
         configs.append((p.name, json.loads(p.read_text(encoding="utf-8"))))
     return configs
+
+
+def _new_test_dir(prefix: str) -> Path:
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    path = TEST_TMP_ROOT / f"{prefix}_{uuid.uuid4().hex[:8]}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 # ═════════════════════════════════════════════════════════════
@@ -260,6 +268,84 @@ def test_config_hash_integrity():
         _ok(f"All {len(configs)} config hashes match hashes.json")
 
 
+def test_fleet_registry_stage_defaults():
+    from argus_flow.ops.fleet_registry import (
+        STAGE_PAPER,
+        STAGE_QUARANTINE,
+        default_log_dir,
+        infer_stage,
+        normalize_stage,
+        resolve_risk_policy,
+        stage_account,
+        stage_execution_mode,
+    )
+
+    gbp_path = CONFIGS_DIR / "gbpusd_range_paper_v1.json"
+    aud_path = CONFIGS_DIR / "audusd_ny_paper_v1.json"
+
+    gbp_cfg = json.loads(gbp_path.read_text(encoding="utf-8"))
+    aud_cfg = json.loads(aud_path.read_text(encoding="utf-8"))
+
+    if infer_stage(gbp_cfg, gbp_path) == "paper":
+        _ok("fleet_registry infers GBPUSD legacy paper stage")
+    else:
+        _fail("fleet_registry paper-stage inference failed for GBPUSD")
+
+    if infer_stage(aud_cfg, aud_path) == "watcher":
+        _ok("fleet_registry infers AUDUSD legacy watcher stage")
+    else:
+        _fail("fleet_registry watcher-stage inference failed for AUDUSD")
+
+    if default_log_dir("EURUSD", "real").endswith("live_eurusd"):
+        _ok("fleet_registry uses stage-aware live log dir")
+    else:
+        _fail("fleet_registry live log dir mismatch", default_log_dir("EURUSD", "real"))
+
+    risk = resolve_risk_policy(gbp_cfg, gbp_path, stage="paper")
+    if abs(float(risk.get("active_risk_pct", 0.0)) - 0.005) < 1e-9:
+        _ok("fleet_registry default active risk policy is 0.5%")
+    else:
+        _fail("fleet_registry risk policy mismatch", f"got {risk.get('active_risk_pct')}")
+
+    if abs(float(risk.get("earned_cap_pct", 0.0)) - 0.03) < 1e-9:
+        _ok("fleet_registry earned risk cap is 3.0%")
+    else:
+        _fail("fleet_registry earned cap mismatch", f"got {risk.get('earned_cap_pct')}")
+
+    watcher_risk = resolve_risk_policy(aud_cfg, aud_path, stage="watcher")
+    if abs(float(watcher_risk.get("active_risk_pct", -1.0)) - 0.0) < 1e-9:
+        _ok("fleet_registry watcher stage is observe-only (0 active risk)")
+    else:
+        _fail("fleet_registry watcher active risk mismatch", f"got {watcher_risk.get('active_risk_pct')}")
+
+    if normalize_stage("qa") == STAGE_PAPER and normalize_stage("quarantined") == STAGE_QUARANTINE:
+        _ok("fleet_registry normalizes QA/prod stage aliases")
+    else:
+        _fail("fleet_registry stage alias normalization mismatch")
+
+    if stage_account("watcher") == "observer" and stage_execution_mode("watcher") == "observe":
+        _ok("fleet_registry exposes observe-only watcher execution metadata")
+    else:
+        _fail("fleet_registry watcher execution metadata mismatch")
+
+
+def test_generate_live_config_promoted_runner_parse():
+    from argus_flow.ops.generate_live_config import _get_promoted_pairs
+
+    report = {
+        "runners": [
+            {"symbol": "GBPUSD", "verdict": "PROMOTE"},
+            {"symbol": "EURUSD", "verdict": "NOT_READY"},
+        ]
+    }
+    paths = _get_promoted_pairs(report)
+    names = sorted(path.name for path in paths)
+    if "gbpusd_range_paper_v1.json" in names and "eurusd_t4_paper_v1.json" not in names:
+        _ok("generate_live_config reads promoted pairs from gate report runners[]")
+    else:
+        _fail("generate_live_config promoted pair parsing mismatch", str(names))
+
+
 # ═════════════════════════════════════════════════════════════
 # 7. Unique client IDs
 # ═════════════════════════════════════════════════════════════
@@ -283,6 +369,82 @@ def test_config_unique_client_ids():
             _fail(f"Duplicate ibkr_client_id={cid}: {first} and {second}")
     else:
         _ok(f"All {len(seen)} ibkr_client_ids are unique")
+
+
+def test_runner_client_id_resolution():
+    from argus_flow.runner_unified import resolve_client_id
+
+    eurusd_cfg = str(CONFIGS_DIR / "eurusd_t4_paper_v1.json")
+    fx_group = [
+        str(CONFIGS_DIR / "cadjpy_t4_paper_v1.json"),
+        str(CONFIGS_DIR / "usdjpy_ny_paper_v1.json"),
+        str(CONFIGS_DIR / "eurusd_t4_paper_v1.json"),
+    ]
+    futures_group = [
+        str(CONFIGS_DIR / "m2k_range_paper_v1.json"),
+        str(CONFIGS_DIR / "mnq_range_paper_v1.json"),
+        str(CONFIGS_DIR / "mym_range_paper_v1.json"),
+    ]
+
+    single_id, single_source = resolve_client_id([eurusd_cfg], default_client_id=1)
+    if single_id == 10 and single_source.startswith("config:"):
+        _ok("runner_unified uses config ibkr_client_id for single-config launches")
+    else:
+        _fail("single-config client ID resolution mismatch", f"got id={single_id} source={single_source}")
+
+    fx_id, fx_source = resolve_client_id(fx_group, default_client_id=1)
+    futures_id, futures_source = resolve_client_id(futures_group, default_client_id=1)
+    if fx_source == "auto-group" and futures_source == "auto-group" and fx_id != futures_id:
+        _ok("runner_unified derives distinct stable client IDs for grouped FX/futures launches")
+    else:
+        _fail(
+            "grouped client ID resolution mismatch",
+            f"fx=({fx_id},{fx_source}) futures=({futures_id},{futures_source})",
+        )
+
+
+def test_trade_history_hydration_from_journal():
+    from argus_flow.runner_unified import InstrumentRunner, State
+
+    tmpdir = _new_test_dir("journal_hydrate")
+    try:
+        log_dir = tmpdir / "gbpusd"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        state = State(log_dir / "state.json")
+        state.position = "FLAT"
+        state.trade_count = 0
+        state.pnl_pips = 0.0
+        state.pnl_usd = 0.0
+        state.save()
+
+        trade_log = log_dir / "trades.csv"
+        trade_log.write_text(
+            "\n".join(
+                [
+                    "ts,direction,entry_px,exit_px,pnl_pips,exit_reason,duration_min,trade_num,pnl_usd",
+                    "2026-03-31T10:00:00Z,long,1.20000,1.20050,5.00,timeout,90.0,1,2.75",
+                    "2026-03-31T11:00:00Z,short,1.20100,1.20000,10.00,target,20.0,2,5.50",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        runner = InstrumentRunner.__new__(InstrumentRunner)
+        runner.trade_log = trade_log
+        runner.uses_pips = True
+        runner.state = state
+        runner._hydrate_trade_history_from_journal()
+
+        if runner.state.trade_count == 2 and abs(runner.state.pnl_pips - 15.0) < 1e-9 and abs(runner.state.pnl_usd - 8.25) < 1e-9:
+            _ok("runner_unified hydrates trade count and realized PnL from journal on restart")
+        else:
+            _fail(
+                "journal hydration mismatch",
+                f"trade_count={runner.state.trade_count} pnl_pips={runner.state.pnl_pips} pnl_usd={runner.state.pnl_usd}",
+            )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -403,8 +565,7 @@ def test_bar_buffer_overflow():
 def test_state_roundtrip():
     from argus_flow.runner_unified import State
 
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    tmpdir = _new_test_dir("state_roundtrip")
     try:
         state_file = tmpdir / "test_state.json"
 
@@ -449,8 +610,7 @@ def test_state_roundtrip():
 def test_state_missing_file():
     from argus_flow.runner_unified import State
 
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    tmpdir = _new_test_dir("state_missing")
     try:
         state_file = tmpdir / "nonexistent_state.json"
 
@@ -477,8 +637,7 @@ def test_state_missing_file():
 def test_broker_truth_helpers():
     from argus_flow.ops.broker_truth import atomic_write_json, is_fresh, read_json, runner_broker_state_path
 
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    tmpdir = _new_test_dir("broker_truth")
     try:
         log_dir = tmpdir / "eurusd"
         path = runner_broker_state_path(log_dir)
@@ -503,8 +662,7 @@ def test_evidence_registry_broker_truth():
     from argus_flow.ops.broker_truth import atomic_write_json
     from argus_flow.ops.evidence_registry import _build_broker_truth
 
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    tmpdir = _new_test_dir("evidence_broker")
     try:
         payload = {
             "broker_connected": True,
@@ -570,11 +728,53 @@ def test_walkforward_summary_logic():
         _fail("walkforward FAIL classification mismatch", f"got {fail_summary}")
 
 
+def test_walkforward_missing_data_report():
+    import argus_flow.ops.walkforward_validation as walkforward_validation
+
+    tmpdir = _new_test_dir("walkforward_missing")
+    old_logs_dir = walkforward_validation.LOGS_DIR
+    old_data_dir = walkforward_validation.DATA_DIR
+    try:
+        config_path = tmpdir / "m2k_range_paper_v1.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "symbol": "M2K",
+                    "strategy": "range_accel",
+                    "instrument_type": "future",
+                    "replay_expectations": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        walkforward_validation.LOGS_DIR = tmpdir / "logs"
+        walkforward_validation.DATA_DIR = tmpdir / "data"
+        walkforward_validation.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        report, out_path = walkforward_validation.run_one(
+            config_path=config_path,
+            data_path=None,
+            folds=4,
+            warmup_bars=10,
+            min_trades_per_fold=1,
+            enable_pyramid=False,
+        )
+
+        if report["status"] == "MISSING_DATA" and out_path.exists():
+            _ok("walkforward_validation writes explicit MISSING_DATA reports")
+        else:
+            _fail("walkforward missing-data report mismatch", f"report={report} out={out_path}")
+    finally:
+        walkforward_validation.LOGS_DIR = old_logs_dir
+        walkforward_validation.DATA_DIR = old_data_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_promotion_gate_v2_walkforward_checks():
     from argus_flow.ops.promotion_gate_v2 import check_live_drawdown_vs_walkforward, check_walk_forward_positive
 
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(dir=TEST_TMP_ROOT))
+    tmpdir = _new_test_dir("promotion_gate")
     try:
         missing = check_walk_forward_positive(tmpdir)
         if missing.classification == "unevidenced":
@@ -602,7 +802,7 @@ def test_promotion_gate_v2_walkforward_checks():
         else:
             _fail("promotion_gate_v2 PASS walkforward mismatch", f"got {passed}")
 
-        valid_trades = [{"pnl_pips": "1.0"} for _ in range(15)] + [{"pnl_pips": "-0.5"} for _ in range(15)]
+        valid_trades = [{"pnl_pips": "1.0"} for _ in range(30)] + [{"pnl_pips": "-0.4"} for _ in range(30)]
         dd_result = check_live_drawdown_vs_walkforward(valid_trades, tmpdir)
         if dd_result.passed:
             _ok("promotion_gate_v2 compares live drawdown against walkforward budget")
@@ -610,6 +810,22 @@ def test_promotion_gate_v2_walkforward_checks():
             _fail("promotion_gate_v2 live drawdown comparison failed unexpectedly", f"got {dd_result}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_shared_risk_progression_reaches_earned_cap():
+    from argus_flow.ops.demotion_check import recommend_risk_pct
+
+    risk_pct = recommend_risk_pct(
+        n_trades=300,
+        pf=1.40,
+        max_dd=15.0,
+        model_dd=10.0,
+        is_quarantined=False,
+    )
+    if abs(risk_pct - 0.03) < 1e-9:
+        _ok("shared risk progression reaches the 3.0% earned cap")
+    else:
+        _fail("shared risk progression earned-cap mismatch", f"got {risk_pct}")
 
 
 def test_generate_live_config_gate_report_reader():
@@ -628,45 +844,174 @@ def test_generate_live_config_gate_report_reader():
         _fail("generate_live_config allowed blocked verdict unexpectedly")
 
 
-def test_divergence_guard_runners_match_cohort():
-    guard_path = Path(__file__).resolve().parents[1] / "ops" / "divergence_guard.py"
-    if not guard_path.exists():
-        _fail("divergence_guard.py not found")
+def test_managed_governance_runner_selection():
+    from argus_flow.ops.artifact_divergence import governed_runners as artifact_runners
+    from argus_flow.ops.divergence_guard import governed_runners as divergence_runners
+    from argus_flow.ops.fleet_registry import STAGE_PAPER, STAGE_QUARANTINE, STAGE_REAL, STAGE_WATCHER, discover_managed_runners
+    from argus_flow.ops.kill_discipline import governed_runners as kill_runners
+
+    managed = discover_managed_runners()
+    expected_promotion_symbols = sorted(
+        runner["symbol"]
+        for runner in managed
+        if runner["current_stage"] in (STAGE_PAPER, STAGE_REAL, STAGE_QUARANTINE)
+    )
+    expected_divergence_symbols = sorted(
+        runner["symbol"]
+        for runner in managed
+        if runner["current_stage"] in (STAGE_WATCHER, STAGE_PAPER, STAGE_REAL, STAGE_QUARANTINE)
+    )
+    expected_artifact_symbols = sorted(
+        runner["symbol"]
+        for runner in managed
+        if runner.get("launch_enabled", True)
+    )
+
+    div_symbols = sorted(runner["symbol"] for runner in divergence_runners())
+    kill_symbols = sorted(runner["symbol"] for runner in kill_runners())
+    artifact_symbols = sorted(runner["symbol"] for runner in artifact_runners())
+
+    if div_symbols == expected_divergence_symbols:
+        _ok("divergence_guard follows managed watcher/QA/prod runners")
+    else:
+        _fail("divergence_guard managed-runner mismatch", f"got {div_symbols} expected {expected_divergence_symbols}")
+
+    if kill_symbols == expected_promotion_symbols:
+        _ok("kill_discipline follows managed paper/real runners")
+    else:
+        _fail("kill_discipline managed-runner mismatch", f"got {kill_symbols} expected {expected_promotion_symbols}")
+
+    if artifact_symbols == expected_artifact_symbols:
+        _ok("artifact_divergence follows all managed runners")
+    else:
+        _fail("artifact_divergence managed-runner mismatch", f"got {artifact_symbols} expected {expected_artifact_symbols}")
+
+
+def test_alert_reason_fallback_from_flags():
+    from argus_flow.ops.alert_escalation_v2 import _report_reason
+
+    divergence_item = {
+        "flags": ["SIGNAL_FREQ_KILL: 0.0/day vs replay 8.0/day (ratio 0.00)"],
+        "metrics": {"days_observed": 1.02, "signals_per_day": 0.0, "replay_signals_per_day": 8.0},
+    }
+    divergence_reason = _report_reason(divergence_item, "KILL")
+    if "SIGNAL_FREQ_KILL" in divergence_reason and "signals/day=0.0 vs replay=8.0" in divergence_reason:
+        _ok("alert escalation derives divergence reasons from flags + metrics")
+    else:
+        _fail("alert escalation divergence reason fallback mismatch", divergence_reason)
+
+    kill_item = {
+        "flags": ["KILL_DRAWDOWN: 42.0 pips > 3.0x model (10.0)"],
+        "metrics": {"valid_trades": 14},
+    }
+    kill_reason = _report_reason(kill_item, "KILL")
+    if "KILL_DRAWDOWN" in kill_reason and "trades=14" in kill_reason:
+        _ok("alert escalation derives kill-discipline reasons from flags + metrics")
+    else:
+        _fail("alert escalation kill-discipline reason fallback mismatch", kill_reason)
+
+
+def test_managed_watchdog_task_target():
+    register_tasks = Path(__file__).resolve().parents[2] / "ops" / "register_tasks.ps1"
+    watchdog_managed = Path(__file__).resolve().parents[2] / "ops" / "watchdog_managed.ps1"
+
+    if not watchdog_managed.exists():
+        _fail("watchdog_managed.ps1 not found")
         return
 
-    code = guard_path.read_text(encoding="utf-8")
-
-    # Extract symbols from RUNNERS list
-    expected_symbols = {"EURUSD", "GBPUSD", "EURJPY"}
-    found_symbols = set()
-
-    # Parse RUNNERS block: look for "symbol": "XXX" entries
-    in_runners = False
-    for line in code.split("\n"):
-        stripped = line.strip()
-        if "RUNNERS" in stripped and "=" in stripped and "[" in stripped:
-            in_runners = True
-            continue
-        if in_runners and "]" in stripped:
-            break
-        if in_runners and '"symbol"' in stripped:
-            # Extract value: "symbol": "EURUSD"
-            parts = stripped.split('"symbol"')
-            if len(parts) > 1:
-                rest = parts[1]
-                # Find the quoted value after the colon
-                start = rest.find('"')
-                if start >= 0:
-                    end = rest.find('"', start + 1)
-                    if end > start:
-                        found_symbols.add(rest[start + 1:end])
-
-    if found_symbols == expected_symbols:
-        _ok(f"divergence_guard RUNNERS matches Class A pairs: {sorted(found_symbols)}")
-    elif not found_symbols:
-        _fail("Could not parse RUNNERS symbols from divergence_guard.py")
+    code = register_tasks.read_text(encoding="utf-8", errors="replace")
+    if "watchdog_managed.ps1" in code:
+        _ok("register_tasks points ArgusWatchdog at watchdog_managed.ps1")
     else:
-        _fail(f"RUNNERS mismatch: found {sorted(found_symbols)}, expected {sorted(expected_symbols)}")
+        _fail("register_tasks still targets legacy watchdog")
+
+
+def test_artifact_divergence_uses_futures_points_field():
+    from argus_flow.ops.artifact_divergence import check_runner
+
+    tmpdir = _new_test_dir("artifact_div")
+    try:
+        log_dir = tmpdir / "mgc"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "position": "FLAT",
+                    "trade_count": 11,
+                    "pnl_pips": 0.0,
+                    "pnl_points": -11.5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (log_dir / "trades.csv").write_text(
+            "\n".join(
+                [
+                    "ts,direction,entry_px,exit_px,pnl_pts,pnl_usd,exit_reason,duration_min,trade_num,experiment_valid,invalid_reason,config_hash,session_id,runtime_epoch,git_sha",
+                    "2026-03-30T11:54:54.998177+00:00,short,4571.50,4590.80,-11.50,-115.00,stop,17.9,11,true,,hash,session,123,sha",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (log_dir / "signals.csv").write_text("ts,action\n2026-03-31T00:00:00+00:00,HOLD\n", encoding="utf-8")
+        (log_dir / "heartbeat.json").write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        (log_dir / "evidence_registry.json").write_text(json.dumps({"cohort": {"valid_trade_count": 1, "total_trade_count": 1}}), encoding="utf-8")
+
+        cfg_path = tmpdir / "mgc_range_paper_v1.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        config_hash_dir = tmpdir / "argus_flow" / "configs"
+        config_hash_dir.mkdir(parents=True, exist_ok=True)
+        config_hash_file = config_hash_dir / "hashes.json"
+        config_hash_file.write_text(
+            json.dumps(
+                {
+                    cfg_path.name: hashlib.sha256(cfg_path.read_text(encoding="utf-8").encode()).hexdigest()[:16]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        import argus_flow.ops.artifact_divergence as artifact_divergence
+
+        old_repo = artifact_divergence.REPO
+        artifact_divergence.REPO = tmpdir
+        try:
+            result = check_runner(
+                {
+                    "name": "MGC",
+                    "symbol": "MGC",
+                    "log_dir": "mgc",
+                    "config": "mgc_range_paper_v1.json",
+                    "pip_tolerance": 0.1,
+                    "instrument_type": "future",
+                }
+            )
+        finally:
+            artifact_divergence.REPO = old_repo
+
+        pnl_checks = [c for c in result["checks"] if c["name"] == "pnl_match"]
+        if pnl_checks and pnl_checks[0]["passed"]:
+            _ok("artifact_divergence uses pnl_points for futures state checks")
+        else:
+            _fail("artifact_divergence futures pnl-field selection mismatch", str(pnl_checks))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_discord_alerts_follow_managed_runners():
+    from argus_flow.ops.discord_alerts import notification_runners
+    from argus_flow.ops.fleet_registry import discover_managed_runners
+
+    expected = sorted(
+        runner["symbol"]
+        for runner in discover_managed_runners()
+        if runner.get("launch_enabled", True)
+    )
+    actual = sorted(runner["symbol"] for runner in notification_runners())
+    if actual == expected:
+        _ok("discord_alerts follows managed runner registry")
+    else:
+        _fail("discord_alerts managed-runner mismatch", f"got {actual} expected {expected}")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -691,18 +1036,26 @@ def main():
         ("6.  Config required fields", test_config_required_fields),
         ("7.  Config hash integrity", test_config_hash_integrity),
         ("8.  Unique ibkr_client_ids", test_config_unique_client_ids),
-        ("9.  replay_expectations present", test_config_replay_expectations),
-        ("10. Cohort validity flags", test_cohort_validity_flags),
-        ("11. BarBuffer basic", test_bar_buffer_basic),
-        ("12. BarBuffer overflow", test_bar_buffer_overflow),
-        ("13. State save/load roundtrip", test_state_roundtrip),
-        ("14. State missing file -> FLAT", test_state_missing_file),
-        ("15. Broker truth helpers", test_broker_truth_helpers),
-        ("16. Evidence registry broker truth", test_evidence_registry_broker_truth),
-        ("17. Walkforward summary logic", test_walkforward_summary_logic),
-        ("18. Promotion gate v2 walkforward checks", test_promotion_gate_v2_walkforward_checks),
-        ("19. generate_live_config gate report reader", test_generate_live_config_gate_report_reader),
-        ("20. Divergence guard RUNNERS", test_divergence_guard_runners_match_cohort),
+        ("9.  runner client-id resolution", test_runner_client_id_resolution),
+        ("10. journal trade-history hydration", test_trade_history_hydration_from_journal),
+        ("11. replay_expectations present", test_config_replay_expectations),
+        ("12. Cohort validity flags", test_cohort_validity_flags),
+        ("13. BarBuffer basic", test_bar_buffer_basic),
+        ("14. BarBuffer overflow", test_bar_buffer_overflow),
+        ("15. State save/load roundtrip", test_state_roundtrip),
+        ("16. State missing file -> FLAT", test_state_missing_file),
+        ("17. Broker truth helpers", test_broker_truth_helpers),
+        ("18. Evidence registry broker truth", test_evidence_registry_broker_truth),
+        ("19. Walkforward summary logic", test_walkforward_summary_logic),
+        ("20. Walkforward missing-data reporting", test_walkforward_missing_data_report),
+        ("21. Promotion gate v2 walkforward checks", test_promotion_gate_v2_walkforward_checks),
+        ("22. shared risk progression cap", test_shared_risk_progression_reaches_earned_cap),
+        ("23. generate_live_config gate report reader", test_generate_live_config_gate_report_reader),
+        ("24. managed governance runner selection", test_managed_governance_runner_selection),
+        ("25. alert reason fallback", test_alert_reason_fallback_from_flags),
+        ("26. managed watchdog task target", test_managed_watchdog_task_target),
+        ("27. artifact divergence futures pnl field", test_artifact_divergence_uses_futures_points_field),
+        ("28. discord alerts managed runner selection", test_discord_alerts_follow_managed_runners),
     ]
 
     for name, fn in tests:

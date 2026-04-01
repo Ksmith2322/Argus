@@ -122,7 +122,21 @@ def save_integrity_manifest(log_dir: str, hashes: Optional[Dict[str, Dict[str, A
         json.dump(manifest, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    for _ in range(3):
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            time.sleep(0.05)
+    else:
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return path
 
 

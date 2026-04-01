@@ -83,7 +83,11 @@ def futures_contracts_for_risk(
 
     raw_contracts = int((equity_usd * risk_pct) // risk_per_contract)
     if raw_contracts < min_contracts:
-        return 0
+        # If calculated contracts is 0 but we CAN afford 1 contract at up to 2% risk, allow it
+        max_risk_amount = equity_usd * 0.02  # 2% ceiling for minimum viability
+        if risk_per_contract <= max_risk_amount:
+            return 1  # Allow minimum 1 contract for paper/small accounts
+        return 0  # Truly cannot afford even 1 contract
     if max_contracts is not None:
         raw_contracts = min(raw_contracts, max_contracts)
     return raw_contracts

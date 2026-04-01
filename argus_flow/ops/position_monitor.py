@@ -17,6 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from argus_flow.ops.broker_truth import file_age_s, load_fleet_snapshot, load_runner_broker_state
+from argus_flow.ops.fleet_registry import discover_managed_runners
 
 load_dotenv()
 
@@ -30,6 +31,22 @@ COHORT_RUNNERS = [
 ]
 
 HEARTBEAT_STALE_S = 600  # 10 min (heartbeat writes every 5 min, so 2x buffer)
+
+
+def _managed_runners() -> list[dict]:
+    dynamic = []
+    for runner in discover_managed_runners():
+        if not runner.get("launch_enabled", True):
+            continue
+        dynamic.append(
+            {
+                "name": runner["name"],
+                "ib_canonical": f"{runner['symbol'][:3]}.{runner['symbol'][3:]}" if runner["instrument_type"] == "forex" and len(runner["symbol"]) == 6 else runner["symbol"],
+                "log_dir": runner["log_dir"],
+                "type": runner["instrument_type"],
+            }
+        )
+    return dynamic or COHORT_RUNNERS
 
 
 def _normalize_ib_symbol(contract) -> str:
@@ -172,7 +189,7 @@ def main():
     alerts = []
     has_critical = False
 
-    for runner in COHORT_RUNNERS:
+    for runner in _managed_runners():
         state = get_runner_state(runner)
         ibkr_pos = ibkr_positions.get(runner["ib_canonical"], {"qty": 0, "direction": "FLAT"})
 
@@ -218,7 +235,7 @@ def main():
         })
 
     # Check for orphaned IBKR positions not tracked by any runner
-    tracked_symbols = {r["ib_canonical"] for r in COHORT_RUNNERS}
+    tracked_symbols = {r["ib_canonical"] for r in _managed_runners()}
     for sym, pos in ibkr_positions.items():
         if sym not in tracked_symbols and pos.get("direction") != "FLAT":
             alerts.append(f"ORPHAN: IBKR has {pos['direction']} in {sym} — not tracked by any runner!")

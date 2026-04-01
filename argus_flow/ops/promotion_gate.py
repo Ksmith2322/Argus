@@ -1,12 +1,15 @@
-"""Promotion Gate Checker — automated enforcement of COHORT_SPEC.md criteria.
+"""Legacy shim for the canonical promotion gate.
 
-Checks each FX pair against ALL promotion criteria before advancing
-from paper to micro-live.
-
-Usage:
-    python -m argus_flow.ops.promotion_gate
+Use `python -m argus_flow.ops.promotion_gate_v2` directly going forward.
+This module remains as a compatibility wrapper so old operator commands do not
+drift from the staged deployment pipeline.
 """
 from __future__ import annotations
+
+if __name__ == "__main__":
+    from argus_flow.ops.promotion_gate_v2 import main as _promotion_gate_v2_main
+
+    raise SystemExit(_promotion_gate_v2_main())
 
 import csv
 import json

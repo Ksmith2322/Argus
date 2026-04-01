@@ -13,6 +13,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from argus_flow.ops.fleet_registry import (
+    RISK_POLICY_DEFAULTS,
+    STAGE_REAL,
+    default_log_dir,
+)
+
 REPO = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = REPO / "argus_flow" / "configs"
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
@@ -130,14 +136,8 @@ def generate_live_config(
         promoted = _check_promotion_gate(paper.get("symbol", ""), gate_report)
         if not promoted:
             print(f"ERROR: {paper.get('symbol', '?')} is NOT promoted. Cannot generate live config.")
-            print(f"  Run promotion_gate.py first, or use --force to bypass (UNSAFE).")
+            print(f"  Run promotion_gate_v2 first, or use --force to bypass (UNSAFE).")
             return None
-
-    # --- Block non-FX unless explicitly allowed ---
-    if instrument_type != "forex" and not force:
-        print(f"ERROR: {instrument_type} instruments are not yet live-eligible per COHORT_SPEC.md.")
-        print(f"  Only FX instruments can be promoted. Use --force to bypass (UNSAFE).")
-        return None
 
     # --- Build live config ---
     live = json.loads(json.dumps(paper))  # deep copy
@@ -145,9 +145,25 @@ def generate_live_config(
     # Version bump
     live["version"] = paper.get("version", "paper_v1").replace("paper_", "live_")
     live["live"] = True
+    deployment = live.get("deployment", {}) if isinstance(live.get("deployment", {}), dict) else {}
+    deployment["managed"] = True
+    deployment["stage"] = STAGE_REAL
+    deployment["log_dir"] = default_log_dir(paper.get("symbol", symbol), STAGE_REAL)
+    deployment["paper_source"] = paper_path.name
+    deployment["risk_policy"] = {
+        "model_start_equity_usd": RISK_POLICY_DEFAULTS["model_start_equity_usd"],
+        "base_risk_pct": float(risk_pct or RISK_POLICY_DEFAULTS["base_risk_pct"]),
+        "active_risk_pct": float(risk_pct or RISK_POLICY_DEFAULTS["base_risk_pct"]),
+        "earned_cap_pct": RISK_POLICY_DEFAULTS["earned_cap_pct"],
+        "manual_step_up_required": RISK_POLICY_DEFAULTS["manual_step_up_required"],
+        "scale_state": "BASE",
+    }
+    live["deployment"] = deployment
 
-    # Sizing: pool-based (2% risk) or explicit lot_size
+    # Sizing: keep dynamic risk sizing aligned with the stage risk policy.
+    # Explicit lot/contract sizing remains as a fallback floor.
     if "risk" in live:
+        live["risk"]["risk_pct"] = float(risk_pct or RISK_POLICY_DEFAULTS["base_risk_pct"])
         if instrument_type == "forex":
             if pool > 0 and risk_pct > 0:
                 stop_pips = live["risk"].get("stop_pips", 20)
@@ -237,13 +253,15 @@ def update_hashes(config_path: Path):
 def _get_promoted_pairs(gate_report: dict) -> list[Path]:
     """Return list of paper config paths for all PROMOTE pairs in gate report."""
     paths = []
-    for key, entry in gate_report.items():
+    runners = gate_report.get("runners", []) if isinstance(gate_report, dict) else []
+    for entry in runners:
         if not isinstance(entry, dict):
             continue
-        if entry.get("status") != "PROMOTE":
+        status = str(entry.get("verdict", entry.get("status", "UNKNOWN"))).upper()
+        if status != "PROMOTE":
             continue
         # Find matching paper config
-        symbol = entry.get("symbol", key).lower()
+        symbol = str(entry.get("symbol", "")).lower()
         # Search for any paper config containing this symbol
         matches = list(CONFIGS_DIR.glob(f"{symbol}_*_paper_v1.json"))
         if not matches:
@@ -282,8 +300,8 @@ def main():
     parser.add_argument(
         "--risk-pct",
         type=float,
-        default=0.02,
-        help="Risk per trade as fraction of pool (default: 0.02 = 2%%)",
+        default=RISK_POLICY_DEFAULTS["base_risk_pct"],
+        help=f"Risk per trade as fraction of equity (default: {RISK_POLICY_DEFAULTS['base_risk_pct']:.3f} = 0.5%%)",
     )
     parser.add_argument(
         "--force",

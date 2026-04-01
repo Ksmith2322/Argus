@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from argus_flow.ops.broker_truth import file_age_s, load_runner_broker_state
+from argus_flow.ops.fleet_registry import STAGE_PAPER, discover_managed_runners
 
 REPO = Path(__file__).resolve().parents[2]
 LOGS = REPO / "argus_flow" / "logs"
@@ -30,71 +31,7 @@ CONFIGS = REPO / "argus_flow" / "configs"
 # Runner definitions
 # ─────────────────────────────────────────────────────────────
 
-VALIDATION_RUNNERS = [
-    {
-        "name": "EUR/USD",
-        "symbol": "EURUSD",
-        "log_dir": "eurusd",
-        "config_file": "eurusd_t4_paper_v1.json",
-        "strategy_status": "PAPER-VALIDATING",
-    },
-    {
-        "name": "GBP/USD",
-        "symbol": "GBPUSD",
-        "log_dir": "gbpusd",
-        "config_file": "gbpusd_range_paper_v1.json",
-        "strategy_status": "PAPER-VALIDATING",
-    },
-    {
-        "name": "EUR/JPY",
-        "symbol": "EURJPY",
-        "log_dir": "eurjpy",
-        "config_file": "eurjpy_t4_paper_v1.json",
-        "strategy_status": "PAPER-VALIDATING",
-    },
-]
-
-OBSERVATION_RUNNERS = [
-    {
-        "name": "AUD/USD",
-        "symbol": "AUDUSD",
-        "log_dir": "audusd",
-        "config_file": "audusd_ny_paper_v1.json",
-        "strategy_status": "OBSERVATION",
-    },
-    {
-        "name": "USD/JPY",
-        "symbol": "USDJPY",
-        "log_dir": "usdjpy",
-        "config_file": "usdjpy_ny_paper_v1.json",
-        "strategy_status": "OBSERVATION",
-    },
-    {
-        "name": "AUD/JPY",
-        "symbol": "AUDJPY",
-        "log_dir": "audjpy",
-        "config_file": "audjpy_t4_paper_v1.json",
-        "strategy_status": "OBSERVATION",
-    },
-    {
-        "name": "CAD/JPY",
-        "symbol": "CADJPY",
-        "log_dir": "cadjpy",
-        "config_file": "cadjpy_t4_paper_v1.json",
-        "strategy_status": "OBSERVATION",
-    },
-    {
-        "name": "GBP/JPY",
-        "symbol": "GBPJPY",
-        "log_dir": "gbpjpy",
-        "config_file": "gbpjpy_t4_paper_v1.json",
-        "strategy_status": "OBSERVATION",
-    },
-]
-
-ALL_RUNNERS = VALIDATION_RUNNERS + OBSERVATION_RUNNERS
-
-PROMOTION_TARGET = 30
+PROMOTION_TARGET = 60
 
 
 # ─────────────────────────────────────────────────────────────
@@ -136,10 +73,6 @@ def _find_runner_in_report(report: dict | None, symbol: str) -> dict | None:
     for r in runners:
         if r.get("symbol") == symbol or r.get("name") == symbol:
             return r
-        # Some reports use display name
-        for rdef in ALL_RUNNERS:
-            if rdef["symbol"] == symbol and r.get("name") == rdef["name"]:
-                return r
     return None
 
 
@@ -149,7 +82,7 @@ def _find_runner_in_report(report: dict | None, symbol: str) -> dict | None:
 
 def _build_cohort(trades: list[dict], runner_def: dict, hashes: dict) -> dict:
     """Build cohort section from trades.csv data."""
-    is_validation = runner_def in VALIDATION_RUNNERS
+    is_validation = runner_def.get("current_stage") == STAGE_PAPER
 
     valid_trades = [t for t in trades if t.get("experiment_valid", "").lower() == "true"]
     invalid_trades = [t for t in trades if t.get("experiment_valid", "").lower() == "false"]
@@ -311,8 +244,10 @@ def _build_governance(
     return {
         "kill_discipline_status": kill_status,
         "kill_discipline_flags": kill_flags,
+        "kill_discipline_reason": " | ".join(str(flag) for flag in kill_flags[:3]),
         "divergence_status": div_status,
         "divergence_flags": div_flags,
+        "divergence_reason": " | ".join(str(flag) for flag in div_flags[:3]),
         "artifact_integrity": art_status,
         "artifact_alerts": art_alerts,
         "promotion_gate_verdict": promo_verdict,
@@ -499,9 +434,9 @@ def _build_eligibility_v2(cohort: dict, governance: dict, research_validation: d
 def build_registry(runner_def: dict) -> dict:
     """Build the complete evidence registry for one runner."""
     symbol = runner_def["symbol"]
-    log_dir = LOGS / runner_def["log_dir"]
-    is_validation = runner_def in VALIDATION_RUNNERS
-    lane = "validation" if is_validation else "observation"
+    log_dir = REPO / runner_def["log_dir"]
+    is_validation = runner_def.get("current_stage") == STAGE_PAPER
+    lane = runner_def.get("current_stage", "watcher")
 
     # Load data sources
     trades = _load_trades(log_dir)
@@ -541,7 +476,8 @@ def build_registry(runner_def: dict) -> dict:
         "symbol": symbol,
         "name": runner_def["name"],
         "lane": lane,
-        "strategy_status": runner_def["strategy_status"],
+        "strategy_status": str(runner_def.get("strategy_status", lane.upper()) or lane.upper()),
+        "log_dir": runner_def["log_dir"],
         "blocker": blocker,
         "cohort": cohort,
         "performance": performance,
@@ -560,12 +496,12 @@ def generate_registry(symbol_filter: str | None = None) -> list[dict]:
 
     Returns list of generated registry dicts.
     """
-    runners_to_process = ALL_RUNNERS
+    runners_to_process = discover_managed_runners()
     if symbol_filter:
         symbol_upper = symbol_filter.upper()
-        runners_to_process = [r for r in ALL_RUNNERS if r["symbol"] == symbol_upper]
+        runners_to_process = [r for r in runners_to_process if r["symbol"] == symbol_upper]
         if not runners_to_process:
-            print(f"ERROR: Unknown symbol '{symbol_filter}'. Available: {[r['symbol'] for r in ALL_RUNNERS]}")
+            print(f"ERROR: Unknown symbol '{symbol_filter}'. Available: {[r['symbol'] for r in discover_managed_runners()]}")
             return []
 
     results = []
@@ -573,7 +509,7 @@ def generate_registry(symbol_filter: str | None = None) -> list[dict]:
         registry = build_registry(runner_def)
 
         # Write to per-symbol log dir
-        out_dir = LOGS / runner_def["log_dir"]
+        out_dir = REPO / runner_def["log_dir"]
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "evidence_registry.json"
         out_path.write_text(json.dumps(registry, indent=2, default=str), encoding="utf-8")
@@ -637,7 +573,7 @@ def _print_summary(reg: dict) -> None:
     if elig["blockers_summary"] != "none":
         print(f"  Blockers: {elig['blockers_summary']}")
 
-    out_path = LOGS / symbol.lower() / "evidence_registry.json"
+    out_path = REPO / reg.get("log_dir", f"argus_flow/logs/{symbol.lower()}") / "evidence_registry.json"
     # Use forward slashes for display even on Windows, but show relative from repo
     try:
         rel = out_path.relative_to(REPO)

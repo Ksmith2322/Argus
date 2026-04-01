@@ -15,30 +15,26 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
+from urllib.error import URLError
+from urllib.request import urlopen
+
+from argus_flow.ops.fleet_registry import DEPLOYMENT_REGISTRY_FILE, STAGE_PAPER, discover_managed_runners
 
 REPO = Path(__file__).resolve().parents[2]
 LOGS = REPO / "argus_flow" / "logs"
 CONFIGS = REPO / "argus_flow" / "configs"
 
-RUNNERS = [
-    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "eurusd"},
-    {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "gbpusd"},
-    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "eurjpy"},
-    {"name": "GBP/JPY", "symbol": "GBPJPY", "log_dir": "gbpjpy"},
-    {"name": "CAD/JPY", "symbol": "CADJPY", "log_dir": "cadjpy"},
-    {"name": "AUD/JPY", "symbol": "AUDJPY", "log_dir": "audjpy"},
-    {"name": "USD/JPY", "symbol": "USDJPY", "log_dir": "usdjpy"},
-    {"name": "AUD/USD", "symbol": "AUDUSD", "log_dir": "audusd"},
-]
-
-PROMOTION_THRESHOLD = 30
+PROMOTION_THRESHOLD = 60
+PROMOTION_MIN_CALENDAR_DAYS = 14
 MODELED_FRICTION_PIPS = 0.3
 LIVE_DRAWDOWN_BUFFER_RATIO = 1.25
 LIVE_DRAWDOWN_BUFFER_ABS = 2.0
 REQUIRED_EVIDENCE_CHECKS = {
     "walk_forward_positive",
     "live_drawdown_vs_walkforward",
-    "survived_disconnect",
+    "dashboard_truth",
+    # survived_disconnect is advisory — a broker disconnect may never happen
+    # naturally during paper trading, so requiring it creates a permanent blocker.
 }
 
 
@@ -90,8 +86,54 @@ def _load_json(path: Path) -> dict | None:
         return None
 
 
+_DASHBOARD_FLEET_CACHE: dict[str, dict] | None = None
+
+
+def _load_dashboard_fleet() -> dict[str, dict] | None:
+    global _DASHBOARD_FLEET_CACHE
+    if _DASHBOARD_FLEET_CACHE is not None:
+        return _DASHBOARD_FLEET_CACHE
+    try:
+        with urlopen("http://127.0.0.1:8080/api/ibkr_fleet", timeout=2.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError, TimeoutError):
+        return None
+
+    runners = payload.get("runners", []) if isinstance(payload, dict) else []
+    fleet: dict[str, dict] = {}
+    for runner in runners:
+        if not isinstance(runner, dict):
+            continue
+        symbol = str(runner.get("symbol", "") or "").upper()
+        if symbol:
+            fleet[symbol] = runner
+    _DASHBOARD_FLEET_CACHE = fleet
+    return fleet
+
+
+def _stage_entered_at(symbol: str, config_file: str = "") -> datetime | None:
+    report = _load_json(DEPLOYMENT_REGISTRY_FILE)
+    if not isinstance(report, dict):
+        return None
+    for runner in report.get("runners", []):
+        if not isinstance(runner, dict):
+            continue
+        if str(runner.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if config_file and str(runner.get("config_file", "") or "") != config_file:
+            continue
+        ts = str(runner.get("stage_entered_at", "") or "").strip()
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
 def _load_replay_expectations(symbol: str) -> dict:
-    for cfg_path in CONFIGS.glob("*_paper_v1.json"):
+    for cfg_path in CONFIGS.glob("*.json"):
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -122,6 +164,18 @@ def check_min_valid_trades(valid_trades: list[dict]) -> CheckResult:
     if n >= PROMOTION_THRESHOLD:
         return _hard(True, f"{n} valid trades (>={PROMOTION_THRESHOLD})")
     return _hard(False, f"{n} valid trades (need {PROMOTION_THRESHOLD})")
+
+
+def check_min_calendar_days(runner: dict) -> CheckResult:
+    stage_start = _stage_entered_at(
+        str(runner.get("symbol", "") or ""),
+        str(runner.get("config_file", "") or ""),
+    )
+    if stage_start is None:
+        return _unevidenced("stage_entered_at missing from deployment registry")
+    calendar_days = max((datetime.now(timezone.utc) - stage_start).total_seconds() / 86400.0, 0.0)
+    detail = f"{calendar_days:.1f} calendar days in QA (need >= {PROMOTION_MIN_CALENDAR_DAYS})"
+    return _hard(calendar_days >= PROMOTION_MIN_CALENDAR_DAYS, detail)
 
 
 def check_frozen_config_hash(valid_trades: list[dict]) -> CheckResult:
@@ -225,13 +279,94 @@ def check_outlier_trade(valid_trades: list[dict]) -> CheckResult:
 
     for idx, pnl in enumerate(pnls, start=1):
         concentration = abs(pnl) / abs(total_pnl)
-        if concentration > 0.30:
+        if concentration > 0.25:
             return _hard(
                 False,
                 f"trade #{idx} contributes {concentration:.0%} of total PnL ({pnl:+.2f}/{total_pnl:+.2f})",
             )
     max_concentration = max(abs(p) / abs(total_pnl) for p in pnls) if pnls else 0.0
-    return _hard(True, f"max single-trade concentration {max_concentration:.0%} (<=30%)")
+    return _hard(True, f"max single-trade concentration {max_concentration:.0%} (<=25%)")
+
+
+def check_regime_diversity(valid_trades: list[dict]) -> CheckResult:
+    regimes: set[str] = set()
+    field_found = False
+    for t in valid_trades:
+        for key in ("regime", "entry_regime"):
+            val = str(t.get(key, "") or "").strip()
+            if val and val.lower() not in ("", "null", "none"):
+                field_found = True
+                regimes.add(val)
+    if not field_found:
+        return _advisory(True, "no regime/entry_regime field in trades — check skipped")
+    n = len(regimes)
+    if n >= 2:
+        return _hard(True, f"{n} regimes observed: {', '.join(sorted(regimes))}")
+    return _hard(False, f"only {n} regime(s) observed: {', '.join(sorted(regimes))} (need >=2)")
+
+
+def check_give_back(valid_trades: list[dict]) -> CheckResult:
+    pnl_field = _pnl_field(valid_trades)
+    pnls = [_safe_float(t.get(pnl_field, 0.0)) for t in valid_trades]
+    if not pnls:
+        return _hard(False, "no PnL data in valid trades")
+
+    cumulative = 0.0
+    peak = 0.0
+    for p in pnls:
+        cumulative += p
+        peak = max(peak, cumulative)
+
+    if peak <= 0:
+        return _hard(False, f"peak cumulative PnL {peak:+.2f} never positive")
+
+    retention = cumulative / peak
+    if retention >= 0.65:
+        return _hard(True, f"retained {retention:.0%} of peak PnL (current {cumulative:+.2f}, peak {peak:+.2f})")
+    return _hard(
+        False,
+        f"gave back {1 - retention:.0%} of peak PnL (current {cumulative:+.2f}, peak {peak:+.2f}, threshold 35%)",
+    )
+
+
+def check_consecutive_losses(valid_trades: list[dict]) -> CheckResult:
+    pnl_field = _pnl_field(valid_trades)
+    pnls = [_safe_float(t.get(pnl_field, 0.0)) for t in valid_trades]
+    if not pnls:
+        return _hard(False, "no PnL data in valid trades")
+
+    max_streak = 0
+    current_streak = 0
+    for p in pnls:
+        if p < 0:
+            current_streak += 1
+            max_streak = max(max_streak, current_streak)
+        else:
+            current_streak = 0
+
+    if max_streak >= 8:
+        return _hard(False, f"max consecutive losses: {max_streak} (limit 8)")
+    return _hard(True, f"max consecutive losses: {max_streak} (<8)")
+
+
+def check_profit_factor(valid_trades: list[dict]) -> CheckResult:
+    pnl_field = _pnl_field(valid_trades)
+    pnls = [_safe_float(t.get(pnl_field, 0.0)) for t in valid_trades]
+    if not pnls:
+        return _hard(False, "no PnL data in valid trades")
+
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p <= 0))
+
+    if gross_loss == 0:
+        if gross_profit > 0:
+            return _hard(True, "profit factor infinite (no losses)")
+        return _hard(False, "no wins and no losses — cannot compute PF")
+
+    pf = gross_profit / gross_loss
+    if pf >= 1.10:
+        return _hard(True, f"profit factor {pf:.2f} (>= 1.10)")
+    return _hard(False, f"profit factor {pf:.2f} (need >= 1.10)")
 
 
 def check_win_rate_vs_replay(valid_trades: list[dict], replay_expectations: dict) -> CheckResult:
@@ -308,8 +443,37 @@ def check_survived_disconnect(all_trades: list[dict]) -> CheckResult:
     return _unevidenced("no disconnect/reconnect evidence observed yet")
 
 
-def check_dashboard_truth(log_dir: Path) -> CheckResult:
-    return _advisory(True, f"dashboard spot-check still manual for {log_dir.name}")
+def check_dashboard_truth(runner: dict, all_trades: list[dict], valid_trades: list[dict]) -> CheckResult:
+    fleet = _load_dashboard_fleet()
+    if fleet is None:
+        return _unevidenced("dashboard API unavailable")
+
+    symbol = str(runner.get("symbol", "") or "").upper()
+    entry = fleet.get(symbol)
+    if not isinstance(entry, dict):
+        return _hard(False, f"dashboard missing runner {symbol}")
+
+    stage = str(entry.get("current_stage", entry.get("lane", "")) or "").lower()
+    if stage != STAGE_PAPER:
+        return _hard(False, f"dashboard stage={stage or 'unknown'} expected={STAGE_PAPER}")
+
+    dash_valid = int(entry.get("valid_trades", 0) or 0)
+    dash_invalid = int(entry.get("invalid_trades", 0) or 0)
+    local_invalid = max(len(all_trades) - len(valid_trades), 0)
+    if dash_valid != len(valid_trades) or dash_invalid != local_invalid:
+        return _hard(
+            False,
+            (
+                "dashboard trade counts diverge "
+                f"(dashboard valid/invalid={dash_valid}/{dash_invalid}, "
+                f"local={len(valid_trades)}/{local_invalid})"
+            ),
+        )
+
+    return _hard(
+        True,
+        f"dashboard matches local truth: stage={stage} valid={dash_valid} invalid={dash_invalid}",
+    )
 
 
 def check_no_manual_intervention(valid_trades: list[dict]) -> CheckResult:
@@ -384,6 +548,7 @@ def evaluate_runner(runner: dict) -> dict:
 
     checks: dict[str, CheckResult] = {
         "min_valid_trades": check_min_valid_trades(valid_trades),
+        "min_calendar_days": check_min_calendar_days(runner),
         "frozen_config_hash": check_frozen_config_hash(valid_trades),
         "git_sha_consistent": check_git_sha_consistent(valid_trades),
         "invalid_rate": check_invalid_rate(all_trades),
@@ -391,12 +556,16 @@ def evaluate_runner(runner: dict) -> dict:
         "positive_expectancy": check_positive_expectancy(valid_trades),
         "session_concentration": check_session_concentration(valid_trades),
         "outlier_trade": check_outlier_trade(valid_trades),
+        "regime_diversity": check_regime_diversity(valid_trades),
+        "give_back": check_give_back(valid_trades),
+        "consecutive_losses": check_consecutive_losses(valid_trades),
+        "profit_factor": check_profit_factor(valid_trades),
         "win_rate_vs_replay": check_win_rate_vs_replay(valid_trades, replay_expectations),
         "signal_frequency": check_signal_frequency(log_dir, replay_expectations),
         "walk_forward_positive": check_walk_forward_positive(log_dir),
         "live_drawdown_vs_walkforward": check_live_drawdown_vs_walkforward(valid_trades, log_dir),
         "survived_disconnect": check_survived_disconnect(all_trades),
-        "dashboard_truth": check_dashboard_truth(log_dir),
+        "dashboard_truth": check_dashboard_truth(runner, all_trades, valid_trades),
         "no_manual_intervention": check_no_manual_intervention(valid_trades),
     }
 
@@ -409,10 +578,11 @@ def evaluate_runner(runner: dict) -> dict:
     ]
     advisory_items = [name for name, result in checks.items() if result.classification == "advisory"]
     has_min_trades = checks["min_valid_trades"].passed
+    has_min_days = checks["min_calendar_days"].passed
 
     if hard_blockers:
-        verdict = "BLOCKED" if has_min_trades else "NOT_READY"
-    elif evidence_gaps or not has_min_trades:
+        verdict = "BLOCKED" if has_min_trades and has_min_days else "NOT_READY"
+    elif evidence_gaps or not has_min_trades or not has_min_days:
         verdict = "NOT_READY"
     else:
         verdict = "PROMOTE"
@@ -451,7 +621,12 @@ def main() -> None:
     print(f"  Promotion Gate - {now.strftime('%Y-%m-%d %H:%M')} UTC")
     print("=" * 72)
 
-    results = [evaluate_runner(runner) for runner in RUNNERS]
+    managed_runners = [
+        runner
+        for runner in discover_managed_runners()
+        if runner["current_stage"] == STAGE_PAPER and not runner["live"]
+    ]
+    results = [evaluate_runner(runner) for runner in managed_runners]
     verdict_counts = {"PROMOTE": 0, "NOT_READY": 0, "BLOCKED": 0}
 
     for result in results:

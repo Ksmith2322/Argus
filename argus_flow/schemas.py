@@ -9,7 +9,7 @@ Rules:
 """
 
 # Schema version — bump when columns change
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ── Signal CSV ─────────────────────────────────────────────────
 
@@ -72,12 +72,14 @@ TRADE_FIELDS_PIPS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pips",
     "exit_reason", "duration_min", "trade_num",
     "pnl_usd", "position_size", "risk_usd", "sizing_policy",
+    "entry_regime",
 ] + VALIDITY_FIELDS
 
 TRADE_FIELDS_POINTS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pts",
     "pnl_usd", "exit_reason", "duration_min", "trade_num",
     "position_size", "risk_usd", "sizing_policy",
+    "entry_regime",
 ] + VALIDITY_FIELDS
 
 

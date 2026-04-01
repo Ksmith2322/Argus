@@ -3,7 +3,7 @@
     "version": "paper_v1",
     "symbol": "MYM",
     "instrument_type": "future",
-    "exchange": "CME",
+    "exchange": "CBOT",
     "expiry": "20260618",
     "ibkr_client_id": 32,
     "trigger": {

@@ -26,13 +26,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+from argus_flow.ops.fleet_registry import discover_managed_runners
 
-RUNNERS = [
-    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "pip_tolerance": 0.1},
-    {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "pip_tolerance": 0.1},
-    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "pip_tolerance": 0.5},
-]
+REPO = Path(__file__).resolve().parents[2]
 
 STALE_THRESHOLD_S = 300  # 5 minutes
 HEARTBEAT_STALE_S = 600  # 10 minutes
@@ -41,6 +37,33 @@ HEARTBEAT_STALE_S = 600  # 10 minutes
 INFO = "INFO"
 WARN = "WARN"
 FAIL = "FAIL"
+
+
+def governed_runners() -> list[dict]:
+    """Return all managed runners that should maintain clean local artifacts."""
+    runners: list[dict] = []
+    for runner in discover_managed_runners():
+        if not runner.get("launch_enabled", True):
+            continue
+        instrument_type = str(runner.get("instrument_type", "")).lower()
+        if instrument_type == "forex":
+            tolerance = 0.5 if "JPY" in runner["symbol"] else 0.1
+        else:
+            tolerance = 0.1
+        runners.append(
+            {
+                "name": runner["name"],
+                "symbol": runner["symbol"],
+                "log_dir": runner["log_dir"],
+                "config": runner["config_path"],
+                "pip_tolerance": tolerance,
+                "instrument_type": instrument_type,
+                "current_stage": runner.get("current_stage", ""),
+                "live": bool(runner.get("live", False)),
+            }
+        )
+    runners.sort(key=lambda item: (item.get("current_stage", ""), item["name"]))
+    return runners
 
 
 def _check(name: str, passed: bool, detail: str, severity: str = FAIL) -> dict:
@@ -60,7 +83,16 @@ def _max_trade_num(rows: list[dict]) -> int:
 
 def check_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
-    result = {"name": runner["name"], "symbol": runner["symbol"], "status": "CLEAN", "checks": [], "max_severity": INFO}
+    result = {
+        "name": runner["name"],
+        "symbol": runner["symbol"],
+        "status": "CLEAN",
+        "checks": [],
+        "alerts": [],
+        "max_severity": INFO,
+        "current_stage": runner.get("current_stage", ""),
+        "live": bool(runner.get("live", False)),
+    }
 
     state_file = log_dir / "state.json"
     trade_file = log_dir / "trades.csv"
@@ -78,7 +110,10 @@ def check_runner(runner: dict) -> dict:
         try:
             state = json.loads(state_file.read_text())
             state_pos = state.get("position", "UNKNOWN")
-            state_pnl = state.get("pnl_pips", state.get("pnl_points", 0))
+            if runner.get("instrument_type") == "future":
+                state_pnl = state.get("pnl_points", state.get("pnl_pips", 0))
+            else:
+                state_pnl = state.get("pnl_pips", state.get("pnl_points", 0))
             state_trades = state.get("trade_count", 0)
             result["checks"].append(_check("state_readable", True, f"position={state_pos}", INFO))
         except (json.JSONDecodeError, OSError) as e:
@@ -207,6 +242,8 @@ def check_runner(runner: dict) -> dict:
         result["status"] = "CLEAN"
         result["max_severity"] = INFO
 
+    result["alerts"] = [check["detail"] for check in result["checks"] if not check["passed"]]
+
     return result
 
 
@@ -216,7 +253,8 @@ def main():
     print("=" * 65)
 
     results = []
-    for runner in RUNNERS:
+    runners = governed_runners()
+    for runner in runners:
         r = check_runner(runner)
         results.append(r)
 
@@ -248,6 +286,9 @@ def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "overall": overall,
         "status": overall,
+        "scope": {
+            "runner_count": len(runners),
+        },
         "runners": results,
     }, indent=2, default=str))
     print(f"  Saved: {out_path}")

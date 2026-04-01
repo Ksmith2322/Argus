@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from argus_flow.ops.fleet_registry import STAGE_DISCOVERY, STAGE_WATCHER, default_log_dir
+
 REPO = Path(__file__).resolve().parents[2]
 
 REQUIRED_CONFIG_FIELDS = [
@@ -48,10 +50,9 @@ def _load_config(path: Path) -> dict:
         return json.load(f)
 
 
-def _config_hash(cfg: dict) -> str:
-    """Deterministic SHA-256 of the config dict."""
-    blob = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(blob).hexdigest()[:16]
+def _file_hash(path: Path) -> str:
+    """Deterministic SHA-256 of the config file on disk."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def _validate_fields(cfg: dict) -> list[str]:
@@ -63,26 +64,44 @@ def _validate_fields(cfg: dict) -> list[str]:
     return missing
 
 
-def _ensure_hash(cfg: dict, cfg_path: Path) -> tuple[str, bool]:
-    """Check config hash is in hashes.json. Add if missing. Returns (hash, was_added)."""
-    h = _config_hash(cfg)
+def _ensure_hash(cfg_path: Path) -> tuple[str, bool]:
+    """Ensure hashes.json tracks this config by filename. Returns (hash, changed)."""
+    h = _file_hash(cfg_path)
     hashes = {}
     if HASHES_FILE.exists():
         with open(HASHES_FILE, "r") as f:
             hashes = json.load(f)
 
-    if h in hashes:
-        return h, False
-
-    hashes[h] = {
-        "config": str(cfg_path.name),
-        "symbol": cfg.get("symbol", "unknown"),
-        "strategy": cfg.get("strategy", "unknown"),
-    }
+    changed = hashes.get(cfg_path.name) != h
+    hashes[cfg_path.name] = h
     HASHES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HASHES_FILE, "w") as f:
-        json.dump(hashes, f, indent=2)
-    return h, True
+        json.dump(dict(sorted(hashes.items())), f, indent=2)
+        f.write("\n")
+    return h, changed
+
+
+def _apply_managed_defaults(cfg: dict, cfg_path: Path, stage: str) -> tuple[dict, bool]:
+    """Mark a config as registry-managed so the staged fleet discovers it automatically."""
+    deployment = cfg.get("deployment", {}) if isinstance(cfg.get("deployment", {}), dict) else {}
+    updated = False
+
+    if not deployment.get("managed", False):
+        deployment["managed"] = True
+        updated = True
+
+    normalized_stage = stage if stage in {STAGE_WATCHER, STAGE_DISCOVERY} else STAGE_WATCHER
+    if deployment.get("stage") != normalized_stage:
+        deployment["stage"] = normalized_stage
+        updated = True
+
+    log_dir = default_log_dir(str(cfg.get("symbol", cfg_path.stem)), normalized_stage)
+    if deployment.get("log_dir") != log_dir:
+        deployment["log_dir"] = log_dir
+        updated = True
+
+    cfg["deployment"] = deployment
+    return cfg, updated
 
 
 # ---------------------------------------------------------------------------
@@ -187,36 +206,13 @@ def _create_log_dir(symbol: str) -> Path:
     return log_dir
 
 
-def _print_auto_instructions(symbol: str):
-    """Print manual instructions for adding pair to runners."""
+def _print_auto_instructions(symbol: str, stage: str):
+    """Print registry-driven next steps for a new managed pair."""
     print()
-    print("  Manual steps to complete onboarding:")
-    print(f"    1. Add '{symbol}' to RUNNERS list in argus_flow/ops/daily_report.py")
-    print(f"    2. Add '{symbol}' to RUNNERS list in argus_flow/ops/divergence_guard.py")
-    print(f"    3. Create/update launcher script for {symbol}")
-
-
-def _auto_add_to_runners(symbol: str):
-    """Attempt to add symbol to daily_report.py and divergence_guard.py RUNNERS lists."""
-    files = [
-        REPO / "argus_flow" / "ops" / "daily_report.py",
-        REPO / "argus_flow" / "ops" / "divergence_guard.py",
-    ]
-    for fpath in files:
-        if not fpath.exists():
-            print(f"  WARNING: {fpath.name} not found, skipping auto-add.")
-            continue
-        content = fpath.read_text()
-        # Check if symbol already present
-        if symbol.upper() in content:
-            print(f"  {fpath.name}: {symbol.upper()} already present.")
-            continue
-        # Try to find RUNNERS list and add
-        if "RUNNERS" in content:
-            print(f"  {fpath.name}: Found RUNNERS list. Add '{symbol.upper()}' manually — "
-                  f"auto-edit of list syntax not implemented yet.")
-        else:
-            print(f"  {fpath.name}: No RUNNERS list found. Add manually.")
+    print("  Next steps:")
+    print(f"    1. Managed fleet will discover {symbol} automatically from deployment metadata.")
+    print(f"    2. Current entry stage: {stage}.")
+    print("    3. Run refresh_managed_truth or launch_fleet to rebuild the deployment registry.")
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +223,13 @@ def main():
     parser = argparse.ArgumentParser(description="Onboard a Class B trading pair")
     parser.add_argument("--config", required=True, help="Path to config JSON")
     parser.add_argument("--data", default=None, help="Path to candle data CSV for backtest")
-    parser.add_argument("--auto", action="store_true", help="Auto-add to runner lists")
+    parser.add_argument("--auto", action="store_true", help="Mark the config as managed so the staged fleet discovers it automatically")
+    parser.add_argument(
+        "--stage",
+        default=STAGE_WATCHER,
+        choices=[STAGE_WATCHER, STAGE_DISCOVERY],
+        help="Managed entry stage when --auto is used",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -256,12 +258,20 @@ def main():
         sys.exit(1)
     print(f"  All {len(REQUIRED_CONFIG_FIELDS)} required fields present.")
 
+    if args.auto:
+        cfg, updated = _apply_managed_defaults(cfg, config_path, args.stage)
+        if updated:
+            config_path.write_text(json.dumps(cfg, indent=4) + "\n", encoding="utf-8")
+            print(f"  Managed deployment defaults applied (stage={args.stage}).")
+        else:
+            print(f"  Managed deployment defaults already present (stage={args.stage}).")
+
     # Step 2: Validate / register config hash
     print()
     print("[2/5] Checking config hash...")
-    h, was_added = _ensure_hash(cfg, config_path)
+    h, was_added = _ensure_hash(config_path)
     if was_added:
-        print(f"  Hash {h} added to hashes.json (new config)")
+        print(f"  Hash {h} written to hashes.json")
     else:
         print(f"  Hash {h} already registered.")
 
@@ -324,12 +334,7 @@ def main():
             for a in advisories:
                 print(f"    - {a}")
 
-        if args.auto:
-            print()
-            print("  Auto-adding to runner lists...")
-            _auto_add_to_runners(symbol)
-        else:
-            _print_auto_instructions(symbol)
+        _print_auto_instructions(symbol, args.stage if args.auto else "manual")
     else:
         print(f"  STATUS: FAIL")
         print(f"  Symbol: {symbol}")

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from argus_flow.ops.fx_backtest import BacktestRunner, load_bars
+from argus_flow.ops.fleet_registry import STAGE_PAPER, STAGE_WATCHER, discover_managed_runners
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = REPO / "argus_flow" / "configs"
@@ -28,12 +29,6 @@ LOGS_DIR = REPO / "argus_flow" / "logs"
 DEFAULT_FOLDS = 6
 DEFAULT_WARMUP_BARS = 300
 DEFAULT_MIN_TRADES_PER_FOLD = 3
-
-ACTIVE_RUNNERS = {
-    "EURUSD": "eurusd_t4_paper_v1.json",
-    "GBPUSD": "gbpusd_range_paper_v1.json",
-    "EURJPY": "eurjpy_t4_paper_v1.json",
-}
 
 FUTURES_DATA_MAP = {
     "MES": "ibkr_MES_sp500_micro_1m.csv",
@@ -54,6 +49,12 @@ def infer_data_path(config: dict) -> Path:
         mapped = FUTURES_DATA_MAP.get(symbol)
         if mapped:
             return DATA_DIR / mapped
+        exact = DATA_DIR / f"ibkr_{symbol}_1m.csv"
+        if exact.exists():
+            return exact
+        wildcard_matches = sorted(DATA_DIR.glob(f"ibkr_{symbol}_*_1m.csv"))
+        if wildcard_matches:
+            return wildcard_matches[0]
 
     return DATA_DIR / f"ibkr_{symbol.lower()}_1m.csv"
 
@@ -67,8 +68,9 @@ def resolve_config_path(symbol: str | None = None, config_path: str | None = Non
         raise ValueError("Need either symbol or config path")
 
     symbol = symbol.upper()
-    if symbol in ACTIVE_RUNNERS:
-        return CONFIGS_DIR / ACTIVE_RUNNERS[symbol]
+    for runner in discover_managed_runners():
+        if runner["symbol"] == symbol and not runner["live"]:
+            return REPO / runner["config_path"]
 
     for candidate in sorted(CONFIGS_DIR.glob("*_paper_v1.json")):
         try:
@@ -268,6 +270,53 @@ def build_report(
     return report
 
 
+def build_issue_report(
+    config_path: Path,
+    *,
+    status: str,
+    detail: str,
+    data_path: Path | None = None,
+    folds: int = DEFAULT_FOLDS,
+    warmup_bars: int = DEFAULT_WARMUP_BARS,
+    min_trades_per_fold: int = DEFAULT_MIN_TRADES_PER_FOLD,
+    enable_pyramid: bool = False,
+) -> dict:
+    """Write an explicit non-passing report instead of failing the whole refresh."""
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    resolved_data_path = data_path or infer_data_path(config)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": config.get("symbol", ""),
+        "strategy": config.get("strategy", ""),
+        "config_path": str(config_path),
+        "data_path": str(resolved_data_path),
+        "folds_requested": folds,
+        "warmup_bars": warmup_bars,
+        "min_trades_per_fold": min_trades_per_fold,
+        "pyramiding_enabled": bool(enable_pyramid),
+        "replay_expectations": config.get("replay_expectations", {}),
+        "folds": [],
+        "summary": {
+            "status": status,
+            "rationale": detail,
+            "folds_total": 0,
+            "folds_scored": 0,
+            "positive_folds": 0,
+            "negative_folds": 0,
+            "positive_ratio": 0.0,
+            "total_trades": 0,
+            "mean_expectancy": 0.0,
+            "median_expectancy": 0.0,
+            "worst_fold_expectancy": 0.0,
+            "best_fold_expectancy": 0.0,
+            "median_profit_factor": 0.0,
+            "max_fold_drawdown": 0.0,
+            "aggregate_total_pnl": 0.0,
+        },
+        "status": status,
+    }
+
+
 def output_path_for_symbol(symbol: str) -> Path:
     return LOGS_DIR / symbol.lower() / "walkforward_report.json"
 
@@ -317,14 +366,37 @@ def run_one(
     min_trades_per_fold: int,
     enable_pyramid: bool,
 ) -> tuple[dict, Path]:
-    report = build_report(
-        config_path=config_path,
-        data_path=data_path,
-        folds=folds,
-        warmup_bars=warmup_bars,
-        min_trades_per_fold=min_trades_per_fold,
-        enable_pyramid=enable_pyramid,
-    )
+    try:
+        report = build_report(
+            config_path=config_path,
+            data_path=data_path,
+            folds=folds,
+            warmup_bars=warmup_bars,
+            min_trades_per_fold=min_trades_per_fold,
+            enable_pyramid=enable_pyramid,
+        )
+    except FileNotFoundError as exc:
+        report = build_issue_report(
+            config_path=config_path,
+            status="MISSING_DATA",
+            detail=str(exc),
+            data_path=data_path,
+            folds=folds,
+            warmup_bars=warmup_bars,
+            min_trades_per_fold=min_trades_per_fold,
+            enable_pyramid=enable_pyramid,
+        )
+    except Exception as exc:
+        report = build_issue_report(
+            config_path=config_path,
+            status="ERROR",
+            detail=str(exc),
+            data_path=data_path,
+            folds=folds,
+            warmup_bars=warmup_bars,
+            min_trades_per_fold=min_trades_per_fold,
+            enable_pyramid=enable_pyramid,
+        )
     out_path = write_report(report)
     print_report(report, out_path)
     return report, out_path
@@ -344,13 +416,18 @@ def main() -> None:
 
     targets: list[Path] = []
     if args.all_active:
-        targets = [CONFIGS_DIR / name for name in ACTIVE_RUNNERS.values()]
+        targets = [
+            REPO / runner["config_path"]
+            for runner in discover_managed_runners()
+            if runner["current_stage"] in (STAGE_WATCHER, STAGE_PAPER) and not runner["live"]
+        ]
     else:
         targets = [resolve_config_path(symbol=args.symbol, config_path=args.config)]
 
     override_data = Path(args.data) if args.data else None
+    status_counts: dict[str, int] = {}
     for config_path in targets:
-        run_one(
+        report, _ = run_one(
             config_path=config_path,
             data_path=override_data,
             folds=args.folds,
@@ -358,6 +435,15 @@ def main() -> None:
             min_trades_per_fold=args.min_trades_per_fold,
             enable_pyramid=args.pyramid,
         )
+        status = str(report.get("status", "UNKNOWN")).upper()
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    if len(targets) > 1:
+        print("=" * 68)
+        print("  Walk-Forward Refresh Summary")
+        print("=" * 68)
+        for status, count in sorted(status_counts.items()):
+            print(f"  {status:>14}: {count}")
 
 
 if __name__ == "__main__":

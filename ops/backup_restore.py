@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -246,6 +247,28 @@ def cleanup_old_backups(backup_root: Optional[str] = None, keep: int = 7) -> int
     if not os.path.isdir(backup_root):
         return 0
 
+    def _force_remove_tree(path: str) -> bool:
+        def _handle_remove_error(func, target, exc_info):
+            try:
+                os.chmod(target, stat.S_IWRITE)
+                func(target)
+            except Exception as exc:
+                raise exc from exc_info[1]
+
+        last_error: Optional[Exception] = None
+        for _ in range(10):
+            try:
+                shutil.rmtree(path, onerror=_handle_remove_error)
+                return True
+            except FileNotFoundError:
+                return True
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.1)
+        if last_error:
+            return False
+        return not os.path.exists(path)
+
     dirs = []
     for name in os.listdir(backup_root):
         path = os.path.join(backup_root, name)
@@ -256,11 +279,8 @@ def cleanup_old_backups(backup_root: Optional[str] = None, keep: int = 7) -> int
 
     removed = 0
     for name, path in dirs[keep:]:
-        try:
-            shutil.rmtree(path)
+        if _force_remove_tree(path):
             removed += 1
-        except Exception:
-            pass
 
     return removed
 

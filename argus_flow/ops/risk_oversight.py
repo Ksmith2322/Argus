@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from argus_flow.ops.broker_truth import load_runner_broker_state
+from argus_flow.ops.fleet_registry import discover_managed_runners
 
 REPO = Path(__file__).resolve().parents[2]
 LOGS = REPO / "argus_flow" / "logs"
@@ -43,6 +44,19 @@ FLEET_DRAWDOWN_PAUSE_PIPS = 50.0
 INVALID_TRADE_RATE_THRESHOLD = 0.15  # 15%
 BROKER_STATE_FRESH_S = 600
 MAX_TOTAL_OPEN_RISK_PCT = 0.05
+
+
+def _managed_runners() -> list[dict]:
+    dynamic = [
+        {
+            "name": runner["name"],
+            "symbol": runner["symbol"].lower(),
+            "log_dir": REPO / runner["log_dir"],
+        }
+        for runner in discover_managed_runners()
+        if runner.get("launch_enabled", True)
+    ]
+    return dynamic or RUNNERS
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +124,7 @@ def _read_positions() -> tuple[list[dict], dict]:
     fleet_unrealized_pnl_usd = 0.0
     account_equity_usd = 0.0
     truth_sources = set()
-    for r in RUNNERS:
+    for r in _managed_runners():
         truth = _read_runtime_truth(r)
         status = str(truth.get("status", "FLAT")).upper()
         truth_sources.add(truth.get("source", "unknown"))
@@ -160,7 +174,7 @@ def _check_correlation_exposure(open_positions: list[dict]) -> dict:
 def _check_fleet_drawdown() -> float:
     """Sum drawdown across all pairs from their state files."""
     total_dd = 0.0
-    for r in RUNNERS:
+    for r in _managed_runners():
         state = _read_state(r["log_dir"])
         if state is None:
             continue
@@ -251,7 +265,7 @@ def assess_risk() -> dict:
 
     # Per-pair status
     per_pair = {}
-    for r in RUNNERS:
+    for r in _managed_runners():
         truth = _read_runtime_truth(r)
         status = str(truth.get("status", "FLAT")).upper()
         per_pair[r["symbol"]] = {

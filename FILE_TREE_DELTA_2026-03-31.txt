@@ -3,23 +3,39 @@ ARGUS FILE TREE DELTA
 # Purpose: current additions since FILE_TREE.txt (2026-03-18 snapshot)
 
 repo\
-├── argus_flow\
-│   ├── sizing.py
-│   └── ops\
-│       ├── broker_truth.py
-│       ├── walkforward_validation.py
-│       ├── promotion_gate_v2.py
-│       └── alert_escalation_v2.py
-├── ops\
-│   ├── dashboard.py
-│   ├── process_lock.py
-│   └── run_cohort_report.ps1
-└── argus_flow\logs\
-    ├── _broker\broker_snapshot.json
-    ├── alert_state.json
-    └── alert_events.jsonl
+|-- argus_flow\
+|   |-- sizing.py
+|   `-- ops\
+|       |-- alert_escalation_v2.py
+|       |-- broker_truth.py
+|       |-- deployment_pipeline.py
+|       |-- evidence_registry.py
+|       |-- fleet_registry.py
+|       |-- promotion_gate_v2.py
+|       |-- risk_oversight.py
+|       |-- smoke_test.py
+|       `-- walkforward_validation.py
+|-- ops\
+|   |-- autostart_runner.ps1
+|   |-- dashboard.py
+|   |-- launch_fleet.ps1
+|   |-- process_lock.py
+|   |-- run_cohort_report.ps1
+|   `-- watchdog_managed.ps1
+`-- argus_flow\logs\
+    |-- _broker\broker_snapshot.json
+    |-- alert_events.jsonl
+    |-- alert_state.json
+    |-- artifact_divergence_report.json
+    |-- deployment_registry.json
+    |-- discord_watcher_heartbeat.json
+    |-- position_monitor.json
+    `-- risk_oversight_report.json
 
 Notes
-- dashboard.py now exposes broker-truth, active issues, manual actions, recent alert events, and report freshness.
-- run_cohort_report.ps1 now calls alert_escalation_v2.
-- broker_snapshot.json is the fleet-level broker/account truth surface.
+- deployment_registry.json is the staged fleet registry and modeled risk-policy snapshot.
+- dashboard.py is the single-page staged control center with separate real broker truth and QA model truth.
+- run_cohort_report.ps1 now refreshes deployment pipeline, evidence registry, risk oversight, promotion gate, and alert escalation.
+- walkforward_validation.py writes explicit MISSING_DATA reports for incomplete watcher futures instead of aborting the whole refresh.
+- smoke_test.py is read-only and collision-safe for live gateway verification.
+- watchdog_managed.ps1 replaces the legacy watchdog.ps1 path for stage-aware supervision.

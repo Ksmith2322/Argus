@@ -1,6 +1,6 @@
 # ops/watchdog.ps1 -- Monitor Argus runners and auto-restart on crash
-# Monitors ALL heartbeats. Sends Discord alerts on failures.
-# Updated 2026-03-28 for full fleet (8 FX + 7 futures) + Discord alerts
+# Monitors managed grouped runners + heartbeats. Sends Discord alerts on failures.
+# Updated 2026-03-31 for grouped FX/futures paper fleet supervision.
 
 $ErrorActionPreference = "Continue"
 Set-Location "C:\Argus\repo"
@@ -43,13 +43,65 @@ $futuresConfigs = @(
     "argus_flow/configs/m2k_range_paper_v1.json",
     "argus_flow/configs/mgc_range_paper_v1.json",
     "argus_flow/configs/mcl_range_paper_v1.json"
-    # NKD KILLED 2026-03-29: 0/7 win rate, -550 pips, no edge with range_accel
+    # NKD quarantined 2026-03-29: no edge with range_accel
 )
 
 function Log($msg) {
     $line = "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')] $msg"
     Write-Host $line
     Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+}
+
+function Get-ConfigSignature([string[]]$configs) {
+    return (@(
+        $configs |
+        ForEach-Object {
+            $leaf = Split-Path $_ -Leaf
+            if ([string]::IsNullOrWhiteSpace($leaf)) { $_ } else { $leaf }
+        } |
+        ForEach-Object { $_.ToLower() } |
+        Sort-Object -Unique
+    ) -join '|')
+}
+
+function Get-AliveRunnerLocks() {
+    $results = @()
+    $lockFiles = Get-ChildItem "argus_flow/logs/_locks" -Filter "runner_*.json" -ErrorAction SilentlyContinue
+    foreach ($file in $lockFiles) {
+        try {
+            $lock = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            if (-not $lock) { continue }
+            $lockPid = [int]$lock.pid
+            $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
+            if (-not $proc) { continue }
+            $results += [pscustomobject]@{
+                Path = $file.FullName
+                Id = $lockPid
+                Configs = @($lock.configs)
+            }
+        } catch {}
+    }
+    return @($results)
+}
+
+function Get-LogDirForConfig([string]$configPath) {
+    try {
+        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+        $symbol = [string]$cfg.symbol
+        if (-not $symbol) { return $null }
+        return "argus_flow/logs/$($symbol.ToLower())"
+    } catch {
+        return $null
+    }
+}
+
+function Get-WatchedLogDirs() {
+    $dirs = @()
+    foreach ($cfg in @($fxConfigs + $futuresConfigs | Select-Object -Unique)) {
+        $dir = Get-LogDirForConfig $cfg
+        if ($dir) { $dirs += $dir }
+    }
+    return @($dirs | Select-Object -Unique)
 }
 
 function Send-Discord($message, $color) {
@@ -77,15 +129,12 @@ function Send-Discord($message, $color) {
 }
 
 function Is-RunnerAlive($type) {
-    $procs = Get-Process python* -ErrorAction SilentlyContinue
-    foreach ($p in $procs) {
-        try {
-            $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue).CommandLine
-            if ($cmd -match "runner_unified") {
-                if ($type -eq "fx" -and $cmd -notmatch "client-id" -and $cmd -match "gbpusd.*eurusd.*eurjpy.*gbpjpy") { return $true }
-                if ($type -eq "futures" -and $cmd -match "client-id 2") { return $true }
-            }
-        } catch {}
+    $expectedConfigs = if ($type -eq "fx") { $fxConfigs } else { $futuresConfigs }
+    $expectedSignature = Get-ConfigSignature $expectedConfigs
+    $locks = Get-AliveRunnerLocks
+    foreach ($lock in $locks) {
+        $actualSignature = Get-ConfigSignature $lock.Configs
+        if ($actualSignature -eq $expectedSignature) { return $true }
     }
     return $false
 }
@@ -95,8 +144,8 @@ function Restart-Runner($type) {
         $argsList = @("-m", "argus_flow.runner_unified", "--configs") + $fxConfigs
         Log "Restarting FX runner (8 pairs)..."
     } else {
-        $argsList = @("-m", "argus_flow.runner_unified", "--client-id", "2", "--configs") + $futuresConfigs
-        Log "Restarting Futures runner (7 instruments)..."
+        $argsList = @("-m", "argus_flow.runner_unified", "--configs") + $futuresConfigs
+        Log "Restarting Futures runner (6 instruments)..."
     }
 
     try {
@@ -207,12 +256,7 @@ while ($true) {
     $staleCount = 0
     $freshCount = 0
     # Check ALL active instruments, not just FX
-    $hbDirs = @(
-        "argus_flow/logs/eurusd", "argus_flow/logs/gbpusd", "argus_flow/logs/gbpjpy",
-        "argus_flow/logs/eurjpy", "argus_flow/logs/usdjpy", "argus_flow/logs/audjpy",
-        "argus_flow/logs/audusd", "argus_flow/logs/cadjpy",
-        "argus_flow/logs/mes", "argus_flow/logs/mnq", "argus_flow/logs/mgc", "argus_flow/logs/mcl"
-    )
+    $hbDirs = Get-WatchedLogDirs
     foreach ($dir in $hbDirs) {
         $hbFile = Join-Path $dir "heartbeat.json"
         if (Test-Path $hbFile) {

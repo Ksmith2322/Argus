@@ -16,6 +16,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from argus_flow.ops.fleet_registry import STAGE_PAPER, discover_managed_runners
+
 REPO = Path(__file__).resolve().parents[2]
 
 # -- Active Cohort (Class A) — must match runner_unified.py and dashboard.py --
@@ -32,10 +34,25 @@ COHORT_RUNNERS = [
     {"name": "AUD/USD", "symbol": "AUDUSD", "log_dir": "argus_flow/logs/audusd", "config": "argus_flow/configs/audusd_ny_paper_v1.json", "unit": "pips"},
 ]
 
-PROMOTION_THRESHOLD = 30   # valid trades needed
+PROMOTION_THRESHOLD = 60   # valid trades needed
 INVALIDITY_RATE_MAX = 0.10  # 10% max invalid rate for promotion
 INVALIDITY_WINDOW = 10      # sliding window for quarantine check
 INVALIDITY_WINDOW_MAX = 0.20  # 20% max over any 10-trade window
+
+
+def _active_cohort_runners() -> list[dict]:
+    dynamic = [
+        {
+            "name": runner["name"],
+            "symbol": runner["symbol"],
+            "log_dir": runner["log_dir"],
+            "config": runner["config_path"],
+            "unit": runner["unit"],
+        }
+        for runner in discover_managed_runners()
+        if runner["current_stage"] == STAGE_PAPER and not runner["live"]
+    ]
+    return dynamic or COHORT_RUNNERS
 
 
 def _load_csv(path: Path) -> list[dict]:
@@ -144,7 +161,7 @@ def generate_report() -> dict:
     git_shas_seen = set()
     any_quarantine_triggered = False
 
-    for runner in COHORT_RUNNERS:
+    for runner in _active_cohort_runners():
         log_dir = REPO / runner["log_dir"]
         cfg_path = REPO / runner["config"]
         pnl_field = "pnl_pips" if runner["unit"] == "pips" else "pnl_pts"
@@ -249,12 +266,12 @@ def generate_report() -> dict:
             r["wr_delta_vs_replay"] = round(wr_delta, 3)
             r["wr_within_15pp"] = wr_delta <= 0.15
 
-        # Promotion eligibility — deferred to promotion_gate.py (sole authority)
+        # Promotion eligibility — deferred to promotion_gate_v2.py (sole authority)
         # daily_report only shows progress, not verdict
         promo_report = REPO / "argus_flow" / "logs" / "promotion_gate_report.json"
         r["promotion_eligible"] = False
         remaining = max(0, PROMOTION_THRESHOLD - r["valid_trades"])
-        r["promotion_blocker"] = f"need {remaining} more valid trades" if remaining > 0 else "gate report missing — run promotion_gate.py"
+        r["promotion_blocker"] = f"need {remaining} more valid trades" if remaining > 0 else "gate report missing — run promotion_gate_v2.py"
         if promo_report.exists():
             try:
                 pg = json.loads(promo_report.read_text())
@@ -336,7 +353,7 @@ def print_report(report: dict):
 
         if r.get("signal_freq_ratio"):
             ratio = r["signal_freq_ratio"]
-            flag = " WATCH" if ratio < 0.5 or ratio > 1.5 else ""  # matches promotion_gate.py band
+            flag = " WATCH" if ratio < 0.5 or ratio > 1.5 else ""  # matches promotion_gate_v2.py band
             print(f"    Signal Freq: {r.get('live_signals_per_day', 0):.1f}/day (ratio={ratio:.2f}){flag}")
 
         promo = r.get("promotion_eligible", False)

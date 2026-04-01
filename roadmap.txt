@@ -13,9 +13,23 @@
     The goal is not more surface area. The goal is fewer hidden blind spots.
 
   Recently completed:
+    - Grouped runner client-id resolution:
+        single-config runs honor config ibkr_client_id
+        grouped FX / futures lanes auto-resolve stable non-colliding client ids
+        futures watcher lane restored and MYM stale warning cleared
+    - Managed fleet reconciliation now uses runtime lock metadata to identify grouped runners
+    - Smoke test now validates live artifact readability instead of writing scratch files into runner state
+    - Smoke test now uses read-only IBKR sessions with collision-safe client IDs so fleet launch checks do not fight the live paper lanes
     - Canonical broker truth surfaces (runner broker_state + merged broker_snapshot)
+    - Managed deployment registry and staged pipeline:
+        watcher -> paper QA -> real money
+        sticky stage tracking in deployment_registry.json
+        auto-materialize live config once a paper runner earns PROMOTE
+        launcher emits watcher/paper/real config sets from one source of truth
     - Evidence registry per validation runner
     - Walk-forward validation reports for active cohort pairs
+        nightly refresh no longer aborts when one watcher is missing historical data
+        missing-data watchers now get explicit MISSING_DATA reports instead of silent/stale state
     - promotion_gate_v2.py with walk-forward-aware hard gates
     - artifact_divergence.py aligned to cohort truth:
         registry row counts vs trades.csv
@@ -23,30 +37,91 @@
         false manual alert on EUR/JPY resolved
     - Dashboard ops visibility pass:
         real broker equity
+        staged fleet view on one page:
+          watcher runners
+          paper QA runners
+          real-money runners
+          same runner cards across all three lanes
         active issues
         manual-action queue
         alert event history
         report freshness
         runner-level governance state
         health bar now shows blocked signals over the last 24h instead of warning on lifetime totals
+        validation and observation lanes separated on the same page
+        synthetic USD fallbacks removed from summary/daily views
+        broker equity chart reduced to session-only broker truth
+        page order locked to:
+          system health
+          config / source of truth
+          prod pairs
+          QA pairs
+          watchers
+          signal feed
+        QA/prod daily performance now renders as compact single-line journals
+        QA/prod journals are scrollable so visibility stays usable as history builds
+        signal feed now keeps watcher + QA + prod rows together at the bottom
+        separate hypothetical paper-model account for promotion testing:
+          starts at $10k
+          models at 0.5% risk per trade
+          keeps 3% as a manual earned cap
+          remains explicitly separate from live broker balance
+        paper and real now share the same display language so paper->prod is a transition, not a dashboard rewrite
     - Alert escalation v2:
         durable alert_state.json
         alert_events.jsonl
         issue opened / resolved notifications
         manual-action tagging
+    - Managed watchdog hardening:
+        singleton watchdog_managed.ps1 path
+        consecutive-failure thresholds before lane/dashboard/Discord alerts
+        dashboard health falls back to dashboard lock truth if HTTP check blips
+        managed truth refresh now runs every 10 minutes from the watchdog path
+    - Canonical managed truth refresh:
+        refresh_managed_truth.py / ops/refresh_managed_truth.ps1
+        launch_fleet fails closed if governance refresh fails
+        nightly cohort report now reuses the same canonical refresh path
+        scheduled task registration includes ArgusManagedTruth every 10 minutes
+    - Promotion evidence hardening:
+        deployment_pipeline now freezes stage transitions when promotion/kill/divergence reports are stale
+        promotion_gate_v2 now requires objective dashboard truth instead of a manual spot-check
+        trade journals now persist entry_regime on new cohort trades
+    - Registry-driven onboarding:
+        onboard_pair now writes filename-keyed hashes.json entries
+        --auto marks configs as managed and stage-seeded for registry discovery
+        no more manual runner-list editing for newly onboarded managed configs
+    - Futures live path:
+        generate_live_config no longer blocks futures live promotion by instrument type alone
+    - Current staged fleet now reads:
+        7 watcher configs
+        7 paper QA configs
+        0 real-money configs
+        USD/JPY auto-promoted from watcher -> paper after fresh walk-forward PASS
 
   Still required before any production promotion:
-    - 30+ valid paper trades on a promoted candidate
+    - 60+ valid paper trades on a promoted candidate
     - Live-paper expectancy consistent with replay / walk-forward
     - First real watch/kill/degrade event handled correctly by the governance stack
     - Manual truth spot-checks of dashboard vs source artifacts after real incidents
     - Legacy path cleanup so the old promotion/alert code cannot drift from v2 surfaces
+    - Full journal USD coverage for validation trades if we want trustworthy per-day FX dollar summaries
+    - Discord webhook delivery verified on a real network path
+    - Historical 1m datasets for watcher futures that still read MISSING_DATA:
+        M2K
+        MCL
+        MGC
+      or retire them from the managed watcher lane until data exists
+    - One clean operator pass to retire any leftover legacy watchdog shell from earlier QA runs if it is still present on the machine
 
   Current evidence read:
     - GBP/USD: strongest validation candidate so far (walk-forward PASS, live sample still tiny)
     - EUR/JPY: promising on walk-forward, live sample still tiny
     - EUR/USD: not yet proven (walk-forward WATCH / negative mean expectancy)
-    - Fleet ops state: CLEAN right now (0 active issues, 0 manual actions, broker truth connected, risk oversight GREEN)
+    - USD/JPY: walk-forward PASS and now promoted into paper QA, but still divergence-killed on live-paper signal frequency
+    - Fleet ops state:
+        broker truth / position monitor / artifact divergence are clean after the grouped-runner restart
+        active manual-action items are currently divergence KILLs on EUR/USD, GBP/USD, EUR/JPY, GBP/JPY, USD/JPY
+        AUD/USD remains WATCH on signal-frequency divergence
 
 ---
 
@@ -116,7 +191,7 @@ Rules:
                       at least one real fault, not just simulated fault.
                       For reporting/dashboard: requires running and monitored.
   PROMOTION-TRUSTED:  Has earned the right to inform capital decisions.
-                      Requires: 30+ valid trades, divergence guard PASS,
+                      Requires: 60+ valid trades, divergence guard PASS,
                       artifact divergence CLEAN, kill discipline PASS.
 
   No component may borrow credibility from a higher-maturity sibling.
@@ -133,9 +208,9 @@ Rules:
   HYPOTHESIS:         Idea stage. No backtest.
   BACKTEST-PASS:      Positive expectancy in backtest. Payoff Contract defined.
   PAPER-VALIDATING:   Live paper runner accumulating cohort trades.
-  PAPER-PASS:         30+ valid trades, all promotion criteria met.
+  PAPER-PASS:         60+ valid trades, all promotion criteria met.
   LIVE-VALIDATING:    Real capital, micro size, accumulating live fills.
-  LIVE-PASS:          30+ live fills, slippage within model, expectancy holds.
+  LIVE-PASS:          60+ live fills, slippage within model, expectancy holds.
   SCALED:             Full position sizing, proven edge.
   KILLED:             Deployment killed. Thesis archived. Config retired.
   DORMANT:            Thesis preserved, deployment stopped. Awaiting venue/regime change.
@@ -251,10 +326,10 @@ Rules:
   - Regime coverage: trending, ranging, volatile all represented
 
 ## Paper -> Live gate:
-  - 30+ valid paper trades (noisy evidence, not proof)
+  - 60+ valid paper trades (still evidence, not certainty)
   - Expectancy within 20% of backtest expectancy
   - Replay-Live Divergence Guard passes (outcome + state-space)
-  - All promotion_gate.py checks PASS
+  - All promotion_gate_v2.py checks PASS
   - Kill discipline PASS
   - Artifact divergence CLEAN
   - Governance component trust rule: any BUILT component feeding promotion
@@ -263,7 +338,7 @@ Rules:
     Automated output from untested-by-reality components is advisory only.
 
 ## Live -> Scale gate:
-  - 30+ live fills
+  - 60+ live fills
   - Slippage within model bounds
   - Expectancy within 30% of paper expectancy
 
@@ -413,38 +488,38 @@ Rules:
 # SYSTEM 2: IBKR TRADING ENGINE -- PRIMARY ACTIVE
 # ===================================================================
 
-## Runner Lanes
+## Runner Stages
 
-  ### VALIDATION LANE (eligible for promotion evidence)
-  Only these runners may accumulate trades toward paper->live promotion.
+  ### WATCHER STAGE (research / observation, not yet promotion-eligible)
+  New pairs should enter here by default. They gather walk-forward evidence and
+  signal telemetry only, but they do not earn promotion credit until the stage
+  pipeline moves them into paper QA. This stage is emitted automatically from
+  deployment_registry.json, not maintained by hand.
 
-    EUR/USD T4       clientId=10  Status: PAPER-VALIDATING  Cohort: 0/30 valid trades  | Walk-forward: WATCH
-    GBP/USD range    clientId=12  Status: PAPER-VALIDATING  Cohort: 1/30 valid trades
-    EUR/JPY T4       clientId=18  Status: PAPER-VALIDATING  Cohort: 1/30 valid trades
+    CAD/JPY T4       Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
+    M2K range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
+    MCL range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
+    MES range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
+    MGC range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
+    MNQ range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
+    MYM range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
 
-  ### OBSERVATION LANE (collecting data, not eligible for promotion)
-  Data collected here informs future decisions but cannot be used for
-  promotion claims. These runners must pass Research->Paper gate
-  and enter the validation lane before accumulating promotion evidence.
+  ### PAPER QA STAGE (eligible for paper->real promotion evidence)
+  Only this lane may accumulate the valid trade sample that earns production
+  promotion. Paper QA uses the same display language as real money on the dashboard.
 
-    GBP/JPY T4       clientId=13  Status: BACKTEST-PASS     Backtested, +3.22 bps/trade
-    AUD/USD NY       clientId=14  Status: BACKTEST-PASS     Backtested, +1.08 bps/trade
-    USD/JPY NY       clientId=15  Status: BACKTEST-PASS     Backtested, +0.65 bps/trade
-    AUD/JPY T4       clientId=19  Status: HYPOTHESIS        No backtest yet
-    CAD/JPY T4       clientId=20  Status: HYPOTHESIS        No backtest yet
-    MNQ vol_burst    clientId=11  Status: BACKTEST-PASS     Day1: -128pts (quarantined)
+    AUD/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    AUD/USD NY       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    EUR/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    EUR/USD T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    GBP/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    GBP/USD range    Stage: PAPER-QA  Status: PAPER-VALIDATING
+    USD/JPY NY       Stage: PAPER-QA  Status: PAPER-VALIDATING
 
-  ### EXPLORATION LANE (new/weak hypotheses, explicitly non-promotable)
-  No expectation of near-term capital path.
-
-    MES vol_burst    clientId=16  Status: HYPOTHESIS        Needs wider stops
-    MYM vol_burst    clientId=17  Status: HYPOTHESIS        No data
-    M2K vol_burst    clientId=23  Status: HYPOTHESIS        No data
-    MGC vol_burst    clientId=21  Status: HYPOTHESIS        No data
-    MCL vol_burst    clientId=22  Status: HYPOTHESIS        No data
-    NKD vol_burst    clientId=24  Status: KILLED            25% WR
-    BTC range        clientId=25  Status: HYPOTHESIS        Blocker: No Paxos subscription
-    ETH range        clientId=26  Status: HYPOTHESIS        Blocker: No Paxos subscription
+  ### REAL MONEY STAGE (production capital)
+  No managed configs have earned this stage yet. When a paper QA runner reaches
+  PROMOTE, deployment_pipeline.py materializes the live config and the same
+  dashboard surface shows it under the real-money lane.
 
 ## Closed (killed deployments):
     - Kraken BTC perpetuals (Cascade): KILLED. Thesis: DORMANT (payoff exists on perps, not spot)
@@ -452,12 +527,12 @@ Rules:
 
 ## Evidence Registry
 
-  Each validation-lane runner maintains:
+  Each managed runner maintains:
 
   | Field | Source |
   |-------|--------|
   | Current status | Manual assignment |
-  | Config hash | Frozen at cohort start, verified by promotion_gate.py |
+  | Config hash | Frozen at cohort start, verified by promotion_gate_v2.py |
   | Cohort start date | First valid trade timestamp |
   | Valid trades | trades.csv where experiment_valid=true |
   | Invalid trades + reasons | trades.csv where experiment_valid=false |
@@ -493,8 +568,8 @@ Rules:
   Gateway: TWS Gateway, port 7496, auto-restart 11:45 PM ET
   Runners simulate positions internally (state.json) -- no real orders placed
 
-  Primary runner: runner_unified.py (single process, 3 validation-lane pairs)
-  Configs: argus_flow/configs/*.json (17 versioned configs, 3 active)
+  Primary runner: runner_unified.py (grouped managed watcher/paper runner processes, stage-aware)
+  Configs: argus_flow/configs/*.json (14 managed configs in deployment_registry: 7 watcher, 7 paper, 0 real)
   Logs: argus_flow/logs/{symbol}/
 
 ---
@@ -553,11 +628,12 @@ Rules:
 # SCHEDULED TASKS (PC1)
 
   ArgusGitBackup:       daily@02:00  -> ops/auto_git_backup.ps1
+  ArgusManagedTruth:    every 10 min -> ops/refresh_managed_truth.ps1
   ArgusCohortReport:    daily@23:00  -> ops/run_cohort_report.ps1
   ArgusUSBBackup:       daily@03:00  -> ops/backup_to_usb.ps1
   ArgusVerifyBackup:    Sunday@04:00 -> ops/verify_backup.ps1
   ArgusWeeklyDigest:    Sunday@06:00 -> ops/run_weekly_digest.ps1
-  ArgusWatchdog:        on startup   -> ops/watchdog.ps1
+  ArgusWatchdog:        on startup   -> ops/watchdog_managed.ps1
   Runner auto-start:    on login     -> ops/autostart_runner.ps1
   Dashboard auto-start: on login     -> ops/autostart_dashboard.ps1
 

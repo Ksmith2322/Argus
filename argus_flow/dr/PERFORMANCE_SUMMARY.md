@@ -1,7 +1,7 @@
 # Argus FX — Performance Summary
 # Auto-generated context: replaces RESEARCH dashboard tab (removed 2026-03-25)
 # For live metrics, run: python -m argus_flow.ops.daily_report
-# For promotion gate: python -m argus_flow.ops.promotion_gate
+# For promotion gate: python -m argus_flow.ops.promotion_gate_v2
 
 ## Active Cohort (Paper Trading)
 

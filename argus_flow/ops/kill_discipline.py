@@ -10,21 +10,36 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+from argus_flow.ops.fleet_registry import STAGE_PAPER, STAGE_QUARANTINE, STAGE_REAL, runners_for_stages
 
-RUNNERS = [
-    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "unit": "pips"},
-    {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips"},
-    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips"},
-]
+REPO = Path(__file__).resolve().parents[2]
 
 # Kill thresholds
 CONSECUTIVE_NEGATIVE_WEEKS = 3
 MIN_TRADES_PER_WEEK = 15
 MAX_DRAWDOWN_MULT = 3.0  # 3x model drawdown = kill
+
+
+def governed_runners() -> list[dict]:
+    """Return managed paper/live runners covered by kill discipline."""
+    runners: list[dict] = []
+    for runner in runners_for_stages({STAGE_PAPER, STAGE_REAL, STAGE_QUARANTINE}):
+        runners.append(
+            {
+                "name": runner["name"],
+                "symbol": runner["symbol"],
+                "log_dir": runner["log_dir"],
+                "config": runner["config_path"],
+                "unit": runner["unit"],
+                "current_stage": runner["current_stage"],
+                "live": runner["live"],
+            }
+        )
+    runners.sort(key=lambda item: (item.get("current_stage", ""), item["name"]))
+    return runners
 
 
 def _load_trades(log_dir: Path) -> list[dict]:
@@ -35,30 +50,31 @@ def _load_trades(log_dir: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def _load_replay_expectations(symbol: str) -> dict:
+def _load_replay_expectations(config_path: Path) -> dict:
     """Load replay expectations from config."""
-    cfg_map = {
-        "EURUSD": "eurusd_t4_paper_v1.json",
-        "GBPUSD": "gbpusd_range_paper_v1.json",
-        "EURJPY": "eurjpy_t4_paper_v1.json",
-    }
-    cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(symbol, "")
-    if cfg_path.exists():
-        return json.loads(cfg_path.read_text()).get("replay_expectations", {})
+    if config_path.exists():
+        return json.loads(config_path.read_text()).get("replay_expectations", {})
     return {}
 
 
 def check_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     trades = _load_trades(log_dir)
-    rexp = _load_replay_expectations(runner["symbol"])
+    cfg_path = REPO / runner["config"]
+    rexp = _load_replay_expectations(cfg_path)
 
     result = {
         "name": runner["name"],
         "symbol": runner["symbol"],
         "status": "PASS",
+        "verdict": "PASS",
+        "reason": "",
         "flags": [],
+        "kill_flags": [],
+        "watch_flags": [],
         "metrics": {},
+        "current_stage": runner.get("current_stage", ""),
+        "live": bool(runner.get("live", False)),
     }
 
     # Filter to valid trades only
@@ -66,6 +82,8 @@ def check_runner(runner: dict) -> dict:
 
     if not valid_trades:
         result["status"] = "COLLECTING"
+        result["verdict"] = "COLLECTING"
+        result["reason"] = "no valid trades yet"
         result["metrics"]["valid_trades"] = 0
         return result
 
@@ -159,8 +177,6 @@ def check_runner(runner: dict) -> dict:
     # Model drawdown: derived from config stop_pips if available,
     # otherwise fallback to conservative 10-pip baseline.
     # Rationale: expected max DD ~ 3-5 consecutive stop-outs at full stop distance.
-    cfg_map = {"EURUSD": "eurusd_t4_paper_v1.json", "GBPUSD": "gbpusd_range_paper_v1.json", "EURJPY": "eurjpy_t4_paper_v1.json"}
-    cfg_path = REPO / "argus_flow" / "configs" / cfg_map.get(runner["symbol"], "")
     default_model_dd_used = True
     model_dd = 10.0  # fallback
     if cfg_path.exists():
@@ -190,13 +206,20 @@ def check_runner(runner: dict) -> dict:
     # ── Determine status ──
     kills = [f for f in result["flags"] if "KILL" in f]
     watches = [f for f in result["flags"] if "WATCH" in f]
+    result["kill_flags"] = kills
+    result["watch_flags"] = watches
 
     if kills:
         result["status"] = "KILL"
+        result["reason"] = " | ".join(kills[:3])
     elif watches:
         result["status"] = "WATCH"
+        result["reason"] = " | ".join(watches[:3])
     else:
         result["status"] = "PASS"
+        result["reason"] = "within kill-discipline guardrails"
+
+    result["verdict"] = result["status"]
 
     return result
 
@@ -207,7 +230,8 @@ def main():
     print("=" * 65)
 
     results = []
-    for runner in RUNNERS:
+    runners = governed_runners()
+    for runner in runners:
         r = check_runner(runner)
         results.append(r)
 
@@ -237,6 +261,10 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scope": {
+            "stages": [STAGE_PAPER, STAGE_REAL],
+            "runner_count": len(runners),
+        },
         "runners": results,
     }, indent=2, default=str))
     print(f"\n  Saved: {out_path}")

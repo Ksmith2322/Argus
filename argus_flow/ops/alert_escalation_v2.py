@@ -39,6 +39,7 @@ SEVERITY_COLOR = {
     "RESOLVED": 0x00FF88,
 }
 MANUAL_SEVERITIES = {"HIGH", "CRITICAL"}
+MANAGED_GOVERNANCE_FRESH_S = 30 * 60
 
 REPORT_SPECS = [
     {
@@ -59,28 +60,28 @@ REPORT_SPECS = [
         "id": "promotion_gate",
         "label": "Promotion Gate",
         "path": LOGS / "promotion_gate_report.json",
-        "fresh_s": 36 * 3600,
+        "fresh_s": MANAGED_GOVERNANCE_FRESH_S,
         "manual_when_stale": False,
     },
     {
         "id": "artifact_divergence",
         "label": "Artifact Divergence",
         "path": LOGS / "artifact_divergence_report.json",
-        "fresh_s": 36 * 3600,
+        "fresh_s": MANAGED_GOVERNANCE_FRESH_S,
         "manual_when_stale": False,
     },
     {
         "id": "divergence",
         "label": "Divergence Guard",
         "path": LOGS / "divergence_report.json",
-        "fresh_s": 36 * 3600,
+        "fresh_s": MANAGED_GOVERNANCE_FRESH_S,
         "manual_when_stale": False,
     },
     {
         "id": "kill_discipline",
         "label": "Kill Discipline",
         "path": LOGS / "kill_discipline_report.json",
-        "fresh_s": 36 * 3600,
+        "fresh_s": MANAGED_GOVERNANCE_FRESH_S,
         "manual_when_stale": False,
     },
 ]
@@ -159,6 +160,44 @@ def _iter_report_items(report: dict | list | None, *, runner_key: str = "runners
     return []
 
 
+def _joined_flags(item: dict, verdict: str) -> list[str]:
+    preferred_key = "kill_flags" if verdict == "KILL" else "watch_flags"
+    preferred = item.get(preferred_key, [])
+    if isinstance(preferred, list) and preferred:
+        return [str(flag).strip() for flag in preferred if str(flag).strip()]
+    flags = item.get("flags", [])
+    if not isinstance(flags, list):
+        return []
+    verdict_upper = verdict.upper()
+    return [str(flag).strip() for flag in flags if verdict_upper in str(flag).upper()]
+
+
+def _report_reason(item: dict, verdict: str) -> str:
+    reason = str(item.get("reason", item.get("message", "")) or "").strip()
+    if reason and reason.lower() != "no reason provided":
+        return reason
+
+    flags = _joined_flags(item, verdict)
+    if flags:
+        metrics = item.get("metrics", {})
+        metric_bits: list[str] = []
+        if isinstance(metrics, dict):
+            if metrics.get("days_observed") is not None:
+                metric_bits.append(f"days={metrics.get('days_observed')}")
+            if metrics.get("closed_trades") is not None:
+                metric_bits.append(f"trades={metrics.get('closed_trades')}")
+            elif metrics.get("valid_trades") is not None:
+                metric_bits.append(f"trades={metrics.get('valid_trades')}")
+            if metrics.get("signals_per_day") is not None and metrics.get("replay_signals_per_day") is not None:
+                metric_bits.append(
+                    f"signals/day={metrics.get('signals_per_day')} vs replay={metrics.get('replay_signals_per_day')}"
+                )
+        if metric_bits:
+            return f"{' | '.join(flags[:3])} | {'; '.join(metric_bits[:3])}"
+        return " | ".join(flags[:3])
+    return "no reason provided"
+
+
 def _check_report_freshness() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     issues: list[dict[str, Any]] = []
     freshness: list[dict[str, Any]] = []
@@ -230,7 +269,7 @@ def _check_kill_discipline() -> list[dict[str, Any]]:
         if verdict not in {"KILL", "WATCH"}:
             continue
         pair = str(item.get("pair", item.get("symbol", "unknown")))
-        reason = str(item.get("reason", item.get("message", "no reason provided")))
+        reason = _report_reason(item, verdict)
         severity = "CRITICAL" if verdict == "KILL" else "WARNING"
         issues.append(
             _issue(
@@ -259,7 +298,7 @@ def _check_divergence() -> list[dict[str, Any]]:
         if verdict not in {"KILL", "WATCH"}:
             continue
         pair = str(item.get("pair", item.get("symbol", item.get("name", "unknown"))))
-        reason = str(item.get("reason", item.get("message", "no reason provided")))
+        reason = _report_reason(item, verdict)
         severity = "HIGH" if verdict == "KILL" else "WARNING"
         issues.append(
             _issue(

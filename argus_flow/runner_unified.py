@@ -38,6 +38,15 @@ from argus_flow.ops.broker_truth import (
     process_snapshot_path,
     runner_broker_state_path,
 )
+from argus_flow.ops.fleet_registry import (
+    default_log_dir,
+    infer_stage,
+    load_existing_registry_entry,
+    normalize_stage,
+    resolve_risk_policy,
+    stage_account,
+    stage_execution_mode,
+)
 from argus_flow.schemas import signal_header, build_signal_row, trade_header
 from argus_flow.sizing import (
     DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD,
@@ -50,7 +59,7 @@ from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_na
 load_dotenv()
 
 try:
-    from ib_insync import IB, Forex, Future, util
+    from ib_insync import IB, Forex, Future, MarketOrder, StopOrder, LimitOrder, util
 except ImportError:
     print("ERROR: pip install ib_insync")
     sys.exit(1)
@@ -68,10 +77,13 @@ IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
 IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
+REPO = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
 DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
+AUTO_GROUP_CLIENT_ID_BASE = 1000
+AUTO_GROUP_CLIENT_ID_SPAN = 8000
 
 
 # ═════════════════════════════════════════════════════════════
@@ -125,11 +137,23 @@ class State:
         self.entry_risk_usd = 0.0
         self.sizing_policy = ""
         self.account_equity_at_entry = 0.0
+        self.entry_regime = ""
         # Profit floor state machine (BUILT but not deployed — behind config flag)
         self.hard_stop_price = 0.0        # Original catastrophic stop (never changes)
         self.profit_floor_price = 0.0     # Dynamic floor (0 = inactive)
         self.profit_floor_state = "DISARMED"  # DISARMED | ARMED_10 | ARMED_15
         self.max_favorable_pips = 0.0     # Running MFE for this trade
+        # Real execution order tracking
+        self.entry_pending: bool = False
+        self.exit_pending: bool = False
+        self.entry_order_id: str = ""
+        self.stop_order_id: str = ""
+        self.target_order_id: str = ""
+        self.exit_order_id: str = ""
+        self.entry_fill_px: float = 0.0
+        self.exit_fill_px: float = 0.0
+        self.entry_submitted_ts: str = ""
+        self.exit_submitted_ts: str = ""
 
     def save(self) -> None:
         """Atomic state write: write to temp file, flush, then rename."""
@@ -150,10 +174,32 @@ class State:
             "entry_risk_usd": self.entry_risk_usd,
             "sizing_policy": self.sizing_policy,
             "account_equity_at_entry": self.account_equity_at_entry,
+            "entry_regime": self.entry_regime,
+            "entry_pending": self.entry_pending,
+            "exit_pending": self.exit_pending,
+            "entry_order_id": self.entry_order_id,
+            "stop_order_id": self.stop_order_id,
+            "target_order_id": self.target_order_id,
+            "exit_order_id": self.exit_order_id,
+            "entry_fill_px": self.entry_fill_px,
+            "exit_fill_px": self.exit_fill_px,
+            "entry_submitted_ts": self.entry_submitted_ts,
+            "exit_submitted_ts": self.exit_submitted_ts,
         }, indent=2)
         tmp = self.file.with_suffix(".tmp")
         tmp.write_text(data)
-        tmp.replace(self.file)  # atomic on same filesystem
+        for _ in range(3):
+            try:
+                tmp.replace(self.file)  # atomic on same filesystem
+                return
+            except PermissionError:
+                time.sleep(0.05)
+
+        self.file.write_text(data)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def load(self, sym_label: str) -> None:
         if not self.file.exists():
@@ -177,6 +223,17 @@ class State:
         self.entry_risk_usd = d.get("entry_risk_usd", 0.0)
         self.sizing_policy = d.get("sizing_policy", "")
         self.account_equity_at_entry = d.get("account_equity_at_entry", 0.0)
+        self.entry_regime = d.get("entry_regime", "")
+        self.entry_pending = d.get("entry_pending", False)
+        self.exit_pending = d.get("exit_pending", False)
+        self.entry_order_id = d.get("entry_order_id", "")
+        self.stop_order_id = d.get("stop_order_id", "")
+        self.target_order_id = d.get("target_order_id", "")
+        self.exit_order_id = d.get("exit_order_id", "")
+        self.entry_fill_px = d.get("entry_fill_px", 0.0)
+        self.exit_fill_px = d.get("exit_fill_px", 0.0)
+        self.entry_submitted_ts = d.get("entry_submitted_ts", "")
+        self.exit_submitted_ts = d.get("exit_submitted_ts", "")
         if d.get("entry_time"):
             try:
                 self.entry_time = datetime.fromisoformat(d["entry_time"])
@@ -441,6 +498,7 @@ def _write_broker_truth_artifacts(
             "account": account_snapshot,
             "runner": {
                 "symbol": inst.symbol,
+                "deployment_stage": inst.deployment_stage,
                 "ib_key": ib_key,
                 "local_position": inst.state.position,
                 "position_size": inst.state.position_size,
@@ -486,11 +544,16 @@ def _write_heartbeat_files(
     for inst in instruments:
         hb_file = inst.log_dir / "heartbeat.json"
         try:
-            hb_file.write_text(json.dumps({
+            # Keep the local state artifact present whenever the runner is alive
+            # enough to emit a heartbeat so dashboard/oversight surfaces never
+            # fall back to inferred runtime state.
+            inst.state.save()
+            atomic_write_json(hb_file, {
                 "ts": now.isoformat(),
                 "pid": os.getpid(),
                 "session_id": getattr(inst, '_session_id', ''),
                 "instrument": inst.symbol,
+                "deployment_stage": inst.deployment_stage,
                 "runtime_mode": runtime_mode,
                 "position": inst.state.position,
                 "broker_position": getattr(inst, '_broker_position', 'FLAT'),
@@ -504,7 +567,7 @@ def _write_heartbeat_files(
                 "account_equity_usd": equity_tracker.equity_usd,
                 "open_risk_usd": inst.current_open_risk_usd(),
                 "unrealized_pnl_usd": inst.current_unrealized_pnl_usd(),
-            }))
+            })
         except Exception:
             pass
 
@@ -512,6 +575,47 @@ def _write_heartbeat_files(
 def _config_short_hash(path: Path) -> str:
     raw = path.read_text(encoding="utf-8")
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _load_config_for_client_id(path_str: str | Path) -> tuple[Path, dict] | None:
+    path = Path(path_str)
+    try:
+        return path, json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def resolve_client_id(
+    config_paths: Optional[list[str]] = None,
+    explicit_client_id: Optional[int] = None,
+    default_client_id: Optional[int] = None,
+) -> tuple[int, str]:
+    """Resolve a stable IBKR client ID for this runner instance."""
+    fallback = int(default_client_id or IBKR_CLIENT_ID)
+    if explicit_client_id is not None:
+        return int(explicit_client_id), "cli"
+
+    loaded = []
+    for raw_path in config_paths or []:
+        cfg_pair = _load_config_for_client_id(raw_path)
+        if cfg_pair is not None:
+            loaded.append(cfg_pair)
+
+    if len(loaded) == 1:
+        cfg_client_id = loaded[0][1].get("ibkr_client_id")
+        if isinstance(cfg_client_id, int) and cfg_client_id > 0:
+            return int(cfg_client_id), f"config:{loaded[0][0].name}"
+        return fallback, "env"
+
+    if len(loaded) > 1:
+        signature = "|".join(sorted(path.name.lower() for path, _ in loaded))
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        derived = AUTO_GROUP_CLIENT_ID_BASE + (
+            int(digest[:8], 16) % AUTO_GROUP_CLIENT_ID_SPAN
+        )
+        return int(derived), "auto-group"
+
+    return fallback, "env"
 
 
 def _validate_config_registry(cfg_files: list[Path]) -> bool:
@@ -830,6 +934,22 @@ class InstrumentRunner:
         self.instrument_type: str = config.get("instrument_type", "forex")
         self.strategy: str = config.get("strategy", "unknown")
         self.label = f"{self.symbol}:{self.strategy}"
+        self.deployment = config.get("deployment", {}) if isinstance(config.get("deployment", {}), dict) else {}
+        self.deployment_stage = infer_stage(config, Path(config_path))
+        self.risk_policy = resolve_risk_policy(config, Path(config_path), stage=self.deployment_stage)
+        registry_entry = load_existing_registry_entry(Path(config_path).name)
+        if isinstance(registry_entry, dict):
+            registry_stage = normalize_stage(registry_entry.get("current_stage"))
+            if registry_stage:
+                self.deployment_stage = registry_stage
+            registry_risk = registry_entry.get("risk_policy", {}) if isinstance(registry_entry.get("risk_policy", {}), dict) else {}
+            merged_risk = dict(self.risk_policy)
+            merged_risk.update({k: v for k, v in registry_risk.items() if v is not None})
+            merged_risk["stage"] = self.deployment_stage
+            self.risk_policy = merged_risk
+        self.stage_account = stage_account(self.deployment_stage)
+        self.execution_mode = stage_execution_mode(self.deployment_stage)
+        self.trade_enabled = self.execution_mode in ("paper", "real")
 
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -860,7 +980,7 @@ class InstrumentRunner:
         self.num_contracts = risk.get("num_contracts", 1)
         self.min_contracts = int(risk.get("min_contracts", 1))
         self.max_contracts = risk.get("max_contracts")
-        self.risk_pct = float(risk.get("risk_pct", 0) or 0)
+        self.risk_pct = float(self.risk_policy.get("active_risk_pct", risk.get("risk_pct", 0)) or 0)
         self.dynamic_position_sizing = self.risk_pct > 0
 
         # Derived: pip size for FX
@@ -890,6 +1010,9 @@ class InstrumentRunner:
 
         # Track last feature eval minute to avoid double-evaluation
         self._last_eval_minute: Optional[datetime] = None
+
+        # Fill deduplication
+        self._processed_fill_ids: set[str] = set()
 
     # ── Price extraction ─────────────────────────────────────
     def _get_mid(self) -> Optional[float]:
@@ -936,6 +1059,11 @@ class InstrumentRunner:
 
     # ── CSV helpers ──────────────────────────────────────────
     def _get_account_equity(self) -> float:
+        # Paper/watcher stages use modeled equity from risk policy, not live account
+        if getattr(self, "deployment_stage", "") in ("paper", "watcher"):
+            modeled = float(self.risk_policy.get("model_start_equity_usd", 0) or 0)
+            if modeled > 0:
+                return modeled
         tracker = getattr(self, "_equity_tracker", None)
         if tracker is None:
             return DEFAULT_ACCOUNT_EQUITY_USD
@@ -1011,6 +1139,51 @@ class InstrumentRunner:
         s.position_size = fallback
         s.entry_risk_usd = self._risk_usd_for_size(s.entry_price, s.stop_price, fallback)
         s.sizing_policy = s.sizing_policy or "legacy_fixed"
+
+    def _hydrate_trade_history_from_journal(self) -> None:
+        """Recover cumulative closed-trade history if state lags the journal."""
+        if not self.trade_log.exists():
+            return
+        try:
+            with open(self.trade_log, newline="") as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            return
+        if not rows:
+            return
+
+        serials = []
+        pnl_total = 0.0
+        pnl_usd_total = 0.0
+        pnl_field = "pnl_pips" if self.uses_pips else "pnl_pts"
+
+        for row in rows:
+            try:
+                serials.append(int(float(row.get("trade_num", 0) or 0)))
+            except (TypeError, ValueError):
+                pass
+            try:
+                pnl_total += float(row.get(pnl_field, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                pnl_usd_total += float(row.get("pnl_usd", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+        if not serials:
+            return
+
+        journal_trade_count = max(serials)
+        s = self.state
+        if s.trade_count < journal_trade_count:
+            s.trade_count = journal_trade_count
+
+        if self.uses_pips:
+            s.pnl_pips = pnl_total
+        else:
+            s.pnl_points = pnl_total
+        s.pnl_usd = pnl_usd_total
 
     def current_open_risk_usd(self) -> float:
         s = self.state
@@ -1152,7 +1325,7 @@ class InstrumentRunner:
                     f"{exit_price:.5f}", f"{pnl:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
                     f"{pnl_usd:.2f}", f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}",
-                    s.sizing_policy or "fixed",
+                    s.sizing_policy or "fixed", s.entry_regime or "",
                 ] + validity_fields)
             else:
                 if self.instrument_type == "future":
@@ -1166,6 +1339,7 @@ class InstrumentRunner:
                     ep, xp, f"{pnl:.2f}", f"{pnl_usd:.2f}",
                     exit_reason, f"{dur:.1f}", s.trade_count,
                     f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}", s.sizing_policy or "fixed",
+                    s.entry_regime or "",
                 ] + validity_fields)
 
         # Reset validity flags after trade closes
@@ -1430,6 +1604,314 @@ class InstrumentRunner:
             f"new_stop={s.stop_price:.5f} size={s.position_size:.0f}"
         )
 
+    # ── Real execution helpers (gated behind execution_mode == "real") ──
+    def _submit_real_entry(self, direction: str, size: float, stop_px: float, target_px: float) -> bool:
+        """Submit a market order for real entry. Returns True on success."""
+        s = self.state
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            self._log.error("REAL_ENTRY FAILED: no IB reference on runner")
+            return False
+        try:
+            action = "BUY" if direction == "long" else "SELL"
+            # ib_insync MarketOrder: totalQuantity must be positive
+            order = MarketOrder(action, abs(size))
+            order.account = getattr(self, 'stage_account', '') or ''
+            trade = ib.placeOrder(self.contract, order)
+            s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
+            s.entry_pending = True
+            s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
+            s.save()
+            self._log.info(
+                f"REAL_ENTRY SUBMITTED {action} {size} {self.symbol} "
+                f"orderId={s.entry_order_id} stop={stop_px} target={target_px}"
+            )
+            # Stash planned stops for bracket submission after fill
+            self._pending_stop_px = stop_px
+            self._pending_target_px = target_px
+            self._pending_direction = direction
+            self._pending_size = size
+            return True
+        except Exception as exc:
+            self._log.error(f"REAL_ENTRY FAILED: {exc}", exc_info=True)
+            return False
+
+    def _submit_bracket_orders(self, stop_px: float, target_px: float) -> bool:
+        """After entry fills, place protective stop and target limit orders."""
+        s = self.state
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            self._log.error("BRACKET FAILED: no IB reference on runner")
+            return False
+        try:
+            size = s.position_size
+            # Closing action is opposite of position
+            close_action = "SELL" if s.position == "LONG" else "BUY"
+
+            # Stop order (protective)
+            stop_order = StopOrder(close_action, abs(size), round(stop_px, 5))
+            stop_order.account = getattr(self, 'stage_account', '') or ''
+            stop_trade = ib.placeOrder(self.contract, stop_order)
+            s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
+
+            # Target limit order
+            limit_order = LimitOrder(close_action, abs(size), round(target_px, 5))
+            limit_order.account = getattr(self, 'stage_account', '') or ''
+            target_trade = ib.placeOrder(self.contract, limit_order)
+            s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+
+            s.save()
+            self._log.info(
+                f"BRACKET SUBMITTED {self.symbol} "
+                f"stop_orderId={s.stop_order_id} @ {stop_px:.5f} | "
+                f"target_orderId={s.target_order_id} @ {target_px:.5f}"
+            )
+            return True
+        except Exception as exc:
+            self._log.error(f"BRACKET FAILED: {exc}", exc_info=True)
+            return False
+
+    def _submit_real_exit(self, reason: str, mid: float) -> bool:
+        """Cancel existing bracket orders and submit a market exit."""
+        s = self.state
+        qty = abs(s.position_size)
+        if qty <= 0:
+            self._log.error("Cannot exit: position_size is 0")
+            s.position = "FLAT"
+            s.exit_pending = False
+            s.save()
+            return False
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            self._log.error("REAL_EXIT FAILED: no IB reference on runner")
+            return False
+        try:
+            # Cancel existing stop and target orders
+            self._cancel_order_by_id(s.stop_order_id, "stop")
+            self._cancel_order_by_id(s.target_order_id, "target")
+
+            close_action = "SELL" if s.position == "LONG" else "BUY"
+            order = MarketOrder(close_action, abs(s.position_size))
+            order.account = getattr(self, 'stage_account', '') or ''
+            trade = ib.placeOrder(self.contract, order)
+            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+            s.exit_pending = True
+            s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
+            s.save()
+            self._log.info(
+                f"REAL_EXIT SUBMITTED {close_action} {s.position_size} {self.symbol} "
+                f"orderId={s.exit_order_id} reason={reason}"
+            )
+            self._pending_exit_reason = reason
+            return True
+        except Exception as exc:
+            self._log.error(f"REAL_EXIT FAILED: {exc}", exc_info=True)
+            return False
+
+    def _cancel_order_by_id(self, order_id: str, label: str) -> None:
+        """Cancel an open order by ID. Best-effort, logs warnings on failure."""
+        if not order_id:
+            return
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            return
+        try:
+            for trade in ib.openTrades():
+                if str(getattr(trade.order, 'orderId', '')) == order_id:
+                    ib.cancelOrder(trade.order)
+                    self._log.info(f"CANCELLED {label} order {order_id}")
+                    return
+            self._log.debug(f"Cancel {label} order {order_id}: not found in open trades (may already be done)")
+        except Exception as exc:
+            self._log.warning(f"Cancel {label} order {order_id} failed: {exc}")
+
+    def _on_fill(self, trade, fill) -> None:
+        """Callback when an order fills. Routes to entry/exit handling."""
+        # ── Fill deduplication ──
+        fill_id = f"{fill.execution.execId}" if hasattr(fill, 'execution') else str(id(fill))
+        if fill_id in self._processed_fill_ids:
+            self._log.warning(f"Duplicate fill ignored: {fill_id}")
+            return
+        self._processed_fill_ids.add(fill_id)
+
+        s = self.state
+        order_id = str(getattr(trade.order, 'orderId', ''))
+        fill_px = float(getattr(fill, 'price', 0) or 0)
+        fill_qty = float(getattr(fill, 'shares', 0) or 0)
+        now = datetime.now(timezone.utc)
+
+        self._log.info(
+            f"FILL RECEIVED orderId={order_id} px={fill_px} qty={fill_qty} "
+            f"symbol={self.symbol}"
+        )
+
+        # ── Entry fill ──
+        if order_id == s.entry_order_id and s.entry_pending:
+            s.entry_pending = False
+            s.entry_fill_px = fill_px
+            direction = getattr(self, '_pending_direction', 'long')
+            size = getattr(self, '_pending_size', 0.0)
+            stop_px = getattr(self, '_pending_stop_px', 0.0)
+            target_px = getattr(self, '_pending_target_px', 0.0)
+
+            s.position = direction.upper()
+            s.entry_price = fill_px
+            s.avg_entry_price = fill_px
+            s.pyramid_adds = 0
+            s.entry_time = now
+            s.stop_price = stop_px
+            s.target_price = target_px
+            s.timeout_time = now.replace(second=0, microsecond=0) + timedelta(minutes=self.timeout_min)
+            s.last_signal_time = now
+            s.trade_count += 1
+            s.direction_str = direction
+            s.position_size = fill_qty  # Use actual filled quantity, not requested size
+            s.entry_risk_usd = self._risk_usd_for_size(fill_px, stop_px, fill_qty)
+            s.sizing_policy = getattr(self, '_pending_sizing_policy', 'dynamic')
+            s.account_equity_at_entry = self._get_account_equity()
+            s.entry_regime = getattr(self, "_pending_entry_regime", "")
+            s.save()
+
+            self._log.info(
+                f"ENTRY FILLED {direction.upper()} @ {fill_px:.5f} "
+                f"size={size} stop={stop_px:.5f} target={target_px:.5f}"
+            )
+
+            # Submit protective bracket orders
+            ok = self._submit_bracket_orders(stop_px, target_px)
+            if not ok:
+                self._log.critical("BRACKET ORDERS FAILED — position unhedged, submitting emergency exit")
+                self._submit_real_exit("bracket_failure", fill_px)
+            return
+
+        # ── Exit fill (explicit market exit) ──
+        if order_id == s.exit_order_id and s.exit_pending:
+            s.exit_pending = False
+            s.exit_fill_px = fill_px
+            exit_reason = getattr(self, '_pending_exit_reason', 'exit')
+            self._finalize_real_exit(fill_px, exit_reason, now)
+            return
+
+        # ── Stop fill ──
+        if order_id == s.stop_order_id and s.position != "FLAT":
+            # Stop filled — cancel the target order
+            self._cancel_order_by_id(s.target_order_id, "target")
+            self._finalize_real_exit(fill_px, "stop", now)
+            return
+
+        # ── Target fill ──
+        if order_id == s.target_order_id and s.position != "FLAT":
+            # Target filled — cancel the stop order
+            self._cancel_order_by_id(s.stop_order_id, "stop")
+            self._finalize_real_exit(fill_px, "target", now)
+            return
+
+        self._log.warning(
+            f"UNMATCHED FILL orderId={order_id} px={fill_px} — "
+            f"entry_oid={s.entry_order_id} stop_oid={s.stop_order_id} "
+            f"target_oid={s.target_order_id} exit_oid={s.exit_order_id}"
+        )
+
+    def _finalize_real_exit(self, fill_px: float, exit_reason: str, now: datetime) -> None:
+        """Common exit finalization after a real fill (stop, target, or explicit exit)."""
+        s = self.state
+        pnl, pnl_usd = self._log_trade(fill_px, exit_reason, now)
+
+        if self.uses_pips:
+            s.pnl_pips += pnl
+            unit = "pip"
+            total = s.pnl_pips
+        else:
+            s.pnl_points += pnl
+            unit = "pts"
+            total = s.pnl_points
+        s.pnl_usd += pnl_usd
+
+        if hasattr(self, '_risk_mgr'):
+            stop_size = self.stop_pips if self.uses_pips else self.stop_bps
+            pnl_r = pnl / stop_size if stop_size > 0 else pnl
+            self._risk_mgr.record_trade_pnl(self.symbol, pnl_r)
+
+        self._log.info(
+            f"REAL EXIT {s.position} @ {fill_px:.5f} reason={exit_reason} "
+            f"pnl={pnl:+.2f}{unit} (${pnl_usd:+.2f}) total={total:+.2f}{unit} "
+            f"trades={s.trade_count}"
+        )
+
+        # Flatten state
+        s.position = "FLAT"
+        s.entry_time = None
+        s.timeout_time = None
+        s.pyramid_adds = 0
+        s.avg_entry_price = 0.0
+        s.position_size = 0.0
+        s.entry_risk_usd = 0.0
+        s.sizing_policy = ""
+        s.account_equity_at_entry = 0.0
+        s.entry_regime = ""
+        s.entry_pending = False
+        s.exit_pending = False
+        s.entry_order_id = ""
+        s.stop_order_id = ""
+        s.target_order_id = ""
+        s.exit_order_id = ""
+        s.entry_fill_px = 0.0
+        s.exit_fill_px = 0.0
+        s.entry_submitted_ts = ""
+        s.exit_submitted_ts = ""
+        s.save()
+
+    def _check_order_timeouts(self, now: datetime) -> None:
+        """Cancel stuck orders after timeout. Entry: 60s, Exit: 30s."""
+        s = self.state
+        if s.entry_pending and s.entry_submitted_ts:
+            try:
+                submitted = datetime.fromisoformat(s.entry_submitted_ts)
+                if (now - submitted).total_seconds() > 60:
+                    self._log.warning(
+                        f"ENTRY TIMEOUT: order {s.entry_order_id} pending >60s — cancelling"
+                    )
+                    self._cancel_order_by_id(s.entry_order_id, "entry_timeout")
+                    s.entry_pending = False
+                    s.entry_order_id = ""
+                    s.entry_submitted_ts = ""
+                    s.position = "FLAT"
+                    s.save()
+            except (ValueError, TypeError):
+                pass
+
+        if s.exit_pending and s.exit_submitted_ts:
+            try:
+                submitted = datetime.fromisoformat(s.exit_submitted_ts)
+                elapsed = (now - submitted).total_seconds()
+                if elapsed > 30:
+                    self._log.warning(
+                        f"EXIT TIMEOUT: order {s.exit_order_id} pending >30s — "
+                        f"cancelling and retrying with aggressive MKT"
+                    )
+                    self._cancel_order_by_id(s.exit_order_id, "exit_timeout")
+                    # Retry with a fresh market order
+                    ib = getattr(self, '_ib', None)
+                    if ib is not None and s.position != "FLAT":
+                        close_action = "SELL" if s.position == "LONG" else "BUY"
+                        order = MarketOrder(close_action, abs(s.position_size))
+                        order.account = getattr(self, 'stage_account', '') or ''
+                        order.tif = "IOC"  # Immediate-or-Cancel for urgency
+                        trade = ib.placeOrder(self.contract, order)
+                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                        s.exit_submitted_ts = now.isoformat()
+                        s.save()
+                        self._log.info(
+                            f"EXIT RETRY (IOC MKT) orderId={s.exit_order_id}"
+                        )
+                    else:
+                        s.exit_pending = False
+                        s.exit_order_id = ""
+                        s.exit_submitted_ts = ""
+                        s.save()
+            except (ValueError, TypeError):
+                pass
+
     # ── Main tick (called every second) ──────────────────────
     def tick(self, now: datetime) -> None:
         """Process one tick: update bar, check exits, evaluate signals."""
@@ -1463,8 +1945,15 @@ class InstrumentRunner:
             if vol > 0:
                 self.current_bar["volume"] = self.current_bar.get("volume", 0) + vol  # accumulate, not overwrite
 
-        # ── Position management (every tick) ─────────────────
+        # ── Order timeout check (real execution only) ────────
         s = self.state
+        if self.execution_mode == "real":
+            self._check_order_timeouts(now)
+            # While orders are pending, skip normal paper stop/target checks
+            if s.entry_pending or s.exit_pending:
+                return
+
+        # ── Position management (every tick) ─────────────────
         if s.position != "FLAT":
             exit_reason = None
 
@@ -1486,7 +1975,12 @@ class InstrumentRunner:
             if s.position != "FLAT" and not exit_reason:
                 self._check_trailing_stop(mid)
 
-            if exit_reason:
+            if exit_reason and self.execution_mode == "real" and not s.exit_pending:
+                # Real execution: submit exit order, don't log trade yet
+                self._submit_real_exit(exit_reason, mid)
+                return  # wait for fill callback
+            elif exit_reason:
+                # Paper execution: immediate fill simulation
                 pnl, pnl_usd = self._log_trade(mid, exit_reason, now)
                 if self.uses_pips:
                     s.pnl_pips += pnl
@@ -1516,6 +2010,7 @@ class InstrumentRunner:
                 s.entry_risk_usd = 0.0
                 s.sizing_policy = ""
                 s.account_equity_at_entry = 0.0
+                s.entry_regime = ""
                 s.save()
             else:
                 # ── Pyramiding: scale-in on confirmed move ────
@@ -1575,9 +2070,18 @@ class InstrumentRunner:
                 direction = None
 
         # Block new entries if reconciliation requires recovery
-        if direction and getattr(self, '_entries_blocked', False):
+        if direction and self.trade_enabled and getattr(self, '_entries_blocked', False):
             self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
             direction = None
+
+        if direction and not self.trade_enabled:
+            s.last_signal_time = now
+            self._log_signal(features, direction, "ENTRY")
+            self._log.info(
+                f"{self.deployment_stage.upper()} OBSERVE {direction.upper()} @ {mid} "
+                f"| execution_mode={self.execution_mode} | no trade executed"
+            )
+            return
 
         entry_plan = None
         if direction:
@@ -1616,6 +2120,32 @@ class InstrumentRunner:
             stop_px = entry_plan["stop_px"]
             target_px = entry_plan["target_px"]
 
+            if self.execution_mode == "real":
+                # Real execution: submit order, wait for fill callback
+                if s.entry_pending:
+                    self._log.warning("Entry already pending — skipping duplicate")
+                    return
+                self._pending_sizing_policy = entry_plan["sizing_policy"]
+                self._pending_entry_regime = features.get("regime", "")
+                ok = self._submit_real_entry(
+                    direction, entry_plan["size"], stop_px, target_px,
+                )
+                if not ok:
+                    self._log.warning(f"REAL_ENTRY SUBMIT FAILED — staying FLAT")
+                    s.position = "FLAT"
+                    self._log_signal(features, direction, "REAL_ENTRY_FAILED")
+                    return
+                # Don't set position yet — _on_fill will handle it
+                s.last_signal_time = now
+                self._log_signal(features, direction, "ENTRY_SUBMITTED")
+                self._log.info(
+                    f"ENTRY SUBMITTED {direction.upper()} @ ~{entry_px} "
+                    f"stop={stop_px} target={target_px} "
+                    f"size={entry_plan['size']:.0f} risk=${entry_plan['risk_usd']:.2f}"
+                )
+                return
+
+            # Paper execution: immediate fill
             s.position = direction.upper()
             s.entry_price = entry_px
             s.avg_entry_price = entry_px
@@ -1631,6 +2161,7 @@ class InstrumentRunner:
             s.entry_risk_usd = entry_plan["risk_usd"]
             s.sizing_policy = entry_plan["sizing_policy"]
             s.account_equity_at_entry = self._get_account_equity()
+            s.entry_regime = features.get("regime", "")
             s.save()
 
             # Capture spread at entry for toxicity analysis
@@ -1724,12 +2255,14 @@ def create_contract(cfg: dict):
 
 
 def log_dir_for(cfg: dict) -> Path:
-    """Derive per-instrument log directory from symbol.
-
-    NOTE: if you ever run two configs with the same symbol (e.g. two EURUSD strategies),
-    this will collide. The main() function checks for duplicates at startup.
-    """
-    return LOGS_ROOT / cfg["symbol"].lower()
+    """Derive per-instrument log directory from deployment stage/config metadata."""
+    deployment = cfg.get("deployment", {}) if isinstance(cfg.get("deployment", {}), dict) else {}
+    raw = str(deployment.get("log_dir", "") or "").strip()
+    if raw:
+        path = Path(raw)
+        return path if path.is_absolute() else REPO / path
+    stage = str(deployment.get("stage", "paper") or "paper").lower()
+    return REPO / default_log_dir(cfg["symbol"], stage)
 
 
 # =================================================================
@@ -1874,9 +2407,17 @@ def reconcile_instruments(ib, instruments: list) -> dict:
     return results
 
 
+_written_incident_keys: set = set()   # dedup: one file per (symbol, type) per session
+
+
 def _write_incident(inst, result: str, detail: str,
                     local_pos: str, broker_info: dict) -> None:
     """Persist an incident artifact for audit trail."""
+    dedup_key = f"{inst.symbol}_{result}"
+    if dedup_key in _written_incident_keys:
+        return
+    _written_incident_keys.add(dedup_key)
+
     incident_dir = inst.log_dir / "incidents"
     incident_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -2073,6 +2614,81 @@ class PortfolioRiskManager:
 
 
 # ═════════════════════════════════════════════════════════════
+# Emergency kill switch
+# ═════════════════════════════════════════════════════════════
+def _execute_emergency_shutdown(ib, instruments, kill_file):
+    """Emergency halt: cancel all orders, close all positions, notify, exit."""
+
+    # 1. Block all entries
+    for inst in instruments:
+        inst._entries_blocked = True
+        inst.trade_enabled = False
+
+    # 2. Cancel all open orders on the IB connection
+    try:
+        for trade in ib.openTrades():
+            try:
+                ib.cancelOrder(trade.order)
+                ib.sleep(0.1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3. Close all open positions via market orders
+    for inst in instruments:
+        if inst.state.position != "FLAT":
+            side = "SELL" if inst.state.position == "LONG" else "BUY"
+            qty = inst.state.position_size or getattr(inst, "lot_size", 0)
+            if qty > 0:
+                try:
+                    from ib_insync import MarketOrder
+                    flatten = MarketOrder(side, qty)
+                    ib.placeOrder(inst.contract, flatten)
+                    log.critical(f"EMERGENCY CLOSE {inst.symbol} {side} qty={qty}")
+                    ib.sleep(0.5)
+                except Exception as e:
+                    log.error(f"Emergency close {inst.symbol} failed: {e}")
+
+        # Reset local state
+        inst.state.position = "FLAT"
+        inst.state.entry_price = 0.0
+        inst.state.stop_price = 0.0
+        inst.state.target_price = 0.0
+        inst.state.save()
+
+    # 4. Discord notification
+    try:
+        import urllib.request
+        webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+        if not webhook:
+            env_file = REPO / ".env"
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("DISCORD_WEBHOOK_URL="):
+                        webhook = line.split("=", 1)[1].strip().strip('"')
+        if webhook:
+            payload = json.dumps({"embeds": [{
+                "title": "EMERGENCY SHUTDOWN",
+                "description": "Kill switch triggered. All positions closed, all orders cancelled.",
+                "color": 16711680,
+            }]}).encode()
+            req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        log.error(f"Discord kill notification failed: {e}")
+
+    # 5. Disconnect
+    log.critical("EMERGENCY: Disconnecting from IBKR")
+    try:
+        ib.disconnect()
+    except Exception:
+        pass
+
+    log.critical("EMERGENCY SHUTDOWN COMPLETE — exiting")
+
+
+# ═════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════���══════
 def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] = None) -> bool:
@@ -2175,7 +2791,23 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         ldir = log_dir_for(cfg)
         runner = InstrumentRunner(cfg, contract, ticker, ldir, str(cfg_path))
         runner.state.load(runner.label)
+        if not runner.trade_enabled and runner.state.position != "FLAT":
+            runner._log.warning(
+                f"[{runner.label}] {runner.deployment_stage.upper()} stage is non-trading; "
+                f"forcing local state FLAT from restored {runner.state.position}"
+            )
+            runner.state.position = "FLAT"
+            runner.state.entry_price = 0.0
+            runner.state.stop_price = 0.0
+            runner.state.target_price = 0.0
+            runner.state.timeout_time = None
+            runner.state.entry_time = None
+            runner.state.position_size = 0.0
+            runner.state.entry_risk_usd = 0.0
+            runner.state.sizing_policy = ""
+        runner._hydrate_trade_history_from_journal()
         runner._hydrate_legacy_state_size()
+        runner.state.save()
 
         # Cohort tracking fields
         runner._config_hash = _config_short_hash(cfg_path)
@@ -2200,15 +2832,15 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         ib.disconnect()
         return False
 
-    # Check for duplicate symbols (would cause log/state dir collision)
-    seen_syms = {}
+    # Check for duplicate log directories (paper/live same symbol is allowed if log dirs differ)
+    seen_log_dirs = {}
     for inst in instruments:
-        sym = inst.symbol.lower()
-        if sym in seen_syms:
-            log.error(f"FATAL: duplicate symbol '{inst.symbol}' — configs '{seen_syms[sym]}' and '{inst.config_path}' would share log dir")
+        log_key = str(inst.log_dir).lower()
+        if log_key in seen_log_dirs:
+            log.error(f"FATAL: duplicate log dir '{inst.log_dir}' — configs '{seen_log_dirs[log_key]}' and '{inst.config_path}' would collide")
             ib.disconnect()
             return False
-        seen_syms[sym] = inst.config_path
+        seen_log_dirs[log_key] = inst.config_path
 
     log.info(f"Loaded {len(instruments)} instruments ({skipped} skipped)")
     log.info("-" * 70)
@@ -2247,9 +2879,12 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     )
 
     # -- Portfolio risk manager ----------------------------------------
+    # Determine drawdown limit based on fleet stage
+    any_real = any(inst.execution_mode == "real" for inst in instruments)
+    dd_limit = 0.02 if any_real else 0.03  # 2% for prod, 3% for paper
     risk_mgr = PortfolioRiskManager(
-        max_same_currency=3,
-        max_drawdown_pct=0.99,  # DISABLED for paper validation. Re-enable and calibrate before go-live.
+        max_same_currency=2,
+        max_drawdown_pct=dd_limit,
         daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
         max_total_open_risk_pct=0.05,
@@ -2258,6 +2893,27 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     for inst in instruments:
         inst._risk_mgr = risk_mgr
         inst._all_instruments = instruments  # reference for correlation checks
+
+    # -- Wire IB reference and fill callback for real execution --------
+    for inst in instruments:
+        inst._ib = ib
+
+    def _route_fill_to_runner(trade, fill):
+        """Route IB fill events to the correct InstrumentRunner."""
+        trade_symbol = getattr(trade.contract, 'symbol', '') or ''
+        trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
+        for inst in instruments:
+            if inst.execution_mode != "real":
+                continue
+            inst_key = _runner_to_ib_key(inst)
+            if trade_key == inst_key or trade_symbol == inst.symbol:
+                try:
+                    inst._on_fill(trade, fill)
+                except Exception as exc:
+                    inst._log.error(f"Fill callback error: {exc}", exc_info=True)
+                break
+
+    ib.execDetailsEvent += _route_fill_to_runner
 
     # -- Seed historical data -----------------------------------------
     log.info("Seeding historical bars...")
@@ -2269,10 +2925,28 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     log.info("Starting main loop (Ctrl+C to stop)...")
     heartbeat_interval = 300  # log heartbeat every 5 min
     last_heartbeat = time.time()
+    _last_periodic_recon = time.time()  # periodic broker recon every 5 min
 
     try:
         while True:
             ib.sleep(1)  # process all IB events for all instruments
+
+            # Check kill switch
+            kill_file = REPO / "KILL_SWITCH"
+            if kill_file.exists():
+                log.critical("KILL SWITCH DETECTED — emergency shutdown")
+                _execute_emergency_shutdown(ib, instruments, kill_file)
+                break
+
+            # Check pause file — block new entries but keep existing positions
+            pause_file = REPO / "PAUSE_ENTRIES"
+            if pause_file.exists():
+                for inst in instruments:
+                    inst._entries_blocked = True
+            else:
+                # Only unblock if not quarantined or otherwise blocked
+                pass  # Entry blocking is managed per-instrument elsewhere
+
             now = datetime.now(timezone.utc)
 
             risk_mgr.set_account_equity(equity_tracker.refresh())
@@ -2295,8 +2969,9 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         _write_incident(inst, "QUARANTINED", f"{inst._consecutive_errors} consecutive tick errors",
                                         inst.state.position, {"direction": "unknown", "qty": 0})
 
-            # Periodic broker reconciliation (every 5 min, same key logic as startup)
-            if False:
+            # Periodic broker reconciliation (every 5 min, warn-only, no entry blocking)
+            if time.time() - _last_periodic_recon >= 300:
+                _last_periodic_recon = time.time()
                 try:
                     # Use same normalized key as startup reconciliation
                     broker_positions = {}
@@ -2546,9 +3221,13 @@ def cli() -> None:
         help="IBKR client ID (default: from IBKR_CLIENT_ID env or 1). Use different IDs for parallel runners.",
     )
     args = parser.parse_args()
-    if args.client_id is not None:
-        global IBKR_CLIENT_ID
-        IBKR_CLIENT_ID = args.client_id
+    global IBKR_CLIENT_ID
+    IBKR_CLIENT_ID, client_id_source = resolve_client_id(
+        config_paths=args.configs,
+        explicit_client_id=args.client_id,
+        default_client_id=IBKR_CLIENT_ID,
+    )
+    log.info(f"Resolved clientId={IBKR_CLIENT_ID} via {client_id_source}")
     run_with_reconnect(config_paths=args.configs, exclude=args.exclude)
 
 

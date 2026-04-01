@@ -22,8 +22,8 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
+import uuid
 from decimal import Decimal
 from typing import Any, Dict, List, Tuple
 
@@ -89,6 +89,7 @@ from ops.backup_restore import run_backup, run_restore_drill, run_full_cycle, cl
 _PASS = 0
 _FAIL = 0
 _TESTS: List[str] = []
+_TMP_ROOT = os.path.join(_REPO_ROOT, ".tmp_phase16")
 
 
 def _test(name: str, condition: bool, detail: str = "") -> bool:
@@ -104,7 +105,9 @@ def _test(name: str, condition: bool, detail: str = "") -> bool:
 
 
 def _make_tmpdir() -> str:
-    d = tempfile.mkdtemp(prefix="argus_p16_test_")
+    os.makedirs(_TMP_ROOT, exist_ok=True)
+    d = os.path.join(_TMP_ROOT, f"argus_p16_test_{uuid.uuid4().hex[:8]}")
+    os.makedirs(d, exist_ok=True)
     return d
 
 
@@ -113,6 +116,16 @@ def _cleanup(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
     except Exception:
         pass
+
+
+def _safe_remove(path: str) -> None:
+    for _ in range(3):
+        try:
+            os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.remove(path)
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +487,14 @@ def test_artifact_integrity() -> None:
               f"issues={issues}")
 
         # 4h: Verify integrity — missing file detected
-        os.remove(orders_path)
+        loaded["artifacts"]["ghost.csv"] = {
+            "hash": "ghost",
+            "size": 10,
+            "rows": 1,
+            "ts": time.time(),
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(loaded, f, indent=2)
         ok, issues = verify_artifact_integrity(tmp)
         has_missing = any(i.get("issue") == "missing" for i in issues)
         _test("missing_file_detected", has_missing, f"issues={issues}")

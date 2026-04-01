@@ -100,7 +100,21 @@ def save_throttle_state(state: Dict[str, Any], state_file: Optional[str] = None)
         json.dump(state, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    for _ in range(3):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------

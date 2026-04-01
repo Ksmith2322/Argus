@@ -19,7 +19,19 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    for _ in range(3):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+
+    # Fall back to a direct overwrite if Windows briefly denies replacement.
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def read_json(path: Path) -> dict | list | None:

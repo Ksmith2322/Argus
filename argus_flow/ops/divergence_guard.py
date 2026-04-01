@@ -13,13 +13,28 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from argus_flow.ops.fleet_registry import STAGE_PAPER, STAGE_QUARANTINE, STAGE_REAL, STAGE_WATCHER, runners_for_stages
+
 REPO = Path(__file__).resolve().parents[2]
 
-RUNNERS = [
-    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "unit": "pips"},
-    {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "unit": "pips"},
-    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "unit": "pips"},
-]
+
+def governed_runners() -> list[dict]:
+    """Return managed runners that should be held to replay/live divergence checks."""
+    runners: list[dict] = []
+    for runner in runners_for_stages({STAGE_WATCHER, STAGE_PAPER, STAGE_REAL, STAGE_QUARANTINE}):
+        runners.append(
+            {
+                "name": runner["name"],
+                "symbol": runner["symbol"],
+                "log_dir": runner["log_dir"],
+                "config": runner["config_path"],
+                "unit": runner["unit"],
+                "current_stage": runner["current_stage"],
+                "live": runner["live"],
+            }
+        )
+    runners.sort(key=lambda item: (item.get("current_stage", ""), item["name"]))
+    return runners
 
 
 def _load_signals(log_dir: Path) -> list[dict]:
@@ -53,11 +68,24 @@ def check_runner(runner: dict) -> dict:
     log_dir = REPO / runner["log_dir"]
     cfg_path = REPO / runner["config"]
 
-    result = {"name": runner["name"], "symbol": runner["symbol"], "status": "NO_DATA", "flags": [], "metrics": {}}
+    result = {
+        "name": runner["name"],
+        "symbol": runner["symbol"],
+        "status": "NO_DATA",
+        "verdict": "NO_DATA",
+        "reason": "",
+        "flags": [],
+        "kill_flags": [],
+        "watch_flags": [],
+        "metrics": {},
+        "current_stage": runner.get("current_stage", ""),
+        "live": bool(runner.get("live", False)),
+    }
 
     # Load replay expectations
     if not cfg_path.exists():
         result["flags"].append("CONFIG_MISSING")
+        result["reason"] = "CONFIG_MISSING"
         return result
     cfg = json.loads(cfg_path.read_text())
     rexp = cfg.get("replay_expectations", {})
@@ -68,6 +96,8 @@ def check_runner(runner: dict) -> dict:
 
     if not signals:
         result["status"] = "NO_SIGNALS"
+        result["verdict"] = "NO_SIGNALS"
+        result["reason"] = "signals.csv missing or empty"
         return result
 
     days = _compute_days(signals)
@@ -135,15 +165,23 @@ def check_runner(runner: dict) -> dict:
     # Determine overall status
     kills = [f for f in result["flags"] if "KILL" in f]
     watches = [f for f in result["flags"] if "WATCH" in f]
+    result["kill_flags"] = kills
+    result["watch_flags"] = watches
 
     if kills:
         result["status"] = "KILL"
+        result["reason"] = " | ".join(kills[:3])
     elif watches:
         result["status"] = "WATCH"
+        result["reason"] = " | ".join(watches[:3])
     elif len(trades) >= 5:
         result["status"] = "PASS"
+        result["reason"] = "within replay/live divergence guardrails"
     else:
         result["status"] = "COLLECTING"
+        result["reason"] = "insufficient closed trades for divergence verdict"
+
+    result["verdict"] = result["status"]
 
     return result
 
@@ -154,7 +192,8 @@ def main():
     print("=" * 65)
 
     results = []
-    for runner in RUNNERS:
+    runners = governed_runners()
+    for runner in runners:
         r = check_runner(runner)
         results.append(r)
 
@@ -179,6 +218,10 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scope": {
+            "stages": [STAGE_PAPER, STAGE_REAL],
+            "runner_count": len(runners),
+        },
         "runners": results,
     }, indent=2, default=str))
     print(f"\n  Saved: {out_path}")

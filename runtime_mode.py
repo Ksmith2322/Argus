@@ -66,7 +66,24 @@ def _atomic_write_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    for _ in range(3):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+
+    # Windows can transiently deny atomic replacement when scanners briefly hold
+    # the destination. Fall back to a direct overwrite so runtime mode still
+    # persists instead of failing closed on operator state changes.
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------

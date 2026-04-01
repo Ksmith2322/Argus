@@ -18,17 +18,59 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from argus_flow.ops.fleet_registry import discover_managed_runners
+from ops.process_lock import ProcessLock, ProcessLockError
 
 load_dotenv()
 
 REPO = Path(__file__).resolve().parents[2]
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+WATCHER_HEARTBEAT = REPO / "argus_flow" / "logs" / "discord_watcher_heartbeat.json"
 
-RUNNERS = [
-    {"name": "EUR/USD", "log_dir": "argus_flow/logs/eurusd", "unit": "pips"},
-    {"name": "GBP/USD", "log_dir": "argus_flow/logs/gbpusd", "unit": "pips"},
-    {"name": "EUR/JPY", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips"},
-]
+# OS file-lock held for the lifetime of the --watch process.
+# Automatically released by the OS if the process is killed or crashes.
+_watcher_lock: ProcessLock | None = None
+
+
+def _acquire_watcher_lock() -> None:
+    """Ensure only one --watch process runs.  Exit immediately if another is alive."""
+    global _watcher_lock
+    lock = ProcessLock("discord_watcher")
+    try:
+        lock.acquire(metadata={"mode": "watch"})
+    except ProcessLockError as exc:
+        print(f"Discord watcher already running, exiting. ({exc})")
+        sys.exit(0)
+    _watcher_lock = lock
+
+
+def notification_runners() -> list[dict]:
+    runners = []
+    for runner in discover_managed_runners():
+        if not runner.get("launch_enabled", True):
+            continue
+        runners.append(
+            {
+                "name": runner["name"],
+                "symbol": runner["symbol"],
+                "log_dir": runner["log_dir"],
+                "unit": runner["unit"],
+                "current_stage": runner["current_stage"],
+                "live": bool(runner["live"]),
+            }
+        )
+    runners.sort(key=lambda item: (item.get("current_stage", ""), item["name"]))
+    return runners
+
+
+def _write_watcher_heartbeat(runners: list[dict]) -> None:
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "runner_count": len(runners),
+        "symbols": [runner["symbol"] for runner in runners],
+    }
+    WATCHER_HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+    WATCHER_HEARTBEAT.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def send_discord(content: str = "", embeds: list | None = None) -> bool:
@@ -97,11 +139,14 @@ def send_test():
 
 def watch_trades():
     """Poll trade files for new trades and send alerts."""
-    print("Watching for new trades... (Ctrl+C to stop)")
+    _acquire_watcher_lock()
+    print(f"Watching for new trades (PID {os.getpid()})... (Ctrl+C to stop)")
 
     # Track last known trade count per runner
     last_counts = {}
-    for runner in RUNNERS:
+    runners = notification_runners()
+    _write_watcher_heartbeat(runners)
+    for runner in runners:
         trade_file = REPO / runner["log_dir"] / "trades.csv"
         if trade_file.exists():
             with open(trade_file) as f:
@@ -110,7 +155,9 @@ def watch_trades():
             last_counts[runner["name"]] = 0
 
     while True:
-        for runner in RUNNERS:
+        runners = notification_runners()
+        _write_watcher_heartbeat(runners)
+        for runner in runners:
             trade_file = REPO / runner["log_dir"] / "trades.csv"
             if not trade_file.exists():
                 continue

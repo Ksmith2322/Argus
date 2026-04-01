@@ -153,7 +153,21 @@ def save_manifest(manifest: Dict[str, Any], log_dir: str) -> str:
         json.dump(manifest, f, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    for _ in range(3):
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            time.sleep(0.05)
+    else:
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return path
 
 

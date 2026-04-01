@@ -34,25 +34,79 @@ function Send-Discord($message, $color) {
     } catch { Log "Discord failed: $_" }
 }
 
-$fxConfigs = @(
-    "argus_flow/configs/gbpusd_range_paper_v1.json",
-    "argus_flow/configs/eurusd_t4_paper_v1.json",
-    "argus_flow/configs/eurjpy_t4_paper_v1.json",
-    "argus_flow/configs/gbpjpy_t4_paper_v1.json",
-    "argus_flow/configs/cadjpy_t4_paper_v1.json",
-    "argus_flow/configs/audjpy_t4_paper_v1.json",
-    "argus_flow/configs/usdjpy_ny_paper_v1.json",
-    "argus_flow/configs/audusd_ny_paper_v1.json"
-)
-$futuresConfigs = @(
-    "argus_flow/configs/mes_range_paper_v1.json",
-    "argus_flow/configs/mnq_range_paper_v1.json",
-    "argus_flow/configs/mym_range_paper_v1.json",
-    "argus_flow/configs/m2k_range_paper_v1.json",
-    "argus_flow/configs/mgc_range_paper_v1.json",
-    "argus_flow/configs/mcl_range_paper_v1.json"
-    # NKD KILLED 2026-03-29
-)
+# --- Load configs from deployment pipeline (source of truth) ---
+$fxConfigs = @()
+$futuresConfigs = @()
+$pipelineOk = $false
+
+try {
+    $allConfigs = @(& $python -m argus_flow.ops.deployment_pipeline --emit-configs watcher,paper 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $allConfigs.Count -gt 0) {
+        foreach ($cfg in $allConfigs) {
+            $cfgPath = $cfg.Trim()
+            if (-not $cfgPath) { continue }
+            try {
+                $parsed = Get-Content $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $itype = [string]$parsed.instrument_type
+            } catch {
+                $itype = "unknown"
+            }
+            if ($itype -eq "future") {
+                $futuresConfigs += $cfgPath
+            } else {
+                $fxConfigs += $cfgPath
+            }
+        }
+        $pipelineOk = $true
+        Log "Loaded configs from deployment pipeline: $($fxConfigs.Count) FX, $($futuresConfigs.Count) futures"
+    } else {
+        Log "WARNING: deployment_pipeline --emit-configs returned no configs (exit=$LASTEXITCODE)"
+    }
+} catch {
+    Log "WARNING: deployment_pipeline --emit-configs failed: $_"
+}
+
+if (-not $pipelineOk) {
+    # Fallback: read deployment_registry.json directly (same source, no Python needed)
+    $registryPath = "C:\Argus\repo\argus_flow\logs\deployment_registry.json"
+    if (Test-Path $registryPath) {
+        try {
+            $registry = Get-Content $registryPath -Raw | ConvertFrom-Json
+            $allFromRegistry = @($registry.launcher.paper_configs)
+            if ($allFromRegistry.Count -gt 0) {
+                foreach ($cfgPath in $allFromRegistry) {
+                    $cfgPath = $cfgPath.Trim()
+                    if (-not $cfgPath) { continue }
+                    try {
+                        $parsed = Get-Content $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                        $itype = [string]$parsed.instrument_type
+                    } catch {
+                        $itype = "unknown"
+                    }
+                    if ($itype -eq "future") {
+                        $futuresConfigs += $cfgPath
+                    } else {
+                        $fxConfigs += $cfgPath
+                    }
+                }
+                $pipelineOk = $true
+                Log "Loaded configs from deployment_registry.json fallback: $($fxConfigs.Count) FX, $($futuresConfigs.Count) futures"
+            } else {
+                Log "WARNING: deployment_registry.json has no paper_configs"
+            }
+        } catch {
+            Log "WARNING: Failed to parse deployment_registry.json: $_"
+        }
+    } else {
+        Log "WARNING: deployment_registry.json not found at $registryPath"
+    }
+}
+
+if (-not $pipelineOk) {
+    Log "CRITICAL: No config source available (pipeline failed, registry missing). Cannot start runners."
+    Send-Discord "**CRITICAL: Pre-market check ABORTED.** No config source available. Run deployment_pipeline manually." "red"
+    exit 1
+}
 
 Log "=========================================="
 Log "PRE-MARKET HEALTH CHECK"
@@ -97,15 +151,26 @@ if ($runners) {
 }
 
 # Step 4: Start fresh runners
-Log "Starting FX runner (8 pairs)..."
-$fxArgs = @("-m", "argus_flow.runner_unified", "--configs") + $fxConfigs
-Start-Process -FilePath $python -ArgumentList $fxArgs -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
-Start-Sleep -Seconds 10
+$expectedRunners = 0
+if ($fxConfigs.Count -gt 0) {
+    Log "Starting FX runner ($($fxConfigs.Count) pairs)..."
+    $fxArgs = @("-m", "argus_flow.runner_unified", "--configs") + $fxConfigs
+    Start-Process -FilePath $python -ArgumentList $fxArgs -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
+    $expectedRunners++
+    Start-Sleep -Seconds 10
+} else {
+    Log "No FX configs found. Skipping FX runner."
+}
 
-Log "Starting Futures runner (7 instruments)..."
-$futArgs = @("-m", "argus_flow.runner_unified", "--client-id", "2", "--configs") + $futuresConfigs
-Start-Process -FilePath $python -ArgumentList $futArgs -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
-Start-Sleep -Seconds 10
+if ($futuresConfigs.Count -gt 0) {
+    Log "Starting Futures runner ($($futuresConfigs.Count) instruments)..."
+    $futArgs = @("-m", "argus_flow.runner_unified", "--client-id", "2", "--configs") + $futuresConfigs
+    Start-Process -FilePath $python -ArgumentList $futArgs -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
+    $expectedRunners++
+    Start-Sleep -Seconds 10
+} else {
+    Log "No Futures configs found. Skipping Futures runner."
+}
 
 # Step 5: Verify runners started
 $newRunners = Get-Process python* -ErrorAction SilentlyContinue | Where-Object {
@@ -118,7 +183,7 @@ $newRunners = Get-Process python* -ErrorAction SilentlyContinue | Where-Object {
 $runnerCount = if ($newRunners) { $newRunners.Count } else { 0 }
 Log "Runners started: $runnerCount processes"
 
-if ($runnerCount -ge 2) {
+if ($runnerCount -ge $expectedRunners -and $expectedRunners -gt 0) {
     Log "PRE-MARKET CHECK: PASS"
     Send-Discord "Pre-market check PASSED. $runnerCount runner processes active. API port: $(if ($portListening) { 'OK' } else { 'CHECK NEEDED' })." "green"
 } else {

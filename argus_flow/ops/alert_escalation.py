@@ -1,10 +1,14 @@
-"""Alert Escalation — consolidated Discord alerts for system events.
-Checks all monitoring reports and sends alerts on issues.
+"""Legacy shim for the canonical alert escalation flow.
 
-Usage:
-    python -m argus_flow.ops.alert_escalation
+Use `python -m argus_flow.ops.alert_escalation_v2` directly going forward.
+This wrapper prevents older commands from forking the alert state model.
 """
 from __future__ import annotations
+
+if __name__ == "__main__":
+    from argus_flow.ops.alert_escalation_v2 import main as _alert_escalation_v2_main
+
+    raise SystemExit(_alert_escalation_v2_main())
 import json, os, time
 from datetime import datetime, timezone
 from pathlib import Path
