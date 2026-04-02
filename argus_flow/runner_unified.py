@@ -1014,6 +1014,18 @@ class InstrumentRunner:
         # Fill deduplication
         self._processed_fill_ids: set[str] = set()
 
+        # Advanced features: multi-timeframe, spread gate, session scoring, sequencing
+        from argus_flow.advanced_features import MultiTimeframeBuffer, SpreadTracker, SessionScorer
+        self._mtf = MultiTimeframeBuffer()
+        self._spread_tracker = SpreadTracker(window=120)
+        self._session_scorer = SessionScorer(self.symbol)
+        trigger_cfg = config.get("trigger", {})
+        self._max_spread_ratio = float(trigger_cfg.get("max_spread_ratio", 1.5))
+        self._mtf_enabled = bool(trigger_cfg.get("mtf_enabled", True))
+        self._spread_gate_enabled = bool(trigger_cfg.get("spread_gate_enabled", True))
+        self._news_filter_enabled = bool(trigger_cfg.get("news_filter_enabled", True))
+        self._sequencing_gap_minutes = float(trigger_cfg.get("sequencing_gap_minutes", 30))
+
     # ── Price extraction ─────────────────────────────────────
     def _get_mid(self) -> Optional[float]:
         """Extract mid price from ticker. FX: bid/ask mid. Futures: last or delayed."""
@@ -1315,6 +1327,36 @@ class InstrumentRunner:
             str(runtime_epoch), getattr(self, '_git_sha', ''),
         ]
 
+        # Entry-feature + execution quality fields (v4 schema)
+        ef = getattr(self, '_entry_features', {})
+        signal_mid = ef.get("signal_mid", s.entry_price)
+        slippage = abs(s.entry_price - signal_mid) / self.pip_size if self.uses_pips and signal_mid else 0
+        signal_ts = ef.get("signal_ts", "")
+        fill_latency_ms = 0
+        if signal_ts and s.entry_time:
+            try:
+                from datetime import datetime as _dt
+                sig_dt = _dt.fromisoformat(signal_ts)
+                fill_latency_ms = int((s.entry_time - sig_dt).total_seconds() * 1000)
+            except Exception:
+                pass
+
+        entry_feature_fields = [
+            f"{ef.get('mtf_score', 0):.3f}",
+            ef.get("mtf_alignment", ""),
+            f"{ef.get('session_score', 0):.3f}",
+            ef.get("session_label", ""),
+            f"{ef.get('spread_ratio', 0):.3f}",
+            f"{ef.get('entry_spread', 0):.2f}" if 'entry_spread' in ef else "0",
+            f"{ef.get('entry_bid', 0):.5f}" if ef.get('entry_bid') else "0",
+            f"{ef.get('entry_ask', 0):.5f}" if ef.get('entry_ask') else "0",
+            f"{ef.get('conviction_score', 0):.3f}",
+            ef.get("bias_4h", ""),
+            f"{signal_mid:.5f}" if signal_mid else "0",
+            str(fill_latency_ms),
+            f"{slippage:.2f}",
+        ]
+
         self._ensure_trade_header()
         with open(self.trade_log, "a", newline="") as f:
             w = csv.writer(f)
@@ -1326,7 +1368,7 @@ class InstrumentRunner:
                     exit_reason, f"{dur:.1f}", s.trade_count,
                     f"{pnl_usd:.2f}", f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}",
                     s.sizing_policy or "fixed", s.entry_regime or "",
-                ] + validity_fields)
+                ] + validity_fields + entry_feature_fields)
             else:
                 if self.instrument_type == "future":
                     ep = f"{s.entry_price:.2f}"
@@ -1340,7 +1382,10 @@ class InstrumentRunner:
                     exit_reason, f"{dur:.1f}", s.trade_count,
                     f"{s.position_size:.0f}", f"{s.entry_risk_usd:.2f}", s.sizing_policy or "fixed",
                     s.entry_regime or "",
-                ] + validity_fields)
+                ] + validity_fields + entry_feature_fields)
+
+        # Clear entry features after trade close
+        self._entry_features = {}
 
         # Reset validity flags after trade closes
         s.restored_this_session = False
@@ -1919,6 +1964,13 @@ class InstrumentRunner:
         if mid is None or mid <= 0:
             return
 
+        # Update spread tracker with every tick
+        t = self.ticker
+        _bid = getattr(t, "bid", None) or getattr(t, "delayedBid", None)
+        _ask = getattr(t, "ask", None) or getattr(t, "delayedAsk", None)
+        if _bid and _ask and _bid > 0 and _ask > 0:
+            self._spread_tracker.update(float(_bid), float(_ask))
+
         vol = self._get_volume()
         bar_minute = now.replace(second=0, microsecond=0)
         new_bar_closed = False
@@ -1933,6 +1985,7 @@ class InstrumentRunner:
             # Close prior bar, push to buffer
             self.current_bar["ts"] = str(self.current_bar_minute)
             self.buf.add(self.current_bar)
+            self._mtf.on_bar_close(self.current_bar)
             new_bar_closed = True
             self.current_bar_minute = bar_minute
             self.current_bar = {
@@ -2063,6 +2116,61 @@ class InstrumentRunner:
                 self._log_signal(features, direction, "MAINTENANCE_BLACKOUT")
                 direction = None
 
+        # ── Advanced gates (multi-timeframe, spread, news, session, sequencing) ──
+        if direction:
+            from argus_flow.advanced_features import check_news_filter, check_entry_sequencing, compute_conviction_score
+
+            # 1. Multi-timeframe confirmation (LOG_ONLY — shadow mode)
+            # Stamps features but does NOT block entries until proven with 60+ trades
+            mtf_data = self._mtf.get_multi_trend()
+            features["mtf_alignment"] = mtf_data.get("alignment", "neutral")
+            features["mtf_score"] = mtf_data.get("alignment_score", 0)
+            features["bias_4h"] = mtf_data.get("timeframes", {}).get("4h", {}).get("direction", "neutral")
+            if self._mtf_enabled:
+                mtf_ok, mtf_reason = self._mtf.check_entry_alignment(direction)
+                if not mtf_ok:
+                    # Shadow log — would have blocked, but LOG_ONLY
+                    self._log.info(f"MTF_SHADOW_BLOCK {direction.upper()} | {mtf_reason}")
+                    features["mtf_shadow_blocked"] = True
+
+        if direction:
+            # 2. Spread gate
+            if self._spread_gate_enabled:
+                spread_ok, spread_reason = self._spread_tracker.check_entry(self._max_spread_ratio)
+                features["spread_ratio"] = self._spread_tracker.spread_ratio
+                features["spread_current"] = self._spread_tracker.current_spread
+                if not spread_ok:
+                    self._log.info(f"SPREAD_BLOCK {direction.upper()} | {spread_reason}")
+                    self._log_signal(features, direction, "SPREAD_BLOCKED")
+                    direction = None
+
+        if direction:
+            # 3. News/economic calendar filter
+            if self._news_filter_enabled:
+                news_ok, news_reason = check_news_filter(self.symbol, now)
+                if not news_ok:
+                    self._log.info(f"NEWS_BLOCK {direction.upper()} | {news_reason}")
+                    self._log_signal(features, direction, "NEWS_BLOCKED")
+                    direction = None
+
+        if direction:
+            # 4. Adaptive session scoring (log-only by default, set min_score > 0 to gate)
+            session_score = self._session_scorer.score_hour(now.hour)
+            features["session_score"] = session_score["score"]
+            features["session_label"] = session_score["label"]
+
+        if direction:
+            # 5. Correlation-aware entry sequencing
+            if self._sequencing_gap_minutes > 0 and hasattr(self, '_all_instruments'):
+                seq_ok, seq_reason = check_entry_sequencing(
+                    self.symbol, direction, getattr(self, '_all_instruments', []),
+                    min_gap_minutes=self._sequencing_gap_minutes,
+                )
+                if not seq_ok:
+                    self._log.info(f"SEQ_BLOCK {direction.upper()} | {seq_reason}")
+                    self._log_signal(features, direction, "SEQUENCING_BLOCKED")
+                    direction = None
+
         # Min gap between signals
         if direction and s.last_signal_time:
             gap = (now - s.last_signal_time).total_seconds() / 60
@@ -2083,11 +2191,35 @@ class InstrumentRunner:
             )
             return
 
+        # Compute conviction score (LOG_ONLY — equal-weighted, not used for sizing yet)
+        if direction:
+            mtf_data = self._mtf.get_multi_trend()
+            features["conviction_score"] = compute_conviction_score(features, direction, mtf_data)
+
         entry_plan = None
         if direction:
             entry_px = mid
             stop_px, target_px = self._compute_stops(entry_px, direction)
             size, risk_usd, sizing_policy = self._resolve_position_size(entry_px, stop_px)
+
+            # Drawdown-scaled sizing: linear ramp-down with floor at 0.2x
+            if hasattr(self, '_risk_mgr') and self._risk_mgr._drawdown_pause:
+                size = 0  # hard pause already active
+            elif hasattr(self, '_risk_mgr') and self._risk_mgr._peak_pnl > 0:
+                dd = (self._risk_mgr._peak_pnl - self._risk_mgr._current_pnl) / abs(self._risk_mgr._peak_pnl)
+                if dd > 0 and self._risk_mgr.max_drawdown_pct > 0:
+                    dd_mult = max(0.2, 1.0 - (dd / self._risk_mgr.max_drawdown_pct))
+                    size = int(size * dd_mult)
+                    if dd_mult < 1.0:
+                        self._log.info(f"DD_RAMP: dd={dd:.1%} mult={dd_mult:.2f} size={size}")
+
+            # Minimum trade size floor
+            min_size = self.min_lot_size if self.uses_pips else 1
+            if 0 < size < min_size:
+                self._log.info(f"SIZE_BELOW_FLOOR: {size} < min {min_size}")
+                self._log_signal(features, direction, "SIZE_BELOW_FLOOR")
+                size = 0
+
             if size <= 0:
                 self._log.info(f"SIZE_BLOCK {direction.upper()} | size=0 policy={sizing_policy}")
                 self._log_signal(features, direction, "RISK_BLOCKED_SIZE_ZERO")
@@ -2162,6 +2294,19 @@ class InstrumentRunner:
             s.sizing_policy = entry_plan["sizing_policy"]
             s.account_equity_at_entry = self._get_account_equity()
             s.entry_regime = features.get("regime", "")
+
+            # Capture entry features for trade-close stamping + execution quality
+            self._entry_features = {
+                "mtf_score": features.get("mtf_score", 0),
+                "mtf_alignment": features.get("mtf_alignment", "neutral"),
+                "session_score": features.get("session_score", 0),
+                "session_label": features.get("session_label", ""),
+                "spread_ratio": features.get("spread_ratio", 0),
+                "conviction_score": features.get("conviction_score", 0),
+                "bias_4h": features.get("bias_4h", "neutral"),
+                "signal_mid": mid,
+                "signal_ts": now.isoformat(),
+            }
             s.save()
 
             # Capture spread at entry for toxicity analysis
@@ -2483,6 +2628,9 @@ class PortfolioRiskManager:
         "MGC": {"GOLD": +1}, "MCL": {"OIL": +1}, "NKD": {"JPY_EQUITY": +1},
     }
 
+    # Persistent state file for drawdown pause (survives restart)
+    _STATE_FILE = REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
+
     def __init__(self, max_same_currency: int = 3, max_drawdown_pct: float = 0.03,
                  daily_max_loss: float = 3.0, portfolio_daily_max_loss: float = 10.0,
                  max_total_open_risk_pct: float = 0.05):
@@ -2499,6 +2647,42 @@ class PortfolioRiskManager:
         self._daily_paused: set[str] = set()
         self._portfolio_daily_paused: bool = False
         self._current_day: str = ""
+        self._load_persistent_state()
+
+    # ── Persistent state (survives restart) ──────────────────
+    def _load_persistent_state(self) -> None:
+        """Restore drawdown pause and peak PnL from disk if available."""
+        if not self._STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(self._STATE_FILE.read_text())
+            self._drawdown_pause = bool(data.get("drawdown_pause", False))
+            self._peak_pnl = float(data.get("peak_pnl", 0.0))
+            day = data.get("current_day", "")
+            if day == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                self._daily_pnl = {k: float(v) for k, v in data.get("daily_pnl", {}).items()}
+                self._daily_paused = set(data.get("daily_paused", []))
+                self._portfolio_daily_paused = bool(data.get("portfolio_daily_paused", False))
+                self._current_day = day
+            if self._drawdown_pause:
+                log.warning(f"RISK_MGR: restored DRAWDOWN_PAUSE from disk (peak={self._peak_pnl:.2f}R)")
+        except Exception as exc:
+            log.warning(f"RISK_MGR: failed to load persistent state: {exc}")
+
+    def save_persistent_state(self) -> None:
+        """Persist drawdown pause and daily limits so they survive restart."""
+        self._STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "drawdown_pause": self._drawdown_pause,
+            "peak_pnl": self._peak_pnl,
+            "current_pnl": self._current_pnl,
+            "current_day": self._current_day,
+            "daily_pnl": self._daily_pnl,
+            "daily_paused": list(self._daily_paused),
+            "portfolio_daily_paused": self._portfolio_daily_paused,
+        }
+        atomic_write_json(self._STATE_FILE, data)
 
     def update(self, instruments: list) -> None:
         """Update portfolio PnL tracking.
@@ -2614,7 +2798,10 @@ class PortfolioRiskManager:
 
 
 # ═════════════════════════════════════════════════════════════
-# Emergency kill switch
+# Shutdown Modes (3-mode lifecycle)
+#   PAUSE_ENTRIES  — block new entries, keep existing positions running
+#   GRACEFUL_EXIT  — block entries, let positions exit via stop/target/timeout, then stop
+#   KILL_SWITCH    — cancel all orders, market-close all positions immediately, stop
 # ═════════════════════════════════════════════════════════════
 def _execute_emergency_shutdown(ib, instruments, kill_file):
     """Emergency halt: cancel all orders, close all positions, notify, exit."""
@@ -2938,6 +3125,33 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                 _execute_emergency_shutdown(ib, instruments, kill_file)
                 break
 
+            # Check graceful exit — block entries, wait for all positions to close, then stop
+            graceful_file = REPO / "GRACEFUL_EXIT"
+            if graceful_file.exists():
+                for inst in instruments:
+                    inst._entries_blocked = True
+                all_flat = all(inst.state.position == "FLAT" for inst in instruments)
+                if all_flat:
+                    log.critical("GRACEFUL EXIT: all positions closed. Shutting down.")
+                    risk_mgr.save_persistent_state()
+                    for inst in instruments:
+                        inst.state.save()
+                    try:
+                        from argus_flow.ops.discord_alerts import send_discord
+                        send_discord(embeds=[{
+                            "title": "GRACEFUL EXIT complete",
+                            "description": "All positions closed, runner stopped.",
+                            "color": 0x00FF88,
+                        }])
+                    except Exception:
+                        pass
+                    try:
+                        ib.disconnect()
+                    except Exception:
+                        pass
+                    _log_summary(instruments)
+                    break
+
             # Check pause file — block new entries but keep existing positions
             pause_file = REPO / "PAUSE_ENTRIES"
             if pause_file.exists():
@@ -2945,7 +3159,8 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     inst._entries_blocked = True
             else:
                 # Only unblock if not quarantined or otherwise blocked
-                pass  # Entry blocking is managed per-instrument elsewhere
+                if not graceful_file.exists():
+                    pass  # Entry blocking is managed per-instrument elsewhere
 
             now = datetime.now(timezone.utc)
 
@@ -3060,6 +3275,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     f"HEARTBEAT | {len(instruments)} instruments | "
                     f"{flat_count} flat | {pos_str}"
                 )
+                risk_mgr.save_persistent_state()
                 _write_heartbeat_files(
                     instruments,
                     runtime_mode,
@@ -3070,6 +3286,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     except KeyboardInterrupt:
         log.info("Shutting down (Ctrl+C)...")
+        risk_mgr.save_persistent_state()
         for inst in instruments:
             inst.state.save()
         try:
@@ -3081,6 +3298,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     except (ConnectionError, OSError, asyncio.CancelledError) as e:
         log.warning(f"Connection lost: {e}. Will reconnect...")
+        risk_mgr.save_persistent_state()
         for inst in instruments:
             inst.state.save()
         try:
@@ -3092,6 +3310,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     except (TypeError, ValueError, KeyError, AttributeError, IndexError) as e:
         # Logic/programming errors — do NOT reconnect, fail loudly
         log.critical(f"CODE DEFECT (not a connection issue): {type(e).__name__}: {e}", exc_info=True)
+        risk_mgr.save_persistent_state()
         for inst in instruments:
             inst.state.save()
         try:

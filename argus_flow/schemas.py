@@ -9,7 +9,7 @@ Rules:
 """
 
 # Schema version — bump when columns change
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # ── Signal CSV ─────────────────────────────────────────────────
 
@@ -68,19 +68,27 @@ VALIDITY_FIELDS = [
     "config_hash", "session_id", "runtime_epoch", "git_sha",
 ]
 
+# Entry-feature + execution quality fields (v4)
+ENTRY_FEATURE_FIELDS = [
+    "mtf_score", "mtf_alignment", "session_score", "session_label",
+    "spread_ratio", "entry_spread", "entry_bid", "entry_ask",
+    "conviction_score", "bias_4h",
+    "signal_mid", "fill_latency_ms", "slippage_pips",
+]
+
 TRADE_FIELDS_PIPS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pips",
     "exit_reason", "duration_min", "trade_num",
     "pnl_usd", "position_size", "risk_usd", "sizing_policy",
     "entry_regime",
-] + VALIDITY_FIELDS
+] + VALIDITY_FIELDS + ENTRY_FEATURE_FIELDS
 
 TRADE_FIELDS_POINTS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pts",
     "pnl_usd", "exit_reason", "duration_min", "trade_num",
     "position_size", "risk_usd", "sizing_policy",
     "entry_regime",
-] + VALIDITY_FIELDS
+] + VALIDITY_FIELDS + ENTRY_FEATURE_FIELDS
 
 
 def trade_header(uses_pips: bool) -> list[str]:

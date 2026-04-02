@@ -22,5 +22,22 @@
   "mym_vol_burst_paper_v1.json": "c7d74338ee349b73",
   "nkd_range_paper_v1.json": "04040af70a5c490a",
   "nkd_vol_burst_paper_v1.json": "98688e9b95521472",
-  "usdjpy_ny_paper_v1.json": "2cc9a46a0a49b0e4"
+  "usdjpy_ny_paper_v1.json": "2cc9a46a0a49b0e4",
+  "audjpy_var_a_watcher_v1.json": "4595949be46f3bbb",
+  "audjpy_var_b_watcher_v1.json": "565417d34271d617",
+  "audusd_var_a_watcher_v1.json": "95ba94edfa1adab3",
+  "audusd_var_b_watcher_v1.json": "aba81786bf1b79c8",
+  "cadjpy_var_a_watcher_v1.json": "e85e354ac925baae",
+  "cadjpy_var_b_watcher_v1.json": "52e8740bffac2165",
+  "discovery_fx_universe.json": "59970accb0dca123",
+  "eurjpy_var_a_watcher_v1.json": "b88f6535181bc41b",
+  "eurjpy_var_b_watcher_v1.json": "e4ef8eb10e0ea22b",
+  "eurusd_var_a_watcher_v1.json": "963497d458608aa1",
+  "eurusd_var_b_watcher_v1.json": "054bb138912421b7",
+  "gbpjpy_var_a_watcher_v1.json": "f592d333ef305b18",
+  "gbpjpy_var_b_watcher_v1.json": "ec6a04e8768c4af3",
+  "gbpusd_var_a_watcher_v1.json": "38299f895534b860",
+  "gbpusd_var_b_watcher_v1.json": "09aca85ce21ef2a3",
+  "usdjpy_var_a_watcher_v1.json": "54f510019160e103",
+  "usdjpy_var_b_watcher_v1.json": "5aa7777894c86a74"
 }

@@ -41,10 +41,12 @@ STEPS = [
     {"id": "promotion_gate_v2", "module": "argus_flow.ops.promotion_gate_v2", "critical": False},
     {"id": "artifact_divergence", "module": "argus_flow.ops.artifact_divergence", "critical": False},
     {"id": "deployment_pipeline", "module": "argus_flow.ops.deployment_pipeline", "critical": True},
+    {"id": "stage_actions", "module": "argus_flow.ops.stage_actions", "args": ["--auto-apply"], "critical": False},
     {"id": "evidence_registry", "module": "argus_flow.ops.evidence_registry", "critical": True},
     {"id": "demotion_check", "module": "argus_flow.ops.demotion_check", "critical": False},
     {"id": "position_monitor", "module": "argus_flow.ops.position_monitor", "critical": False},
     {"id": "risk_oversight", "module": "argus_flow.ops.risk_oversight", "critical": False},
+    {"id": "qa_learning", "module": "argus_flow.ops.qa_learning", "critical": False},
     {"id": "alert_escalation_v2", "module": "argus_flow.ops.alert_escalation_v2", "critical": True},
 ]
 

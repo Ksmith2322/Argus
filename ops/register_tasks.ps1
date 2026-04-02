@@ -54,6 +54,14 @@ $tasks = @(
         Description = "Weekly FX cohort Discord report"
     },
     @{
+        Name = "ArgusWeeklyPairOnboarding"
+        Script = "C:\Argus\repo\ops\run_weekly_pair_onboarding.ps1"
+        Schedule = "WEEKLY"
+        Time = "18:00"
+        Day = "FRI"
+        Description = "Weekly FX discovery + onboarding into watcher lane"
+    },
+    @{
         Name = "ArgusWatchdog"
         Script = "C:\Argus\repo\ops\watchdog_managed.ps1"
         Schedule = "ONSTART"

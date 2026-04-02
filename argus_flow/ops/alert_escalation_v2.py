@@ -20,6 +20,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from argus_flow.ops.fleet_registry import STAGE_WATCHER, STAGE_PAPER, STAGE_REAL, STAGE_QUARANTINE
+
 load_dotenv()
 
 REPO = Path(__file__).resolve().parents[2]
@@ -465,6 +467,51 @@ def _sort_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+# Stage-aware suppression: early-stage runners generate noise that looks like
+# production incidents.  Suppress non-critical items for immature cohorts so
+# operators don't learn to ignore alerts (alert fatigue).
+_IMMATURE_STAGES = {STAGE_WATCHER}
+_IMMATURE_MAX_SEVERITY = "WARNING"  # cap at WARNING for watcher-stage items
+
+
+def _apply_stage_suppression(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Downgrade HIGH/CRITICAL issues from immature-stage runners to WARNING.
+
+    Items from real-stage or fleet-wide scope pass through unchanged.
+    """
+    from argus_flow.ops.fleet_registry import runners_for_stages
+
+    # Build set of watcher-stage symbols for fast lookup
+    try:
+        watcher_symbols = {
+            r["symbol"].lower()
+            for r in runners_for_stages(_IMMATURE_STAGES)
+        }
+    except Exception:
+        return issues  # fail open — don't suppress if registry unavailable
+
+    filtered = []
+    for issue in issues:
+        scope = str(issue.get("scope", "")).lower()
+        severity = str(issue.get("severity", "")).upper()
+        category = str(issue.get("category", ""))
+
+        # Only suppress per-runner issues, not fleet-wide or infrastructure
+        is_runner_scoped = scope in watcher_symbols
+        is_suppressible = category in ("divergence", "kill_discipline", "artifact_divergence")
+
+        if is_runner_scoped and is_suppressible and SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(_IMMATURE_MAX_SEVERITY, 1):
+            issue = dict(issue)  # copy to avoid mutation
+            issue["severity"] = _IMMATURE_MAX_SEVERITY
+            issue["requires_manual_action"] = False
+            issue["message"] = f"[{STAGE_WATCHER} suppressed] {issue['message']}"
+            issue["color"] = SEVERITY_COLOR.get(_IMMATURE_MAX_SEVERITY, SEVERITY_COLOR["WARNING"])
+
+        filtered.append(issue)
+
+    return filtered
+
+
 def run() -> None:
     """Collect incidents, update alert state, and notify Discord."""
     from argus_flow.ops.discord_alerts import send_discord
@@ -504,6 +551,7 @@ def run() -> None:
                 )
             )
 
+    current_issues = _apply_stage_suppression(current_issues)
     current_map = {issue["key"]: issue for issue in _sort_issues(current_issues)}
     opened = [current_map[key] for key in current_map if key not in previous_active]
     resolved = [previous_active[key] for key in previous_active if key not in current_map]

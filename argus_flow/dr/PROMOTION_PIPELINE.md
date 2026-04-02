@@ -22,6 +22,7 @@
 
 ### Entry criteria (Discovery -> Watcher):
 - Discovery intake is registry-driven via managed config metadata or onboarding automation.
+- The weekly Friday onboarding job may seed up to 5 new FX candidates into WATCHER after onboarding PASS + walk-forward PASS.
 - Walk-forward backtest exists with >= 6 folds
 - At least 60% of scored folds have positive expectancy
 - Backtest covers >= 14 days of data

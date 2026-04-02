@@ -1,0 +1,28 @@
+{
+  "template_config": "argus_flow/configs/eurusd_t4_paper_v1.json",
+  "entry_stage": "watcher",
+  "history_days": 45,
+  "max_new_pairs": 5,
+  "max_data_age_days": 7.0,
+  "candidate_symbols": [
+    "USDCHF",
+    "USDCAD",
+    "NZDUSD",
+    "EURGBP",
+    "EURCHF",
+    "EURAUD",
+    "EURNZD",
+    "EURCAD",
+    "GBPCHF",
+    "GBPAUD",
+    "GBPCAD",
+    "AUDCAD",
+    "AUDCHF",
+    "AUDNZD",
+    "NZDJPY",
+    "NZDCHF",
+    "NZDCAD",
+    "CHFJPY",
+    "CADCHF"
+  ]
+}

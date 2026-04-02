@@ -484,6 +484,35 @@ def check_no_manual_intervention(valid_trades: list[dict]) -> CheckResult:
     return _hard(True, "no manual intervention flags found")
 
 
+def check_execution_quality(valid_trades: list[dict]) -> CheckResult:
+    """Advisory: check that execution slippage is not eating the edge.
+
+    Reads slippage_pips from v4 trade artifacts. If avg slippage exceeds
+    20% of avg winning trade, flags as advisory concern.
+    """
+    slippages = []
+    for t in valid_trades:
+        slip = _safe_float(t.get("slippage_pips", 0))
+        if slip > 0:
+            slippages.append(slip)
+
+    if len(slippages) < 5:
+        return _advisory(True, f"execution quality: {len(slippages)} trades with slippage data (need 5+)")
+
+    avg_slip = sum(slippages) / len(slippages)
+    max_slip = max(slippages)
+
+    # Compare to avg win size
+    pnl_field = "pnl_pips" if "pnl_pips" in valid_trades[0] else "pnl_pts"
+    wins = [_safe_float(t.get(pnl_field, 0)) for t in valid_trades if _safe_float(t.get(pnl_field, 0)) > 0]
+    avg_win = sum(wins) / len(wins) if wins else 1.0
+
+    slip_ratio = avg_slip / avg_win if avg_win > 0 else 0
+    ok = slip_ratio < 0.20  # slippage < 20% of avg win
+    detail = f"avg_slip={avg_slip:.2f} max={max_slip:.2f} vs avg_win={avg_win:.2f} (ratio={slip_ratio:.1%})"
+    return _advisory(ok, detail)
+
+
 def check_walk_forward_positive(log_dir: Path) -> CheckResult:
     report = _load_walkforward_report(log_dir)
     if not report:
@@ -567,6 +596,7 @@ def evaluate_runner(runner: dict) -> dict:
         "survived_disconnect": check_survived_disconnect(all_trades),
         "dashboard_truth": check_dashboard_truth(runner, all_trades, valid_trades),
         "no_manual_intervention": check_no_manual_intervention(valid_trades),
+        "execution_quality": check_execution_quality(valid_trades),
     }
 
     hard_checks = {name: result for name, result in checks.items() if result.classification == "hard"}

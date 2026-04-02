@@ -40,12 +40,15 @@ def _fail(label, detail=""):
 # ── Helpers ───────────────────────────────────────────────────
 
 def _load_configs() -> list[tuple[str, dict]]:
-    """Load all config JSON files (excluding hashes.json)."""
+    """Load strategy config JSON files (excluding hashes.json and non-runner metadata)."""
     configs = []
     for p in sorted(CONFIGS_DIR.glob("*.json")):
         if p.name == "hashes.json":
             continue
-        configs.append((p.name, json.loads(p.read_text(encoding="utf-8"))))
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if "instrument_type" not in payload:
+            continue
+        configs.append((p.name, payload))
     return configs
 
 
@@ -926,6 +929,99 @@ def test_managed_watchdog_task_target():
         _fail("register_tasks still targets legacy watchdog")
 
 
+def test_onboard_pair_percentage_normalization():
+    from argus_flow.ops.onboard_pair import _evaluate_results
+
+    passed, kills, _ = _evaluate_results({"win_rate": 10.0, "profit_factor": 1.2})
+    if not passed and any("WR" in kill for kill in kills):
+        _ok("onboard_pair normalizes numeric percentage-style win rates")
+    else:
+        _fail("onboard_pair win-rate normalization failed", f"passed={passed} kills={kills}")
+
+
+def test_weekly_pair_onboarding_candidate_plan():
+    from argus_flow.ops.weekly_pair_onboarding import build_candidate_plan
+
+    candidates, skipped = build_candidate_plan(
+        ["NZDUSD", "EURUSD", "USDCAD", "NZDUSD", "bad", ""],
+        {"EURUSD", "AUDUSD"},
+    )
+    if candidates == ["NZDUSD", "USDCAD"] and skipped == ["EURUSD"]:
+        _ok("weekly_pair_onboarding filters invalid/duplicate/existing candidates")
+    else:
+        _fail("weekly_pair_onboarding candidate plan mismatch", f"candidates={candidates} skipped={skipped}")
+
+
+def test_weekly_pair_onboarding_config_render():
+    from argus_flow.ops.weekly_pair_onboarding import build_final_candidate_config
+
+    template_path = CONFIGS_DIR / "eurusd_t4_paper_v1.json"
+    template_cfg = json.loads(template_path.read_text(encoding="utf-8"))
+    config_name, cfg = build_final_candidate_config(
+        template_cfg=template_cfg,
+        template_path=template_path,
+        symbol="USDJPY",
+        stage="watcher",
+        results={
+            "win_rate": 54.2,
+            "expectancy": 1.11,
+            "total_entries": 42,
+            "stop_rate": 20.0,
+            "target_rate": 10.0,
+            "timeout_rate": 70.0,
+        },
+    )
+
+    deployment = cfg.get("deployment", {}) if isinstance(cfg.get("deployment", {}), dict) else {}
+    replay = cfg.get("replay_expectations", {}) if isinstance(cfg.get("replay_expectations", {}), dict) else {}
+    if (
+        config_name == "usdjpy_t4_paper_v1.json"
+        and cfg.get("symbol") == "USDJPY"
+        and deployment.get("managed") is True
+        and deployment.get("stage") == "watcher"
+        and abs(float(replay.get("win_rate", 0.0)) - 0.542) < 1e-9
+    ):
+        _ok("weekly_pair_onboarding renders managed watcher configs from template + results")
+    else:
+        _fail(
+            "weekly_pair_onboarding config render mismatch",
+            f"name={config_name} deployment={deployment} replay={replay}",
+        )
+
+
+def test_weekly_pair_onboarding_top_five_selection():
+    from argus_flow.ops.weekly_pair_onboarding import select_top_candidates
+
+    candidates = []
+    for idx, score in enumerate([1.0, 7.0, 3.5, 9.0, 4.0, 8.0, 2.0], start=1):
+        candidates.append(
+            {
+                "symbol": f"AA{idx:02d}BB",
+                "status": "PASS",
+                "score": score,
+                "walkforward_summary": {"mean_expectancy": score / 10.0},
+                "backtest": {"expectancy": score / 20.0},
+            }
+        )
+    candidates.append({"symbol": "FAILME", "status": "FAIL", "score": 100.0})
+
+    winners = select_top_candidates(candidates, 5)
+    winner_symbols = [item["symbol"] for item in winners]
+    if winner_symbols == ["AA04BB", "AA06BB", "AA02BB", "AA05BB", "AA03BB"]:
+        _ok("weekly_pair_onboarding keeps only the top five passing candidates")
+    else:
+        _fail("weekly_pair_onboarding top-five selection mismatch", f"got {winner_symbols}")
+
+
+def test_register_tasks_has_weekly_pair_onboarding():
+    register_tasks = Path(__file__).resolve().parents[2] / "ops" / "register_tasks.ps1"
+    code = register_tasks.read_text(encoding="utf-8", errors="replace")
+    if "ArgusWeeklyPairOnboarding" in code and "run_weekly_pair_onboarding.ps1" in code:
+        _ok("register_tasks includes the Friday pair-onboarding job")
+    else:
+        _fail("register_tasks missing weekly pair onboarding task")
+
+
 def test_artifact_divergence_uses_futures_points_field():
     from argus_flow.ops.artifact_divergence import check_runner
 
@@ -1054,8 +1150,13 @@ def main():
         ("24. managed governance runner selection", test_managed_governance_runner_selection),
         ("25. alert reason fallback", test_alert_reason_fallback_from_flags),
         ("26. managed watchdog task target", test_managed_watchdog_task_target),
-        ("27. artifact divergence futures pnl field", test_artifact_divergence_uses_futures_points_field),
-        ("28. discord alerts managed runner selection", test_discord_alerts_follow_managed_runners),
+        ("27. onboard_pair percentage normalization", test_onboard_pair_percentage_normalization),
+        ("28. weekly onboarding candidate plan", test_weekly_pair_onboarding_candidate_plan),
+        ("29. weekly onboarding config render", test_weekly_pair_onboarding_config_render),
+        ("30. weekly onboarding top five", test_weekly_pair_onboarding_top_five_selection),
+        ("31. register_tasks weekly onboarding task", test_register_tasks_has_weekly_pair_onboarding),
+        ("32. artifact divergence futures pnl field", test_artifact_divergence_uses_futures_points_field),
+        ("33. discord alerts managed runner selection", test_discord_alerts_follow_managed_runners),
     ]
 
     for name, fn in tests:

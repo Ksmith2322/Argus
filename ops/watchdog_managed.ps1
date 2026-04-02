@@ -260,7 +260,9 @@ function Get-LogDirForConfig([string]$configPath) {
         $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
         $deployment = $cfg.deployment
         if ($deployment -and $deployment.log_dir) {
-            return [string]$deployment.log_dir
+            $raw = [string]$deployment.log_dir
+            if ([System.IO.Path]::IsPathRooted($raw)) { return $raw }
+            return Join-Path "C:\Argus\repo" $raw
         }
         $symbol = [string]$cfg.symbol
         if (-not $symbol) { return $null }
@@ -268,8 +270,8 @@ function Get-LogDirForConfig([string]$configPath) {
         if ($cfg.live) { $isLive = $true }
         elseif ([string]$cfg.version -match "live") { $isLive = $true }
         elseif ((Split-Path $configPath -Leaf) -match "live_v1") { $isLive = $true }
-        if ($isLive) { return "argus_flow/logs/live_$($symbol.ToLower())" }
-        return "argus_flow/logs/$($symbol.ToLower())"
+        if ($isLive) { return Join-Path "C:\Argus\repo" "argus_flow/logs/live_$($symbol.ToLower())" }
+        return Join-Path "C:\Argus\repo" "argus_flow/logs/$($symbol.ToLower())"
     } catch {
         return $null
     }
@@ -330,6 +332,8 @@ $failureCounts = @{
     "discord" = 0
 }
 $script:portWarnSent = $false
+$script:gatewayDownCount = 0
+$script:gatewayWarnSent = $false
 $script:staleWarnSent = $false
 $script:staleWarnTime = $null
 $script:tradeCounts = @{}
@@ -494,19 +498,61 @@ while ($true) {
         $script:portWarnSent = $false
     }
 
+    # IB Gateway / TWS process supervision — fail-closed on sustained outage
+    $gatewayAlive = $false
+    try {
+        $twsProc = Get-Process -Name "tws" -ErrorAction SilentlyContinue
+        $gatewayProc = Get-Process -Name "ibgateway" -ErrorAction SilentlyContinue
+        $gatewayAlive = ($null -ne $twsProc) -or ($null -ne $gatewayProc)
+    } catch {}
+    if (-not $gatewayAlive -and -not $portListening) {
+        $script:gatewayDownCount++
+        if ($script:gatewayDownCount -ge 3 -and -not $script:gatewayWarnSent) {
+            Log "CRITICAL: IB Gateway/TWS process NOT running for $($script:gatewayDownCount) checks. Creating PAUSE_ENTRIES."
+            $pauseFile = Join-Path "C:\Argus\repo" "PAUSE_ENTRIES"
+            if (-not (Test-Path $pauseFile)) {
+                "gateway_supervision" | Out-File -FilePath $pauseFile -Encoding utf8
+                Log "PAUSE_ENTRIES created by gateway supervision (fail-closed)"
+            }
+            Send-Discord "**CRITICAL: IB Gateway/TWS not running**`nEntries PAUSED (fail-closed). Manual restart required.`nDown for $($script:gatewayDownCount) consecutive checks ($checkIntervalSeconds sec each)." "red"
+            $script:gatewayWarnSent = $true
+        } elseif ($script:gatewayDownCount -lt 3) {
+            Log ("WARNING: IB Gateway/TWS not detected (check {0}/3 before fail-closed)" -f $script:gatewayDownCount)
+        }
+    } else {
+        if ($script:gatewayWarnSent) {
+            Log "IB Gateway/TWS process restored"
+            # Remove PAUSE_ENTRIES only if we created it
+            $pauseFile = Join-Path "C:\Argus\repo" "PAUSE_ENTRIES"
+            if (Test-Path $pauseFile) {
+                $content = Get-Content $pauseFile -Raw -ErrorAction SilentlyContinue
+                if ($content -match "gateway_supervision") {
+                    Remove-Item $pauseFile -Force
+                    Log "PAUSE_ENTRIES removed (gateway restored)"
+                }
+            }
+            Send-Discord "IB Gateway/TWS is **BACK**. Entries resumed." "green"
+            $script:gatewayWarnSent = $false
+        }
+        $script:gatewayDownCount = 0
+    }
+
     $watchedConfigs = @($paperState.Configs + $realState.Configs | Select-Object -Unique)
     $hbDirs = Get-WatchedLogDirs $watchedConfigs
     $staleCount = 0
     $freshCount = 0
+    $missingCount = 0
     foreach ($dir in $hbDirs) {
         $hbFile = Join-Path $dir "heartbeat.json"
         if (Test-Path $hbFile) {
             try {
                 $hb = Get-Content $hbFile -Raw | ConvertFrom-Json
-                $hbTime = [DateTime]::Parse($hb.ts)
+                $hbTime = [DateTimeOffset]::Parse($hb.ts).UtcDateTime
                 $hbAge = ((Get-Date).ToUniversalTime() - $hbTime).TotalSeconds
                 if ($hbAge -lt $staleThresholdSeconds) { $freshCount++ } else { $staleCount++ }
             } catch { $staleCount++ }
+        } else {
+            $missingCount++
         }
     }
 
@@ -593,6 +639,7 @@ while ($true) {
         $realStr = if ($realState.Expected) { $(if ($realState.Healthy) { "UP" } else { "DOWN" }) } else { "N/A" }
         $dashStr = if ($dashboardUp) { "UP" } else { "DOWN" }
         $discordStr = if ($discordUp) { "UP" } else { "DOWN" }
-        Log "HEARTBEAT | Paper=$paperStr | Real=$realStr | Dashboard=$dashStr | Discord=$discordStr | Port=$portListening | Fresh=$freshCount Stale=$staleCount"
+        $gwStr = if ($gatewayAlive) { "UP" } else { "DOWN" }
+        Log "HEARTBEAT | Paper=$paperStr | Real=$realStr | Dashboard=$dashStr | Discord=$discordStr | Port=$portListening | Gateway=$gwStr | Fresh=$freshCount Stale=$staleCount Missing=$missingCount"
     }
 }

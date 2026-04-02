@@ -40,8 +40,9 @@ SIGNAL_FEATURES = [
     "nearest_support", "nearest_resistance",
     "dist_support", "dist_resistance",
     "near_support", "near_resistance",
-    # Portfolio state at entry
-    "cash_usd", "equity_usd", "realized_pnl_usd",
+    # Portfolio state at entry — REMOVED: leaks run-specific portfolio evolution
+    # into training data, creating train/test contamination.
+    # "cash_usd", "equity_usd", "realized_pnl_usd",
     # Risk
     "cooldown_remaining_s",
 ]

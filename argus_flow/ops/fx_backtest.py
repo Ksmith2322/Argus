@@ -197,6 +197,7 @@ class BacktestRunner:
         pnls = [t["pnl"] for t in self.trades]
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
+        exits = [str(t.get("exit_reason", "")).lower() for t in self.trades]
 
         peak = 0
         equity = 0
@@ -224,6 +225,9 @@ class BacktestRunner:
             "total_signals": len(self.signals),
             "total_entries": len(entries),
             "trigger_rate": round(len(entries) / len(self.signals) * 100, 2) if self.signals else 0,
+            "stop_rate": round(exits.count("stop") / len(self.trades) * 100, 2),
+            "target_rate": round(exits.count("target") / len(self.trades) * 100, 2),
+            "timeout_rate": round(exits.count("timeout") / len(self.trades) * 100, 2),
         }
 
 
@@ -257,6 +261,7 @@ def main():
 
     if s["trades"] == 0:
         print("  No trades generated.")
+        print(json.dumps(s))
         return
 
     print(f"  Trades:      {s['trades']} ({s['wins']}W / {s['losses']}L)")
@@ -285,6 +290,7 @@ def main():
             w.writeheader()
             w.writerows(bt.trades)
     print(f"\n  Trades saved: {out_path}")
+    print(json.dumps(s))
 
 
 if __name__ == "__main__":

@@ -2157,6 +2157,9 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "strategy_status": "",
         "cohort_active": False,
         "risk_policy": runner.get("risk_policy", {}),
+        "transition_ready": runner.get("transition_ready", False),
+        "transition_reason": runner.get("transition_reason", ""),
+        "next_stage": runner.get("next_stage", ""),
     }
 
     # Load replay expectations from config
@@ -2639,6 +2642,99 @@ async def api_ibkr_fleet():
     })
 
 
+@app.post("/api/stage_action")
+async def api_stage_action(request: Request):
+    """Execute a manual stage transition (promote, demote, kill, pause, unpause)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    action = body.get("action", "")
+    symbol = body.get("symbol", "")
+    reason = body.get("reason", "")
+    if not action or not symbol:
+        return JSONResponse({"success": False, "error": "action and symbol required"}, status_code=400)
+    try:
+        from argus_flow.ops.stage_actions import execute_manual_action
+        result = execute_manual_action(action, symbol, reason, operator="dashboard")
+        status_code = 200 if result.get("success") else 400
+        return JSONResponse(result, status_code=status_code)
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/stage_history")
+async def api_stage_history():
+    """Stage transition history for timeline display."""
+    symbol = None  # could filter via query param later
+    try:
+        from argus_flow.ops.stage_actions import load_history
+        events = load_history(symbol=symbol, limit=200)
+        return JSONResponse({"events": events, "count": len(events)})
+    except Exception as e:
+        return JSONResponse({"events": [], "count": 0, "error": str(e)})
+
+
+@app.get("/api/governance_health")
+async def api_governance_health():
+    """Governance report freshness — shows what's blocking transitions."""
+    reports = [
+        {"id": "promotion_gate", "label": "Promotion Gate", "path": "argus_flow/logs/promotion_gate_report.json"},
+        {"id": "kill_discipline", "label": "Kill Discipline", "path": "argus_flow/logs/kill_discipline_report.json"},
+        {"id": "divergence_guard", "label": "Divergence Guard", "path": "argus_flow/logs/divergence_report.json"},
+        {"id": "managed_truth", "label": "Managed Truth", "path": "argus_flow/logs/managed_truth_refresh.json"},
+        {"id": "deployment_registry", "label": "Deployment Registry", "path": "argus_flow/logs/deployment_registry.json"},
+    ]
+    import time as _time
+    result = []
+    for spec in reports:
+        p = Path(spec["path"])
+        if not p.is_absolute():
+            p = Path("C:/Argus/repo") / p
+        age_s = None
+        status = "MISSING"
+        last_status = None
+        if p.exists():
+            try:
+                age_s = int(_time.time() - p.stat().st_mtime)
+                fresh_threshold = 30 * 60  # 30 min
+                status = "FRESH" if age_s < fresh_threshold else "STALE"
+                data = json.loads(p.read_text(encoding="utf-8"))
+                last_status = data.get("status", data.get("summary", {}).get("status", None))
+            except Exception:
+                status = "ERROR"
+        result.append({
+            "id": spec["id"],
+            "label": spec["label"],
+            "age_s": age_s,
+            "status": status,
+            "last_status": last_status,
+        })
+    all_fresh = all(r["status"] == "FRESH" for r in result)
+    return JSONResponse({
+        "reports": result,
+        "all_fresh": all_fresh,
+        "governance_ready": all_fresh,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.get("/api/qa_learning")
+async def api_qa_learning():
+    """QA learning insights — regime, session, exit quality, variant comparison."""
+    try:
+        report_path = Path("C:/Argus/repo/argus_flow/logs/qa_learning_report.json")
+        if report_path.exists():
+            import time as _time
+            age = int(_time.time() - report_path.stat().st_mtime)
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            data["report_age_s"] = age
+            return JSONResponse(data)
+        return JSONResponse({"instruments": {}, "variant_comparison": {}, "report_age_s": None})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/daily_performance")
 async def api_daily_performance():
     """Daily performance journal — split by stage, with compact per-day rows."""
@@ -3071,6 +3167,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   @keyframes trade-pulse { 0%,100%{box-shadow:0 0 8px rgba(0,230,118,0.2)} 50%{box-shadow:0 0 20px rgba(0,230,118,0.6)} }
   .coin-summary.trading-active { animation: trade-pulse 2s ease-in-out infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  @keyframes stage-transition-glow { 0%,100%{box-shadow:0 0 4px rgba(0,212,255,0.2);border-color:#1e2a42} 50%{box-shadow:0 0 16px rgba(0,212,255,0.5);border-color:#00d4ff} }
   .coin-summary .coin-name { font-size: 1.1em; font-weight: bold; color: #00d4ff; margin-bottom: 6px; }
   .coin-summary .coin-state { font-size: 0.85em; margin-bottom: 4px; }
   .coin-summary .coin-pnl { font-size: 1.3em; font-weight: bold; }
@@ -3241,8 +3338,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- QA paper-model account and cohort status moved below the production section -->
 
-<!-- Legacy sections removed 2026-03-29: Divergence Guard, Kill Discipline, Promotion Gate -->
-<!-- Replaced by: health bar, degradation_report.py, drift_report.py, trade_tracker.py, Discord alerts -->
+<!-- Governance health bar -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin:12px 0;" id="governance-health-bar">
+  <span style="color:#7b8ab8;font-size:0.7em;">Loading governance health...</span>
+</div>
+
+<!-- Stage transition history -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin:12px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">STAGE TRANSITION HISTORY</h3>
+    <span style="font-size:0.65em;color:#7b8ab8;">Recent promotions, demotions, kills</span>
+  </div>
+  <div id="stage-history-timeline" style="max-height:200px;overflow-y:auto;">
+    <span style="color:#7b8ab8;font-size:0.7em;">Loading...</span>
+  </div>
+</div>
+
+<!-- Fleet-wide actions -->
+<div style="display:flex;gap:8px;margin:8px 0;justify-content:flex-end;">
+  <button onclick="stageAction('pause','FLEET')" style="background:#ffaa00;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.7em;font-weight:bold;">PAUSE ALL ENTRIES</button>
+  <button onclick="stageAction('unpause','FLEET')" style="background:#00e676;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.7em;font-weight:bold;">RESUME ENTRIES</button>
+</div>
 
 <!-- Production section -->
 <div style="margin:16px 0 10px 0;">
@@ -3382,6 +3498,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span style="font-size:0.72em;color:#7b8ab8;">Research lane. New managed pairs start here and must earn paper QA.</span>
   </div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-watcher-cards"></div>
+</div>
+
+<!-- QA Learning Insights -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA LEARNING INSIGHTS</h3>
+    <span style="font-size:0.65em;color:#7b8ab8;">Regime, direction, exit quality, variant comparison</span>
+  </div>
+  <div id="qa-learning-panel" style="font-size:0.72em;color:#7b8ab8;">Loading...</div>
 </div>
 
 <!-- Recent signals -->
@@ -3689,7 +3814,9 @@ async function loadIBKRFleet() {
         ? (r.journal_usd_complete ? 'journal-backed' : 'partial ' + (r.journal_usd_trade_count || 0) + '/' + (r.journal_total_trades || 0))
         : 'missing pnl_usd';
 
-      let card = `<div style="background:#141b2d;border:1px solid ${borderColor};border-radius:6px;padding:12px;${pulse}">`;
+      const transitionReady = r.transition_ready || false;
+      const transitionGlow = transitionReady ? 'animation:stage-transition-glow 2s ease-in-out infinite;' : '';
+      let card = `<div style="background:#141b2d;border:1px solid ${borderColor};border-radius:6px;padding:12px;${pulse}${transitionGlow}transition:all 0.5s ease;">`;
 
       // Header: name + status + health
       const isProdLane = r.current_stage === 'real' || r.current_stage === 'quarantine';
@@ -3822,6 +3949,31 @@ async function loadIBKRFleet() {
           <span>Avg L: ${Number(r.avg_loss).toFixed(1)}</span>
           <span>Max CL: ${r.max_consec_loss}</span>
         </div>`;
+      }
+
+      // Action buttons
+      const sym = r.symbol;
+      const stage = r.current_stage;
+      let actions = '';
+      if (stage === 'watcher') {
+        actions += `<button onclick="stageAction('promote','${sym}')" style="background:#00d4ff;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;font-weight:bold;" title="Promote to Paper QA">&#9650; PAPER</button>`;
+        actions += `<button onclick="stageAction('kill','${sym}')" style="background:#ff4444;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Kill this pair">&#10005; KILL</button>`;
+      } else if (stage === 'paper') {
+        if (r.promotion_eligible) {
+          actions += `<button onclick="stageAction('promote','${sym}')" style="background:#00e676;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;font-weight:bold;animation:pulse 2s infinite;" title="Promote to Real">&#9650; REAL</button>`;
+        }
+        actions += `<button onclick="stageAction('demote','${sym}')" style="background:#ffaa00;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Demote to Watcher">&#9660; WATCH</button>`;
+        actions += `<button onclick="stageAction('kill','${sym}')" style="background:#ff4444;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Kill">&#10005;</button>`;
+      } else if (stage === 'real') {
+        actions += `<button onclick="stageAction('demote','${sym}')" style="background:#ffaa00;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;" title="Demote to Paper">&#9660; PAPER</button>`;
+        actions += `<button onclick="stageAction('quarantine','${sym}')" style="background:#ff9800;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Quarantine">&#9888; QUAR</button>`;
+        actions += `<button onclick="stageAction('kill','${sym}')" style="background:#ff4444;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Kill">&#10005;</button>`;
+      } else if (stage === 'quarantine') {
+        actions += `<button onclick="stageAction('demote','${sym}')" style="background:#ffaa00;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;" title="Demote to Paper for revalidation">&#9660; PAPER</button>`;
+        actions += `<button onclick="stageAction('kill','${sym}')" style="background:#ff4444;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Kill permanently">&#10005; KILL</button>`;
+      }
+      if (actions) {
+        card += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e2a42;display:flex;gap:4px;justify-content:flex-end;">${actions}</div>`;
       }
 
       card += `</div>`;
@@ -6415,9 +6567,156 @@ async function loadDailyPerformance() {
   } catch(e) { console.error('daily perf error', e); }
 }
 
+// ── Stage action handler ──────────────────────────────
+async function stageAction(action, symbol) {
+  const labels = {promote:'Promote',demote:'Demote',quarantine:'Quarantine',kill:'Kill',pause:'Pause'};
+  const label = labels[action] || action;
+  if (!confirm(label + ' ' + symbol + '?')) return;
+  try {
+    const resp = await fetch('/api/stage_action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action, symbol, reason: 'manual via dashboard'}),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      loadIBKRFleet(); // refresh immediately
+      loadGovernanceHealth();
+      loadStageHistory();
+    } else {
+      alert('Action failed: ' + (data.error || 'unknown'));
+    }
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+// ── QA Learning loader ────────────────────────────────
+async function loadQALearning() {
+  try {
+    const resp = await fetch('/api/qa_learning');
+    const data = await resp.json();
+    const el = document.getElementById('qa-learning-panel');
+    if (!el) return;
+    const instruments = data.instruments || {};
+    const variants = data.variant_comparison || {};
+    const syms = Object.keys(instruments);
+    if (!syms.length && !Object.keys(variants).length) {
+      el.innerHTML = '<div style="color:#7b8ab8;">No trade data yet. Insights appear after closed trades accumulate.</div>';
+      return;
+    }
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;">';
+    // Per-instrument insights
+    for (const sym of syms) {
+      const d = instruments[sym];
+      html += '<div style="background:#0d1117;border:1px solid #1e2a42;border-radius:4px;padding:10px;">';
+      html += '<div style="color:#00d4ff;font-weight:bold;margin-bottom:6px;">' + sym + ' <span style="color:#555;">(' + d.trade_count + ' trades)</span></div>';
+      // Direction
+      const dirs = d.direction || {};
+      for (const [dir, s] of Object.entries(dirs)) {
+        if (!s.trades) continue;
+        const c = s.win_rate >= 0.5 ? '#00e676' : s.win_rate >= 0.35 ? '#ffaa00' : '#ff4444';
+        html += '<div style="display:flex;justify-content:space-between;"><span>' + dir + '</span><span style="color:' + c + ';">' + s.trades + 'T WR=' + (s.win_rate*100).toFixed(0) + '% avg=' + (s.avg_pnl>=0?'+':'') + s.avg_pnl.toFixed(1) + '</span></div>';
+      }
+      // Exit quality
+      const exits = d.exit_quality || {};
+      if (Object.keys(exits).length) {
+        html += '<div style="margin-top:4px;border-top:1px solid #1e2a42;padding-top:4px;">';
+        for (const [reason, s] of Object.entries(exits)) {
+          if (!s.count) continue;
+          html += '<div style="display:flex;justify-content:space-between;"><span style="color:#888;">' + reason + '</span><span>' + (s.pct_of_trades*100).toFixed(0) + '% (' + s.count + ') avg=' + (s.avg_pnl>=0?'+':'') + s.avg_pnl.toFixed(1) + '</span></div>';
+        }
+        html += '</div>';
+      }
+      // Streaks
+      const st = d.streaks || {};
+      if (st.max_win_streak || st.max_loss_streak) {
+        html += '<div style="margin-top:4px;color:#888;">Streaks: W' + (st.max_win_streak||0) + ' / L' + (st.max_loss_streak||0) + ' (current: ' + (st.current_streak||0) + ')</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    // Variant comparison
+    if (Object.keys(variants).length) {
+      html += '<div style="margin-top:10px;border-top:1px solid #1e2a42;padding-top:8px;"><span style="color:#00d4ff;font-weight:bold;">Watcher Variants</span>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px;margin-top:6px;">';
+      for (const [sym, vs] of Object.entries(variants).sort()) {
+        for (const [vtype, vdata] of Object.entries(vs)) {
+          const label = vdata.label || vtype;
+          const sigs = vdata.signal_count || 0;
+          const tp = vdata.trigger_params || {};
+          html += '<div style="background:#0d1117;border:1px solid #1e2a42;border-radius:3px;padding:6px;">';
+          html += '<span style="color:#00d4ff;">' + sym + '</span> <span style="color:#ffaa00;">' + label + '</span>';
+          html += '<div style="color:#888;">' + sigs + ' signals | range=' + (tp.range_pct_min||'?') + ' sess=' + (tp.session_start||'?') + '-' + (tp.session_end||'?') + '</div>';
+          html += '</div>';
+        }
+      }
+      html += '</div></div>';
+    }
+    el.innerHTML = html;
+  } catch(e) {}
+}
+
+// ── Governance health loader ──────────────────────────
+async function loadGovernanceHealth() {
+  try {
+    const resp = await fetch('/api/governance_health');
+    const data = await resp.json();
+    const el = document.getElementById('governance-health-bar');
+    if (!el) return;
+    let html = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">';
+    html += '<span style="color:#7b8ab8;font-size:0.7em;font-weight:bold;">GOVERNANCE:</span>';
+    for (const r of (data.reports || [])) {
+      const color = r.status === 'FRESH' ? '#00e676' : r.status === 'STALE' ? '#ff4444' : '#ffaa00';
+      const ageStr = r.age_s != null ? (r.age_s < 60 ? r.age_s + 's' : Math.round(r.age_s/60) + 'm') : '?';
+      html += `<span style="font-size:0.6em;padding:2px 6px;border-radius:3px;background:${color}22;color:${color};border:1px solid ${color}44;" title="${r.label}: ${r.status} (${ageStr} ago)">${r.label.split(' ')[0]} ${ageStr}</span>`;
+    }
+    const readyColor = data.governance_ready ? '#00e676' : '#ff4444';
+    html += `<span style="font-size:0.6em;font-weight:bold;color:${readyColor};margin-left:4px;">${data.governance_ready ? 'READY' : 'BLOCKED'}</span>`;
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) {}
+}
+
+// ── Stage transition history loader ───────────────────
+async function loadStageHistory() {
+  try {
+    const resp = await fetch('/api/stage_history');
+    const data = await resp.json();
+    const el = document.getElementById('stage-history-timeline');
+    if (!el) return;
+    const events = (data.events || []).slice(-20).reverse();
+    if (!events.length) {
+      el.innerHTML = '<div style="color:#7b8ab8;font-size:0.7em;padding:8px;">No stage transitions recorded yet.</div>';
+      return;
+    }
+    let html = '';
+    for (const e of events) {
+      const ts = (e.ts || '').substring(0, 19).replace('T', ' ');
+      const fromColor = e.from_stage === 'watcher' ? '#7b8ab8' : e.from_stage === 'paper' ? '#00d4ff' : e.from_stage === 'real' ? '#00e676' : '#ff4444';
+      const toColor = e.to_stage === 'watcher' ? '#7b8ab8' : e.to_stage === 'paper' ? '#00d4ff' : e.to_stage === 'real' ? '#00e676' : e.to_stage === 'killed' ? '#ff4444' : '#ff9800';
+      const triggerBadge = e.trigger === 'auto' ? '<span style="color:#00d4ff;font-size:0.7em;">AUTO</span>' : '<span style="color:#ffaa00;font-size:0.7em;">MANUAL</span>';
+      html += `<div style="padding:4px 0;border-bottom:1px solid #1e2a42;font-size:0.7em;display:flex;gap:8px;align-items:center;">
+        <span style="color:#555;min-width:110px;">${ts}</span>
+        <span style="color:#00d4ff;font-weight:bold;min-width:60px;">${e.symbol}</span>
+        <span style="color:${fromColor};">${e.from_stage}</span>
+        <span style="color:#555;">→</span>
+        <span style="color:${toColor};font-weight:bold;">${e.to_stage}</span>
+        ${triggerBadge}
+        <span style="color:#7b8ab8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${(e.reason || '').substring(0, 50)}</span>
+      </div>`;
+    }
+    el.innerHTML = html;
+  } catch(e) {}
+}
+
 try {
   loadIBKRFleet();
   setInterval(loadIBKRFleet, 10000);
+  loadGovernanceHealth();
+  setInterval(loadGovernanceHealth, 30000);
+  loadQALearning();
+  setInterval(loadQALearning, 60000);
+  loadStageHistory();
+  setInterval(loadStageHistory, 30000);
   loadDailyPerformance();
   setInterval(loadDailyPerformance, 60000); // refresh every 60s
 

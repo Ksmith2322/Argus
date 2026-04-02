@@ -153,27 +153,28 @@ def _evaluate_results(results: dict) -> tuple[bool, list[str], list[str]]:
     kills = []
     advisories = []
 
+    def _normalize_ratio(value: object) -> float:
+        if isinstance(value, str):
+            value = float(value.strip("%")) / 100
+        else:
+            value = float(value or 0)
+            if value > 1.0:
+                value /= 100.0
+        return value
+
     # Win rate
-    wr = results.get("win_rate", results.get("wr", 0))
-    if isinstance(wr, str):
-        wr = float(wr.strip("%")) / 100
+    wr = _normalize_ratio(results.get("win_rate", results.get("wr", 0)))
     if wr < PAYOFF_THRESHOLDS["min_wr"]:
         kills.append(f"WR {wr:.1%} < {PAYOFF_THRESHOLDS['min_wr']:.0%} minimum")
 
     # Timeout rate
-    timeout_rate = results.get("timeout_rate", 0)
-    if isinstance(timeout_rate, str):
-        timeout_rate = float(timeout_rate.strip("%")) / 100
+    timeout_rate = _normalize_ratio(results.get("timeout_rate", 0))
     if timeout_rate > PAYOFF_THRESHOLDS["max_timeout_rate"]:
         kills.append(f"Timeout rate {timeout_rate:.1%} > {PAYOFF_THRESHOLDS['max_timeout_rate']:.0%} max")
 
     # Stop rate vs target rate
-    stop_rate = results.get("stop_rate", 0)
-    target_rate = results.get("target_rate", 0)
-    if isinstance(stop_rate, str):
-        stop_rate = float(stop_rate.strip("%")) / 100
-    if isinstance(target_rate, str):
-        target_rate = float(target_rate.strip("%")) / 100
+    stop_rate = _normalize_ratio(results.get("stop_rate", 0))
+    target_rate = _normalize_ratio(results.get("target_rate", 0))
     if target_rate > 0 and stop_rate > PAYOFF_THRESHOLDS["max_stop_target_ratio"] * target_rate:
         kills.append(
             f"Stop rate {stop_rate:.1%} > {PAYOFF_THRESHOLDS['max_stop_target_ratio']:.0f}x target rate {target_rate:.1%}"

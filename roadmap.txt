@@ -90,6 +90,10 @@
         onboard_pair now writes filename-keyed hashes.json entries
         --auto marks configs as managed and stage-seeded for registry discovery
         no more manual runner-list editing for newly onboarded managed configs
+    - Weekly FX discovery onboarding:
+        discovery universe now lives in argus_flow/configs/discovery_fx_universe.json
+        weekly_pair_onboarding evaluates only new FX symbols, skips existing rotation members, requires onboarding PASS + walk-forward PASS, and adds only the top 5 candidates to watcher
+        scheduled wrapper added for Friday automation via ArgusWeeklyPairOnboarding
     - Futures live path:
         generate_live_config no longer blocks futures live promotion by instrument type alone
     - Current staged fleet now reads:

@@ -37,6 +37,15 @@ DRAWDOWN_KILL_MULT = 3.0  # 3x model DD -> KILL
 SINGLE_DAY_LOSS_PCT = 0.05  # 5% of model equity
 MODEL_EQUITY_DEFAULT = 10_000.0
 
+# No-progress kill: if a pair is break-even after this many trades, prune it
+NO_PROGRESS_TRADE_THRESHOLD = 80  # trades in paper/real before checking
+NO_PROGRESS_MIN_PF = 1.05  # must show at least marginal edge
+NO_PROGRESS_MAX_RESIDENCY_DAYS = 90  # or this many days in stage
+
+# Hard strategy kill clock: if PF < this after threshold trades, strategy is dead
+STRATEGY_KILL_PF_THRESHOLD = 1.0  # PF < 1.0 after 60 trades = net negative
+STRATEGY_KILL_TRADE_THRESHOLD = 60
+
 # Quarantine resolver thresholds
 QUARANTINE_MIN_TRADES = 10
 QUARANTINE_MIN_PF = 1.10
@@ -250,6 +259,43 @@ def _check_single_day_loss(trades: list[dict], pnl_field: str, model_equity: flo
     }
 
 
+def _check_no_progress(pnls: list[float], runner: dict) -> dict:
+    """Kill pairs that show no meaningful edge after sufficient sample.
+
+    Break-even after 80 trades or 90 days = not worth more runway.
+    Prevents mediocrity from consuming resources indefinitely.
+    """
+    n = len(pnls)
+    if n < NO_PROGRESS_TRADE_THRESHOLD:
+        return {"triggered": False, "detail": f"only {n}/{NO_PROGRESS_TRADE_THRESHOLD} trades, too early"}
+
+    pf = _profit_factor(pnls)
+    triggered = pf < NO_PROGRESS_MIN_PF
+    return {
+        "triggered": triggered,
+        "detail": f"PF={pf:.3f} after {n} trades (min={NO_PROGRESS_MIN_PF})",
+        "action": "KILL" if triggered else "PASS",
+    }
+
+
+def _check_strategy_kill_clock(pnls: list[float]) -> dict:
+    """Hard strategy kill: PF < 1.0 after 60 trades = strategy is net negative.
+
+    Not 'demote and try again' — the hypothesis is dead.
+    """
+    n = len(pnls)
+    if n < STRATEGY_KILL_TRADE_THRESHOLD:
+        return {"triggered": False, "detail": f"only {n}/{STRATEGY_KILL_TRADE_THRESHOLD} trades"}
+
+    pf = _profit_factor(pnls)
+    triggered = pf < STRATEGY_KILL_PF_THRESHOLD
+    return {
+        "triggered": triggered,
+        "detail": f"PF={pf:.3f} after {n} trades — {'STRATEGY DEAD' if triggered else 'alive'}",
+        "action": "KILL" if triggered else "PASS",
+    }
+
+
 def check_demotion(runner: dict) -> dict:
     """Run all demotion checks for a PROD runner. Returns verdict dict."""
     log_dir = REPO / runner["log_dir"]
@@ -289,6 +335,8 @@ def check_demotion(runner: dict) -> dict:
         "consecutive_negative_weeks": _check_consecutive_negative_weeks(valid, pnl_f),
         "drawdown_2x_3x": _check_drawdown(pnls, model_dd),
         "single_day_loss": _check_single_day_loss(valid, pnl_f, model_eq),
+        "no_progress": _check_no_progress(pnls, runner),
+        "strategy_kill_clock": _check_strategy_kill_clock(pnls),
     }
     result["checks"] = checks
 

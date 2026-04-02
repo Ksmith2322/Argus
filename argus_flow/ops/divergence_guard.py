@@ -17,6 +17,35 @@ from argus_flow.ops.fleet_registry import STAGE_PAPER, STAGE_QUARANTINE, STAGE_R
 
 REPO = Path(__file__).resolve().parents[2]
 
+# Stage-aware thresholds: early stages need more data before KILL escalation.
+# Prevents false KILLs on immature cohorts (alert fatigue / operator desensitization).
+STAGE_ESCALATION_RULES = {
+    STAGE_WATCHER: {
+        "min_days_for_kill": 7,
+        "min_signals_for_kill": 50,
+        "min_trades_for_wr_kill": 20,
+        "max_verdict": "WATCH",  # cap at WATCH until minimums met
+    },
+    STAGE_PAPER: {
+        "min_days_for_kill": 14,
+        "min_signals_for_kill": 60,
+        "min_trades_for_wr_kill": 20,
+        "max_verdict": "WATCH",  # cap at WATCH until minimums met
+    },
+    STAGE_REAL: {
+        "min_days_for_kill": 0,
+        "min_signals_for_kill": 0,
+        "min_trades_for_wr_kill": 10,
+        "max_verdict": "KILL",  # no cap for real capital
+    },
+    STAGE_QUARANTINE: {
+        "min_days_for_kill": 0,
+        "min_signals_for_kill": 0,
+        "min_trades_for_wr_kill": 10,
+        "max_verdict": "KILL",
+    },
+}
+
 
 def governed_runners() -> list[dict]:
     """Return managed runners that should be held to replay/live divergence checks."""
@@ -95,9 +124,16 @@ def check_runner(runner: dict) -> dict:
     trades = _load_trades(log_dir)
 
     if not signals:
-        result["status"] = "NO_SIGNALS"
-        result["verdict"] = "NO_SIGNALS"
-        result["reason"] = "signals.csv missing or empty"
+        # Distinguish QUIET (healthy watcher with no signals yet) from broken
+        stage = runner.get("current_stage", "")
+        if stage in (STAGE_WATCHER,):
+            result["status"] = "QUIET"
+            result["verdict"] = "QUIET"
+            result["reason"] = "watcher has no signals yet (normal for new/quiet observer)"
+        else:
+            result["status"] = "NO_SIGNALS"
+            result["verdict"] = "NO_SIGNALS"
+            result["reason"] = "signals.csv missing or empty"
         return result
 
     days = _compute_days(signals)
@@ -180,6 +216,32 @@ def check_runner(runner: dict) -> dict:
     else:
         result["status"] = "COLLECTING"
         result["reason"] = "insufficient closed trades for divergence verdict"
+
+    # Stage-aware escalation cap: prevent KILL on immature cohorts
+    stage = runner.get("current_stage", "")
+    rules = STAGE_ESCALATION_RULES.get(stage, {})
+    if rules and result["status"] == "KILL":
+        max_verdict = rules.get("max_verdict", "KILL")
+        min_days = rules.get("min_days_for_kill", 0)
+        min_signals = rules.get("min_signals_for_kill", 0)
+        min_trades = rules.get("min_trades_for_wr_kill", 0)
+
+        days_ok = days >= min_days
+        signals_ok = len(entries) >= min_signals
+        trades_ok = len(trades) >= min_trades
+
+        if not (days_ok and signals_ok and trades_ok):
+            capped = max_verdict
+            cap_reasons = []
+            if not days_ok:
+                cap_reasons.append(f"days={days:.1f}<{min_days}")
+            if not signals_ok:
+                cap_reasons.append(f"signals={len(entries)}<{min_signals}")
+            if not trades_ok:
+                cap_reasons.append(f"trades={len(trades)}<{min_trades}")
+            result["status"] = capped
+            result["reason"] = f"KILL capped to {capped} ({stage}): {', '.join(cap_reasons)} | " + result["reason"]
+            result["stage_capped"] = True
 
     result["verdict"] = result["status"]
 
