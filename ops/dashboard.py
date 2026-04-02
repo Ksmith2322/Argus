@@ -2049,6 +2049,7 @@ def _build_paper_model_summary() -> dict:
 
     current_risk_budget = round(equity * base_risk_pct, 2)
     cap_risk_budget = round(equity * cap_risk_pct, 2)
+    last_trade_ts = history[-1]["ts"] if history else ""
     return {
         "label": "Promotion Model",
         "mode": "hypothetical_validation_only",
@@ -2068,6 +2069,7 @@ def _build_paper_model_summary() -> dict:
         "coverage_gaps": coverage_gaps,
         "history": history,
         "recent_trades": history[-8:],
+        "last_trade_ts": last_trade_ts,
     }
 
 
@@ -2160,6 +2162,12 @@ def _read_ibkr_runner(runner: dict) -> dict:
         "transition_ready": runner.get("transition_ready", False),
         "transition_reason": runner.get("transition_reason", ""),
         "next_stage": runner.get("next_stage", ""),
+        "chart_key": Path(str(runner.get("log_dir", ""))).name,
+        "runner_id": runner.get("id", ""),
+        "log_dir": runner.get("log_dir", ""),
+        "config_file": runner.get("config_file", ""),
+        "config_path": runner.get("config_path", ""),
+        "execution_mode": runner.get("execution_mode", ""),
     }
 
     # Load replay expectations from config
@@ -2719,6 +2727,233 @@ async def api_governance_health():
     })
 
 
+@app.get("/api/runner_chart/{symbol}")
+async def api_runner_chart(symbol: str):
+    """Real-time candlestick data + trade markers for a specific runner."""
+    raw_identifier = str(symbol or "").strip()
+    symbol = raw_identifier.upper()
+
+    def _runner_stage_priority(stage: str) -> int:
+        normalized = str(stage or "").lower()
+        if normalized == STAGE_REAL:
+            return 0
+        if normalized == STAGE_QUARANTINE:
+            return 1
+        if normalized == STAGE_PAPER:
+            return 2
+        if normalized == STAGE_WATCHER:
+            return 3
+        return 9
+
+    # Find runner log dir
+    runners = _managed_ibkr_runners()
+    runner = next(
+        (
+            r for r in runners
+            if raw_identifier.lower()
+            in {
+                str(r.get("id", "")).lower(),
+                Path(str(r.get("log_dir", ""))).name.lower(),
+            }
+        ),
+        None,
+    )
+    if runner is None:
+        same_symbol = [r for r in runners if r.get("symbol", "").upper() == symbol]
+        if same_symbol:
+            same_symbol.sort(key=lambda item: (_runner_stage_priority(item.get("current_stage", "")), item.get("name", "")))
+            runner = same_symbol[0]
+    if not runner:
+        return JSONResponse({"error": f"Runner {raw_identifier or symbol} not found"}, status_code=404)
+
+    log_dir = REPO / runner["log_dir"]
+    hb_file = log_dir / "heartbeat.json"
+    state_file = log_dir / "state.json"
+    signal_file = log_dir / "signals.csv"
+    trade_file = log_dir / "trades.csv"
+
+    def _parse_ts(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _safe_float(raw, default: float = 0.0) -> float:
+        try:
+            if raw in ("", None):
+                return default
+            return float(raw)
+        except Exception:
+            return default
+
+    now_utc = datetime.now(timezone.utc)
+    bars = []
+    position = "FLAT"
+    entry_price = None
+    stop_price = None
+    target_price = None
+    entry_time = None
+    heartbeat_ts = None
+    last_bar_ts = None
+    deployment_stage = runner.get("current_stage", "")
+    execution_mode = runner.get("execution_mode", "")
+    unrealized_pnl_usd = 0.0
+    open_risk_usd = 0.0
+
+    if hb_file.exists():
+        try:
+            hb = json.loads(hb_file.read_text(encoding="utf-8"))
+            raw_bars = hb.get("recent_bars", [])
+            for b in raw_bars:
+                ts_raw = b.get("t") or b.get("ts")
+                if not ts_raw:
+                    continue
+                bars.append({
+                    "t": ts_raw,
+                    "o": _safe_float(b.get("o", b.get("open", 0))),
+                    "h": _safe_float(b.get("h", b.get("high", 0))),
+                    "l": _safe_float(b.get("l", b.get("low", 0))),
+                    "c": _safe_float(b.get("c", b.get("close", 0))),
+                    "v": max(0.0, _safe_float(b.get("v", b.get("volume", 0)))),
+                    "n": max(0.0, _safe_float(b.get("n", b.get("ticks", 0)))),
+                })
+            bars.sort(key=lambda row: row.get("t", ""))
+            position = hb.get("position", "FLAT")
+            entry_price = hb.get("entry_price")
+            stop_price = hb.get("stop_price")
+            target_price = hb.get("target_price")
+            heartbeat_ts = hb.get("ts")
+            last_bar_ts = hb.get("last_bar_ts") or (bars[-1]["t"] if bars else None)
+            deployment_stage = hb.get("deployment_stage", deployment_stage)
+            unrealized_pnl_usd = _safe_float(hb.get("unrealized_pnl_usd", 0))
+            open_risk_usd = _safe_float(hb.get("open_risk_usd", 0))
+        except Exception:
+            pass
+
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            position = state.get("position", position or "FLAT")
+            entry_price = state.get("entry_price", entry_price)
+            stop_price = state.get("stop_price", stop_price)
+            target_price = state.get("target_price", target_price)
+            entry_time = state.get("entry_time")
+        except Exception:
+            pass
+
+    window_start = _parse_ts(bars[0]["t"]) if bars else None
+    entry_signals = []
+    if signal_file.exists():
+        try:
+            rows = _tail_csv(signal_file, 800)
+            for row in rows:
+                action = str(row.get("action", "") or "").upper()
+                direction = str(row.get("direction", "") or "").lower()
+                ts_raw = row.get("ts", "")
+                ts_dt = _parse_ts(ts_raw)
+                if action not in ("ENTRY", "ENTRY_SUBMITTED") or not direction or ts_dt is None:
+                    continue
+                if window_start and ts_dt < window_start - timedelta(minutes=5):
+                    continue
+                entry_signals.append({
+                    "ts": ts_raw,
+                    "direction": direction,
+                    "price": _safe_float(row.get("price", 0)),
+                    "action": action,
+                })
+        except Exception:
+            pass
+
+    trades = []
+    exit_markers = []
+    if trade_file.exists():
+        try:
+            rows = _tail_csv(trade_file, 80)
+            for t in rows:
+                pnl = _safe_float(t.get("pnl_pips", t.get("pnl_pts", 0)))
+                trade = {
+                    "ts": t.get("ts", ""),
+                    "direction": str(t.get("direction", "") or "").lower(),
+                    "entry_px": _safe_float(t.get("entry_px", 0)),
+                    "exit_px": _safe_float(t.get("exit_px", 0)),
+                    "pnl": pnl,
+                    "pnl_usd": _safe_float(t.get("pnl_usd", 0)),
+                    "exit_reason": t.get("exit_reason", ""),
+                    "duration_min": _safe_float(t.get("duration_min", 0)),
+                    "slippage_pips": _safe_float(t.get("slippage_pips", 0)),
+                    "fill_latency_ms": int(_safe_float(t.get("fill_latency_ms", 0))),
+                    "trade_num": int(_safe_float(t.get("trade_num", 0))),
+                }
+                trades.append(trade)
+                ts_dt = _parse_ts(trade["ts"])
+                if ts_dt is not None and (window_start is None or ts_dt >= window_start - timedelta(minutes=5)):
+                    exit_markers.append({
+                        "ts": trade["ts"],
+                        "direction": trade["direction"],
+                        "price": trade["exit_px"],
+                        "pnl": pnl,
+                        "exit_reason": trade["exit_reason"],
+                    })
+        except Exception:
+            pass
+
+    if position != "FLAT" and entry_time and entry_price:
+        open_entry_ts = _parse_ts(entry_time)
+        if open_entry_ts is not None and not any(sig.get("ts") == entry_time for sig in entry_signals):
+            if window_start is None or open_entry_ts >= window_start - timedelta(minutes=5):
+                entry_signals.append({
+                    "ts": entry_time,
+                    "direction": "long" if position == "LONG" else "short",
+                    "price": _safe_float(entry_price),
+                    "action": "OPEN_POSITION",
+                })
+
+    heartbeat_age_s = None
+    if heartbeat_ts:
+        hb_dt = _parse_ts(heartbeat_ts)
+        if hb_dt is not None:
+            heartbeat_age_s = int((now_utc - hb_dt.astimezone(timezone.utc)).total_seconds())
+
+    last_bar_age_s = None
+    if bars:
+        bar_dt = _parse_ts(bars[-1]["t"])
+        if bar_dt is not None:
+            last_bar_age_s = int((now_utc - bar_dt.astimezone(timezone.utc)).total_seconds())
+
+    instrument_type = runner.get("instrument_type", "")
+    precision = 5 if instrument_type == "forex" else 2
+
+    return JSONResponse({
+        "symbol": runner.get("symbol", symbol),
+        "runner_name": runner.get("name", symbol),
+        "chart_key": Path(str(runner.get("log_dir", ""))).name,
+        "instrument_type": instrument_type,
+        "precision": precision,
+        "deployment_stage": deployment_stage,
+        "execution_mode": execution_mode,
+        "bars": bars,
+        "entry_signals": entry_signals[-40:],
+        "exit_markers": exit_markers[-40:],
+        "trades": trades[-20:],
+        "position": position,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "entry_time": entry_time,
+        "bar_count": len(bars),
+        "heartbeat_ts": heartbeat_ts,
+        "heartbeat_age_s": heartbeat_age_s,
+        "last_bar_ts": bars[-1]["t"] if bars else last_bar_ts,
+        "last_bar_age_s": last_bar_age_s,
+        "latest_price": bars[-1]["c"] if bars else None,
+        "open_risk_usd": open_risk_usd,
+        "unrealized_pnl_usd": unrealized_pnl_usd,
+        "timestamp": now_utc.isoformat(),
+    })
+
+
 @app.get("/api/qa_learning")
 async def api_qa_learning():
     """QA learning insights — regime, session, exit quality, variant comparison."""
@@ -2750,6 +2985,20 @@ async def api_daily_performance():
         "MES": 5, "MNQ": 2, "MYM": 0.5, "M2K": 5, "MGC": 1, "MCL": 1,
     }
 
+    def _local_trade_date(ts: str) -> str:
+        raw = str(ts or "").strip()
+        if not raw:
+            return ""
+        try:
+            return (
+                datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                .astimezone()
+                .date()
+                .isoformat()
+            )
+        except Exception:
+            return raw[:10] if len(raw) >= 10 else ""
+
     # Collect all trades from all runners
     all_trades = []
     for runner in _managed_ibkr_runners():
@@ -2760,7 +3009,7 @@ async def api_daily_performance():
             with open(trade_file, "r") as f:
                 for row in csv.DictReader(f):
                     ts = row.get("ts") or row.get("exit_ts") or row.get("close_ts") or row.get("entry_ts") or ""
-                    date_str = ts[:10] if len(ts) >= 10 else ""
+                    date_str = _local_trade_date(ts)
                     if not date_str:
                         continue
                     pnl_raw = float(row.get("pnl_pips") or row.get("pnl_pts") or 0)
@@ -2843,6 +3092,10 @@ async def api_daily_performance():
         }
 
     def build_rows(day_map):
+        if isinstance(day_map, dict):
+            for days_back in range(7):
+                day_key = (datetime.now().astimezone().date() - timedelta(days=days_back)).isoformat()
+                day_map.setdefault(day_key, {"fx": [], "futures": [], "all": []})
         result = []
         for date_str in sorted(day_map.keys(), reverse=True):
             d = day_map[date_str]
@@ -2876,6 +3129,7 @@ async def api_fx_analytics():
         result = {
             "name": runner["name"],
             "symbol": runner["symbol"],
+            "current_stage": runner.get("current_stage", ""),
             "equity_curve": [],
             "drawdown_curve": [],
             "daily_pnl": {},
@@ -3123,7 +3377,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#00d4ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Argus">
 <link rel="manifest" href="/manifest.json">
@@ -3148,6 +3402,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .state-BUYING { color: #ffc107; }
   .state-SELLING { color: #ff9800; }
   .chart-container { background: #141b2d; border: 1px solid #1e2a42; border-radius: 6px; padding: 12px; margin-bottom: 12px; max-height: 280px; position: relative; }
+  .live-chart-card { background: linear-gradient(180deg, rgba(20,27,45,0.98), rgba(13,17,23,0.98)); border: 1px solid #223150; border-radius: 10px; padding: 14px; margin: 12px 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02), 0 8px 24px rgba(0,0,0,0.22); }
+  .live-chart-toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px; flex-wrap:wrap; }
+  .live-chart-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .live-chart-pills { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .chart-pill-btn { background:#0d1117; color:#9fb3d9; border:1px solid #243454; border-radius:999px; padding:4px 10px; font-size:0.72em; font-family:inherit; cursor:pointer; transition:all 0.15s ease; }
+  .chart-pill-btn:hover { color:#e8f0ff; border-color:#3f5f99; }
+  .chart-pill-btn.active { color:#0a0e17; background:#00d4ff; border-color:#00d4ff; font-weight:bold; }
+  .chart-pill-btn.soft-active { color:#e8f0ff; border-color:#00d4ff; box-shadow:0 0 0 1px rgba(0,212,255,0.15) inset; }
+  .live-chart-wrap { position:relative; height:380px; min-height:380px; border:1px solid #1d2840; border-radius:10px; overflow:hidden; background:
+      linear-gradient(180deg, rgba(15,20,34,0.95), rgba(9,12,20,0.98)),
+      radial-gradient(circle at top right, rgba(0,212,255,0.08), transparent 35%); }
+  .live-chart-wrap canvas { width:100% !important; height:100% !important; display:block; cursor:grab; user-select:none; -webkit-user-select:none; touch-action:none; }
+  .chart-meta-line { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-top:10px; font-size:0.68em; color:#7b8ab8; }
+  .chart-hover-line { margin-top:8px; font-size:0.72em; color:#d7e4ff; min-height:22px; }
+  .chart-recent-list { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .chart-trade-pill { background:#0f1626; border:1px solid #223150; border-radius:8px; color:#d7e4ff; padding:7px 10px; font-size:0.72em; cursor:pointer; min-width:145px; text-align:left; transition:border-color 0.15s ease, transform 0.15s ease; }
+  .chart-trade-pill:hover { border-color:#00d4ff; transform:translateY(-1px); }
+  .chart-trade-pill .pnl-pos { color:#00e676; font-weight:bold; }
+  .chart-trade-pill .pnl-neg { color:#ff5252; font-weight:bold; }
+  .chart-legend { display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:0.68em; color:#7b8ab8; margin-top:8px; }
+  .chart-legend-swatch { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .chart-interaction-note { margin-top:8px; font-size:0.66em; color:#6f82b4; letter-spacing:0.03em; }
+  .chart-empty-note { color:#7b8ab8; font-size:0.72em; margin-top:10px; }
   table { width: 100%; border-collapse: collapse; font-size: 0.78em; }
   th { color: #7b8ab8; text-align: left; padding: 4px 6px; border-bottom: 1px solid #1e2a42; }
   td { padding: 4px 6px; border-bottom: 1px solid #0d1321; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
@@ -3338,6 +3615,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- QA paper-model account and cohort status moved below the production section -->
 
+<!-- Live Strategy Chart -->
+<div id="live-strategy-chart-card" class="live-chart-card">
+  <div class="live-chart-toolbar">
+    <div>
+      <h3 style="font-size:0.9em;color:#00d4ff;margin:0;letter-spacing:1px;">LIVE STRATEGY CHART</h3>
+      <div class="chart-legend">
+        <span><span class="chart-legend-swatch" style="background:#00d4ff;border-radius:50%;clip-path: polygon(50% 0%, 0% 100%, 100% 100%);"></span>Long entry</span>
+        <span><span class="chart-legend-swatch" style="background:#ff9800;border-radius:50%;clip-path: polygon(50% 100%, 0% 0%, 100% 0%);"></span>Short entry</span>
+        <span><span class="chart-legend-swatch" style="background:#cfd8dc;"></span>Exit</span>
+        <span><span class="chart-legend-swatch" style="background:#00d4ff;"></span>Entry line</span>
+        <span><span class="chart-legend-swatch" style="background:#ff5252;"></span>Stop</span>
+        <span><span class="chart-legend-swatch" style="background:#00e676;"></span>Target</span>
+        <span><span class="chart-legend-swatch" style="background:rgba(123,138,184,0.65);"></span>Volume / Activity</span>
+      </div>
+      <div class="chart-interaction-note">Wheel to zoom. Drag to pan. Hold Shift and drag to zoom into a selected window. Double-click resets.</div>
+    </div>
+    <div class="live-chart-controls">
+      <select id="chart-symbol-select" onchange="loadRunnerChart(true)" style="background:#0d1117;color:#e0e0e0;border:1px solid #1e2a42;border-radius:6px;padding:6px 10px;font-size:0.75em;">
+        <option value="">Select pair...</option>
+      </select>
+      <span id="chart-selection-state" style="font-size:0.68em;color:#7b8ab8;border:1px solid #1e2a42;border-radius:999px;padding:5px 10px;white-space:nowrap;">No pair selected</span>
+      <div class="live-chart-pills">
+        <button id="chart-range-5" class="chart-pill-btn" onclick="setRunnerChartRange(5)">5m</button>
+        <button id="chart-range-30" class="chart-pill-btn" onclick="setRunnerChartRange(30)">30m</button>
+        <button id="chart-range-60" class="chart-pill-btn" onclick="setRunnerChartRange(60)">1h</button>
+        <button id="chart-range-120" class="chart-pill-btn active" onclick="setRunnerChartRange(120)">2h</button>
+        <button id="chart-follow-toggle" class="chart-pill-btn soft-active" onclick="toggleRunnerChartFollow()">Follow Live</button>
+        <button class="chart-pill-btn" onclick="resetRunnerChartView()">Reset View</button>
+      </div>
+      <span id="chart-position-badge" style="font-size:0.72em;font-weight:bold;"></span>
+    </div>
+  </div>
+  <div class="live-chart-wrap">
+    <canvas id="strategy-chart" height="360"></canvas>
+  </div>
+  <div id="chart-status-line" class="chart-meta-line"></div>
+  <div id="chart-trade-info" class="chart-hover-line"></div>
+  <div id="chart-recent-trades" class="chart-recent-list"></div>
+</div>
+
 <!-- Governance health bar -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin:12px 0;" id="governance-health-bar">
   <span style="color:#7b8ab8;font-size:0.7em;">Loading governance health...</span>
@@ -3371,26 +3688,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">REAL MONEY RUNNERS</h3>
     <span style="font-size:0.7em;color:#7b8ab8;">Production lane. Same runner surface as QA, but capital-backed.</span>
   </div>
-  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-real-cards"></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-bottom:12px;" id="ibkr-real-cards"></div>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+  <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-bottom:10px;">
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD EQUITY TRACE</h3>
         <span id="prod-equity-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
       </div>
-      <canvas id="balance-history-chart" height="140" style="width:100%;display:block;"></canvas>
+      <canvas id="balance-history-chart" height="160" style="width:100%;display:block;"></canvas>
     </div>
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD FLEET HISTORY</h3>
         <span id="prod-fleet-history-label" style="font-size:0.7em;color:#7b8ab8;"></span>
       </div>
-      <canvas id="prod-fleet-pnl-chart" height="120"></canvas>
+      <canvas id="prod-fleet-pnl-chart" height="150" style="width:100%;display:block;"></canvas>
+      <div id="prod-fleet-history-hover" style="margin-top:6px;font-size:0.72em;color:#7b8ab8;">Hover points for trade-close details.</div>
     </div>
   </div>
 
-  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:10px;margin-bottom:14px;">
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:14px;">
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <h3 style="font-size:0.8em;color:#00e676;margin:0 0 10px 0;letter-spacing:1px;">PROD TRADE JOURNAL</h3>
       <div id="prod-trades-table" style="font-size:0.75em;max-height:380px;overflow:auto;padding-right:4px;"></div>
@@ -3414,7 +3732,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA MODEL ACCOUNT</h3>
       <span style="font-size:0.7em;color:#7b8ab8;">Separate from broker truth. Hypothetical promotion account only.</span>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:12px;">
       <div style="background:#0d1117;border-radius:6px;padding:10px;">
         <div style="font-size:0.7em;color:#7b8ab8;">Start Equity</div>
         <div id="paper-model-start" style="font-size:1.1em;font-weight:bold;color:#e0e0e0;">$10,000.00</div>
@@ -3436,7 +3754,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="paper-model-cap" style="font-size:1.1em;font-weight:bold;color:#ffaa00;">3.00%</div>
       </div>
     </div>
-    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:10px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;">
       <div style="background:#0d1117;border-radius:6px;padding:10px;">
         <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">MODEL STATUS</div>
         <div id="paper-model-status" style="font-size:0.8em;color:#e0e0e0;">Loading...</div>
@@ -3460,26 +3778,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">PAPER QA RUNNERS</h3>
     <span style="font-size:0.7em;color:#7b8ab8;">These runners earn the right to real-money configs.</span>
   </div>
-  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-paper-cards"></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-bottom:12px;" id="ibkr-paper-cards"></div>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+  <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-bottom:10px;">
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA EQUITY TRACE</h3>
         <span id="qa-equity-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
       </div>
-      <canvas id="qa-model-equity-chart" height="140"></canvas>
+      <canvas id="qa-model-equity-chart" height="170" style="width:100%;display:block;"></canvas>
+      <div id="qa-equity-chart-hover" style="margin-top:6px;font-size:0.72em;color:#7b8ab8;">Hover points for modeled equity details.</div>
     </div>
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">QA FLEET HISTORY</h3>
         <span id="qa-fleet-history-label" style="font-size:0.7em;color:#7b8ab8;"></span>
       </div>
-      <canvas id="ibkr-pnl-chart" height="120"></canvas>
+      <canvas id="ibkr-pnl-chart" height="155" style="width:100%;display:block;"></canvas>
+      <div id="qa-fleet-history-hover" style="margin-top:6px;font-size:0.72em;color:#7b8ab8;">Hover points for modeled trade-close details.</div>
     </div>
   </div>
 
-  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:10px;margin-bottom:14px;">
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:14px;">
     <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
       <h3 style="font-size:0.8em;color:#00d4ff;margin:0 0 10px 0;letter-spacing:1px;">QA TRADE JOURNAL</h3>
       <div id="qa-trades-table" style="font-size:0.75em;max-height:380px;overflow:auto;padding-right:4px;"></div>
@@ -3491,13 +3811,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="ibkr-analytics" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin:12px 0;"></div>
+
 <!-- Watcher section -->
 <div style="margin:16px 0 14px 0;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <h2 style="font-size:0.95em;color:#7b8ab8;margin:0;letter-spacing:2px;">WATCHERS</h2>
     <span style="font-size:0.72em;color:#7b8ab8;">Research lane. New managed pairs start here and must earn paper QA.</span>
   </div>
-  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="ibkr-watcher-cards"></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-bottom:12px;" id="ibkr-watcher-cards"></div>
+</div>
+
+<!-- Graveyard (killed pairs) -->
+<div style="margin:16px 0 14px 0;" id="graveyard-section" style="display:none;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2 style="font-size:0.95em;color:#555;margin:0;letter-spacing:2px;">&#x1F9DF; GRAVEYARD</h2>
+    <span style="font-size:0.72em;color:#555;">Killed pairs. Walk-forward failed or strategy proven unprofitable. Revive to re-evaluate.</span>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:12px;opacity:0.7;" id="ibkr-graveyard-cards"></div>
 </div>
 
 <!-- QA Learning Insights -->
@@ -3527,6 +3858,7 @@ let currentCoin = 'ETH';
 let sseConnection = null;
 let balanceHistory = [];
 let balanceChart = null;
+let _ibkrFleetCache = [];
 const MAX_BALANCE_POINTS = 500;
 
 // Single-page dashboard — no tab switching needed
@@ -3560,13 +3892,25 @@ function ibkrMiniChart(data, width, height, color) {
   const mn = Math.min(...data), mx = Math.max(...data);
   const range = mx - mn || 1;
   const pts = data.map((v, i) => `${(i/(data.length-1))*width},${height - ((v-mn)/range)*height}`).join(' ');
-  return `<svg width="${width}" height="${height}" style="vertical-align:middle;"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
+  const step = Math.max(1, Math.ceil(data.length / 16));
+  const dots = data.map((v, i) => {
+    if (i !== 0 && i !== data.length - 1 && i % step !== 0) return '';
+    const x = (i / (data.length - 1)) * width;
+    const y = height - ((v - mn) / range) * height;
+    const r = i === data.length - 1 ? 2.4 : 1.6;
+    return `<circle cx="${x}" cy="${y}" r="${r}" fill="${color}" stroke="#08131f" stroke-width="0.8"/>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%;height:${height}px;display:block;vertical-align:middle;">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.7"/>
+    ${dots}
+  </svg>`;
 }
 
 async function loadIBKRFleet() {
   try {
     const resp = await fetch('/api/ibkr_fleet');
     const data = await resp.json();
+    _ibkrFleetCache = Array.isArray(data.runners) ? data.runners : [];
 
     document.getElementById('ibkr-timestamp').textContent = (data.timestamp || '').substring(11,19) + ' UTC';
     document.getElementById('ibkr-total-signals').textContent = data.total_signals || 0;
@@ -3725,6 +4069,9 @@ async function loadIBKRFleet() {
       const ret = Number(paperModel.return_pct || 0);
       const retText = (ret >= 0 ? '+' : '') + ret.toFixed(2) + '%';
       const coverage = (paperModel.coverage_gaps || []).length ? ' | gaps: ' + paperModel.coverage_gaps.join(', ') : '';
+      const lastTradeText = paperModel.last_trade_ts
+        ? ' | last modeled close ' + new Date(paperModel.last_trade_ts).toLocaleString()
+        : ' | no modeled closes yet';
       modelStatusEl.innerHTML =
         '<div style="color:' + (ret >= 0 ? '#00e676' : '#ff4444') + ';font-weight:bold;">'
           + retText + ' modeled return | ' + (paperModel.modeled_trade_count || 0) + ' valid trades'
@@ -3733,6 +4080,7 @@ async function loadIBKRFleet() {
           + 'Win rate ' + Number(paperModel.win_rate || 0).toFixed(1) + '% | '
           + 'Max DD $' + Number(paperModel.max_drawdown_usd || 0).toFixed(2) + ' | '
           + 'shared risk ladder auto-steps toward the 3% cap'
+          + lastTradeText
           + coverage
           + '</div>';
     }
@@ -3778,11 +4126,23 @@ async function loadIBKRFleet() {
     const watcherCardsDiv = document.getElementById('ibkr-watcher-cards');
     const paperCardsDiv = document.getElementById('ibkr-paper-cards');
     const realCardsDiv = document.getElementById('ibkr-real-cards');
+    const graveyardDiv = document.getElementById('ibkr-graveyard-cards');
+    if (graveyardDiv) graveyardDiv.innerHTML = '';
     watcherCardsDiv.innerHTML = '';
     paperCardsDiv.innerHTML = '';
     realCardsDiv.innerHTML = '';
 
+    // Deduplicate by symbol per stage — keep the first (highest-priority) config per symbol
+    const seenByStage = {};
+    const dedupedRunners = [];
     for (const r of data.runners) {
+      const key = (r.symbol || '') + '|' + (r.current_stage || '');
+      if (seenByStage[key]) continue;
+      seenByStage[key] = true;
+      dedupedRunners.push(r);
+    }
+
+    for (const r of dedupedRunners) {
       const statusColors = {RUNNING:'#00ff88',IDLE:'#ffaa00',STALE:'#ff4444',ERROR:'#ff4444',NOT_STARTED:'#555'};
       const sc = statusColors[r.status] || '#555';
       const posColor = r.position === 'FLAT' ? '#666' : r.position === 'LONG' ? '#00ff88' : '#ff4444';
@@ -3813,6 +4173,9 @@ async function loadIBKRFleet() {
       const journalUsdDetail = r.realized_pnl_usd_available
         ? (r.journal_usd_complete ? 'journal-backed' : 'partial ' + (r.journal_usd_trade_count || 0) + '/' + (r.journal_total_trades || 0))
         : 'missing pnl_usd';
+      const lastSignalText = r.last_signal_ts ? _chartAgeFromIso(r.last_signal_ts) : 'none';
+      const lastTradeRow = (r.trades && r.trades.length) ? r.trades[r.trades.length - 1] : null;
+      const lastCloseText = lastTradeRow && lastTradeRow.ts ? _chartAgeFromIso(lastTradeRow.ts) : 'none';
 
       const transitionReady = r.transition_ready || false;
       const transitionGlow = transitionReady ? 'animation:stage-transition-glow 2s ease-in-out infinite;' : '';
@@ -3831,6 +4194,7 @@ async function loadIBKRFleet() {
           <span style="color:${stageColor};font-size:0.6em;font-weight:bold;margin-left:6px;text-transform:uppercase;">${r.current_stage || r.lane || 'unknown'}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center;">
+          <button onclick="selectRunnerChart('${r.chart_key || r.symbol}')" style="background:#0d1117;color:#7b8ab8;border:1px solid #1e2a42;padding:2px 7px;border-radius:999px;cursor:pointer;font-size:0.6em;">CHART</button>
           <span style="color:${healthColor};font-size:0.6em;font-weight:bold;">&#9679; ${healthLabel}</span>
           <span style="color:${sc};font-size:0.6em;font-weight:bold;text-transform:uppercase;">${r.status}</span>
         </div>
@@ -3861,6 +4225,10 @@ async function loadIBKRFleet() {
       card += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.68em;color:#7b8ab8;">
         <div>Risk Policy: <span style="color:#00d4ff;">${activeRiskPct.toFixed(2)}%</span></div>
         <div>Earned Cap: <span style="color:#ffaa00;">${capRiskPct.toFixed(2)}%</span></div>
+      </div>`;
+      card += `<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px;font-size:0.66em;color:#7b8ab8;">
+        <div>Last signal: <span style="color:#e0e0e0;">${lastSignalText}</span></div>
+        <div>Last close: <span style="color:#e0e0e0;">${lastCloseText}</span></div>
       </div>`;
 
       // Equity mini chart
@@ -3971,17 +4339,41 @@ async function loadIBKRFleet() {
       } else if (stage === 'quarantine') {
         actions += `<button onclick="stageAction('demote','${sym}')" style="background:#ffaa00;color:#000;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;" title="Demote to Paper for revalidation">&#9660; PAPER</button>`;
         actions += `<button onclick="stageAction('kill','${sym}')" style="background:#ff4444;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;margin-left:4px;" title="Kill permanently">&#10005; KILL</button>`;
+      } else if (stage === 'killed') {
+        actions += `<button onclick="stageAction('revive','${sym}')" style="background:#7b8ab8;color:#fff;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:0.65em;font-weight:bold;" title="Revive to Watcher for re-evaluation">&#8635; REVIVE</button>`;
       }
       if (actions) {
         card += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e2a42;display:flex;gap:4px;justify-content:flex-end;">${actions}</div>`;
       }
 
       card += `</div>`;
-      if (r.current_stage === 'real' || r.current_stage === 'quarantine') realCardsDiv.innerHTML += card;
-      else if (r.current_stage === 'paper') paperCardsDiv.innerHTML += card;
-      else watcherCardsDiv.innerHTML += card;
+      if (r.current_stage === 'killed') {
+        // Compact graveyard tombstone — just name + reason + revive button
+        if (graveyardDiv) {
+          const reason = r.transition_reason || r.next_milestone || 'walk-forward failed';
+          graveyardDiv.innerHTML += `<div style="background:#0d1117;border:1px solid #333;border-radius:4px;padding:6px 10px;display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <span style="color:#555;font-weight:bold;font-size:0.8em;">${r.name || r.symbol}</span>
+              <span style="color:#444;font-size:0.6em;margin-left:8px;">${reason.substring(0, 50)}</span>
+            </div>
+            <button onclick="stageAction('revive','${r.symbol}')" style="background:#7b8ab8;color:#fff;border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:0.65em;font-weight:bold;white-space:nowrap;" title="Revive to Watcher">&#8635; REVIVE</button>
+          </div>`;
+        }
+      } else if (r.current_stage === 'real' || r.current_stage === 'quarantine') {
+        realCardsDiv.innerHTML += card;
+      } else if (r.current_stage === 'paper') {
+        paperCardsDiv.innerHTML += card;
+      } else {
+        watcherCardsDiv.innerHTML += card;
+      }
+    }
+    // Show/hide graveyard section
+    const graveyardSection = document.getElementById('graveyard-section');
+    if (graveyardSection) {
+      graveyardSection.style.display = (graveyardDiv && graveyardDiv.innerHTML) ? 'block' : 'none';
     }
     if (!watcherCardsDiv.innerHTML) watcherCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No watcher runners staged right now.</div>';
+    populateChartSelector(data.runners || []);
     if (!paperCardsDiv.innerHTML) paperCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No paper QA runners staged right now.</div>';
     if (!realCardsDiv.innerHTML) realCardsDiv.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">No real-money runners deployed yet.</div>';
 
@@ -3999,43 +4391,83 @@ async function loadIBKRFleet() {
     // Stage history charts
     const paperHistory = (paperModel.history || []);
     const qaEquitySeries = [];
-    if (paperModel.start_equity_usd != null) qaEquitySeries.push(Number(paperModel.start_equity_usd));
+    if (paperModel.start_equity_usd != null) {
+      qaEquitySeries.push({
+        value: Number(paperModel.start_equity_usd),
+        label: 'Start',
+        detail: 'modeled QA baseline',
+      });
+    }
     for (const item of paperHistory) {
       const equityAfter = Number(item.equity_after || 0);
-      if (isFinite(equityAfter)) qaEquitySeries.push(equityAfter);
+      if (isFinite(equityAfter)) {
+        qaEquitySeries.push({
+          value: equityAfter,
+          label: formatTsShort(item.ts),
+          detail: `${item.name || item.symbol || ''} | R ${Number(item.r_multiple || 0).toFixed(2)} | ${(Number(item.modeled_pnl_usd || 0) >= 0 ? '+' : '')}$${Number(item.modeled_pnl_usd || 0).toFixed(2)}`,
+          raw: item,
+        });
+      }
     }
     renderSeriesChart('qa-model-equity-chart', 'qa-equity-chart-label', qaEquitySeries, {
       formatter: (v) => '$' + Number(v).toFixed(2),
       emptyText: 'No modeled QA equity history yet.',
+      hoverTargetId: 'qa-equity-chart-hover',
+      hoverDefaultText: 'Hover points for modeled equity details.',
+      hoverEmptyText: 'No modeled QA points yet.',
     });
 
-    const qaFleetSeries = [0];
+    const qaFleetSeries = [{
+      value: 0,
+      label: 'Start',
+      detail: 'modeled fleet baseline',
+    }];
     if (paperModel.start_equity_usd != null) {
       for (const item of paperHistory) {
         const equityAfter = Number(item.equity_after || 0);
         if (!isFinite(equityAfter)) continue;
-        qaFleetSeries.push(equityAfter - Number(paperModel.start_equity_usd));
+        qaFleetSeries.push({
+          value: equityAfter - Number(paperModel.start_equity_usd),
+          label: formatTsShort(item.ts),
+          detail: `${item.name || item.symbol || ''} | ${(Number(item.modeled_pnl_usd || 0) >= 0 ? '+' : '')}$${Number(item.modeled_pnl_usd || 0).toFixed(2)}`,
+          raw: item,
+        });
       }
     }
     renderSeriesChart('ibkr-pnl-chart', 'qa-fleet-history-label', qaFleetSeries, {
       formatter: (v) => '$' + Number(v).toFixed(2),
       emptyText: 'No QA fleet history yet.',
+      hoverTargetId: 'qa-fleet-history-hover',
+      hoverDefaultText: 'Hover points for modeled trade-close details.',
+      hoverEmptyText: 'No QA fleet history points yet.',
     });
 
     const prodUsdTrades = prodTradeRows
       .filter(t => t.pnl_usd !== undefined && t.pnl_usd !== null && t.pnl_usd !== '')
       .sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
-    const prodFleetSeries = [0];
+    const prodFleetSeries = [{
+      value: 0,
+      label: 'Start',
+      detail: 'real-money baseline',
+    }];
     let prodCum = 0;
     for (const t of prodUsdTrades) {
       const pnlUsd = Number(t.pnl_usd || 0);
       if (!isFinite(pnlUsd)) continue;
       prodCum += pnlUsd;
-      prodFleetSeries.push(Number(prodCum.toFixed(2)));
+      prodFleetSeries.push({
+        value: Number(prodCum.toFixed(2)),
+        label: formatTsShort(t.ts),
+        detail: `${t.runner || ''} | ${(pnlUsd >= 0 ? '+' : '')}$${pnlUsd.toFixed(2)} | ${t.exit_reason || 'close'}`,
+        raw: t,
+      });
     }
     renderSeriesChart('prod-fleet-pnl-chart', 'prod-fleet-history-label', prodFleetSeries, {
       formatter: (v) => '$' + Number(v).toFixed(2),
       emptyText: 'No real-money journal USD history yet.',
+      hoverTargetId: 'prod-fleet-history-hover',
+      hoverDefaultText: 'Hover points for trade-close details.',
+      hoverEmptyText: 'No real-money fleet history points yet.',
     });
 
     // Signals table — all signal feeds across watcher, QA, and prod
@@ -4074,26 +4506,37 @@ async function loadIBKRFleet() {
 
     // Per-pair equity + drawdown section
     fetch('/api/fx_analytics').then(r=>r.json()).then(fa=>{
-      let anaDiv = document.getElementById('ibkr-analytics');
-      if (!anaDiv) {
-        anaDiv = document.createElement('div');
-        anaDiv.id = 'ibkr-analytics';
-        anaDiv.style.cssText = 'margin-top:16px;';
-        document.getElementById('ibkr-pnl-chart').parentElement.after(anaDiv);
-      }
-      let html = '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;margin-bottom:8px;">Per-Pair Analytics</div>';
-      html += '<div style="display:flex;gap:12px;">';
-      for (const a of fa.analytics) {
+      const anaDiv = document.getElementById('ibkr-analytics');
+      if (!anaDiv) return;
+      const order = { real: 0, quarantine: 1, paper: 2, watcher: 3 };
+      const analytics = (fa.analytics || []).slice().sort((a, b) => {
+        const diff = (order[a.current_stage] ?? 9) - (order[b.current_stage] ?? 9);
+        if (diff) return diff;
+        return String(a.name || '').localeCompare(String(b.name || ''));
+      });
+      let html = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">'
+        + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;">Per-Pair Analytics</div>'
+        + '<div style="color:#7b8ab8;font-size:0.68em;">Stacked cards, full-width sparklines, stage-aware ordering.</div>'
+        + '</div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">';
+      for (const a of analytics) {
         const ddColor = a.current_drawdown > 0 ? '#ff4444' : '#00ff88';
-        html += '<div style="flex:1;padding:8px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">';
-        html += '<div style="font-weight:bold;color:#00d4ff;font-size:0.8em;">' + a.name + '</div>';
+        const stage = String(a.current_stage || '').toUpperCase();
+        const stageColor = stage === 'REAL' || stage === 'QUARANTINE' ? '#00e676' : (stage === 'PAPER' ? '#00d4ff' : '#7b8ab8');
+        html += '<div style="min-width:0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">';
+        html += '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">'
+          + '<div style="font-weight:bold;color:#00d4ff;font-size:0.8em;min-width:0;">' + a.name + '</div>'
+          + '<div style="font-size:0.62em;font-weight:bold;color:' + stageColor + ';letter-spacing:0.8px;white-space:nowrap;">' + stage + '</div>'
+          + '</div>';
         html += '<div style="font-size:0.7em;margin-top:4px;">';
         html += 'PnL: <span style="color:' + (a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '">' + (a.cumulative_pnl>=0?'+':'') + a.cumulative_pnl.toFixed(1) + '</span>';
         html += ' | Max DD: <span style="color:#ff4444">' + a.max_drawdown.toFixed(1) + '</span>';
         html += ' | Now: <span style="color:' + ddColor + '">' + a.current_drawdown.toFixed(1) + '</span>';
         html += '</div>';
         if (a.equity_curve && a.equity_curve.length > 1) {
-          html += '<div style="margin-top:4px;">' + ibkrMiniChart(a.equity_curve, 180, 25, a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '</div>';
+          html += '<div style="margin-top:8px;">' + ibkrMiniChart(a.equity_curve, 220, 44, a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '</div>';
+        } else {
+          html += '<div style="margin-top:8px;color:#7b8ab8;font-size:0.68em;">No equity history yet.</div>';
         }
         html += '</div>';
       }
@@ -6366,17 +6809,34 @@ function updateBalanceChart(balance) {
     const canvas = document.getElementById('balance-history-chart');
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    const W = canvas.width = canvas.offsetWidth;
+    const W = canvas.width = Math.max(canvas.offsetWidth || canvas.clientWidth || 320, 320);
     const H = canvas.height;
+    const padX = 14;
+    const padY = 12;
+    const innerW = Math.max(1, W - padX * 2);
+    const innerH = Math.max(1, H - padY * 2);
 
     ctx.clearRect(0, 0, W, H);
 
     if (balanceHistory.length < 2) return;
 
     const values = balanceHistory.map(b => b.value);
-    const minVal = Math.min(...values) - 1;
-    const maxVal = Math.max(...values) + 1;
+    const rawMin = Math.min(...values);
+    const rawMax = Math.max(...values);
+    const padVal = Math.max((rawMax - rawMin) * 0.14, Math.abs(rawMax || 1) * 0.0025, 0.5);
+    const minVal = rawMin - padVal;
+    const maxVal = rawMax + padVal;
     const range = maxVal - minVal || 1;
+
+    ctx.strokeStyle = 'rgba(30,42,66,0.65)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 3; i++) {
+      const y = padY + (innerH / 3) * i;
+      ctx.beginPath();
+      ctx.moveTo(padX, y);
+      ctx.lineTo(W - padX, y);
+      ctx.stroke();
+    }
 
     // Draw balance line
     const isUp = values[values.length-1] >= values[0];
@@ -6384,52 +6844,110 @@ function updateBalanceChart(balance) {
     ctx.lineWidth = 2;
     ctx.beginPath();
     for (let i = 0; i < values.length; i++) {
-      const x = (i / (values.length - 1)) * W;
-      const y = H - ((values[i] - minVal) / range) * H;
+      const x = padX + (i / (values.length - 1)) * innerW;
+      const y = H - padY - ((values[i] - minVal) / range) * innerH;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
 
     // Fill under the line
-    ctx.lineTo(W, H);
-    ctx.lineTo(0, H);
+    ctx.lineTo(W - padX, H - padY);
+    ctx.lineTo(padX, H - padY);
     ctx.closePath();
     ctx.fillStyle = isUp ? 'rgba(0,230,118,0.08)' : 'rgba(255,68,68,0.08)';
     ctx.fill();
+
+    const pointStep = Math.max(1, Math.ceil(values.length / 18));
+    for (let i = 0; i < values.length; i++) {
+      if (i !== 0 && i !== values.length - 1 && i % pointStep !== 0) continue;
+      const x = padX + (i / (values.length - 1)) * innerW;
+      const y = H - padY - ((values[i] - minVal) / range) * innerH;
+      ctx.fillStyle = isUp ? '#00e676' : '#ff4444';
+      ctx.strokeStyle = '#08131f';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(x, y, i === values.length - 1 ? 3.4 : 2.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
 
     // Label
     const current = values[values.length-1];
     const delta = current - values[0];
     const labelEl = document.getElementById('prod-equity-chart-label') || document.getElementById('balance-chart-label');
     if (labelEl) {
-      labelEl.textContent = '$' + current.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' (' + (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2) + ' since page load)';
+      labelEl.textContent = '$' + current.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' (' + (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2) + ' since page load, ' + values.length + ' pts)';
       labelEl.style.color = delta >= 0 ? '#00e676' : '#ff4444';
     }
   }
 
+function _seriesNormalize(values) {
+    if (!Array.isArray(values)) return [];
+    const result = [];
+    for (let i = 0; i < values.length; i++) {
+      const item = values[i];
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const value = Number(item.value);
+        if (!Number.isFinite(value)) continue;
+        result.push({
+          value,
+          label: item.label || '',
+          detail: item.detail || '',
+          raw: item.raw || item,
+        });
+      } else {
+        const value = Number(item);
+        if (!Number.isFinite(value)) continue;
+        result.push({
+          value,
+          label: '',
+          detail: '',
+          raw: item,
+        });
+      }
+    }
+    return result;
+}
+
 function renderSeriesChart(canvasId, labelId, values, opts = {}) {
     const canvas = document.getElementById(canvasId);
     const labelEl = document.getElementById(labelId);
+    const hoverEl = opts.hoverTargetId ? document.getElementById(opts.hoverTargetId) : null;
     if (!canvas) return;
 
-    const points = Array.isArray(values) ? values.filter(v => typeof v === 'number' && isFinite(v)) : [];
+    const series = _seriesNormalize(values);
+    const points = series.map(item => item.value);
     const emptyText = opts.emptyText || 'No history yet.';
     if (labelEl && points.length < 2) {
       labelEl.textContent = emptyText;
       labelEl.style.color = '#7b8ab8';
     }
+    if (hoverEl && points.length < 2) {
+      hoverEl.textContent = opts.hoverEmptyText || 'Waiting for more points.';
+      hoverEl.style.color = '#7b8ab8';
+    }
+    if (points.length < 2) {
+      canvas.onmousemove = null;
+      canvas.onmouseleave = null;
+    }
 
     const ctx = canvas.getContext('2d');
-    const W = canvas.width = canvas.offsetWidth;
+    const W = canvas.width = Math.max(canvas.offsetWidth || canvas.clientWidth || 320, 320);
     const H = canvas.height;
+    const padX = 14;
+    const padY = 12;
+    const innerW = Math.max(1, W - padX * 2);
+    const innerH = Math.max(1, H - padY * 2);
     ctx.clearRect(0, 0, W, H);
 
     if (points.length < 2) return;
 
-    const minVal = Math.min(...points);
-    const maxVal = Math.max(...points);
-    const pad = 6;
+    const rawMin = Math.min(...points);
+    const rawMax = Math.max(...points);
+    const valPad = Math.max((rawMax - rawMin) * 0.14, Math.abs(rawMax || 1) * 0.0025, 0.25);
+    const minVal = rawMin - valPad;
+    const maxVal = rawMax + valPad;
     const range = (maxVal - minVal) || 1;
     const start = points[0];
     const end = points[points.length - 1];
@@ -6437,49 +6955,183 @@ function renderSeriesChart(canvasId, labelId, values, opts = {}) {
     const stroke = isUp ? (opts.positiveColor || '#00e676') : (opts.negativeColor || '#ff4444');
     const fill = isUp ? (opts.positiveFill || 'rgba(0,230,118,0.08)') : (opts.negativeFill || 'rgba(255,68,68,0.08)');
 
+    ctx.strokeStyle = 'rgba(30,42,66,0.65)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 3; i++) {
+      const y = padY + (innerH / 3) * i;
+      ctx.beginPath();
+      ctx.moveTo(padX, y);
+      ctx.lineTo(W - padX, y);
+      ctx.stroke();
+    }
+
     let zeroY = null;
     if (opts.showZeroLine !== false && minVal <= 0 && maxVal >= 0) {
-      zeroY = H - pad - ((0 - minVal) / range) * (H - pad * 2);
+      zeroY = H - padY - ((0 - minVal) / range) * innerH;
       ctx.strokeStyle = '#333';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
-      ctx.moveTo(0, zeroY);
-      ctx.lineTo(W, zeroY);
+      ctx.moveTo(padX, zeroY);
+      ctx.lineTo(W - padX, zeroY);
       ctx.stroke();
       ctx.setLineDash([]);
     }
 
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let i = 0; i < points.length; i++) {
-      const x = (i / (points.length - 1)) * W;
-      const y = H - pad - ((points[i] - minVal) / range) * (H - pad * 2);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+    const plotPoints = points.map((point, i) => ({
+      x: padX + (i / (points.length - 1)) * innerW,
+      y: H - padY - ((point - minVal) / range) * innerH,
+      value: point,
+      meta: series[i] || {},
+      index: i,
+    }));
 
-    const baselineY = zeroY != null ? zeroY : H - pad;
-    ctx.lineTo(W, baselineY);
-    ctx.lineTo(0, baselineY);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
+    const draw = (activeIndex = -1) => {
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.strokeStyle = 'rgba(30,42,66,0.65)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 3; i++) {
+        const y = padY + (innerH / 3) * i;
+        ctx.beginPath();
+        ctx.moveTo(padX, y);
+        ctx.lineTo(W - padX, y);
+        ctx.stroke();
+      }
+
+      if (zeroY != null) {
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padX, zeroY);
+        ctx.lineTo(W - padX, zeroY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < plotPoints.length; i++) {
+        const p = plotPoints[i];
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+
+      const baselineY = zeroY != null ? zeroY : H - padY;
+      ctx.lineTo(W - padX, baselineY);
+      ctx.lineTo(padX, baselineY);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+
+      const pointStep = Math.max(1, Math.ceil(plotPoints.length / 18));
+      for (let i = 0; i < plotPoints.length; i++) {
+        const p = plotPoints[i];
+        if (i !== 0 && i !== plotPoints.length - 1 && i % pointStep !== 0 && i !== activeIndex) continue;
+        ctx.fillStyle = stroke;
+        ctx.strokeStyle = '#08131f';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, i === activeIndex ? 4.2 : (i === plotPoints.length - 1 ? 3.4 : 2.2), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      if (activeIndex >= 0 && plotPoints[activeIndex]) {
+        const p = plotPoints[activeIndex];
+        ctx.strokeStyle = 'rgba(0, 212, 255, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(p.x, padY);
+        ctx.lineTo(p.x, H - padY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    };
+
+    draw(-1);
 
     if (labelEl) {
       const fmt = opts.formatter || ((v) => Number(v).toFixed(2));
       const delta = end - start;
-      labelEl.textContent = `${fmt(end)} (${delta >= 0 ? '+' : ''}${fmt(delta)} vs start)`;
+      labelEl.textContent = `${fmt(end)} (${delta >= 0 ? '+' : ''}${fmt(delta)} vs start, ${points.length} pts)`;
       labelEl.style.color = stroke;
     }
+
+    if (hoverEl) {
+      hoverEl.textContent = opts.hoverDefaultText || 'Hover points for details.';
+      hoverEl.style.color = '#7b8ab8';
+    }
+
+    canvas.onmousemove = evt => {
+      if (!plotPoints.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = evt.clientX - rect.left;
+      let nearest = 0;
+      let nearestDist = Infinity;
+      for (const p of plotPoints) {
+        const dist = Math.abs(p.x - x);
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearest = p.index;
+        }
+      }
+      draw(nearest);
+      if (hoverEl) {
+        const p = plotPoints[nearest];
+        const fmt = opts.formatter || ((v) => Number(v).toFixed(2));
+        const meta = p.meta || {};
+        const label = meta.label ? `${meta.label} | ` : '';
+        const detail = meta.detail ? ` | ${meta.detail}` : '';
+        hoverEl.textContent = `${label}${fmt(p.value)}${detail}`;
+        hoverEl.style.color = stroke;
+      }
+    };
+
+    canvas.onmouseleave = () => {
+      draw(-1);
+      if (hoverEl) {
+        hoverEl.textContent = opts.hoverDefaultText || 'Hover points for details.';
+        hoverEl.style.color = '#7b8ab8';
+      }
+    };
 }
 
 function formatTsShort(ts) {
     const clean = String(ts || '').replace('T', ' ');
     if (!clean) return '';
     return clean.length >= 19 ? clean.substring(5, 19) : clean;
+}
+
+function _chartAgeFromIso(ts) {
+    const raw = String(ts || '').trim();
+    if (!raw) return 'n/a';
+    try {
+      const dt = new Date(raw);
+      const ageS = Math.max(0, Math.round((Date.now() - dt.getTime()) / 1000));
+      return _chartFmtAgo(ageS);
+    } catch (_) {
+      return 'n/a';
+    }
+}
+
+function selectRunnerChart(chartKey, followLive = true) {
+    const sel = document.getElementById('chart-symbol-select');
+    if (!sel || !chartKey) return;
+    sel.value = chartKey;
+    _strategyChartState.autoFollow = !!followLive;
+    _strategyChartState.focusTs = null;
+    _strategyChartState.selection = null;
+    _updateChartFollowButton();
+    loadRunnerChart(true);
+    const card = document.getElementById('live-strategy-chart-card');
+    if (card && typeof card.scrollIntoView === 'function') {
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
 }
 
 function renderStageTradeJournal(targetId, rows, emptyMessage, accentColor) {
@@ -6587,6 +7239,1101 @@ async function stageAction(action, symbol) {
       alert('Action failed: ' + (data.error || 'unknown'));
     }
   } catch(e) { alert('Error: ' + e.message); }
+}
+
+// ── Live Strategy Chart ───────────────────────────────
+let _strategyChart = null;
+const _strategyChartState = {
+  symbol: '',
+  rangeMinutes: 120,
+  autoFollow: true,
+  isLoading: false,
+  lastYRange: null,
+  focusTs: null,
+  dragMode: '',
+  dragStartX: null,
+  dragStartY: null,
+  dragStartRange: null,
+  selection: null,
+};
+
+function _chartTs(raw) {
+  const ts = Date.parse(raw || '');
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function _chartNum(raw, fallback = 0) {
+  const v = Number(raw);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+function _chartFmtPrice(v, precision = 5) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(precision) : '--';
+}
+
+function _chartFmtSigned(v, digits = 1) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '--';
+  return (n >= 0 ? '+' : '') + n.toFixed(digits);
+}
+
+function _chartFmtAgo(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s)) return 'n/a';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  return (s / 3600).toFixed(1) + 'h ago';
+}
+
+function _chartFmtVolume(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return '--';
+  if (Math.abs(n) >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (Math.abs(n) >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return n.toFixed(0);
+}
+
+function _chartActivityMeta(bar) {
+  const kind = String((bar && bar.activityKind) || '').toLowerCase();
+  if (kind === 'volume') return { short: 'V', pane: 'VOL', label: 'Volume' };
+  if (kind === 'ticks') return { short: 'Ticks', pane: 'TICKS', label: 'Ticks' };
+  if (kind === 'range') return { short: 'Range', pane: 'RNG', label: 'Range' };
+  const volume = _chartNum(bar && bar.v, 0);
+  const ticks = _chartNum(bar && bar.n, 0);
+  const high = _chartNum(bar && bar.h, 0);
+  const low = _chartNum(bar && bar.l, 0);
+  if (volume > 0) return { short: 'V', pane: 'VOL', label: 'Volume' };
+  if (ticks > 0) return { short: 'Ticks', pane: 'TICKS', label: 'Ticks' };
+  if (high > 0 && low > 0 && high >= low) return { short: 'Range', pane: 'RNG', label: 'Range' };
+  return { short: 'Activity', pane: 'ACT', label: 'Activity' };
+}
+
+function _chartActivityValue(bar) {
+  const explicit = _chartNum(bar && bar.activity, NaN);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const volume = _chartNum(bar && bar.v, 0);
+  if (volume > 0) return volume;
+  const ticks = _chartNum(bar && bar.n, 0);
+  if (ticks > 0) return ticks;
+  const high = _chartNum(bar && bar.h, 0);
+  const low = _chartNum(bar && bar.l, 0);
+  return Math.max(0, high - low);
+}
+
+function _setChartCursor(mode) {
+  const canvas = document.getElementById('strategy-chart');
+  if (canvas) canvas.style.cursor = mode || 'grab';
+}
+
+function _updateChartRangeButtons() {
+  [5, 30, 60, 120].forEach(mins => {
+    const btn = document.getElementById('chart-range-' + mins);
+    if (btn) btn.classList.toggle('active', _strategyChartState.rangeMinutes === mins);
+  });
+}
+
+function _updateChartFollowButton() {
+  const btn = document.getElementById('chart-follow-toggle');
+  if (!btn) return;
+  btn.classList.toggle('soft-active', _strategyChartState.autoFollow);
+  btn.textContent = _strategyChartState.autoFollow ? 'Follow Live' : 'View Locked';
+}
+
+function setRunnerChartRange(minutes) {
+  _strategyChartState.rangeMinutes = minutes;
+  _strategyChartState.autoFollow = true;
+  _strategyChartState.focusTs = null;
+  _strategyChartState.selection = null;
+  _strategyChartState.lastYRange = null;
+  _updateChartRangeButtons();
+  _updateChartFollowButton();
+  loadRunnerChart(true);
+}
+
+function toggleRunnerChartFollow() {
+  _strategyChartState.autoFollow = !_strategyChartState.autoFollow;
+  if (_strategyChartState.autoFollow) _strategyChartState.focusTs = null;
+  _strategyChartState.selection = null;
+  _updateChartFollowButton();
+  loadRunnerChart(false);
+}
+
+function resetRunnerChartView() {
+  _strategyChartState.autoFollow = true;
+  _strategyChartState.focusTs = null;
+  _strategyChartState.selection = null;
+  _strategyChartState.lastYRange = null;
+  _updateChartRangeButtons();
+  _updateChartFollowButton();
+  loadRunnerChart(true);
+}
+
+function focusRunnerTrade(ts) {
+  const parsed = _chartTs(ts);
+  if (!parsed) return;
+  _strategyChartState.autoFollow = false;
+  _strategyChartState.focusTs = parsed;
+  _strategyChartState.selection = null;
+  _strategyChartState.lastYRange = null;
+  _updateChartFollowButton();
+  loadRunnerChart(true);
+}
+
+function _renderChartStatus(data, precision) {
+  const el = document.getElementById('chart-status-line');
+  if (!el) return;
+  const lastPrice = _chartFmtPrice(data.latest_price, precision);
+  const posColor = data.position === 'LONG' ? '#00e676' : (data.position === 'SHORT' ? '#ff9800' : '#7b8ab8');
+  const stage = (data.deployment_stage || '').toUpperCase();
+  const watcherNote = String(data.deployment_stage || '').toLowerCase() === 'watcher'
+    ? '<span>Signals only: <span style="color:#e8f0ff;">observe-only</span></span>'
+    : '';
+  el.innerHTML =
+    '<span>Stage: <span style="color:#e8f0ff;">' + stage + '</span></span>' +
+    '<span>Mode: <span style="color:#e8f0ff;">' + (data.execution_mode || '--') + '</span></span>' +
+    '<span>Last: <span style="color:#e8f0ff;">' + lastPrice + '</span></span>' +
+    '<span>Bar age: <span style="color:#e8f0ff;">' + _chartFmtAgo(data.last_bar_age_s) + '</span></span>' +
+    '<span>Heartbeat: <span style="color:#e8f0ff;">' + _chartFmtAgo(data.heartbeat_age_s) + '</span></span>' +
+    '<span>Unrealized: <span style="color:' + posColor + ';">$' + _chartNum(data.unrealized_pnl_usd, 0).toFixed(2) + '</span></span>' +
+    '<span>Open risk: <span style="color:#e8f0ff;">$' + _chartNum(data.open_risk_usd, 0).toFixed(2) + '</span></span>' +
+    watcherNote;
+}
+
+function _renderChartHoverDefault(data, precision) {
+  const info = document.getElementById('chart-trade-info');
+  if (!info) return;
+  const bars = data.bars || [];
+  if (!bars.length) {
+    info.innerHTML = '<span style="color:#7b8ab8;">Waiting for recent bar data...</span>';
+    return;
+  }
+  const last = bars[bars.length - 1];
+  const delta = _chartNum(last.c) - _chartNum(last.o);
+  const deltaColor = delta >= 0 ? '#00e676' : '#ff5252';
+  const meta = _chartActivityMeta(last);
+  const activityValue = _chartActivityValue(last);
+  const activityText = meta.short === 'Range'
+    ? _chartFmtSigned(activityValue, precision === 5 ? 5 : 2).replace(/^[+]/, '')
+    : _chartFmtVolume(activityValue);
+  info.innerHTML =
+    '<span style="color:#7b8ab8;">Hover a candle or marker for details.</span> ' +
+    '<span style="color:#e8f0ff;">Last candle</span> ' +
+    '<span>O ' + _chartFmtPrice(last.o, precision) + '</span> ' +
+    '<span>H ' + _chartFmtPrice(last.h, precision) + '</span> ' +
+    '<span>L ' + _chartFmtPrice(last.l, precision) + '</span> ' +
+    '<span>C <span style="color:' + deltaColor + ';">' + _chartFmtPrice(last.c, precision) + '</span></span> ' +
+    '<span style="color:' + deltaColor + ';">' + _chartFmtSigned(delta, precision === 5 ? 5 : 2) + '</span> ' +
+    '<span>' + meta.short + ' ' + activityText + '</span>';
+}
+
+function _renderChartRecentTrades(data, precision) {
+  const box = document.getElementById('chart-recent-trades');
+  if (!box) return;
+  const recent = (data.trades || []).slice(-5).reverse();
+  if (!recent.length) {
+    if (String(data.deployment_stage || '').toLowerCase() === 'watcher') {
+      box.innerHTML = '<div class="chart-empty-note">Watcher lanes are observe-only. Entry markers are candidate signals, not executed trades, so exits only appear after QA/Prod fills.</div>';
+    } else {
+      box.innerHTML = '<div class="chart-empty-note">No closed trades yet for this runner.</div>';
+    }
+    return;
+  }
+  box.innerHTML = recent.map(t => {
+    const pnlClass = t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const dir = (t.direction || '').toUpperCase();
+    const exitText = t.exit_reason || 'exit';
+    const slip = Number.isFinite(Number(t.slippage_pips)) ? Number(t.slippage_pips).toFixed(1) : '--';
+    const latency = Number.isFinite(Number(t.fill_latency_ms)) ? Number(t.fill_latency_ms) : 0;
+    return '' +
+      '<button class="chart-trade-pill" onclick="focusRunnerTrade(\\'' + (t.ts || '') + '\\')">' +
+      '  <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">' +
+      '    <span style="font-weight:bold;color:#e8f0ff;">' + dir + '</span>' +
+      '    <span class="' + pnlClass + '">' + _chartFmtSigned(t.pnl, 1) + '</span>' +
+      '  </div>' +
+      '  <div style="margin-top:4px;color:#7b8ab8;">' + exitText + ' - ' + _chartNum(t.duration_min, 0).toFixed(0) + 'm</div>' +
+      '  <div style="margin-top:3px;color:#7b8ab8;">slip ' + slip + ' - latency ' + latency + 'ms</div>' +
+      '</button>';
+  }).join('');
+}
+
+function _buildRunnerChartSeries(data) {
+  const candles = (data.bars || [])
+    .map(b => {
+      const o = _chartNum(b.o);
+      const h = _chartNum(b.h);
+      const l = _chartNum(b.l);
+      const c = _chartNum(b.c);
+      const v = _chartNum(b.v, 0);
+      const n = _chartNum(b.n, 0);
+      const rangeActivity = Math.max(0, h - l);
+      let activity = v;
+      let activityKind = 'volume';
+      if (activity <= 0 && n > 0) {
+        activity = n;
+        activityKind = 'ticks';
+      } else if (activity <= 0) {
+        activity = rangeActivity;
+        activityKind = 'range';
+      }
+      return {
+        x: _chartTs(b.t),
+        o,
+        h,
+        l,
+        c,
+        v,
+        n,
+        activity,
+        activityKind,
+        t: b.t,
+      };
+    })
+    .filter(b => b.x && b.o > 0 && b.h > 0 && b.l > 0 && b.c > 0);
+
+  const longEntries = [];
+  const shortEntries = [];
+  for (const sig of (data.entry_signals || [])) {
+    const point = {
+      x: _chartTs(sig.ts),
+      y: _chartNum(sig.price),
+      ts: sig.ts,
+      direction: sig.direction,
+      action: sig.action,
+      price: _chartNum(sig.price),
+    };
+    if (!point.x || !point.y) continue;
+    if ((sig.direction || '').toLowerCase() === 'long') longEntries.push(point);
+    if ((sig.direction || '').toLowerCase() === 'short') shortEntries.push(point);
+  }
+
+  const exits = (data.exit_markers || [])
+    .map(t => ({
+      x: _chartTs(t.ts),
+      y: _chartNum(t.price),
+      ts: t.ts,
+      direction: t.direction,
+      pnl: _chartNum(t.pnl),
+      exit_reason: t.exit_reason || '',
+    }))
+    .filter(p => p.x && p.y);
+
+  return { candles, longEntries, shortEntries, exits };
+}
+
+function _clampRunnerChartXRange(series, xMin, xMax) {
+  const candles = series.candles || [];
+  if (!candles.length) return null;
+  const firstX = candles[0].x;
+  const lastX = candles[candles.length - 1].x;
+  const minWindowMs = 5 * 60 * 1000;
+  const leftBound = firstX - 60 * 1000;
+  const rightBound = lastX + 60 * 1000;
+  let nextMin = Number(xMin);
+  let nextMax = Number(xMax);
+  if (!Number.isFinite(nextMin) || !Number.isFinite(nextMax)) return null;
+  if (nextMax <= nextMin) nextMax = nextMin + minWindowMs;
+  let span = Math.max(minWindowMs, nextMax - nextMin);
+  if (span > (rightBound - leftBound)) span = rightBound - leftBound;
+  if (nextMin < leftBound) {
+    nextMin = leftBound;
+    nextMax = nextMin + span;
+  }
+  if (nextMax > rightBound) {
+    nextMax = rightBound;
+    nextMin = nextMax - span;
+  }
+  nextMin = Math.max(leftBound, nextMin);
+  nextMax = Math.min(rightBound, nextMax);
+  return { xMin: nextMin, xMax: nextMax };
+}
+
+function _computeRunnerChartYRange(data, series, xMin, xMax, forceFit) {
+  const candles = series.candles || [];
+  if (!candles.length) return null;
+  const inView = candles.filter(c => c.x >= xMin && c.x <= xMax);
+  const pricePoints = [];
+  for (const c of (inView.length ? inView : candles)) {
+    pricePoints.push(c.h, c.l);
+  }
+  for (const marker of [...series.longEntries, ...series.shortEntries, ...series.exits]) {
+    if (marker.x >= xMin && marker.x <= xMax) pricePoints.push(marker.y);
+  }
+  if (data.position !== 'FLAT') {
+    [data.entry_price, data.stop_price, data.target_price].forEach(v => {
+      const n = _chartNum(v, NaN);
+      if (Number.isFinite(n) && n > 0) pricePoints.push(n);
+    });
+  }
+  if (!pricePoints.length) return null;
+
+  const rawMin = Math.min(...pricePoints);
+  const rawMax = Math.max(...pricePoints);
+  const pricePad = Math.max((rawMax - rawMin) * 0.12, Math.abs(rawMax || 1) * 0.0004);
+  let targetMin = rawMin - pricePad;
+  let targetMax = rawMax + pricePad;
+
+  if (_strategyChartState.lastYRange && !forceFit && _strategyChartState.symbol === data.symbol) {
+    const prev = _strategyChartState.lastYRange;
+    const expandMin = targetMin < prev.min;
+    const expandMax = targetMax > prev.max;
+    const nextMin = expandMin ? targetMin : prev.min + (targetMin - prev.min) * 0.18;
+    const nextMax = expandMax ? targetMax : prev.max + (targetMax - prev.max) * 0.18;
+    _strategyChartState.lastYRange = { min: nextMin, max: nextMax };
+  } else {
+    _strategyChartState.lastYRange = { min: targetMin, max: targetMax };
+  }
+
+  return {
+    min: _strategyChartState.lastYRange.min,
+    max: _strategyChartState.lastYRange.max,
+  };
+}
+
+function _computeRunnerChartViewport(data, series, forceFit) {
+  const candles = series.candles;
+  if (!candles.length) return null;
+
+  const firstX = candles[0].x;
+  const lastX = candles[candles.length - 1].x;
+  const rangeMs = _strategyChartState.rangeMinutes * 60 * 1000;
+
+  let xMin;
+  let xMax;
+  if (!_strategyChartState.autoFollow && _strategyChart && !forceFit) {
+    xMin = Number(_strategyChart.scales.x.min || (lastX - rangeMs));
+    xMax = Number(_strategyChart.scales.x.max || lastX);
+  } else if (_strategyChartState.focusTs && !_strategyChartState.autoFollow) {
+    xMin = _strategyChartState.focusTs - rangeMs * 0.45;
+    xMax = _strategyChartState.focusTs + rangeMs * 0.55;
+  } else {
+    xMax = lastX + 30 * 1000;
+    xMin = xMax - rangeMs;
+  }
+
+  const clamped = _clampRunnerChartXRange(series, xMin, xMax);
+  if (!clamped) return null;
+  const yRange = _computeRunnerChartYRange(data, series, clamped.xMin, clamped.xMax, forceFit);
+  if (!yRange) return null;
+
+  return {
+    xMin: clamped.xMin,
+    xMax: clamped.xMax,
+    yMin: yRange.min,
+    yMax: yRange.max,
+  };
+}
+
+function _applyRunnerChartViewport(chart, xMin, xMax, forceFit = false) {
+  if (!chart || !chart.$argusPayload || !chart.$argusSeries) return;
+  const clamped = _clampRunnerChartXRange(chart.$argusSeries, xMin, xMax);
+  if (!clamped) return;
+  const yRange = _computeRunnerChartYRange(chart.$argusPayload, chart.$argusSeries, clamped.xMin, clamped.xMax, forceFit);
+  if (!yRange) return;
+  chart.options.scales.x.min = clamped.xMin;
+  chart.options.scales.x.max = clamped.xMax;
+  chart.options.scales.y.min = yRange.min;
+  chart.options.scales.y.max = yRange.max;
+  chart.update('none');
+  _runnerChartHoverFromActive(chart, chart.getActiveElements());
+}
+
+function _attachRunnerChartInteractions(chart) {
+  if (!chart || chart.$argusInteractionsAttached) return;
+  const canvas = chart.canvas;
+  if (!canvas) return;
+
+  const onWheel = evt => {
+    if (!chart.$argusSeries || !chart.$argusPayload || !chart.chartArea) return;
+    const area = chart.chartArea;
+    const rect = canvas.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    if (x < area.left || x > area.right || y < area.top || y > area.bottom) return;
+    evt.preventDefault();
+
+    const xScale = chart.scales.x;
+    const currentMin = Number(xScale.min);
+    const currentMax = Number(xScale.max);
+    const span = currentMax - currentMin;
+    const pivot = Number(xScale.getValueForPixel(x));
+    if (!Number.isFinite(pivot) || !Number.isFinite(span) || span <= 0) return;
+
+    const factor = evt.deltaY < 0 ? 0.82 : 1.18;
+    const minSpan = 5 * 60 * 1000;
+    const maxSpan = 8 * 60 * 60 * 1000;
+    const nextSpan = Math.max(minSpan, Math.min(maxSpan, span * factor));
+    const leftRatio = Math.max(0, Math.min(1, (pivot - currentMin) / span));
+    const nextMin = pivot - nextSpan * leftRatio;
+    const nextMax = nextMin + nextSpan;
+
+    _strategyChartState.autoFollow = false;
+    _strategyChartState.focusTs = null;
+    _updateChartFollowButton();
+    _applyRunnerChartViewport(chart, nextMin, nextMax, true);
+  };
+
+  const onMouseDown = evt => {
+    if (evt.button !== 0 || !chart.chartArea) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    const area = chart.chartArea;
+    if (x < area.left || x > area.right || y < area.top || y > area.bottom) return;
+
+    _strategyChartState.autoFollow = false;
+    _strategyChartState.focusTs = null;
+    _strategyChartState.dragMode = evt.shiftKey ? 'box' : 'pan';
+    _strategyChartState.dragStartX = x;
+    _strategyChartState.dragStartY = y;
+    _strategyChartState.dragStartRange = {
+      min: Number(chart.scales.x.min),
+      max: Number(chart.scales.x.max),
+    };
+    _strategyChartState.selection = evt.shiftKey ? { x1: x, x2: x } : null;
+    _updateChartFollowButton();
+    _setChartCursor(evt.shiftKey ? 'crosshair' : 'grabbing');
+    evt.preventDefault();
+  };
+
+  const onMouseMove = evt => {
+    if (!chart.$argusSeries || !_strategyChartState.dragMode || !chart.chartArea) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+
+    if (_strategyChartState.dragMode === 'box') {
+      _strategyChartState.selection = {
+        x1: _strategyChartState.dragStartX,
+        x2: x,
+      };
+      chart.draw();
+      return;
+    }
+
+    const area = chart.chartArea;
+    const startRange = _strategyChartState.dragStartRange;
+    if (!startRange) return;
+    const pixelSpan = Math.max(1, area.right - area.left);
+    const deltaX = x - _strategyChartState.dragStartX;
+    const deltaMs = (deltaX / pixelSpan) * (startRange.max - startRange.min);
+    _applyRunnerChartViewport(chart, startRange.min - deltaMs, startRange.max - deltaMs, false);
+  };
+
+  const finishDrag = evt => {
+    if (!chart.$argusSeries || !_strategyChartState.dragMode) return;
+    if (_strategyChartState.dragMode === 'box' && chart.chartArea) {
+      const rect = canvas.getBoundingClientRect();
+      const x2 = evt && Number.isFinite(evt.clientX) ? (evt.clientX - rect.left) : (_strategyChartState.selection ? _strategyChartState.selection.x2 : _strategyChartState.dragStartX);
+      const x1 = _strategyChartState.dragStartX;
+      if (Math.abs(x2 - x1) > 12) {
+        const xScale = chart.scales.x;
+        const zoomMin = Number(xScale.getValueForPixel(Math.min(x1, x2)));
+        const zoomMax = Number(xScale.getValueForPixel(Math.max(x1, x2)));
+        if (Number.isFinite(zoomMin) && Number.isFinite(zoomMax) && zoomMax - zoomMin >= 60 * 1000) {
+          _applyRunnerChartViewport(chart, zoomMin, zoomMax, true);
+        }
+      }
+      _strategyChartState.selection = null;
+      chart.draw();
+    }
+    _strategyChartState.dragMode = '';
+    _strategyChartState.dragStartX = null;
+    _strategyChartState.dragStartY = null;
+    _strategyChartState.dragStartRange = null;
+    _setChartCursor('grab');
+  };
+
+  const onLeave = () => {
+    if (!_strategyChartState.dragMode) _setChartCursor('grab');
+  };
+
+  const onDoubleClick = evt => {
+    evt.preventDefault();
+    resetRunnerChartView();
+  };
+
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('mousedown', onMouseDown);
+  canvas.addEventListener('mouseleave', onLeave);
+  canvas.addEventListener('dblclick', onDoubleClick);
+  window.addEventListener('mousemove', onMouseMove);
+  window.addEventListener('mouseup', finishDrag);
+
+  chart.$argusDetachInteractions = () => {
+    canvas.removeEventListener('wheel', onWheel);
+    canvas.removeEventListener('mousedown', onMouseDown);
+    canvas.removeEventListener('mouseleave', onLeave);
+    canvas.removeEventListener('dblclick', onDoubleClick);
+    window.removeEventListener('mousemove', onMouseMove);
+    window.removeEventListener('mouseup', finishDrag);
+  };
+  chart.$argusInteractionsAttached = true;
+  _setChartCursor('grab');
+}
+
+function _updateChartPositionBadge(data, precision) {
+  const badge = document.getElementById('chart-position-badge');
+  if (!badge) return;
+  const stage = (data.deployment_stage || '').toUpperCase();
+  if (data.position !== 'FLAT') {
+    const pc = data.position === 'LONG' ? '#00ff88' : '#ff9800';
+    badge.innerHTML =
+      '<span style="color:' + pc + ';">' + data.position + ' @ ' + _chartFmtPrice(data.entry_price, precision) + '</span>' +
+      '<span style="color:#7b8ab8;"> - ' + stage + '</span>';
+  } else {
+    badge.innerHTML = '<span style="color:#7b8ab8;">FLAT</span><span style="color:#7b8ab8;"> - ' + stage + '</span>';
+  }
+}
+
+function _runnerChartHoverFromActive(chart, activeEls) {
+  const info = document.getElementById('chart-trade-info');
+  if (!info) return;
+  const payload = chart.$argusPayload || {};
+  const precision = payload.precision || 5;
+  if (!activeEls || !activeEls.length) {
+    _renderChartHoverDefault(payload, precision);
+    return;
+  }
+  const first = activeEls[0];
+  const ds = chart.data.datasets[first.datasetIndex];
+  const raw = ds.data[first.index] || {};
+  if (ds.label === 'Bars') {
+    const delta = _chartNum(raw.c) - _chartNum(raw.o);
+    const deltaColor = delta >= 0 ? '#00e676' : '#ff5252';
+    const meta = _chartActivityMeta(raw);
+    const activityValue = _chartActivityValue(raw);
+    const activityText = meta.short === 'Range'
+      ? _chartFmtSigned(activityValue, precision === 5 ? 5 : 2).replace(/^[+]/, '')
+      : _chartFmtVolume(activityValue);
+    info.innerHTML =
+      '<span style="color:#e8f0ff;">' + new Date(raw.x).toLocaleString() + '</span> ' +
+      '<span>O ' + _chartFmtPrice(raw.o, precision) + '</span> ' +
+      '<span>H ' + _chartFmtPrice(raw.h, precision) + '</span> ' +
+      '<span>L ' + _chartFmtPrice(raw.l, precision) + '</span> ' +
+      '<span>C <span style="color:' + deltaColor + ';">' + _chartFmtPrice(raw.c, precision) + '</span></span> ' +
+      '<span style="color:' + deltaColor + ';">' + _chartFmtSigned(delta, precision === 5 ? 5 : 2) + '</span> ' +
+      '<span>' + meta.short + ' ' + activityText + '</span>';
+    return;
+  }
+  if (ds.label === 'Long Entry' || ds.label === 'Short Entry') {
+    const dirColor = ds.label === 'Long Entry' ? '#00d4ff' : '#ff9800';
+    info.innerHTML =
+      '<span style="color:' + dirColor + ';font-weight:bold;">' + ds.label.toUpperCase() + '</span> ' +
+      '<span style="color:#e8f0ff;">' + new Date(raw.x).toLocaleString() + '</span> ' +
+      '<span>Price ' + _chartFmtPrice(raw.y, precision) + '</span>';
+    return;
+  }
+  if (ds.label === 'Exit') {
+    const pnlColor = _chartNum(raw.pnl) >= 0 ? '#00e676' : '#ff5252';
+    info.innerHTML =
+      '<span style="color:#e8f0ff;">EXIT ' + new Date(raw.x).toLocaleString() + '</span> ' +
+      '<span>Price ' + _chartFmtPrice(raw.y, precision) + '</span> ' +
+      '<span style="color:' + pnlColor + ';">' + _chartFmtSigned(raw.pnl, 1) + '</span> ' +
+      '<span style="color:#7b8ab8;">' + (raw.exit_reason || 'exit') + '</span>';
+  }
+}
+
+const _runnerCandlestickPlugin = {
+  id: 'argusLiveCandles',
+  afterDraw(chart) {
+    const payload = chart.$argusPayload || {};
+    const candles = chart.data?.datasets?.[0]?.data || [];
+    if (!candles.length) return;
+    const ctx = chart.ctx;
+    const xAxis = chart.scales.x;
+    const yAxis = chart.scales.y;
+    const area = chart.chartArea;
+    const precision = payload.precision || 5;
+
+    let candleW = 8;
+    if (candles.length > 1) {
+      let minGap = Infinity;
+      for (let i = 1; i < candles.length; i++) {
+        const gap = xAxis.getPixelForValue(candles[i].x) - xAxis.getPixelForValue(candles[i - 1].x);
+        if (gap > 0) minGap = Math.min(minGap, gap);
+      }
+      if (Number.isFinite(minGap)) candleW = Math.max(4, Math.min(14, minGap * 0.65));
+    }
+
+    ctx.save();
+    const visibleCandles = candles.filter(bar => bar.x >= Number(xAxis.min) && bar.x <= Number(xAxis.max));
+    const volumeCandles = (visibleCandles.length ? visibleCandles : candles).filter(bar => _chartNum(bar.activity, 0) > 0);
+    if (volumeCandles.length) {
+      const volPaneH = Math.max(38, (area.bottom - area.top) * 0.22);
+      const volTop = area.bottom - volPaneH;
+      const maxVol = Math.max(...volumeCandles.map(bar => _chartNum(bar.activity, 0)), 1);
+      const paneMeta = _chartActivityMeta(volumeCandles.find(bar => _chartNum(bar.activity, 0) > 0) || volumeCandles[0]);
+      const paneText = paneMeta.short === 'Range'
+        ? _chartFmtSigned(maxVol, precision === 5 ? 5 : 2).replace(/^[+]/, '')
+        : _chartFmtVolume(maxVol);
+      ctx.fillStyle = 'rgba(13,17,23,0.78)';
+      ctx.fillRect(area.left, volTop, area.right - area.left, volPaneH);
+      ctx.strokeStyle = 'rgba(47,64,102,0.7)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(area.left, volTop);
+      ctx.lineTo(area.right, volTop);
+      ctx.stroke();
+      for (const bar of volumeCandles) {
+        const x = xAxis.getPixelForValue(bar.x);
+        if (x < area.left - candleW || x > area.right + candleW) continue;
+        const bullish = bar.c >= bar.o;
+        const volH = Math.max(1, (_chartNum(bar.activity, 0) / maxVol) * (volPaneH - 4));
+        ctx.fillStyle = bullish ? 'rgba(0,212,255,0.22)' : 'rgba(255,152,0,0.22)';
+        ctx.fillRect(x - candleW / 2, area.bottom - volH, candleW, volH);
+      }
+      ctx.fillStyle = 'rgba(123,138,184,0.85)';
+      ctx.font = '10px Consolas, monospace';
+      ctx.fillText(paneMeta.pane + ' ' + paneText, area.left + 6, volTop + 11);
+    }
+
+    for (const bar of candles) {
+      const x = xAxis.getPixelForValue(bar.x);
+      if (x < area.left - candleW || x > area.right + candleW) continue;
+      const oY = yAxis.getPixelForValue(bar.o);
+      const cY = yAxis.getPixelForValue(bar.c);
+      const hY = yAxis.getPixelForValue(bar.h);
+      const lY = yAxis.getPixelForValue(bar.l);
+      const bullish = bar.c >= bar.o;
+      ctx.strokeStyle = bullish ? '#00e676' : '#ff5252';
+      ctx.fillStyle = bullish ? 'rgba(0,230,118,0.55)' : 'rgba(255,82,82,0.55)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, hY);
+      ctx.lineTo(x, lY);
+      ctx.stroke();
+      const top = Math.min(oY, cY);
+      const bodyH = Math.max(1.5, Math.abs(oY - cY));
+      ctx.fillRect(x - candleW / 2, top, candleW, bodyH);
+      ctx.strokeRect(x - candleW / 2, top, candleW, bodyH);
+    }
+
+    const drawLine = (price, color, label) => {
+      const n = _chartNum(price, NaN);
+      if (!Number.isFinite(n) || n <= 0) return;
+      const y = yAxis.getPixelForValue(n);
+      if (y < area.top || y > area.bottom) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(area.left, y);
+      ctx.lineTo(area.right, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color;
+      ctx.font = '10px Consolas, monospace';
+      const labelText = label + ' ' + _chartFmtPrice(n, precision);
+      const textW = ctx.measureText(labelText).width + 8;
+      ctx.fillRect(area.right - textW, y - 9, textW, 14);
+      ctx.fillStyle = '#0a0e17';
+      ctx.fillText(labelText, area.right - textW + 4, y + 1);
+    };
+
+    if (payload.position !== 'FLAT') {
+      drawLine(payload.entry_price, '#00d4ff', 'ENTRY');
+      drawLine(payload.stop_price, '#ff5252', 'STOP');
+      drawLine(payload.target_price, '#00e676', 'TARGET');
+    }
+
+    const last = candles[candles.length - 1];
+    if (last) {
+      const lastY = yAxis.getPixelForValue(last.c);
+      const label = _chartFmtPrice(last.c, precision);
+      const bg = last.c >= last.o ? '#00e676' : '#ff5252';
+      ctx.fillStyle = bg;
+      const w = ctx.measureText(label).width + 8;
+      ctx.fillRect(area.right - w, lastY - 8, w, 14);
+      ctx.fillStyle = '#0a0e17';
+      ctx.fillText(label, area.right - w + 4, lastY + 2);
+    }
+
+    const active = chart.getActiveElements();
+    if (active && active.length) {
+      const raw = chart.data.datasets[active[0].datasetIndex].data[active[0].index];
+      const x = xAxis.getPixelForValue(raw.x);
+      const y = yAxis.getPixelForValue(raw.y || raw.c);
+      ctx.strokeStyle = 'rgba(123,138,184,0.35)';
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x, area.top);
+      ctx.lineTo(x, area.bottom);
+      ctx.moveTo(area.left, y);
+      ctx.lineTo(area.right, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (_strategyChartState.selection) {
+      const left = Math.max(area.left, Math.min(_strategyChartState.selection.x1, _strategyChartState.selection.x2));
+      const right = Math.min(area.right, Math.max(_strategyChartState.selection.x1, _strategyChartState.selection.x2));
+      if (right - left > 1) {
+        ctx.fillStyle = 'rgba(0,212,255,0.12)';
+        ctx.strokeStyle = 'rgba(0,212,255,0.55)';
+        ctx.lineWidth = 1;
+        ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+        ctx.strokeRect(left, area.top, right - left, area.bottom - area.top);
+      }
+    }
+    ctx.restore();
+  }
+};
+
+async function loadRunnerChart(forceFit = false) {
+  const sel = document.getElementById('chart-symbol-select');
+  const chartKey = sel ? sel.value : '';
+  const canvas = document.getElementById('strategy-chart');
+  const info = document.getElementById('chart-trade-info');
+  if (!chartKey || !canvas || _strategyChartState.isLoading) return;
+
+  _strategyChartState.isLoading = true;
+  try {
+    const resp = await fetch('/api/runner_chart/' + encodeURIComponent(chartKey), { cache: 'no-store' });
+    const data = await resp.json();
+    if (data.error) {
+      if (info) info.textContent = data.error;
+      return;
+    }
+
+    const symbolChanged = _strategyChartState.symbol && _strategyChartState.symbol !== chartKey;
+    if (symbolChanged) {
+      _strategyChartState.lastYRange = null;
+      _strategyChartState.focusTs = null;
+    }
+    _strategyChartState.symbol = chartKey;
+    const fleetRunner = (_ibkrFleetCache || []).find(r => (r.chart_key || r.symbol) === chartKey) || null;
+    _updateChartSelectionState({
+      ...(fleetRunner || {}),
+      name: data.runner_name || fleetRunner?.name || data.symbol || chartKey,
+      current_stage: data.deployment_stage || fleetRunner?.current_stage || '',
+      stage_label: _chartStageLabel(data.deployment_stage || fleetRunner?.current_stage || ''),
+      position: data.position || fleetRunner?.position || 'FLAT',
+      status: fleetRunner?.status || '',
+    });
+
+    const precision = data.precision || 5;
+    _updateChartRangeButtons();
+    _updateChartFollowButton();
+    _updateChartPositionBadge(data, precision);
+    _renderChartStatus(data, precision);
+    _renderChartRecentTrades(data, precision);
+
+    const series = _buildRunnerChartSeries(data);
+    if (series.candles.length < 5) {
+      if (_strategyChart && symbolChanged) {
+        if (_strategyChart.$argusDetachInteractions) _strategyChart.$argusDetachInteractions();
+        _strategyChart.destroy();
+        _strategyChart = null;
+      }
+      _renderChartHoverDefault(data, precision);
+      return;
+    }
+
+    const view = _computeRunnerChartViewport(data, series, forceFit || symbolChanged);
+    if (!view) {
+      _renderChartHoverDefault(data, precision);
+      return;
+    }
+
+    const chartData = {
+      datasets: [
+        {
+          label: 'Bars',
+          type: 'line',
+          data: series.candles,
+          parsing: false,
+          borderWidth: 0,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          hitRadius: 14,
+          showLine: false,
+          backgroundColor: 'rgba(0,0,0,0)',
+          pointBackgroundColor: 'rgba(0,0,0,0)',
+          pointBorderColor: 'rgba(0,0,0,0)',
+        },
+        {
+          label: 'Long Entry',
+          type: 'scatter',
+          data: series.longEntries,
+          parsing: false,
+          showLine: false,
+          pointRadius: 6,
+          pointHoverRadius: 8,
+          pointStyle: 'triangle',
+          pointRotation: 0,
+          pointBackgroundColor: '#00d4ff',
+          pointBorderColor: '#08131f',
+          pointBorderWidth: 1.5,
+        },
+        {
+          label: 'Short Entry',
+          type: 'scatter',
+          data: series.shortEntries,
+          parsing: false,
+          showLine: false,
+          pointRadius: 6,
+          pointHoverRadius: 8,
+          pointStyle: 'triangle',
+          pointRotation: 180,
+          pointBackgroundColor: '#ff9800',
+          pointBorderColor: '#08131f',
+          pointBorderWidth: 1.5,
+        },
+        {
+          label: 'Exit',
+          type: 'scatter',
+          data: series.exits,
+          parsing: false,
+          showLine: false,
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          pointStyle: 'rectRot',
+          pointBackgroundColor: ctx => _chartNum(ctx.raw?.pnl, 0) >= 0 ? '#00e676' : '#ff5252',
+          pointBorderColor: '#d7e4ff',
+          pointBorderWidth: 1,
+        }
+      ]
+    };
+
+    const commonOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      normalized: true,
+      interaction: { mode: 'nearest', intersect: false },
+      onHover: (evt, activeEls, chart) => _runnerChartHoverFromActive(chart, activeEls),
+      onClick: (evt, activeEls, chart) => {
+        if (!activeEls || !activeEls.length) return;
+        const ds = chart.data.datasets[activeEls[0].datasetIndex];
+        const raw = ds.data[activeEls[0].index];
+        if (raw && raw.ts) focusRunnerTrade(raw.ts);
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          enabled: true,
+          displayColors: false,
+          backgroundColor: '#0d1117',
+          borderColor: '#243454',
+          borderWidth: 1,
+          padding: 10,
+          callbacks: {
+            title(items) {
+              const raw = items[0]?.raw || {};
+              return raw.x ? new Date(raw.x).toLocaleString() : '';
+            },
+            label(ctx) {
+              const raw = ctx.raw || {};
+              if (ctx.dataset.label === 'Bars') {
+                const meta = _chartActivityMeta(raw);
+                const activity = _chartActivityValue(raw);
+                const lines = [
+                  'O ' + _chartFmtPrice(raw.o, precision) + '  H ' + _chartFmtPrice(raw.h, precision),
+                  'L ' + _chartFmtPrice(raw.l, precision) + '  C ' + _chartFmtPrice(raw.c, precision),
+                ];
+                if (activity > 0) {
+                  const text = meta.short === 'Range'
+                    ? _chartFmtSigned(activity, precision === 5 ? 5 : 2).replace(/^[+]/, '')
+                    : _chartFmtVolume(activity);
+                  lines.push(meta.label + ' ' + text);
+                }
+                return lines;
+              }
+              if (ctx.dataset.label === 'Long Entry' || ctx.dataset.label === 'Short Entry') {
+                return ctx.dataset.label + ' @ ' + _chartFmtPrice(raw.y, precision);
+              }
+              if (ctx.dataset.label === 'Exit') {
+                return [
+                  'Exit @ ' + _chartFmtPrice(raw.y, precision),
+                  'PnL ' + _chartFmtSigned(raw.pnl, 1),
+                  raw.exit_reason || 'exit',
+                ];
+              }
+              return '';
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: {
+            unit: 'minute',
+            displayFormats: { minute: 'HH:mm' },
+            tooltipFormat: 'MMM d, HH:mm:ss',
+          },
+          min: view.xMin,
+          max: view.xMax,
+          grid: { color: 'rgba(30,42,66,0.55)' },
+          ticks: { color: '#7b8ab8', font: { size: 9 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+        },
+        y: {
+          min: view.yMin,
+          max: view.yMax,
+          position: 'right',
+          grid: { color: 'rgba(30,42,66,0.55)' },
+          ticks: { color: '#7b8ab8', font: { size: 9 } },
+        }
+      }
+    };
+
+    if (!_strategyChart || symbolChanged) {
+      if (_strategyChart) {
+        if (_strategyChart.$argusDetachInteractions) _strategyChart.$argusDetachInteractions();
+        _strategyChart.destroy();
+      }
+      _strategyChart = new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: chartData,
+        options: commonOptions,
+        plugins: [_runnerCandlestickPlugin],
+      });
+      _attachRunnerChartInteractions(_strategyChart);
+    } else {
+      _strategyChart.data = chartData;
+      _strategyChart.options = commonOptions;
+      _strategyChart.update('none');
+    }
+
+    _strategyChart.$argusPayload = data;
+    _strategyChart.$argusSeries = series;
+    _strategyChart.update('none');
+    _runnerChartHoverFromActive(_strategyChart, _strategyChart.getActiveElements());
+  } catch (e) {
+    if (info) info.textContent = 'Chart error: ' + e.message;
+  } finally {
+    _strategyChartState.isLoading = false;
+  }
+}
+
+// Populate symbol selector from fleet data
+function _chartStageLabel(stage) {
+  const normalized = String(stage || '').toLowerCase();
+  if (normalized === 'paper') return 'QA';
+  if (normalized === 'real' || normalized === 'quarantine') return 'PROD';
+  if (normalized === 'watcher') return 'WATCHER';
+  return normalized ? normalized.toUpperCase() : 'UNKNOWN';
+}
+
+function _chartRunnerActiveTag(runner) {
+  const pos = String(runner?.position || '').toUpperCase();
+  if (pos === 'LONG') return 'ACTIVE LONG';
+  if (pos === 'SHORT') return 'ACTIVE SHORT';
+  return '';
+}
+
+function _chartStageOrder(stageLabel) {
+  const order = { PROD: 0, QA: 1, WATCHER: 2 };
+  return order[stageLabel] ?? 9;
+}
+
+function _chartFindActiveRunner(runners) {
+  return (runners || [])
+    .filter(r => _chartRunnerActiveTag(r))
+    .sort((a, b) => {
+      const stageDiff = _chartStageOrder(a.stage_label) - _chartStageOrder(b.stage_label);
+      if (stageDiff) return stageDiff;
+      return String(a.name || a.symbol || '').localeCompare(String(b.name || b.symbol || ''));
+    })[0] || null;
+}
+
+function _updateChartSelectionState(runner) {
+  const chip = document.getElementById('chart-selection-state');
+  if (!chip) return;
+  if (!runner) {
+    chip.textContent = 'No pair selected';
+    chip.style.color = '#7b8ab8';
+    chip.style.borderColor = '#1e2a42';
+    chip.style.background = 'transparent';
+    return;
+  }
+  const stageLabel = runner.stage_label || _chartStageLabel(runner.current_stage);
+  const activeTag = _chartRunnerActiveTag(runner);
+  const status = String(runner.status || '').toUpperCase() || 'UNKNOWN';
+  const statusColor = activeTag
+    ? (String(runner.position || '').toUpperCase() === 'LONG' ? '#00e676' : '#ff9800')
+    : (stageLabel === 'PROD' ? '#00e676' : stageLabel === 'QA' ? '#00d4ff' : '#7b8ab8');
+  chip.textContent = `${stageLabel} | ${activeTag || status}`;
+  chip.style.color = statusColor;
+  chip.style.borderColor = statusColor + '55';
+  chip.style.background = statusColor + '11';
+}
+
+function populateChartSelector(runners) {
+  const sel = document.getElementById('chart-symbol-select');
+  if (!sel) return;
+  const current = sel.value;
+  const chartRunners = (runners || [])
+    .filter(r => (r.chart_key || r.symbol))
+    .map(r => ({
+      ...r,
+      chart_key: r.chart_key || r.symbol,
+      stage_label: _chartStageLabel(r.current_stage),
+    }))
+    .sort((a, b) => {
+      const diff = _chartStageOrder(a.stage_label) - _chartStageOrder(b.stage_label);
+      if (diff) return diff;
+      const activeDiff = (_chartRunnerActiveTag(b) ? 1 : 0) - (_chartRunnerActiveTag(a) ? 1 : 0);
+      if (activeDiff) return activeDiff;
+      return String(a.name || a.symbol || '').localeCompare(String(b.name || b.symbol || ''));
+    });
+  sel.innerHTML = '<option value="">Select pair...</option>';
+  const groups = { PROD: [], QA: [], WATCHER: [], OTHER: [] };
+  for (const runner of chartRunners) {
+    const bucket = groups[runner.stage_label] ? runner.stage_label : 'OTHER';
+    groups[bucket].push(runner);
+  }
+  ['PROD', 'QA', 'WATCHER', 'OTHER'].forEach(label => {
+    if (!groups[label].length) return;
+    const group = document.createElement('optgroup');
+    group.label = label;
+    groups[label].forEach(r => {
+      const opt = document.createElement('option');
+      opt.value = r.chart_key;
+      const activeTag = _chartRunnerActiveTag(r);
+      opt.textContent = (activeTag ? '>> ' : '') + (r.name || r.symbol || r.chart_key) + ' [' + r.stage_label + ']' + (activeTag ? ' - ' + activeTag : '');
+      if (activeTag) {
+        opt.style.fontWeight = '700';
+        opt.style.color = r.position === 'LONG' ? '#00e676' : '#ff9800';
+        opt.style.backgroundColor = 'rgba(0, 212, 255, 0.08)';
+      }
+      if (r.chart_key === current) opt.selected = true;
+      group.appendChild(opt);
+    });
+    sel.appendChild(group);
+  });
+  let selectedRunner = chartRunners.find(r => r.chart_key === sel.value) || null;
+  const activeRunner = _chartFindActiveRunner(chartRunners);
+  if (_strategyChartState.autoFollow && activeRunner && (!selectedRunner || !_chartRunnerActiveTag(selectedRunner))) {
+    sel.value = activeRunner.chart_key;
+    selectedRunner = activeRunner;
+    _updateChartSelectionState(selectedRunner);
+    if (current !== activeRunner.chart_key) {
+      loadRunnerChart(true);
+      return;
+    }
+  }
+  if (!sel.value && chartRunners.length) {
+    const best = chartRunners
+      .filter(r => _chartRunnerActiveTag(r) || r.closed_trades > 0)
+      .sort((a, b) => {
+        const activeDiff = (_chartRunnerActiveTag(b) ? 1 : 0) - (_chartRunnerActiveTag(a) ? 1 : 0);
+        if (activeDiff) return activeDiff;
+        const stageDiff = _chartStageOrder(a.stage_label) - _chartStageOrder(b.stage_label);
+        if (stageDiff) return stageDiff;
+        return Number(b.pnl_usd || b.pnl || 0) - Number(a.pnl_usd || a.pnl || 0);
+      })[0] || chartRunners.find(r => r.stage_label === 'QA') || chartRunners.find(r => r.stage_label === 'PROD') || chartRunners[0];
+    if (best) {
+      sel.value = best.chart_key;
+      selectedRunner = best;
+      _updateChartSelectionState(selectedRunner);
+      loadRunnerChart(true);
+      return;
+    }
+  }
+  _updateChartSelectionState(selectedRunner || activeRunner || chartRunners[0] || null);
+  _updateChartRangeButtons();
+  _updateChartFollowButton();
 }
 
 // ── QA Learning loader ────────────────────────────────
@@ -6715,6 +8462,10 @@ try {
   setInterval(loadGovernanceHealth, 30000);
   loadQALearning();
   setInterval(loadQALearning, 60000);
+  setInterval(function() {
+    if (document.hidden) return;
+    if (document.getElementById('chart-symbol-select')?.value) loadRunnerChart(false);
+  }, 15000);
   loadStageHistory();
   setInterval(loadStageHistory, 30000);
   loadDailyPerformance();

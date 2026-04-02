@@ -39,15 +39,16 @@ from argus_flow.ops.broker_truth import (
     runner_broker_state_path,
 )
 from argus_flow.ops.fleet_registry import (
-    default_log_dir,
     infer_stage,
     load_existing_registry_entry,
     normalize_stage,
+    resolve_log_dir,
     resolve_risk_policy,
     stage_account,
     stage_execution_mode,
 )
-from argus_flow.schemas import signal_header, build_signal_row, trade_header
+from argus_flow.ops.trade_artifact_schema import ensure_trade_csv_schema
+from argus_flow.schemas import signal_header, build_signal_row
 from argus_flow.sizing import (
     DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD,
     fx_pip_value_per_unit_usd,
@@ -548,6 +549,20 @@ def _write_heartbeat_files(
             # enough to emit a heartbeat so dashboard/oversight surfaces never
             # fall back to inferred runtime state.
             inst.state.save()
+            # Persist recent bars for dashboard candlestick chart
+            recent_bars = [
+                {
+                    "t": b.get("ts", ""),
+                    "o": b["open"],
+                    "h": b["high"],
+                    "l": b["low"],
+                    "c": b["close"],
+                    "v": float(b.get("volume", 0) or 0.0),
+                    "n": int(b.get("ticks", 0) or 0),
+                }
+                for b in inst.buf.bars[-120:]  # last 2 hours of 1-min bars
+            ] if inst.buf.bars else []
+
             atomic_write_json(hb_file, {
                 "ts": now.isoformat(),
                 "pid": os.getpid(),
@@ -567,6 +582,10 @@ def _write_heartbeat_files(
                 "account_equity_usd": equity_tracker.equity_usd,
                 "open_risk_usd": inst.current_open_risk_usd(),
                 "unrealized_pnl_usd": inst.current_unrealized_pnl_usd(),
+                "recent_bars": recent_bars,
+                "entry_price": inst.state.entry_price if inst.state.position != "FLAT" else None,
+                "stop_price": inst.state.stop_price if inst.state.position != "FLAT" else None,
+                "target_price": inst.state.target_price if inst.state.position != "FLAT" else None,
             })
         except Exception:
             pass
@@ -1291,9 +1310,7 @@ class InstrumentRunner:
         return True, ""
 
     def _ensure_trade_header(self) -> None:
-        if not self.trade_log.exists():
-            with open(self.trade_log, "w", newline="") as f:
-                csv.writer(f).writerow(trade_header(self.uses_pips))
+        ensure_trade_csv_schema(self.trade_log, self.uses_pips)
 
     def _log_trade(self, exit_price: float, exit_reason: str, now: datetime) -> tuple[float, float]:
         """Log closed trade, return PnL in pips/points and USD."""
@@ -1979,7 +1996,7 @@ class InstrumentRunner:
         if self.current_bar_minute is None:
             self.current_bar_minute = bar_minute
             self.current_bar = {
-                "open": mid, "high": mid, "low": mid, "close": mid, "volume": vol,
+                "open": mid, "high": mid, "low": mid, "close": mid, "volume": vol, "ticks": 1,
             }
         elif bar_minute > self.current_bar_minute:
             # Close prior bar, push to buffer
@@ -1989,12 +2006,13 @@ class InstrumentRunner:
             new_bar_closed = True
             self.current_bar_minute = bar_minute
             self.current_bar = {
-                "open": mid, "high": mid, "low": mid, "close": mid, "volume": vol,
+                "open": mid, "high": mid, "low": mid, "close": mid, "volume": vol, "ticks": 1,
             }
         else:
             self.current_bar["high"] = max(self.current_bar["high"], mid)
             self.current_bar["low"] = min(self.current_bar["low"], mid)
             self.current_bar["close"] = mid
+            self.current_bar["ticks"] = self.current_bar.get("ticks", 0) + 1
             if vol > 0:
                 self.current_bar["volume"] = self.current_bar.get("volume", 0) + vol  # accumulate, not overwrite
 
@@ -2359,11 +2377,24 @@ class InstrumentRunner:
             self._log.warning(f"Historical data request failed: {e}")
             bars = []
         for b in bars:
+            raw_volume = getattr(b, "volume", 0)
+            try:
+                volume = float(raw_volume)
+            except (TypeError, ValueError):
+                volume = 0.0
+            if volume < 0:
+                volume = 0.0
+            raw_ticks = getattr(b, "barCount", 0)
+            try:
+                ticks = int(raw_ticks)
+            except (TypeError, ValueError):
+                ticks = 0
             self.buf.add({
                 "ts": str(b.date),
                 "open": b.open, "high": b.high,
                 "low": b.low, "close": b.close,
-                "volume": getattr(b, "volume", 0),
+                "volume": volume,
+                "ticks": max(ticks, 0),
             })
         self._log.info(f"Seeded {len(self.buf)} bars")
 
@@ -2406,8 +2437,10 @@ def log_dir_for(cfg: dict) -> Path:
     if raw:
         path = Path(raw)
         return path if path.is_absolute() else REPO / path
-    stage = str(deployment.get("stage", "paper") or "paper").lower()
-    return REPO / default_log_dir(cfg["symbol"], stage)
+    config_path = Path(str(cfg.get("__config_path__", "") or ""))
+    if not config_path.is_absolute():
+        config_path = (REPO / config_path).resolve() if str(config_path) else REPO / "argus_flow" / "configs" / f"{cfg['symbol'].lower()}.json"
+    return REPO / resolve_log_dir(cfg, config_path)
 
 
 # =================================================================
@@ -2935,6 +2968,8 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             skipped += 1
             continue
 
+        cfg["__config_path__"] = str(cfg_path)
+
         sym = cfg.get("symbol", "???")
 
         # Apply exclusion filter
@@ -3110,8 +3145,10 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     # -- Main loop ---------------------------------------------------���───────────────
     log.info("Starting main loop (Ctrl+C to stop)...")
-    heartbeat_interval = 300  # log heartbeat every 5 min
+    heartbeat_interval = 300  # full broker/account heartbeat every 5 min
+    heartbeat_file_interval = 60  # lightweight chart/state heartbeat every 1 min
     last_heartbeat = time.time()
+    last_heartbeat_file_write = 0.0
     _last_periodic_recon = time.time()  # periodic broker recon every 5 min
 
     try:
@@ -3210,7 +3247,18 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                 except Exception as e:
                     log.warning(f"Periodic reconciliation failed: {e}")
 
-            # Periodic heartbeat (log + per-instrument heartbeat files)
+            # Lightweight per-instrument heartbeat for dashboard/chart freshness
+            if time.time() - last_heartbeat_file_write > heartbeat_file_interval:
+                last_heartbeat_file_write = time.time()
+                _write_heartbeat_files(
+                    instruments,
+                    runtime_mode,
+                    ib,
+                    equity_tracker,
+                    now,
+                )
+
+            # Periodic full heartbeat (broker/account truth + log)
             if time.time() - last_heartbeat > heartbeat_interval:
                 last_heartbeat = time.time()
                 broker_positions, broker_ok, broker_error = _fetch_broker_positions(ib) if ib.isConnected() else ({}, False, "ib_disconnected")
@@ -3276,13 +3324,6 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     f"{flat_count} flat | {pos_str}"
                 )
                 risk_mgr.save_persistent_state()
-                _write_heartbeat_files(
-                    instruments,
-                    runtime_mode,
-                    ib,
-                    equity_tracker,
-                    now,
-                )
 
     except KeyboardInterrupt:
         log.info("Shutting down (Ctrl+C)...")

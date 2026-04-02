@@ -162,6 +162,22 @@ def default_display_name(symbol: str) -> str:
     return symbol
 
 
+def _variant_suffix(deployment: dict, stage: str, config_path: Path | None = None) -> str:
+    if normalize_stage(stage) != STAGE_WATCHER:
+        return ""
+    if not isinstance(deployment, dict):
+        return ""
+    raw = str(deployment.get("variant_type", "") or "").strip().lower()
+    if not raw and config_path is not None and deployment.get("variant_of"):
+        stem = config_path.stem.lower()
+        if "_watcher_v1" in stem:
+            raw = stem.replace("_watcher_v1", "")
+    if not raw:
+        return ""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_")
+    return safe
+
+
 def strategy_display_name(strategy: str) -> str:
     text = str(strategy or "").strip()
     if not text:
@@ -188,11 +204,13 @@ def mult_for_config(config: dict) -> int:
     return 100 if "JPY" in symbol else 10000
 
 
-def default_log_dir(symbol: str, stage: str) -> str:
+def default_log_dir(symbol: str, stage: str, variant_suffix: str = "") -> str:
     stage = normalize_stage(stage)
     symbol = str(symbol or "").lower()
     if stage in (STAGE_REAL, STAGE_QUARANTINE):
         return f"argus_flow/logs/live_{symbol}"
+    if stage == STAGE_WATCHER and variant_suffix:
+        return f"argus_flow/logs/{symbol}_{variant_suffix}"
     return f"argus_flow/logs/{symbol}"
 
 
@@ -201,7 +219,9 @@ def resolve_log_dir(config: dict, config_path: Path) -> str:
     raw = str(deployment.get("log_dir", "") or "").strip()
     if raw:
         return raw.replace("\\", "/")
-    return default_log_dir(str(config.get("symbol", config_path.stem)), infer_stage(config, config_path))
+    stage = infer_stage(config, config_path)
+    variant_suffix = _variant_suffix(deployment, stage, config_path)
+    return default_log_dir(str(config.get("symbol", config_path.stem)), stage, variant_suffix=variant_suffix)
 
 
 def is_live_config(config: dict, config_path: Path) -> bool:
@@ -308,7 +328,16 @@ def discover_managed_runners() -> list[dict]:
         runners.append(
             {
                 "id": f"{current_stage}:{config_path.stem.lower()}",
-                "name": str(legacy.get("name", config.get("name", default_display_name(symbol)))),
+                "name": str(
+                    config.get(
+                        "name",
+                        (
+                            f"{default_display_name(symbol)} ({deployment.get('variant_label')})"
+                            if deployment.get("variant_label")
+                            else legacy.get("name", default_display_name(symbol))
+                        ),
+                    )
+                ),
                 "symbol": symbol,
                 "strategy": strategy_display_name(str(config.get("strategy", ""))),
                 "instrument_type": str(config.get("instrument_type", "forex")).lower(),

@@ -1,7 +1,7 @@
 # PROMOTION PIPELINE — Complete Stage Lifecycle
-# Last updated: 2026-03-31
+# Last updated: 2026-04-02
 # Maintained to match the stage engine in fleet_registry.py, deployment_pipeline.py,
-# promotion_gate_v2.py, and demotion_check.py.
+# promotion_gate_v2.py, demotion_check.py, and stage_actions.py.
 
 ---
 
@@ -14,7 +14,7 @@
 | QA | Prove live trading edge | 0.5% base on $10K model, shared earned ladder to 3.0% cap | Paper trades, full governance |
 | PROD | Generate returns | 0.5% base on real equity, shared earned ladder to 3.0% cap | Real money, full governance |
 | QUARANTINED | Under review, reduced activity | 0.25% (half of base) | Real money, reduced size |
-| KILLED | Retired from the managed fleet | None | Non-launchable, excluded from active ops surfaces |
+| KILLED | Retired from the managed fleet | None | Non-launchable, moved to Graveyard on dashboard. REVIVE button available. |
 
 ---
 
@@ -261,3 +261,32 @@ WATCHER --[WF = FAIL]--> KILLED
 | Correlation limits enforcement | PARTIAL | Guard exists, not yet promoted to one canonical governance artifact |
 | Watcher observe-only execution | BUILT | Watcher runners log signals and do not open trades |
 | Managed truth refresh | BUILT | refresh_managed_truth drives launch_fleet, watchdog, scheduler, and nightly summary from one path |
+| Auto-execute stage transitions | BUILT | stage_actions.py runs after deployment_pipeline in managed truth refresh |
+| Dashboard action buttons | BUILT | Promote/demote/kill/quarantine/revive per card + fleet pause/resume |
+| Stage transition history | BUILT | stage_history.jsonl + /api/stage_history + dashboard timeline panel |
+| Graveyard for killed pairs | BUILT | Compact tombstone rows with REVIVE button, auto-hides when empty |
+| No-progress kill rule | BUILT | PF < 1.05 after 80 trades = KILL (mediocrity pruning) |
+| Strategy kill clock | BUILT | PF < 1.0 after 60 trades = strategy hypothesis dead |
+| Execution quality gate | BUILT | Advisory check in promotion_gate: slippage < 20% of avg win |
+| Entry-feature stamping | BUILT | Schema v4: mtf_score, session_score, spread_ratio, conviction_score, slippage_pips, fill_latency_ms |
+| Conviction scoring | BUILT (LOG_ONLY) | Equal-weighted, stamped on trades. Not used for sizing until 60+ trades prove bucket separation |
+| MTF alignment | BUILT (LOG_ONLY) | 5m/15m/30m/1h/4h trend analysis. Shadow-blocks logged but do not prevent entries |
+| Spread gate | BUILT (HARD) | Blocks entry when spread > 1.5x rolling average |
+| News filter | BUILT (HARD) | Blocks entry around FOMC/NFP/ECB high-impact windows |
+| Entry sequencing | BUILT (HARD) | 30-min delay between correlated pair entries |
+| Drawdown-scaled sizing | BUILT | Linear ramp: max(0.2, 1 - dd/max_dd). Floor at 0.2x, hard pause at 3% |
+| Watcher variants | BUILT | 16 aggressive/conservative variants deployed for parallel testing |
+
+---
+
+## CURRENT FLEET STATE (2026-04-02)
+
+| Stage | Count | Details |
+|-------|-------|---------|
+| PAPER | 8 | EUR/USD, GBP/USD, EUR/JPY, GBP/JPY, USD/JPY, AUD/USD, CAD/JPY, AUD/JPY |
+| WATCHER | 28 | 12 futures configs + 16 FX variants (aggressive/conservative per pair) |
+| KILLED | 2 | BTC (crypto, not tradeable on IBKR), MCL (walk-forward FAIL 0/6 folds) |
+| REAL | 0 | No pair has earned promotion yet (max 7 trades on AUD/JPY) |
+
+All pairs properly onboarded with `deployment.managed=true` as of 2026-04-02.
+Futures de-scoped from initial live launch. FX-only first.

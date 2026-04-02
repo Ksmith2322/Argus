@@ -35,5 +35,11 @@
         ]
     },
     "exchange": "NYMEX",
-    "expiry": "202605"
+    "expiry": "202605",
+    "deployment": {
+        "managed": true,
+        "stage": "watcher",
+        "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
+        "onboarded_by": "auto_onboard_cleanup"
+    }
 }

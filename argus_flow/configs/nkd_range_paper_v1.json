@@ -26,9 +26,21 @@
     },
     "replay_expectations": {
         "signals_per_day": 4.0,
-        "signals_per_day_range": [1, 15],
+        "signals_per_day_range": [
+            1,
+            15
+        ],
         "win_rate": 0.48,
-        "win_rate_range": [0.35, 0.65],
+        "win_rate_range": [
+            0.35,
+            0.65
+        ],
         "exp_bps_per_trade": 1.5
+    },
+    "deployment": {
+        "managed": true,
+        "stage": "watcher",
+        "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
+        "onboarded_by": "auto_onboard_cleanup"
     }
 }

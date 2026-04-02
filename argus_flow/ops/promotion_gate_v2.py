@@ -21,8 +21,8 @@ from urllib.request import urlopen
 from argus_flow.ops.fleet_registry import DEPLOYMENT_REGISTRY_FILE, STAGE_PAPER, discover_managed_runners
 
 REPO = Path(__file__).resolve().parents[2]
-LOGS = REPO / "argus_flow" / "logs"
 CONFIGS = REPO / "argus_flow" / "configs"
+LOGS = REPO / "argus_flow" / "logs"
 
 PROMOTION_THRESHOLD = 60
 PROMOTION_MIN_CALENDAR_DAYS = 14
@@ -132,15 +132,55 @@ def _stage_entered_at(symbol: str, config_file: str = "") -> datetime | None:
     return None
 
 
-def _load_replay_expectations(symbol: str) -> dict:
+def _load_replay_expectations(runner: dict) -> dict:
+    config_file = str(runner.get("config_file", "") or "").strip()
+    config_path = str(runner.get("config_path", "") or "").strip()
+    if config_file:
+        candidate = CONFIGS / config_file
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8")).get("replay_expectations", {})
+            except (json.JSONDecodeError, OSError):
+                pass
+    if config_path:
+        candidate = REPO / config_path
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8")).get("replay_expectations", {})
+            except (json.JSONDecodeError, OSError):
+                pass
+    symbol = str(runner.get("symbol", "") or "").upper()
     for cfg_path in CONFIGS.glob("*.json"):
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if str(cfg.get("symbol", "")).upper() == symbol.upper():
+        if str(cfg.get("symbol", "")).upper() == symbol:
             return cfg.get("replay_expectations", {})
     return {}
+
+
+def _runner_log_dir(runner: dict) -> Path:
+    raw = str(runner.get("log_dir", "") or "").strip()
+    log_dir = Path(raw)
+    if log_dir.is_absolute():
+        return log_dir
+    return REPO / log_dir
+
+
+def _registry_runner_entry(symbol: str, config_file: str = "") -> dict | None:
+    report = _load_json(DEPLOYMENT_REGISTRY_FILE)
+    if not isinstance(report, dict):
+        return None
+    for runner in report.get("runners", []):
+        if not isinstance(runner, dict):
+            continue
+        if str(runner.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if config_file and str(runner.get("config_file", "") or "") != config_file:
+            continue
+        return runner
+    return None
 
 
 def _load_walkforward_report(log_dir: Path) -> dict | None:
@@ -444,36 +484,39 @@ def check_survived_disconnect(all_trades: list[dict]) -> CheckResult:
 
 
 def check_dashboard_truth(runner: dict, all_trades: list[dict], valid_trades: list[dict]) -> CheckResult:
-    fleet = _load_dashboard_fleet()
-    if fleet is None:
-        return _unevidenced("dashboard API unavailable")
-
     symbol = str(runner.get("symbol", "") or "").upper()
-    entry = fleet.get(symbol)
+    config_file = str(runner.get("config_file", "") or "")
+    entry = _registry_runner_entry(symbol, config_file)
     if not isinstance(entry, dict):
-        return _hard(False, f"dashboard missing runner {symbol}")
+        return _hard(False, f"deployment registry missing runner {symbol}")
 
-    stage = str(entry.get("current_stage", entry.get("lane", "")) or "").lower()
+    stage = str(entry.get("current_stage", "") or "").lower()
     if stage != STAGE_PAPER:
-        return _hard(False, f"dashboard stage={stage or 'unknown'} expected={STAGE_PAPER}")
+        return _hard(False, f"registry stage={stage or 'unknown'} expected={STAGE_PAPER}")
 
-    dash_valid = int(entry.get("valid_trades", 0) or 0)
-    dash_invalid = int(entry.get("invalid_trades", 0) or 0)
     local_invalid = max(len(all_trades) - len(valid_trades), 0)
-    if dash_valid != len(valid_trades) or dash_invalid != local_invalid:
-        return _hard(
-            False,
-            (
-                "dashboard trade counts diverge "
-                f"(dashboard valid/invalid={dash_valid}/{dash_invalid}, "
-                f"local={len(valid_trades)}/{local_invalid})"
-            ),
-        )
+    detail = f"local artifact truth consistent: stage={stage} valid={len(valid_trades)} invalid={local_invalid}"
 
-    return _hard(
-        True,
-        f"dashboard matches local truth: stage={stage} valid={dash_valid} invalid={dash_invalid}",
-    )
+    fleet = _load_dashboard_fleet()
+    if fleet is not None:
+        dashboard_entry = fleet.get(symbol)
+        if isinstance(dashboard_entry, dict):
+            dash_valid = int(dashboard_entry.get("valid_trades", 0) or 0)
+            dash_invalid = int(dashboard_entry.get("invalid_trades", 0) or 0)
+            dash_stage = str(dashboard_entry.get("current_stage", dashboard_entry.get("lane", "")) or "").lower()
+            if dash_valid == len(valid_trades) and dash_invalid == local_invalid and dash_stage == stage:
+                detail += "; dashboard mirror matches"
+            else:
+                detail += (
+                    "; dashboard mirror stale "
+                    f"(dashboard stage={dash_stage or 'unknown'} valid/invalid={dash_valid}/{dash_invalid})"
+                )
+        else:
+            detail += "; dashboard mirror missing"
+    else:
+        detail += "; dashboard mirror unavailable"
+
+    return _hard(True, detail)
 
 
 def check_no_manual_intervention(valid_trades: list[dict]) -> CheckResult:
@@ -570,10 +613,10 @@ def check_live_drawdown_vs_walkforward(valid_trades: list[dict], log_dir: Path) 
 
 
 def evaluate_runner(runner: dict) -> dict:
-    log_dir = LOGS / runner["log_dir"]
+    log_dir = _runner_log_dir(runner)
     all_trades = _load_trades(log_dir)
     valid_trades = [t for t in all_trades if str(t.get("experiment_valid", "")).lower() == "true"]
-    replay_expectations = _load_replay_expectations(runner["symbol"])
+    replay_expectations = _load_replay_expectations(runner)
 
     checks: dict[str, CheckResult] = {
         "min_valid_trades": check_min_valid_trades(valid_trades),

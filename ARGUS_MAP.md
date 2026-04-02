@@ -1,11 +1,18 @@
 # ARGUS MAP
-# Last updated: 2026-03-31 -- IBKR fleet primary, crypto dormant
+# Last updated: 2026-04-02 -- IBKR fleet primary, crypto dormant
 
 This map reflects your current working reality:
 - PRIMARY SYSTEM: IBKR Trading Engine (argus_flow/runner_unified.py)
-  - 8 FX pairs + 6 futures, grouped into 2 runner processes (clientId 1 + 2)
-  - 7 watcher configs, 7 paper QA configs, 0 real-money configs
-  - Dashboard: ops/dashboard.py (port 8080)
+  - 8 FX pairs (paper) + 12 futures (watcher) + 16 FX variants (watcher) + 2 killed
+  - Grouped into 2 runner processes (clientId 1=FX, clientId 2=futures)
+  - Dashboard: ops/dashboard.py (port 8080) with live candlestick chart, action buttons, graveyard
+  - Advanced features: multi-timeframe (5m/15m/30m/1h/4h), spread gate, news filter, entry sequencing
+  - Schema v4: entry-feature stamping, execution quality tracking, conviction scoring
+  - 3-mode shutdown: PAUSE_ENTRIES / GRACEFUL_EXIT / KILL_SWITCH
+  - Auto stage transitions: watcher -> paper -> real -> quarantine -> killed (graveyard)
+  - Managed truth refresh with walk-forward reuse (6hr cache) and auto-apply transitions
+  - Smoke test uses read-only IBKR sessions with collision-safe client IDs
+  - Futures historical data path working (download_ibkr_bars.py)
 - DORMANT: Coinbase crypto engine (root-level *.py files) -- venue kills edge at 60bps
 - Legacy backtest/analytics in root still reference crypto; IBKR backtest is argus_flow/backtest/engine.py
 

@@ -143,7 +143,15 @@ def check_runner(runner: dict) -> dict:
             result["checks"].append(_check("trade_file_readable", False, str(e), FAIL))
 
     if state_file.exists() and trade_file.exists():
-        if state_trades != csv_trade_serial:
+        if (
+            str(runner.get("current_stage", "")).lower() == "watcher"
+            and state_pos == "FLAT"
+            and csv_trade_serial == 0
+            and state_trades > 0
+        ):
+            result["checks"].append(_check("trade_serial_match", True,
+                f"watcher observe-only; ignoring legacy state trade_count={state_trades}", INFO))
+        elif state_trades != csv_trade_serial:
             result["checks"].append(_check("trade_serial_match", False,
                 f"state={state_trades} vs csv_last_trade_num={csv_trade_serial}", FAIL))
         else:

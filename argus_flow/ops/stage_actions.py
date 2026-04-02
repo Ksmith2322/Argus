@@ -61,6 +61,9 @@ VALID_TRANSITIONS = {
         STAGE_REAL: STAGE_KILLED,
         STAGE_QUARANTINE: STAGE_KILLED,
     },
+    "revive": {
+        STAGE_KILLED: STAGE_WATCHER,
+    },
 }
 
 

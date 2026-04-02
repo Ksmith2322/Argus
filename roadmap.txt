@@ -1,5 +1,5 @@
 # ARGUS ROADMAP
-# Last updated: 2026-03-31
+# Last updated: 2026-04-02
 # Goal: Build multiple independent, automatable edge engines.
 # Each must have measurable EV, be automatable, and scale capital.
 # Strategy: narrow -> prove -> scale -> expand
@@ -110,22 +110,42 @@
     - Legacy path cleanup so the old promotion/alert code cannot drift from v2 surfaces
     - Full journal USD coverage for validation trades if we want trustworthy per-day FX dollar summaries
     - Discord webhook delivery verified on a real network path
-    - Historical 1m datasets for watcher futures that still read MISSING_DATA:
-        M2K
-        MCL
-        MGC
-      or retire them from the managed watcher lane until data exists
-    - One clean operator pass to retire any leftover legacy watchdog shell from earlier QA runs if it is still present on the machine
+    - Historical 1m datasets for watcher futures: RESOLVED
+        M2K: data exists, walk-forward PASS, stage=WATCHER
+        MCL: data exists, walk-forward FAIL (0/6 folds positive), stage=KILLED (graveyard)
+        MGC: data exists, walk-forward PASS, stage=WATCHER
+      All futures now properly onboarded with deployment.managed=true
+    - Legacy watchdog cleanup: RESOLVED
+        ArgusWatchdog task points to watchdog_managed.ps1
+        No legacy watchdog processes remain
+    - Managed truth refresh now reuses fresh walk-forward results (max_age_s=21600)
+        instead of re-running walk-forward on every cycle, saving ~5min per refresh
+    - trade_artifact_schema.py added as first step in managed truth refresh
+    - Schema v4 deployed: trades.csv now includes entry-feature stamping
+        (mtf_score, session_score, spread_ratio, conviction_score, slippage_pips, fill_latency_ms)
 
-  Current evidence read:
-    - GBP/USD: strongest validation candidate so far (walk-forward PASS, live sample still tiny)
-    - EUR/JPY: promising on walk-forward, live sample still tiny
-    - EUR/USD: not yet proven (walk-forward WATCH / negative mean expectancy)
-    - USD/JPY: walk-forward PASS and now promoted into paper QA, but still divergence-killed on live-paper signal frequency
-    - Fleet ops state:
-        broker truth / position monitor / artifact divergence are clean after the grouped-runner restart
-        active manual-action items are currently divergence KILLs on EUR/USD, GBP/USD, EUR/JPY, GBP/JPY, USD/JPY
-        AUD/USD remains WATCH on signal-frequency divergence
+  Current evidence read (updated 2026-04-02):
+    - AUD/JPY: 7 trades, 71% WR, +22.9 pips — best performer so far
+    - AUD/USD: 5 trades, 40% WR, -17.8 pips — negative, needs more data
+    - USD/JPY: 2 trades, 100% WR, +24.4 pips — tiny sample but promising
+    - GBP/USD: 1 trade, 100% WR, +5.4 pips — walk-forward PASS, sample too small
+    - EUR/USD: 0 closed trades — signals generating, no entries triggered yet
+    - EUR/JPY: 1 trade, 0% WR, -15.3 pips — stopped out
+    - CAD/JPY: 1 trade, 0% WR, -0.7 pips — timeout
+    - MGC (Gold): 4 trades, 25% WR, -$115 — shorts losing, longs winning
+    - MCL (Crude): KILLED — walk-forward FAIL (0/6 folds positive)
+    - Fleet state: 8 paper FX + 12 watcher futures + 16 watcher FX variants + 2 killed
+    - All 22 non-crypto configs now properly onboarded with deployment.managed=true
+    - Stage-aware divergence thresholds prevent false KILLs on immature watchers
+    - Graveyard section on dashboard for killed pairs with REVIVE button
+
+  Remaining before production promotion:
+    - 60+ valid paper trades on a promoted candidate (currently max 7 on AUD/JPY)
+    - Trades must be under v4 schema to include execution quality data
+    - Ablation test needed to validate range_accel signal hypothesis
+    - Watcher pruning: trim low-value watchers to focus trade accumulation
+    - Edge-weighted allocation: concentrate risk into proven winners
+    - Scope decision: FX-only first launch confirmed, futures deferred
 
 ---
 
@@ -500,34 +520,45 @@ Rules:
   pipeline moves them into paper QA. This stage is emitted automatically from
   deployment_registry.json, not maintained by hand.
 
-    CAD/JPY T4       Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
-    M2K range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
-    MCL range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
-    MES range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
-    MGC range        Stage: WATCHER   Next: paper   Note: blocked by missing historical data
-    MNQ range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
-    MYM range        Stage: WATCHER   Next: paper   Note: walk-forward not yet PASS
+    M2K range        Stage: WATCHER   WF: WATCH   Data: EXISTS
+    M2K vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    MES range        Stage: WATCHER   WF: pending  Data: EXISTS
+    MES vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    MGC range        Stage: WATCHER   WF: PASS     Data: EXISTS
+    MGC vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    MNQ range        Stage: WATCHER   WF: pending  Data: EXISTS
+    MNQ vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    MYM range        Stage: WATCHER   WF: pending  Data: EXISTS
+    MYM vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    NKD range        Stage: WATCHER   WF: pending  Data: EXISTS
+    NKD vol_burst    Stage: WATCHER   WF: pending  Data: EXISTS
+    + 16 FX variant watchers (aggressive/conservative per pair)
 
   ### PAPER QA STAGE (eligible for paper->real promotion evidence)
   Only this lane may accumulate the valid trade sample that earns production
   promotion. Paper QA uses the same display language as real money on the dashboard.
 
-    AUD/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
-    AUD/USD NY       Stage: PAPER-QA  Status: PAPER-VALIDATING
-    EUR/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
-    EUR/USD T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
-    GBP/JPY T4       Stage: PAPER-QA  Status: PAPER-VALIDATING
-    GBP/USD range    Stage: PAPER-QA  Status: PAPER-VALIDATING
-    USD/JPY NY       Stage: PAPER-QA  Status: PAPER-VALIDATING
+    AUD/JPY T4       Stage: PAPER-QA  Trades: 7   WR: 71%  PnL: +22.9 pips  (best performer)
+    AUD/USD NY       Stage: PAPER-QA  Trades: 5   WR: 40%  PnL: -17.8 pips
+    CAD/JPY T4       Stage: PAPER-QA  Trades: 1   WR: 0%   PnL: -0.7 pips
+    EUR/JPY T4       Stage: PAPER-QA  Trades: 1   WR: 0%   PnL: -15.3 pips
+    EUR/USD T4       Stage: PAPER-QA  Trades: 0   (signals generating, no entries triggered)
+    GBP/JPY T4       Stage: PAPER-QA  Trades: 0   (walk-forward PASS, no entries yet)
+    GBP/USD range    Stage: PAPER-QA  Trades: 1   WR: 100% PnL: +5.4 pips
+    USD/JPY NY       Stage: PAPER-QA  Trades: 2   WR: 100% PnL: +24.4 pips
 
   ### REAL MONEY STAGE (production capital)
   No managed configs have earned this stage yet. When a paper QA runner reaches
   PROMOTE, deployment_pipeline.py materializes the live config and the same
   dashboard surface shows it under the real-money lane.
 
-## Closed (killed deployments):
-    - Kraken BTC perpetuals (Cascade): KILLED. Thesis: DORMANT (payoff exists on perps, not spot)
-    - All Coinbase strategies: KILLED. Thesis: DORMANT (signal real, venue kills it)
+  ### KILLED (graveyard — dashboard shows compact tombstones with REVIVE button)
+    MCL range        KILLED: walk-forward FAIL (0/6 folds positive, mean exp -0.14)
+    MCL vol_burst    KILLED: walk-forward FAIL
+    BTC range        KILLED: crypto not tradeable on IBKR
+    ETH range        KILLED: crypto not tradeable on IBKR
+    Kraken BTC perps KILLED: Cascade thesis DORMANT (payoff exists on perps, not spot)
+    All Coinbase     KILLED: venue kills edge at 60bps
 
 ## Evidence Registry
 

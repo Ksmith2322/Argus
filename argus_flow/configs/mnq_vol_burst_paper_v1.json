@@ -38,5 +38,11 @@
         "target_rate": 0.015,
         "timeout_rate": 0.86,
         "exp_bps_per_trade": 6.41
+    },
+    "deployment": {
+        "managed": true,
+        "stage": "watcher",
+        "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
+        "onboarded_by": "auto_onboard_cleanup"
     }
 }

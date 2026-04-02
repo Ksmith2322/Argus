@@ -1305,4 +1305,35 @@ This document is now the **implementation source of truth** for production readi
 - **Tier 2** (6 items): All resolved — scaling readiness achieved
 - **Tier 3** (6 items): 5 tools built, 1 time-dependent (data collection)
 - **Total items resolved**: 20 of 20 actionable items
-- **Remaining dependency**: 60+ EUR/USD trades for funding gate (currently ~13, time-dependent)
+- **Remaining dependency**: 60+ trades for funding gate (currently max 7 on AUD/JPY, time-dependent)
+
+### Post-Debate Additions (2026-04-02)
+
+| # | Item | Resolution |
+|---|------|-----------|
+| 21 | Entry-feature stamping into trades.csv | **DEPLOYED** — Schema v4 with 13 new fields per trade |
+| 22 | Execution quality tracking | **DEPLOYED** — signal_mid, fill_latency_ms, slippage_pips per trade |
+| 23 | Conviction scoring (LOG_ONLY) | **DEPLOYED** — equal-weighted, stamped on every trade |
+| 24 | Unified sizing stack + drawdown ramp | **DEPLOYED** — linear ramp with 0.2x floor, hard pause at 3% |
+| 25 | MTF switched to LOG_ONLY | **DEPLOYED** — shadow blocks logged, entries not prevented |
+| 26 | Minimum trade size floor | **DEPLOYED** — skip if size < min lot |
+| 27 | No-progress kill rule | **DEPLOYED** — PF < 1.05 after 80 trades = KILL |
+| 28 | Strategy kill clock | **DEPLOYED** — PF < 1.0 after 60 trades = dead |
+| 29 | Execution quality in promotion gate | **DEPLOYED** — advisory check: slippage < 20% of avg win |
+| 30 | Variant config hash registration | **DEPLOYED** — 17 hashes registered, false alerts eliminated |
+| 31 | QUIET vs STALE watcher distinction | **DEPLOYED** — new watchers show QUIET not STALE |
+| 32 | Graveyard for killed pairs | **DEPLOYED** — compact tombstone rows with REVIVE button |
+| 33 | Dashboard deduplication | **DEPLOYED** — one card per symbol per stage |
+| 34 | Live candlestick chart with trade overlay | **DEPLOYED** — real-time OHLC, entry/stop/target lines, trade markers |
+| 35 | Edge-weighted allocation framework | **DEPLOYED** (LOG_ONLY) — PF/WR/confidence scoring, allocation multiplier |
+| 36 | Watcher pruning thresholds | **DEPLOYED** — 14 days with <10 signals = dead watcher |
+| 37 | All configs properly onboarded | **DEPLOYED** — 22 configs with deployment.managed=true |
+| 38 | Docs synced (roadmap, ARGUS_MAP, PROMOTION_PIPELINE) | **DONE** |
+
+### TRUE REMAINING BLOCKERS (nothing can be built to fix these)
+
+1. **Trade accumulation** — max 7 trades on any pair. Need 60 for promotion. Time-dependent.
+2. **Schema v4 trade data** — old trades lack new fields. New trades under new code will populate them.
+3. **Ablation test execution** — configs generated but test not yet run against historical data.
+4. **Edge-weighted allocation activation** — LOG_ONLY until 20+ trades per pair show separation.
+5. **Conviction sizing activation** — LOG_ONLY until 60+ trades prove bucket separation.

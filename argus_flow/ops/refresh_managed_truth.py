@@ -26,8 +26,10 @@ LOG_PATH = LOGS / "managed_truth_refresh.log"
 LOCK_NAME = "managed_truth_refresh"
 
 DEFAULT_ACCEPT_EXISTING_AGE_S = 900
+DEFAULT_WALKFORWARD_MAX_AGE_S = 21600
 
 STEPS = [
+    {"id": "trade_artifact_schema", "module": "argus_flow.ops.trade_artifact_schema", "critical": True},
     {"id": "daily_report", "module": "argus_flow.ops.daily_report", "critical": True},
     {"id": "divergence_guard", "module": "argus_flow.ops.divergence_guard", "critical": False},
     {"id": "correlation_guard", "module": "argus_flow.ops.correlation_guard", "critical": False},
@@ -36,6 +38,7 @@ STEPS = [
         "module": "argus_flow.ops.walkforward_validation",
         "args": ["--all-active"],
         "critical": False,
+        "max_age_s": DEFAULT_WALKFORWARD_MAX_AGE_S,
     },
     {"id": "kill_discipline", "module": "argus_flow.ops.kill_discipline", "critical": False},
     {"id": "promotion_gate_v2", "module": "argus_flow.ops.promotion_gate_v2", "critical": False},
@@ -47,6 +50,7 @@ STEPS = [
     {"id": "position_monitor", "module": "argus_flow.ops.position_monitor", "critical": False},
     {"id": "risk_oversight", "module": "argus_flow.ops.risk_oversight", "critical": False},
     {"id": "qa_learning", "module": "argus_flow.ops.qa_learning", "critical": False},
+    {"id": "edge_allocation", "module": "argus_flow.ops.edge_allocation", "critical": False},
     {"id": "alert_escalation_v2", "module": "argus_flow.ops.alert_escalation_v2", "critical": True},
 ]
 
@@ -88,6 +92,31 @@ def _status_age_s(status: dict | None) -> float | None:
 def _write_status(payload: dict) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _previous_step_map(status: dict | None) -> dict[str, dict]:
+    if not isinstance(status, dict):
+        return {}
+    result: dict[str, dict] = {}
+    for step in status.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        step_id = str(step.get("id", "") or "").strip()
+        if step_id:
+            result[step_id] = step
+    return result
+
+
+def _reuse_step(step: dict, previous: dict, age_s: float) -> dict:
+    reused = dict(previous)
+    reused["status"] = "SKIPPED_FRESH"
+    reused["reused"] = True
+    reused["source_status"] = str(previous.get("status", "") or "OK")
+    reused["source_age_s"] = round(age_s, 2)
+    reused["duration_s"] = 0.0
+    reused["stdout_tail"] = [f"reused prior {step['id']} result ({int(age_s)}s old)"]
+    reused["stderr_tail"] = []
+    return reused
 
 
 def _run_step(step: dict) -> dict:
@@ -149,13 +178,29 @@ def refresh_managed_truth(*, include_summary: bool, accept_existing_age_s: int) 
     failed_critical: list[str] = []
     failed_noncritical: list[str] = []
     started_at = _now_iso()
+    previous_status = _load_status()
+    previous_age_s = _status_age_s(previous_status)
+    previous_step_map = _previous_step_map(previous_status)
 
     try:
         _log("managed truth refresh started")
         for step in STEPS:
-            step_result = _run_step(step)
+            previous_step = previous_step_map.get(step["id"])
+            if (
+                step.get("max_age_s")
+                and isinstance(previous_status, dict)
+                and previous_status.get("status") == "OK"
+                and previous_age_s is not None
+                and previous_age_s <= float(step["max_age_s"])
+                and isinstance(previous_step, dict)
+                and str(previous_step.get("status", "") or "") in {"OK", "SKIPPED_FRESH"}
+            ):
+                step_result = _reuse_step(step, previous_step, previous_age_s)
+                _log(f"{step['id']}: reused previous OK result ({int(previous_age_s)}s old)")
+            else:
+                step_result = _run_step(step)
             steps.append(step_result)
-            if step_result["status"] != "OK":
+            if step_result["status"] not in {"OK", "SKIPPED_FRESH"}:
                 if step_result["critical"]:
                     critical_failure = True
                     failed_critical.append(step_result["id"])

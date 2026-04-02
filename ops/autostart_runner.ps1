@@ -4,7 +4,9 @@
 # Waits 30s after boot for network/TWS to stabilize.
 
 $ErrorActionPreference = "Continue"
+Set-Location "C:\Argus\repo"
 $logFile = "C:\Argus\repo\argus_flow\logs\autostart_$((Get-Date).ToString('yyyyMMdd_HHmmss')).log"
+$python = "C:\Argus\.venv\Scripts\python.exe"
 
 function Log($msg) {
     $line = "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')] $msg"
@@ -162,8 +164,14 @@ if (-not $portListening) {
 }
 Log "API port 7496: LISTENING"
 
+Log "Refreshing managed truth surfaces..."
+& $python -m argus_flow.ops.refresh_managed_truth --accept-existing-age-s 600 2>&1 | ForEach-Object { Log "refresh_managed_truth> $_" }
+if ($LASTEXITCODE -ne 0) {
+    Log "ERROR: managed truth refresh failed (rc=$LASTEXITCODE). Aborting autostart."
+    exit 1
+}
+
 Log "Building deployment-aware watcher/paper config list..."
-$python = "C:\Argus\.venv\Scripts\python.exe"
 $configs = @(& $python -m argus_flow.ops.deployment_pipeline --emit-configs watcher,paper 2>$null)
 if ($configs.Count -eq 0) {
     Log "No managed watcher/paper configs found. Nothing to launch."

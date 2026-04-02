@@ -42,6 +42,10 @@ NO_PROGRESS_TRADE_THRESHOLD = 80  # trades in paper/real before checking
 NO_PROGRESS_MIN_PF = 1.05  # must show at least marginal edge
 NO_PROGRESS_MAX_RESIDENCY_DAYS = 90  # or this many days in stage
 
+# Watcher pruning: auto-kill watchers that show no promise
+WATCHER_MAX_DAYS_NO_SIGNALS = 14  # 14 days with <10 signals = dead watcher
+WATCHER_MIN_SIGNALS_TO_SURVIVE = 10
+
 # Hard strategy kill clock: if PF < this after threshold trades, strategy is dead
 STRATEGY_KILL_PF_THRESHOLD = 1.0  # PF < 1.0 after 60 trades = net negative
 STRATEGY_KILL_TRADE_THRESHOLD = 60

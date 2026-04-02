@@ -33,6 +33,13 @@ SMOKE_BASE_CLIENT_ID = int(os.getenv("IBKR_SMOKE_TEST_CLIENT_ID", "18000"))
 def connect_readonly(label: str, base_client_id: int, attempts: int = 20) -> IB | None:
     """Connect in read-only mode and avoid client-id collisions with the live fleet."""
     last_error: Exception | None = None
+    retry_tokens = (
+        "client id is already in use",
+        "timeout",
+        "peer closed connection",
+        "connection refused",
+        "api connection failed",
+    )
 
     for offset in range(attempts):
         client_id = base_client_id + offset
@@ -53,7 +60,8 @@ def connect_readonly(label: str, base_client_id: int, attempts: int = 20) -> IB 
                 ib.disconnect()
             except Exception:
                 pass
-            if "client id is already in use" in str(exc).lower():
+            if any(token in str(exc).lower() for token in retry_tokens):
+                time.sleep(0.5)
                 continue
             break
 
