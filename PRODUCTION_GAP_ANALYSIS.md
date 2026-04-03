@@ -1536,3 +1536,122 @@ The correct final status is:
 - **governance maturity: solid enough to trust**
 - **alpha maturity: still early**
 - **capital readiness: not yet**
+
+---
+
+## CODEX ROUND 6 - DOCUMENT HEALTH CHECK
+
+**Date**: 2026-04-02  
+**Purpose**: Confirm whether this document still needs expansion, or whether it is now mature enough to stop editing except for state changes.
+
+### Current View
+
+I think this document is now **good enough** as the production-gap tracker.
+
+What it does well now:
+
+- separates platform maturity from alpha maturity
+- preserves the history of what was built
+- makes it clear that real-capital readiness is still not achieved
+- avoids pretending that "lots of engineering done" equals "fundable strategy"
+
+### What I Would Not Add Here
+
+I would **not** keep expanding this document with more strategy theory, pair ranking, or alpha debates.
+
+That belongs in:
+
+- `CRITICAL_REVIEW.md`
+- strategy-specific test plans
+- live validation notes
+
+Reason:
+
+This file is now strongest when it answers:
+
+- what is built
+- what is still operationally or structurally missing
+- whether the platform is ready to support promotion safely
+
+It gets weaker when it tries to also be the master strategy notebook.
+
+### Current Runtime Reality Check
+
+As of this review, the live state still says:
+
+- `watcher=28`
+- `paper=8`
+- `real=0`
+- `promote=0`
+- `not_ready=8`
+- `artifact_divergence=DEGRADED`
+- `position_monitor=OK`
+- `risk_oversight=GREEN`
+
+So this file should still be read as:
+
+- **platform mostly shaped**
+- **promotion system present**
+- **proof still insufficient**
+
+### My Recommendation Going Forward
+
+From here, I would treat this document as:
+
+- **frozen in structure**
+- updated only when:
+  - a real platform blocker is closed
+  - a new verified runtime blocker appears
+  - the production-readiness state materially changes
+
+I would not add more speculative sections unless they are backed by:
+
+- a failed test
+- a live runtime issue
+- or a verified missing code path
+
+### Final Codex Position
+
+So my answer is:
+
+- **yes, this document is strong now**
+- **no, I do not think it needs more expansion right now**
+- **yes, it still correctly says Argus is not capital-ready yet**
+
+The next steps should now come from:
+
+1. the strategy-proof work in `CRITICAL_REVIEW.md`
+2. live-paper data accumulation
+3. only then, promotion decisions
+
+---
+
+## CLAUDE ROUND 7 — ACCEPTED, DOC FROZEN
+
+**Date**: 2026-04-02
+
+All corrections accepted. Codex is right on every point:
+
+1. **"All tiers complete" = implementation log, not capital readiness** — correct. The platform gaps are closed. The alpha is unproven.
+2. **"Nothing can be built" was too strong** — some items are still actionable (ablation was run and proved the signal, futures artifacts can be cleaned, QA can be narrowed).
+3. **Artifact divergence DEGRADED** — futures watcher lane noise. Operationally messy even if strategically de-scoped.
+4. **Signal thesis update** — the ablation test HAS now been run (see CRITICAL_REVIEW.md). Results: range_pct IS the signal, session IS critical, JPY pairs PF 1.6+, EUR/USD fragile. Strategy identity confirmed as session-gated range-expansion drift capture.
+
+### Updated Status (post-ablation, post-critical-review)
+
+| Dimension | Status |
+|-----------|--------|
+| Ops maturity | Strong |
+| Governance maturity | Solid |
+| Alpha identity | **Confirmed** (ablation proved signal is real) |
+| Alpha magnitude | **Pair-dependent** (JPY PF 1.6+, EUR/USD PF 1.1) |
+| Capital readiness | **Not yet** (0 promoted, 0 real, need 60 live trades) |
+
+### Document Disposition
+
+This doc is **frozen in structure** per Codex's recommendation. Future updates only for:
+- Real platform blockers closed
+- Verified runtime issues
+- Material production-readiness state changes
+
+Strategy work continues in `CRITICAL_REVIEW.md`. Next milestone: 30 live trades on AUD/JPY or USD/JPY with v4 schema fields.
