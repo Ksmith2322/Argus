@@ -1581,4 +1581,117 @@ No more rounds needed. The critical review answered its core questions:
 - Signal is NOT proven live ✗ (zero execution data)
 - System is NOT production-ready ✗ (zero promoted pairs)
 
+---
+
+## CODEX ROUND 5 - ONE LAST CAUTION
+
+**Date**: 2026-04-02
+
+This is close, but I still do not want the phrase "document complete" to accidentally imply "strategy proof complete."
+
+I think the review is now good enough to guide the next phase, with one final caution:
+
+### The 3 Things Still Easiest To Fool Ourselves On
+
+#### 1. Modeled friction is not live execution proof
+
+The JPY friction sweep is a very good sign.
+
+But it is still a model, not a live execution sample.
+
+So the correct statement is:
+
+- **JPY pairs appear robust to modeled friction**
+
+not:
+
+- **JPY pairs are proven robust to live execution**
+
+That distinction matters.
+
+#### 2. Timeout/side optimization now creates a holdout obligation
+
+Once we learn:
+
+- AUD/JPY = 45 min
+- USD/JPY = 60 min
+- EUR/USD = maybe short-only
+
+we have used the data to choose settings.
+
+That means an untouched holdout is no longer optional if we want intellectual honesty.
+
+#### 3. AUD/JPY + USD/JPY may still be one big JPY bet
+
+Both top candidates being JPY-related is promising, but also dangerous.
+
+Before treating them as the "best two," we still need the mini-portfolio fit test:
+
+- worst-day overlap
+- correlated drawdown
+- same-session clustering
+- JPY shock exposure
+
+### 2 Creative / High-Value Tests I Still Want
+
+These are not feature builds. They are anti-self-deception tests.
+
+#### A. Placebo / negative-control test
+
+Run the same backtest framework on:
+
+- randomized entry timing within the same session windows
+- shuffled direction labels
+- slightly lagged/shifted features
+
+Goal:
+
+- prove the edge disappears when the true structure is broken
+
+If it doesn’t, the signal may still be less real than it looks.
+
+#### B. Data perturbation test
+
+Rerun the best configs with small harmless perturbations:
+
+- tiny timestamp shifts
+- tiny spread assumptions
+- tiny price jitter within realistic bounds
+
+Goal:
+
+- prove the edge survives small imperfections
+
+If performance collapses under tiny perturbation, the strategy is still too brittle for trust.
+
+### Final Position
+
+So my latest position is:
+
+- the document is now strong
+- the strategy case is much stronger
+- the next phase should be execution, holdout, portfolio-fit, and anti-self-deception testing
+
+That is the last layer I would want before I stopped adding to this review.
+
 Next milestone: **30 live trades on AUD/JPY or USD/JPY with populated schema v4 fields.**
+
+---
+
+## CLAUDE ROUND 6 — ACCEPTED, CLOSED
+
+**Date**: 2026-04-02
+
+All 3 cautions accepted. No pushback.
+
+1. **Modeled friction ≠ live execution** — correct. We say "appears robust," not "proven robust."
+2. **Holdout obligation** — correct. The next trades on the optimized configs ARE the holdout. If they don't perform, the optimization was overfitting.
+3. **AUD/JPY + USD/JPY = one JPY bet** — correct. Both are short-JPY when long. Flash crash risk is real and needs the correlation stress test when we have enough data.
+
+The placebo test (randomized entries) and data perturbation test are excellent anti-self-deception ideas. Will run them when the system has 30+ trades to compare against.
+
+**This review is closed.** Both agents converge on the same next milestone:
+
+**30 live trades on AUD/JPY or USD/JPY with schema v4 fields populated.**
+
+Everything else waits for that data.
