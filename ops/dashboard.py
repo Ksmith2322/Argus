@@ -3568,7 +3568,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div id="ibkr-page">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-  <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR STAGED TRADING FLEET</h2>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR STAGED TRADING FLEET</h2>
+    <a href="/brain" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">NEURAL VIEW</a>
+  </div>
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
 </div>
 
@@ -8616,6 +8619,605 @@ window.addEventListener('load', function() {
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
+
+
+def _load_gate_decisions(log_dir: Path) -> dict:
+    """Load last gate decision chain from runner's gate_decisions.json."""
+    gf = log_dir / "gate_decisions.json"
+    if not gf.exists():
+        return {}
+    try:
+        data = json.loads(gf.read_text(encoding="utf-8"))
+        return {k: v for k, v in data.items() if k not in ("ts", "symbol")}
+    except Exception:
+        return {}
+
+
+@app.get("/api/brain_state")
+async def api_brain_state():
+    """Real-time brain state for neural visualization."""
+    raw_runners = _managed_ibkr_runners()
+    runners = [_read_ibkr_runner(r) for r in raw_runners]
+    raw_map = {r.get("symbol", "").upper(): r for r in raw_runners}
+    nodes = []
+    for r in runners:
+        if r.get("current_stage") in ("killed",):
+            continue
+        features = r.get("features", {})
+        raw = raw_map.get(r["symbol"].upper(), {})
+        log_dir = REPO / raw.get("log_dir", f"argus_flow/logs/{r['symbol'].lower()}")
+        # Compute "heat" — how close to triggering
+        range_pct = features.get("range_pct", 0) or 0
+        threshold = 0.0012
+        heat = min(1.0, range_pct / threshold) if threshold > 0 else 0
+
+        # Recent signal activity
+        sig_age = r.get("last_signal_age_s", 9999)
+        active = sig_age < 120
+
+        nodes.append({
+            "symbol": r["symbol"],
+            "name": r["name"],
+            "stage": r.get("current_stage", "watcher"),
+            "position": r["position"],
+            "entry_price": r.get("entry_price", 0),
+            "pnl": r.get("pnl", 0),
+            "unit": r["unit"],
+            "heat": round(heat, 3),
+            "active": active,
+            "signal_age_s": sig_age,
+            "session": r.get("session", "OFF"),
+            "features": {
+                "range_pct": features.get("range_pct", 0),
+                "vol_z": features.get("vol_z", 0),
+                "range_accel": features.get("range_accel", 0),
+                "dist_from_low": features.get("dist_from_low", 0),
+                "vol_burst_z": features.get("vol_burst_z", 0),
+            },
+            "gates": _load_gate_decisions(log_dir),
+            "conviction": features.get("conviction_score", 0) if features else 0,
+            "win_rate": r.get("win_rate", 0),
+            "closed_trades": r.get("closed_trades", 0),
+            "blocked_24h": r.get("blocked_signals_24h", 0),
+            "entries_today": r.get("entries_today", 0),
+            "broker_connected": r.get("broker_connected", False),
+        })
+    # Recent signals across all pairs (last 20)
+    recent_signals = []
+    for r in runners:
+        for sig in (r.get("recent_signals", []) or [])[-3:]:
+            recent_signals.append({
+                "symbol": r["symbol"],
+                "ts": sig.get("ts", ""),
+                "action": sig.get("action", ""),
+                "direction": sig.get("direction", ""),
+                "range_pct": sig.get("range_pct", 0),
+            })
+    recent_signals.sort(key=lambda x: x.get("ts", ""), reverse=True)
+
+    return JSONResponse({
+        "nodes": nodes,
+        "recent_signals": recent_signals[:20],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+BRAIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Argus Neural Core</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@300;400;500&display=swap');
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #060a12; color: #c8d6e5; font-family: 'JetBrains Mono', monospace; overflow: hidden; }
+canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
+
+#hud { position: fixed; top: 16px; left: 20px; z-index: 10; }
+#hud h1 { font-family: 'Orbitron', sans-serif; font-size: 1.3em; font-weight: 900;
+  background: linear-gradient(135deg, #00d4ff, #00ff88);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  letter-spacing: 6px; text-transform: uppercase; }
+#hud .sub { font-size: 0.6em; color: #4a5568; margin-top: 4px; letter-spacing: 2px; }
+
+#stats-bar { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 10;
+  display: flex; gap: 24px; }
+.stat-item { text-align: center; }
+.stat-val { font-family: 'Orbitron', sans-serif; font-size: 1.4em; font-weight: 700; }
+.stat-label { font-size: 0.55em; color: #4a5568; letter-spacing: 2px; text-transform: uppercase; margin-top: 2px; }
+
+#nav { position: fixed; top: 16px; right: 20px; z-index: 10; }
+#nav a { color: #4a5568; text-decoration: none; font-size: 0.7em; padding: 6px 16px;
+  border: 1px solid #1a2332; border-radius: 20px; transition: all 0.3s; letter-spacing: 1px; }
+#nav a:hover { background: #1a2332; color: #00d4ff; border-color: #00d4ff44; }
+
+#decision-flow { position: fixed; bottom: 50px; left: 20px; z-index: 10;
+  background: rgba(6,10,18,0.88); border: 1px solid #1a2332; border-radius: 8px;
+  padding: 12px 16px; width: 320px; backdrop-filter: blur(10px); }
+#decision-flow h3 { font-family: 'Orbitron', sans-serif; font-size: 0.7em; color: #00d4ff;
+  letter-spacing: 3px; margin-bottom: 8px; }
+.gate-chain { display: flex; flex-direction: column; gap: 3px; }
+.gate-row { display: flex; align-items: center; gap: 6px; font-size: 0.62em; padding: 2px 0; }
+.gate-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.gate-dot.pass { background: #00ff88; box-shadow: 0 0 6px #00ff8866; }
+.gate-dot.fail { background: #ff4444; box-shadow: 0 0 6px #ff444466; }
+.gate-dot.shadow { background: #ffaa00; box-shadow: 0 0 6px #ffaa0044; }
+.gate-dot.idle { background: #1a2332; }
+.gate-name { color: #4a5568; min-width: 80px; }
+.gate-result { color: #c8d6e5; flex: 1; }
+
+#signal-panel { position: fixed; bottom: 50px; right: 20px; z-index: 10;
+  background: rgba(6,10,18,0.88); border: 1px solid #1a2332; border-radius: 8px;
+  padding: 12px 16px; width: 280px; max-height: 300px; overflow-y: auto;
+  backdrop-filter: blur(10px); }
+#signal-panel h3 { font-family: 'Orbitron', sans-serif; font-size: 0.7em; color: #00d4ff;
+  letter-spacing: 3px; margin-bottom: 8px; }
+.sig-entry { font-size: 0.6em; padding: 3px 0; border-bottom: 1px solid #0d1420;
+  display: flex; gap: 6px; align-items: center; }
+
+#ticker { position: fixed; bottom: 0; left: 0; right: 0;
+  background: rgba(6,10,18,0.95); border-top: 1px solid #1a2332;
+  padding: 8px 16px; z-index: 10; overflow: hidden; }
+#ticker-inner { display: flex; gap: 20px; animation: scroll 40s linear infinite; white-space: nowrap; }
+@keyframes scroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+.tick-item { font-size: 0.6em; display: inline-flex; gap: 4px; align-items: center; }
+.tick-dot { width: 4px; height: 4px; border-radius: 50%; display: inline-block; }
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  #hud h1 { font-size: 0.85em; letter-spacing: 3px; }
+  #stats-bar { position: fixed; top: auto; bottom: 40px; left: 8px; right: 8px;
+    transform: none; gap: 12px; justify-content: center;
+    background: rgba(6,10,18,0.9); padding: 8px; border-radius: 6px;
+    border: 1px solid #1a2332; }
+  .stat-val { font-size: 1em; }
+  .stat-label { font-size: 0.5em; }
+  #decision-flow { display: none; }
+  #signal-panel { display: none; }
+  #nav { top: 8px; right: 8px; }
+  #nav a { font-size: 0.6em; padding: 3px 8px; }
+  #ticker { display: none; }
+}
+@media (min-width: 769px) and (max-width: 1200px) {
+  #decision-flow { width: 240px; padding: 8px 10px; }
+  #signal-panel { width: 220px; }
+  .gate-name { min-width: 60px; }
+}
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Argus Neural Core</h1>
+  <div class="sub" id="status-line">Initializing neural network...</div>
+</div>
+<div id="stats-bar">
+  <div class="stat-item"><div class="stat-val" id="s-nodes" style="color:#00d4ff;">--</div><div class="stat-label">Nodes</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-active" style="color:#00ff88;">--</div><div class="stat-label">Active</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-trades" style="color:#ffaa00;">--</div><div class="stat-label">In Trade</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-signals" style="color:#7b8ab8;">--</div><div class="stat-label">Signals/min</div></div>
+</div>
+<div id="nav"><a href="/">Fleet Dashboard</a></div>
+
+<div id="decision-flow">
+  <h3>Decision Pipeline</h3>
+  <div class="gate-chain" id="gate-chain"></div>
+</div>
+
+<div id="signal-panel">
+  <h3>Signal Feed</h3>
+  <div id="signal-feed">Waiting for neural activity...</div>
+</div>
+
+<canvas id="brain"></canvas>
+<div id="ticker"><div id="ticker-inner"></div></div>
+
+<script>
+const canvas = document.getElementById('brain');
+const ctx = canvas.getContext('2d');
+let W, H, cX, cY, t = 0;
+let nodes = [], particles = [], pulses = [];
+let hoveredNode = null, selectedNode = null;
+
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; cX = W/2; cY = H/2; }
+addEventListener('resize', resize); resize();
+
+// Subtle grid background
+function drawGrid() {
+  const spacing = 40;
+  ctx.strokeStyle = 'rgba(26,35,50,0.4)';
+  ctx.lineWidth = 0.5;
+  for (let x = 0; x < W; x += spacing) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = 0; y < H; y += spacing) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+}
+
+// Ambient particles
+class Particle {
+  constructor() { this.reset(); }
+  reset() {
+    this.x = Math.random()*W; this.y = Math.random()*H;
+    this.vx = (Math.random()-0.5)*0.15; this.vy = (Math.random()-0.5)*0.15;
+    this.life = Math.random()*400+200; this.max = this.life;
+    this.r = Math.random()*1.2+0.3;
+    this.hue = Math.random() > 0.7 ? 160 : 200; // mix of cyan and green tints
+  }
+  update() { this.x+=this.vx; this.y+=this.vy; this.life--; if(this.life<=0||this.x<0||this.x>W||this.y<0||this.y>H) this.reset(); }
+  draw() {
+    const a = (this.life/this.max)*0.2;
+    ctx.fillStyle = `hsla(${this.hue},80%,60%,${a})`;
+    ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,Math.PI*2); ctx.fill();
+  }
+}
+for(let i=0;i<200;i++) particles.push(new Particle());
+
+// Energy pulse along connections
+class Pulse {
+  constructor(ax,ay,bx,by,color,speed) {
+    this.ax=ax;this.ay=ay;this.bx=bx;this.by=by;this.color=color;
+    this.p=0; this.speed=speed||0.015+Math.random()*0.01;
+  }
+  update() { this.p+=this.speed; return this.p<1; }
+  draw() {
+    const x=this.ax+(this.bx-this.ax)*this.p, y=this.ay+(this.by-this.ay)*this.p;
+    const a=Math.sin(this.p*Math.PI); // fade in and out
+    // Glow
+    const g=ctx.createRadialGradient(x,y,0,x,y,8);
+    g.addColorStop(0,this.color.replace('1)',a*0.9+')'));
+    g.addColorStop(1,this.color.replace('1)','0)'));
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill();
+    // Core
+    ctx.fillStyle=this.color.replace('1)',Math.min(1,a*1.3)+')');
+    ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+  }
+}
+
+// Hexagonal node drawing
+function drawHex(x,y,r,rot) {
+  ctx.beginPath();
+  for(let i=0;i<6;i++){const a=Math.PI/3*i+rot; ctx.lineTo(x+r*Math.cos(a),y+r*Math.sin(a));}
+  ctx.closePath();
+}
+
+function layoutNodes(data) {
+  const paper=data.filter(n=>n.stage==='paper');
+  const watcher=data.filter(n=>n.stage==='watcher');
+  const real=data.filter(n=>n.stage==='real'||n.stage==='quarantine');
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
+  real.forEach((n,i)=>{const a=(i/Math.max(1,real.length))*Math.PI*2; n.x=cX+Math.cos(a)*45; n.y=cY+Math.sin(a)*45; n.ring='core'; n.radius=30;});
+  paper.forEach((n,i)=>{const a=(i/Math.max(1,paper.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*iR; n.y=cY+Math.sin(a)*iR; n.ring='inner'; n.radius=24;});
+  watcher.forEach((n,i)=>{const a=(i/Math.max(1,watcher.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*oR; n.y=cY+Math.sin(a)*oR; n.ring='outer'; n.radius=14;});
+  nodes=[...real,...paper,...watcher];
+}
+
+function drawNode(n) {
+  const x=n.x, y=n.y, r=n.radius;
+  const inTrade=n.position!=='FLAT';
+  const heat=n.heat||0;
+  const colors={paper:'#00d4ff',watcher:'#4a5568',real:'#00ff88',quarantine:'#ff9800'};
+  const baseC=colors[n.stage]||'#333';
+  const rot=t*0.001; // slow rotation
+
+  // Outer glow
+  if(heat>0.3||inTrade||n.active){
+    const gc=inTrade?'rgba(0,255,136,':'rgba(0,212,255,';
+    const gs=inTrade?25:heat*18;
+    const g=ctx.createRadialGradient(x,y,r*0.5,x,y,r+gs);
+    g.addColorStop(0,gc+'0.15)'); g.addColorStop(1,gc+'0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r+gs,0,Math.PI*2); ctx.fill();
+  }
+
+  // Hex body
+  drawHex(x,y,r,rot);
+  ctx.fillStyle=n.active?'rgba(10,16,28,0.85)':'rgba(10,16,28,0.5)';
+  ctx.fill();
+  ctx.strokeStyle=inTrade?(n.position==='LONG'?'#00ff88':'#ff4444'):baseC;
+  ctx.lineWidth=inTrade?2.5:(n.ring==='inner'?1.5:0.8);
+  ctx.stroke();
+
+  // Feature radar (inner nodes only)
+  if(n.features&&r>=20){
+    const feats=[
+      Math.min(1,(n.features.range_pct||0)/0.003),
+      Math.min(1,Math.max(0,(n.features.vol_z||0)+0.5)/1.5),
+      Math.min(1,Math.max(0,(n.features.range_accel||0)+0.5)/1.5),
+      n.features.dist_from_low||0,
+    ];
+    const fc=['#00ff88','#ffaa00','#00d4ff','#ff6b6b'];
+    ctx.save(); ctx.globalAlpha=0.25;
+    feats.forEach((v,i)=>{
+      if(v<0.05)return;
+      const sa=i*Math.PI/2-Math.PI/2, ea=sa+Math.PI/2;
+      ctx.fillStyle=fc[i];
+      ctx.beginPath(); ctx.moveTo(x,y); ctx.arc(x,y,r*0.65*v,sa,ea); ctx.closePath(); ctx.fill();
+    });
+    ctx.restore();
+  }
+
+  // Position arrow
+  if(inTrade){
+    ctx.fillStyle=n.position==='LONG'?'#00ff88':'#ff4444';
+    ctx.beginPath();
+    if(n.position==='LONG'){ctx.moveTo(x,y-r-10);ctx.lineTo(x-5,y-r-3);ctx.lineTo(x+5,y-r-3);}
+    else{ctx.moveTo(x,y+r+10);ctx.lineTo(x-5,y+r+3);ctx.lineTo(x+5,y+r+3);}
+    ctx.fill();
+  }
+
+  // Label
+  ctx.fillStyle=n.ring==='inner'?'#c8d6e5':'#4a5568';
+  ctx.font=(r>=20?'600 10':'400 7')+'px JetBrains Mono, monospace';
+  ctx.textAlign='center';
+  ctx.fillText(n.symbol,x,y+r+15);
+
+  // Micro conviction bar
+  if(r>=20&&n.conviction>0){
+    const bw=r*1.2, bh=2, by=y+r+19;
+    ctx.fillStyle='#0d1420'; ctx.fillRect(x-bw/2,by,bw,bh);
+    ctx.fillStyle=n.conviction>0.6?'#00ff88':n.conviction>0.4?'#ffaa00':'#ff4444';
+    ctx.fillRect(x-bw/2,by,bw*n.conviction,bh);
+  }
+
+  // PnL micro text (paper nodes)
+  if(r>=20&&n.closed_trades>0){
+    const pnlC=n.pnl>=0?'#00ff88':'#ff4444';
+    ctx.fillStyle=pnlC; ctx.font='500 8px JetBrains Mono';
+    ctx.fillText((n.pnl>=0?'+':'')+Number(n.pnl).toFixed(1),x,y+4);
+  }
+}
+
+function drawConnections() {
+  const groups={USD:['EURUSD','GBPUSD','AUDUSD'],JPY:['EURJPY','GBPJPY','AUDJPY','CADJPY','USDJPY']};
+  for(const[,syms] of Object.entries(groups)){
+    const gn=nodes.filter(n=>syms.includes(n.symbol));
+    for(let i=0;i<gn.length;i++) for(let j=i+1;j<gn.length;j++){
+      const a=gn[i],b=gn[j];
+      const active=a.active&&b.active;
+      const mx=(a.x+b.x)/2*0.6+cX*0.4, my=(a.y+b.y)/2*0.6+cY*0.4;
+      ctx.strokeStyle=active?'rgba(0,212,255,0.25)':'rgba(0,212,255,0.06)';
+      ctx.lineWidth=active?1.2:0.6;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(mx,my,b.x,b.y); ctx.stroke();
+    }
+  }
+}
+
+function drawCore() {
+  const pulse=(Math.sin(t*0.03)+1)/2;
+  // Outer ring
+  ctx.strokeStyle=`rgba(0,212,255,${0.05+pulse*0.05})`;
+  ctx.lineWidth=1;
+  ctx.beginPath(); ctx.arc(cX,cY,35+pulse*3,0,Math.PI*2); ctx.stroke();
+  // Inner glow
+  const g=ctx.createRadialGradient(cX,cY,0,cX,cY,30+pulse*5);
+  g.addColorStop(0,`rgba(0,212,255,${0.08+pulse*0.04})`);
+  g.addColorStop(1,'rgba(0,212,255,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cX,cY,30+pulse*5,0,Math.PI*2); ctx.fill();
+  // Label
+  ctx.fillStyle=`rgba(0,212,255,${0.5+pulse*0.3})`;
+  ctx.font='900 11px Orbitron, sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText('ARGUS',cX,cY+4);
+  // Ring labels
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
+  ctx.strokeStyle='rgba(0,212,255,0.07)'; ctx.lineWidth=0.6;
+  ctx.setLineDash([3,9]);
+  ctx.beginPath(); ctx.arc(cX,cY,iR,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cX,cY,oR,0,Math.PI*2); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='rgba(74,85,104,0.25)'; ctx.font='400 8px JetBrains Mono';
+  ctx.fillText('PAPER QA',cX,cY-iR-6);
+  ctx.fillText('WATCHERS',cX,cY-oR-6);
+}
+
+// Hover tooltip
+canvas.addEventListener('mousemove',e=>{
+  hoveredNode=null;
+  for(const n of nodes){const dx=e.clientX-n.x,dy=e.clientY-n.y;if(Math.sqrt(dx*dx+dy*dy)<n.radius+5){hoveredNode=n;break;}}
+  canvas.style.cursor=hoveredNode?'pointer':'default';
+});
+
+function drawTooltip(){
+  if(!hoveredNode)return;
+  const n=hoveredNode;
+  const lines=[
+    n.name+' ('+n.stage.toUpperCase()+')',
+    n.position+(n.position!=='FLAT'?' @ '+n.entry_price:''),
+    'PnL: '+(n.pnl>=0?'+':'')+Number(n.pnl).toFixed(1)+' '+n.unit,
+    'WR: '+(n.win_rate*100).toFixed(0)+'% | T: '+n.closed_trades,
+    'Conv: '+(n.conviction||0).toFixed(2)+' | Sess: '+n.session,
+    'Heat: '+(n.heat||0).toFixed(2)+' | Blk24h: '+(n.blocked_24h||0),
+  ];
+  const lw=220, lh=lines.length*16+16;
+  let rx=n.x+n.radius+18, ry=n.y-lh/2;
+  if(rx+lw>W-10)rx=n.x-n.radius-18-lw;
+  ry=Math.max(10,Math.min(ry,H-lh-10));
+  // Glassmorphism tooltip
+  ctx.fillStyle='rgba(6,10,18,0.92)';
+  ctx.strokeStyle='rgba(0,212,255,0.2)';
+  ctx.lineWidth=1;
+  ctx.beginPath(); ctx.roundRect(rx,ry,lw,lh,6); ctx.fill(); ctx.stroke();
+  ctx.textAlign='left'; ctx.font='500 10px JetBrains Mono';
+  lines.forEach((l,i)=>{
+    ctx.fillStyle=i===0?'#00d4ff':i===1?(n.position==='LONG'?'#00ff88':n.position==='SHORT'?'#ff4444':'#4a5568'):'#c8d6e5';
+    ctx.fillText(l,rx+10,ry+16+i*16);
+  });
+}
+
+// Scanning radar line
+function drawRadar(){
+  const angle=t*0.008;
+  const len=Math.min(W,H)*0.42;
+  const ex=cX+Math.cos(angle)*len, ey=cY+Math.sin(angle)*len;
+  const g=ctx.createLinearGradient(cX,cY,ex,ey);
+  g.addColorStop(0,'rgba(0,212,255,0)');
+  g.addColorStop(0.5,'rgba(0,212,255,0.03)');
+  g.addColorStop(1,'rgba(0,212,255,0)');
+  ctx.strokeStyle=g; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(cX,cY); ctx.lineTo(ex,ey); ctx.stroke();
+  // Sweep cone (fading trail)
+  for(let i=1;i<=12;i++){
+    const ta=angle-i*0.008;
+    const tx=cX+Math.cos(ta)*len, ty=cY+Math.sin(ta)*len;
+    ctx.strokeStyle=`rgba(0,212,255,${0.015-i*0.001})`;
+    ctx.lineWidth=0.5;
+    ctx.beginPath(); ctx.moveTo(cX,cY); ctx.lineTo(tx,ty); ctx.stroke();
+  }
+}
+
+// Orbital ring particles
+function drawOrbitals(){
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
+  // Inner orbit dots
+  for(let i=0;i<8;i++){
+    const a=t*0.005+i*Math.PI/4;
+    const x=cX+Math.cos(a)*(iR+3), y=cY+Math.sin(a)*(iR+3);
+    ctx.fillStyle=`rgba(0,212,255,${0.15+Math.sin(t*0.02+i)*0.1})`;
+    ctx.beginPath(); ctx.arc(x,y,1.5,0,Math.PI*2); ctx.fill();
+  }
+  // Outer orbit dots
+  for(let i=0;i<16;i++){
+    const a=-t*0.003+i*Math.PI/8;
+    const x=cX+Math.cos(a)*(oR+3), y=cY+Math.sin(a)*(oR+3);
+    ctx.fillStyle=`rgba(74,85,104,${0.12+Math.sin(t*0.015+i)*0.08})`;
+    ctx.beginPath(); ctx.arc(x,y,1,0,Math.PI*2); ctx.fill();
+  }
+}
+
+// Ambient corner glow
+function drawAmbient(){
+  // Top-left cyan glow
+  const g1=ctx.createRadialGradient(0,0,0,0,0,W*0.35);
+  g1.addColorStop(0,'rgba(0,212,255,0.015)');
+  g1.addColorStop(1,'rgba(0,212,255,0)');
+  ctx.fillStyle=g1; ctx.fillRect(0,0,W,H);
+  // Bottom-right green glow
+  const g2=ctx.createRadialGradient(W,H,0,W,H,W*0.3);
+  g2.addColorStop(0,'rgba(0,255,136,0.008)');
+  g2.addColorStop(1,'rgba(0,255,136,0)');
+  ctx.fillStyle=g2; ctx.fillRect(0,0,W,H);
+}
+
+// Main loop
+function render(){
+  t++;
+  ctx.clearRect(0,0,W,H);
+  drawAmbient();
+  drawGrid();
+  particles.forEach(p=>{p.update();p.draw();});
+  drawRadar();
+  drawConnections();
+  drawOrbitals();
+  drawCore();
+  pulses=pulses.filter(p=>{p.draw();return p.update();});
+  nodes.forEach(drawNode);
+  drawTooltip();
+  requestAnimationFrame(render);
+}
+
+// Data
+async function fetchBrainState(){
+  try{
+    const r=await fetch('/api/brain_state');
+    const d=await r.json();
+    layoutNodes(d.nodes);
+
+    // Stats bar
+    const act=d.nodes.filter(n=>n.active).length;
+    const trades=d.nodes.filter(n=>n.position!=='FLAT').length;
+    document.getElementById('s-nodes').textContent=d.nodes.length;
+    document.getElementById('s-active').textContent=act;
+    document.getElementById('s-trades').textContent=trades;
+    document.getElementById('s-signals').textContent=d.recent_signals.length;
+    document.getElementById('status-line').textContent=
+      d.nodes.length+' neural nodes | '+act+' firing | '+new Date().toISOString().substring(11,19)+' UTC';
+
+    // Fire pulses for active nodes
+    for(const n of d.nodes){
+      if(!n.active)continue;
+      const nd=nodes.find(x=>x.symbol===n.symbol);
+      if(nd&&Math.random()<0.35){
+        pulses.push(new Pulse(nd.x,nd.y,cX,cY,'rgba(0,212,255,1)',0.008+Math.random()*0.008));
+      }
+      if(nd&&n.position!=='FLAT'&&Math.random()<0.5){
+        const c=n.position==='LONG'?'rgba(0,255,136,1)':'rgba(255,68,68,1)';
+        pulses.push(new Pulse(cX,cY,nd.x,nd.y,c,0.015));
+      }
+    }
+
+    // Fire cross-pair pulses for correlated active nodes
+    const activeSyms=d.nodes.filter(n=>n.active).map(n=>n.symbol);
+    if(activeSyms.length>=2&&Math.random()<0.1){
+      const a=nodes.find(n=>n.symbol===activeSyms[0]);
+      const b=nodes.find(n=>n.symbol===activeSyms[1]);
+      if(a&&b) pulses.push(new Pulse(a.x,a.y,b.x,b.y,'rgba(0,212,255,1)',0.01));
+    }
+
+    // Decision flow panel — real gate data from most recent active signal
+    const gateKeys=[
+      ['session','Session'],['range_pct','Range Pct'],['direction','Direction'],
+      ['regime','Regime'],['maintenance','Maint.'],['mtf','MTF Align'],
+      ['spread','Spread'],['news','News'],['sequencing','Sequencing'],
+      ['sizing','Sizing'],['risk_gate','Risk Gate']
+    ];
+    // Find the most recent gate decision from any active node
+    let latestGates = {};
+    let latestGateSymbol = '';
+    for (const n of d.nodes) {
+      if (n.gates && n.gates.trigger) {
+        latestGates = n.gates;
+        latestGateSymbol = n.symbol;
+        break;
+      }
+    }
+    const gc=document.getElementById('gate-chain');
+    const triggerStatus = latestGates.trigger || 'NO_SIGNAL';
+    const finalStatus = latestGates.final || '---';
+    let chainHtml = '<div style="font-size:0.6em;color:#4a5568;margin-bottom:4px;">'
+      + (latestGateSymbol ? latestGateSymbol + ' | ' : '')
+      + (triggerStatus === 'PASS' ? '<span style="color:#00ff88;">SIGNAL FIRED</span>' : '<span style="color:#333;">WAITING</span>')
+      + ' | Final: <span style="color:' + (finalStatus === 'ENTRY' ? '#00ff88' : finalStatus === 'BLOCKED' ? '#ff4444' : '#4a5568') + ';">' + finalStatus + '</span></div>';
+    chainHtml += gateKeys.map(([key, label]) => {
+      const val = latestGates[key] || '---';
+      const cls = val === 'PASS' ? 'pass' : val === 'FAIL' ? 'fail' : val === 'SHADOW' ? 'shadow' : 'idle';
+      const color = cls === 'pass' ? '#00ff88' : cls === 'fail' ? '#ff4444' : cls === 'shadow' ? '#ffaa00' : '#1a2332';
+      return '<div class="gate-row"><div class="gate-dot ' + cls + '"></div><span class="gate-name">' + label + '</span><span class="gate-result" style="color:' + color + ';">' + val + '</span></div>';
+    }).join('');
+    gc.innerHTML = chainHtml;
+
+    // Signal feed
+    const sf=document.getElementById('signal-feed');
+    const sigs=d.recent_signals||[];
+    sf.innerHTML=sigs.slice(0,12).map(s=>{
+      const ac=s.action||'';
+      const c=ac==='ENTRY'?'#00ff88':ac.includes('BLOCK')?'#ff4444':'#4a5568';
+      return '<div class="sig-entry"><span style="color:#333;">'+(s.ts||'').substring(11,19)+'</span>'
+        +'<span style="color:#00d4ff;font-weight:500;">'+s.symbol+'</span>'
+        +'<span style="color:'+c+';">'+ac+'</span>'
+        +(s.direction?'<span style="color:#4a5568;">'+s.direction+'</span>':'')+'</div>';
+    }).join('')||'<div style="color:#333;">No recent signals</div>';
+
+    // Ticker
+    const ti=document.getElementById('ticker-inner');
+    const items=d.nodes.map(n=>{
+      const pc=n.position==='LONG'?'#00ff88':n.position==='SHORT'?'#ff4444':'#1a2332';
+      const hc=n.heat>0.8?'#ffaa00':n.heat>0.5?'#00d4ff':'#1a2332';
+      return '<span class="tick-item"><span class="tick-dot" style="background:'+hc+';"></span>'
+        +'<span style="color:'+hc+';">'+n.symbol+'</span>'
+        +'<span style="color:'+pc+';">'+n.position+'</span></span>';
+    }).join('');
+    ti.innerHTML=items+items; // duplicate for seamless scroll
+  }catch(e){document.getElementById('status-line').textContent='Neural link error: '+e.message;}
+}
+
+fetchBrainState();
+setInterval(fetchBrainState,3000);
+render();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/brain", response_class=HTMLResponse)
+async def brain_page():
+    return BRAIN_HTML
 
 
 # ---------------------------------------------------------------------------

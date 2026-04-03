@@ -2103,6 +2103,27 @@ class InstrumentRunner:
 
         direction = self._check_trigger(features)
 
+        # ── Gate decision tracking (for brain visualization) ──
+        _trigger_fired = direction is not None
+        _gate_log = {
+            "ts": now.isoformat(),
+            "symbol": self.symbol,
+            "trigger": "PASS" if _trigger_fired else "NO_SIGNAL",
+            "direction": direction or "",
+            "session": "PASS",
+            "range_pct": "PASS" if _trigger_fired else "FAIL",
+            "regime": "PASS",
+            "maintenance": "PASS",
+            "mtf": "PASS",
+            "spread": "PASS",
+            "news": "PASS",
+            "sequencing": "PASS",
+            "conviction": features.get("conviction_score", 0) if _trigger_fired else 0,
+            "sizing": "PASS",
+            "risk_gate": "PASS",
+            "final": "PENDING",
+        }
+
         # ── Regime gate ──────────────────────────────────────
         # Stamps every signal with regime. In GATE mode, blocks entries
         # when regime doesn't match strategy type.
@@ -2118,6 +2139,7 @@ class InstrumentRunner:
                     f"trend={features.get('trend_strength', 0):.3f}"
                 )
                 self._log_signal(features, direction, "REGIME_BLOCKED")
+                _gate_log["regime"] = "FAIL"
                 direction = None
 
         # ── Maintenance blackout (TWS restart window) ────
@@ -2132,6 +2154,7 @@ class InstrumentRunner:
             if blackout_start <= utc_minutes <= blackout_end:
                 self._log.info(f"MAINTENANCE_BLACKOUT: {direction.upper()} blocked during TWS restart window")
                 self._log_signal(features, direction, "MAINTENANCE_BLACKOUT")
+                _gate_log["maintenance"] = "FAIL"
                 direction = None
 
         # ── Advanced gates (multi-timeframe, spread, news, session, sequencing) ──
@@ -2150,6 +2173,7 @@ class InstrumentRunner:
                     # Shadow log — would have blocked, but LOG_ONLY
                     self._log.info(f"MTF_SHADOW_BLOCK {direction.upper()} | {mtf_reason}")
                     features["mtf_shadow_blocked"] = True
+                    _gate_log["mtf"] = "SHADOW"
 
         if direction:
             # 2. Spread gate
@@ -2160,6 +2184,7 @@ class InstrumentRunner:
                 if not spread_ok:
                     self._log.info(f"SPREAD_BLOCK {direction.upper()} | {spread_reason}")
                     self._log_signal(features, direction, "SPREAD_BLOCKED")
+                    _gate_log["spread"] = "FAIL"
                     direction = None
 
         if direction:
@@ -2169,6 +2194,7 @@ class InstrumentRunner:
                 if not news_ok:
                     self._log.info(f"NEWS_BLOCK {direction.upper()} | {news_reason}")
                     self._log_signal(features, direction, "NEWS_BLOCKED")
+                    _gate_log["news"] = "FAIL"
                     direction = None
 
         if direction:
@@ -2187,6 +2213,7 @@ class InstrumentRunner:
                 if not seq_ok:
                     self._log.info(f"SEQ_BLOCK {direction.upper()} | {seq_reason}")
                     self._log_signal(features, direction, "SEQUENCING_BLOCKED")
+                    _gate_log["sequencing"] = "FAIL"
                     direction = None
 
         # Min gap between signals
@@ -2199,6 +2226,16 @@ class InstrumentRunner:
         if direction and self.trade_enabled and getattr(self, '_entries_blocked', False):
             self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
             direction = None
+
+        # Write gate decision log for brain visualization
+        if _trigger_fired:
+            _gate_log["final"] = "ENTRY" if direction else "BLOCKED"
+            _gate_log["conviction"] = features.get("conviction_score", 0)
+            try:
+                _gf = self.log_dir / "gate_decisions.json"
+                atomic_write_json(_gf, _gate_log)
+            except Exception:
+                pass
 
         if direction and not self.trade_enabled:
             s.last_signal_time = now
@@ -2236,11 +2273,13 @@ class InstrumentRunner:
             if 0 < size < min_size:
                 self._log.info(f"SIZE_BELOW_FLOOR: {size} < min {min_size}")
                 self._log_signal(features, direction, "SIZE_BELOW_FLOOR")
+                _gate_log["sizing"] = "FAIL"
                 size = 0
 
             if size <= 0:
                 self._log.info(f"SIZE_BLOCK {direction.upper()} | size=0 policy={sizing_policy}")
                 self._log_signal(features, direction, "RISK_BLOCKED_SIZE_ZERO")
+                _gate_log["sizing"] = "FAIL"
                 direction = None
             else:
                 entry_plan = {
@@ -2263,6 +2302,7 @@ class InstrumentRunner:
             if not allowed:
                 self._log.info(f"RISK_BLOCK {direction.upper()} | reason={reason}")
                 self._log_signal(features, direction, f"RISK_BLOCKED_{reason}")
+                _gate_log["risk_gate"] = "FAIL"
                 direction = None
 
         if direction:
