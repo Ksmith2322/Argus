@@ -152,10 +152,86 @@ All strategies start on **current pairs only** — no new instruments until prov
 4. **Ares** — event-driven
 5. **Atlas** — pairs/stat arb
 
+### Phase 1.5: OPERATIONAL GAPS (Must fix before paper/real)
+
+These are known issues discovered during deployment. Must be resolved before any strategy moves beyond watcher.
+
+#### Critical
+
+- [ ] **Helio family watchdog** — Apollo/Hermes/Helio runners die silently and are NOT supervised by the Argus watchdog. Need either:
+  - Integrate into `watchdog_managed.ps1` (add Helio process monitoring)
+  - OR build a separate `helio_watchdog.ps1`
+  - Runners have been found dead multiple times with stale heartbeats
+
+- [ ] **Cross-strategy position conflict enforcement** — `portfolio_guard.py` exists (built by Codex) but needs verification:
+  - Test: Argus LONG AUD/JPY + Apollo SHORT AUD/JPY → should block the second entry
+  - Test: Hermes LONG Gold + Helio LONG Gold → should allow (same direction) or limit total exposure
+  - Verify portfolio guard reads heartbeat/state files from ALL strategy families
+
+- [ ] **Shared portfolio risk budget** — currently each strategy has its own risk limits siloed:
+  - Argus: PortfolioRiskManager with 3% DD pause, 2 max same-currency
+  - Helio/Apollo/Hermes: no cross-family risk aggregation
+  - Need: total fleet exposure cap across ALL strategies (e.g., max 5% total risk at any time)
+
+#### High
+
+- [ ] **IBKR connection management** — 4 separate IBKR connections (clientId 1, 200, 210, 220):
+  - IBKR TWS/Gateway has a limit of ~8 simultaneous connections
+  - Each runner holds a persistent connection 24/7 even when only evaluating once daily
+  - Consider: shared connection pool, or connect-evaluate-disconnect pattern for daily strategies
+
+- [ ] **Helio runners not in governance pipeline** — Argus has managed truth refresh, promotion gates, divergence guard, alert escalation. Helio family has none of this:
+  - No promotion pipeline for Helio/Apollo/Hermes
+  - No divergence guard comparing live vs backtest
+  - No kill discipline for swing strategies
+  - No dashboard integration (Helio heartbeats not shown on main dashboard)
+
+- [ ] **Regime router validation** — `regime_router.py` classifies regimes and deprioritizes strategies, but:
+  - Not tested against historical data
+  - Unclear if regime classification is stable or noisy
+  - Could incorrectly suppress the right strategy at the wrong time
+
+#### Medium
+
+- [ ] **Duplicate runner prevention** — process locks exist but each launch creates new PIDs:
+  - Watchdog restarts can create duplicates (seen: 2x APOLLO, 2x HERMES, 2x HELIO)
+  - Need: check for existing process before launching, or use PID file locking
+
+- [ ] **Helio log directory structure** — currently at `helio/logs/` separate from `argus_flow/logs/`:
+  - Dashboard reads from `argus_flow/logs/` only
+  - Helio heartbeats invisible to dashboard system health
+  - Need: either unify log roots or add Helio log scanning to dashboard
+
+- [ ] **Daily evaluation timing** — all Helio strategies evaluate at 21:00 UTC:
+  - FX market close is 22:00 UTC Friday
+  - US equity close is 20:00 UTC (16:00 ET)
+  - Asian session instruments may need different evaluation time
+  - Apollo on FX should evaluate after London close (17:00 UTC), not US close
+
+- [ ] **Hermes sample size concern** — best backtest result is PF 21 on 6 trades:
+  - Statistically meaningless at this sample
+  - Need 30+ trades before trusting the result
+  - May need longer backtest period or more instruments
+
+- [ ] **Apollo stop placement** — current stop at 0.5x ATR is very tight for mean reversion:
+  - Backtest shows high stop-out rate (60-70% of exits are stops)
+  - Winning trades are large enough to compensate, but tight stops mean high churn
+  - Consider widening to 1.0-1.5x ATR and testing impact
+
+### Phase 2: FUTURE RELATIVES (After Phase 1 validated)
+
+- [ ] **Ares** (Event-Driven) — trade NFP/FOMC/ECB reactions
+- [ ] **Atlas** (Pairs/Stat Arb) — correlated pair divergence/convergence
+- [ ] **Unified dashboard tab** for all Greek family strategies
+- [ ] **Cross-family performance report** comparing strategy PnL, drawdown, and correlation
+- [ ] **Meta-allocator** — dynamically shift capital to whichever family is currently performing best
+
 ### Phase 3: SCALE
 - Expand winning strategies to new instruments
 - Cross-strategy portfolio optimization
 - Edge-weighted allocation across families
+- Consider adding: **Hephaestus** (grid/DCA for ranging markets) if regime router identifies extended sideways periods
+- Consider adding: **Athena** (defensive/hedging strategy) that activates during drawdowns to protect portfolio
 
 ---
 
