@@ -864,7 +864,7 @@ def _in_session(hour: int, start: int, end: int) -> bool:
 
 
 def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
-    """FX trigger: range_pct + range_accel + vol_z + session."""
+    """FX trigger: range_pct + range_accel + vol_z + session + blocked hours."""
     trigger = cfg.get("trigger", {})
     if features["range_pct"] < trigger.get("range_pct_min", 0.0012):
         return None
@@ -876,6 +876,10 @@ def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
     h = features["hour"]
     if not _in_session(h, trigger.get("session_start_utc", 0), trigger.get("session_end_utc", 23)):
         return None
+    # Blocked hours: e.g. [[15, 19]] blocks 15:00-18:59 UTC (NY dead zone)
+    for block in trigger.get("blocked_hours_utc", []):
+        if len(block) >= 2 and block[0] <= h < block[1]:
+            return None
 
     dist = features["dist_from_low"]
     direction_cfg = cfg.get("direction", {})
@@ -2701,6 +2705,10 @@ class PortfolioRiskManager:
         "MGC": {"GOLD": +1}, "MCL": {"OIL": +1}, "NKD": {"JPY_EQUITY": +1},
     }
 
+    # London cluster: these pairs are ~0.97 correlated, treat as one macro trade
+    LONDON_CLUSTER = {"GBPUSD", "EURJPY", "GBPJPY", "CADJPY"}
+    MAX_LONDON_CLUSTER_POSITIONS = 2
+
     # Persistent state file for drawdown pause (survives restart)
     _STATE_FILE = REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
 
@@ -2866,6 +2874,16 @@ class PortfolioRiskManager:
             if abs(new_exp) > self.max_same_currency:
                 log.info(f"CORRELATION BLOCK: {symbol} {direction} -> {ccy}={new_exp:+d} (max={self.max_same_currency})")
                 return False, "CORRELATION_LIMIT"
+
+        # 6. London cluster limit (GBPUSD, EURJPY, GBPJPY, CADJPY ≈ 0.97 correlated)
+        if symbol.upper() in self.LONDON_CLUSTER:
+            cluster_open = sum(
+                1 for inst in instruments
+                if inst.state.position != "FLAT" and inst.symbol.upper() in self.LONDON_CLUSTER
+            )
+            if cluster_open >= self.MAX_LONDON_CLUSTER_POSITIONS:
+                log.info(f"LONDON_CLUSTER BLOCK: {symbol} {direction} -> {cluster_open} already open (max={self.MAX_LONDON_CLUSTER_POSITIONS})")
+                return False, "LONDON_CLUSTER_LIMIT"
 
         return True, ""
 
@@ -3149,7 +3167,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         max_drawdown_pct=dd_limit,
         daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
-        max_total_open_risk_pct=0.05,
+        max_total_open_risk_pct=0.10,  # 10% for paper fleet (was 5%, blocked EUR/USD when other pairs held positions)
     )
     risk_mgr.set_account_equity(equity_tracker.equity_usd)
     for inst in instruments:

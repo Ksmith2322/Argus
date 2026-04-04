@@ -14,6 +14,17 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "exit code $LASTEXITCODE"
     }
+    Write-Host "Running drift detector..."
+    $driftOutput = & $python -m helio.drift_detector 2>&1
+    foreach ($line in @($driftOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] drift_detector: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Add-Content -Path $logFile -Value "[$timestamp] === Nightly cohort report complete ==="
 } catch {
     Add-Content -Path $logFile -Value "[$timestamp] refresh_managed_truth ERROR: $_"

@@ -3570,7 +3570,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
   <div style="display:flex;align-items:center;gap:16px;">
     <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR STAGED TRADING FLEET</h2>
-    <a href="/brain" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">NEURAL VIEW</a>
+    <a href="/brain" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">HELIO NEURAL CORE</a>
   </div>
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
 </div>
@@ -8633,9 +8633,114 @@ def _load_gate_decisions(log_dir: Path) -> dict:
         return {}
 
 
+def _scan_greek_family_heartbeats() -> list[dict]:
+    """Scan helio/logs for Greek family heartbeats (Helio, Hermes, Apollo)."""
+    helio_logs = REPO / "helio" / "logs"
+    family_nodes = []
+    if not helio_logs.exists():
+        return family_nodes
+    for sub in sorted(helio_logs.iterdir()):
+        if not sub.is_dir():
+            continue
+        hb_path = sub / "heartbeat.json"
+        if not hb_path.exists():
+            continue
+        try:
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        age_s = _file_age_s(hb_path)
+        family = hb.get("family", "helio")
+        stage = hb.get("stage", "watcher")
+        symbol = hb.get("symbol", sub.name)
+        position = hb.get("position", "FLAT")
+        trade_count = hb.get("trade_count", 0)
+        # Read recent trades for PnL
+        trades_path = sub / "trades.csv"
+        pnl_total = hb.get("pnl_total", 0)
+        win_rate = 0
+        if trades_path.exists():
+            try:
+                rows = list(csv.DictReader(open(trades_path, encoding="utf-8")))
+                if rows:
+                    wins = sum(1 for r in rows if float(r.get("pnl_pct", 0)) > 0)
+                    win_rate = wins / len(rows)
+            except Exception:
+                pass
+        family_nodes.append({
+            "symbol": f"{family.upper()}:{symbol}",
+            "name": f"{family.capitalize()} {symbol}",
+            "system": "helio",
+            "family": family,
+            "stage": stage,
+            "position": position,
+            "entry_price": hb.get("entry_price", 0),
+            "pnl": pnl_total,
+            "unit": "pips" if family == "apollo" else "USD",
+            "heat": 0.3 if position != "FLAT" else 0.1,
+            "active": (age_s or 9999) < 86400,  # daily strategies: active if heartbeat < 24h
+            "signal_age_s": age_s or 9999,
+            "session": "DAILY",
+            "features": {
+                "range_pct": 0, "vol_z": 0, "range_accel": 0,
+                "dist_from_low": hb.get("dist_atr", 0),
+                "vol_burst_z": 0,
+            },
+            "gates": {},
+            "conviction": hb.get("rsi", 0) / 100 if hb.get("rsi") else 0,
+            "win_rate": win_rate,
+            "closed_trades": trade_count,
+            "blocked_24h": 0,
+            "entries_today": 0,
+            "broker_connected": True,
+        })
+    return family_nodes
+
+
+# ---------------------------------------------------------------------------
+# 10x Module APIs: Portfolio Guard, Drift Detector, Regime Router
+# ---------------------------------------------------------------------------
+
+@app.get("/api/portfolio_guard")
+async def api_portfolio_guard():
+    """Cross-family portfolio risk check."""
+    try:
+        report_path = REPO / "helio" / "logs" / "portfolio_guard.json"
+        if report_path.exists():
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+        else:
+            # Run live check
+            sys.path.insert(0, str(REPO))
+            from helio.portfolio_guard import check_current
+            result = check_current()
+            data = {
+                "allowed": result.allowed,
+                "reason": result.reason,
+                "metrics": result.metrics,
+                "warnings": result.warnings,
+            }
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/drift_report")
+async def api_drift_report():
+    """Feature drift detection status."""
+    try:
+        report_path = REPO / "helio" / "logs" / "drift_report.json"
+        if report_path.exists():
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+        else:
+            data = {"overall_health": "UNKNOWN", "features_checked": 0, "drifted_features": []}
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/brain_state")
 async def api_brain_state():
-    """Real-time brain state for neural visualization."""
+    """Real-time brain state for neural visualization — includes Greek family."""
     raw_runners = _managed_ibkr_runners()
     runners = [_read_ibkr_runner(r) for r in raw_runners]
     raw_map = {r.get("symbol", "").upper(): r for r in raw_runners}
@@ -8658,6 +8763,8 @@ async def api_brain_state():
         nodes.append({
             "symbol": r["symbol"],
             "name": r["name"],
+            "system": "argus",
+            "family": "argus",
             "stage": r.get("current_stage", "watcher"),
             "position": r["position"],
             "entry_price": r.get("entry_price", 0),
@@ -8682,6 +8789,11 @@ async def api_brain_state():
             "entries_today": r.get("entries_today", 0),
             "broker_connected": r.get("broker_connected", False),
         })
+
+    # Add Greek family nodes (Helio, Hermes, Apollo)
+    family_nodes = _scan_greek_family_heartbeats()
+    nodes.extend(family_nodes)
+
     # Recent signals across all pairs (last 20)
     recent_signals = []
     for r in runners:
@@ -8695,9 +8807,43 @@ async def api_brain_state():
             })
     recent_signals.sort(key=lambda x: x.get("ts", ""), reverse=True)
 
+    # Family summary
+    families = {}
+    for n in nodes:
+        fam = n.get("family", "argus")
+        if fam not in families:
+            families[fam] = {"count": 0, "active": 0, "in_trade": 0, "trades": 0}
+        families[fam]["count"] += 1
+        if n.get("active"):
+            families[fam]["active"] += 1
+        if n.get("position", "FLAT") != "FLAT":
+            families[fam]["in_trade"] += 1
+        families[fam]["trades"] += n.get("closed_trades", 0)
+
+    # Portfolio guard status
+    pg_data = {}
+    pg_path = REPO / "helio" / "logs" / "portfolio_guard.json"
+    if pg_path.exists():
+        try:
+            pg_data = json.loads(pg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Drift report status
+    drift_data = {"overall_health": "UNKNOWN"}
+    drift_path = REPO / "helio" / "logs" / "drift_report.json"
+    if drift_path.exists():
+        try:
+            drift_data = json.loads(drift_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     return JSONResponse({
         "nodes": nodes,
+        "families": families,
         "recent_signals": recent_signals[:20],
+        "portfolio_guard": pg_data,
+        "drift": drift_data,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -8706,12 +8852,12 @@ BRAIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Argus Neural Core</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Helio Neural Core — Greek Family</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@300;400;500&display=swap');
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #060a12; color: #c8d6e5; font-family: 'JetBrains Mono', monospace; overflow: hidden; }
+body { background: #060a12; color: #c8d6e5; font-family: 'JetBrains Mono', monospace; overflow: hidden; touch-action: none; }
 canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 
 #hud { position: fixed; top: 16px; left: 20px; z-index: 10; }
@@ -8727,10 +8873,15 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 .stat-val { font-family: 'Orbitron', sans-serif; font-size: 1.4em; font-weight: 700; }
 .stat-label { font-size: 0.55em; color: #4a5568; letter-spacing: 2px; text-transform: uppercase; margin-top: 2px; }
 
-#nav { position: fixed; top: 16px; right: 20px; z-index: 10; }
-#nav a { color: #4a5568; text-decoration: none; font-size: 0.7em; padding: 6px 16px;
-  border: 1px solid #1a2332; border-radius: 20px; transition: all 0.3s; letter-spacing: 1px; }
-#nav a:hover { background: #1a2332; color: #00d4ff; border-color: #00d4ff44; }
+#nav { position: fixed; top: 16px; right: 20px; z-index: 10; display: flex; gap: 8px; align-items: center; }
+#nav a, .toggle-btn { color: #4a5568; text-decoration: none; font-size: 0.7em; padding: 6px 16px;
+  border: 1px solid #1a2332; border-radius: 20px; transition: all 0.3s; letter-spacing: 1px; cursor: pointer;
+  background: transparent; font-family: 'JetBrains Mono', monospace; }
+#nav a:hover, .toggle-btn:hover { background: #1a2332; color: #00d4ff; border-color: #00d4ff44; }
+.toggle-btn.active { background: #1a2332; color: #00d4ff; border-color: #00d4ff44; }
+
+.panel { transition: opacity 0.3s, transform 0.3s; }
+.panel.hidden { opacity: 0; pointer-events: none; transform: translateY(10px); }
 
 #decision-flow { position: fixed; bottom: 50px; left: 20px; z-index: 10;
   background: rgba(6,10,18,0.88); border: 1px solid #1a2332; border-radius: 8px;
@@ -8746,6 +8897,12 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 .gate-dot.idle { background: #1a2332; }
 .gate-name { color: #4a5568; min-width: 80px; }
 .gate-result { color: #c8d6e5; flex: 1; }
+
+#system-health { position: fixed; top: 80px; right: 20px; z-index: 10;
+  background: rgba(6,10,18,0.88); border: 1px solid #1a2332; border-radius: 8px;
+  padding: 12px 16px; width: 220px; backdrop-filter: blur(10px); }
+#system-health h3 { font-family: 'Orbitron', sans-serif; font-size: 0.7em; color: #a78bfa;
+  letter-spacing: 3px; margin-bottom: 8px; }
 
 #signal-panel { position: fixed; bottom: 50px; right: 20px; z-index: 10;
   background: rgba(6,10,18,0.88); border: 1px solid #1a2332; border-radius: 8px;
@@ -8764,19 +8921,23 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 .tick-item { font-size: 0.6em; display: inline-flex; gap: 4px; align-items: center; }
 .tick-dot { width: 4px; height: 4px; border-radius: 50%; display: inline-block; }
 
+#zoom-hint { position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%); z-index: 5;
+  color: #1a2332; font-size: 0.55em; letter-spacing: 2px; pointer-events: none;
+  transition: opacity 2s; }
+
 /* Mobile responsive */
 @media (max-width: 768px) {
   #hud h1 { font-size: 0.85em; letter-spacing: 3px; }
   #stats-bar { position: fixed; top: auto; bottom: 40px; left: 8px; right: 8px;
-    transform: none; gap: 12px; justify-content: center;
+    transform: none; gap: 8px; justify-content: center; flex-wrap: wrap;
     background: rgba(6,10,18,0.9); padding: 8px; border-radius: 6px;
     border: 1px solid #1a2332; }
   .stat-val { font-size: 1em; }
-  .stat-label { font-size: 0.5em; }
-  #decision-flow { display: none; }
-  #signal-panel { display: none; }
-  #nav { top: 8px; right: 8px; }
-  #nav a { font-size: 0.6em; padding: 3px 8px; }
+  .stat-label { font-size: 0.45em; }
+  #decision-flow, #signal-panel, #system-health { display: none; }
+  #decision-flow.shown, #signal-panel.shown, #system-health.shown { display: block; }
+  #nav { top: 8px; right: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  #nav a, .toggle-btn { font-size: 0.55em; padding: 3px 8px; }
   #ticker { display: none; }
 }
 @media (min-width: 769px) and (max-width: 1200px) {
@@ -8788,67 +8949,185 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 </head>
 <body>
 <div id="hud">
-  <h1>Argus Neural Core</h1>
+  <h1>Helio Neural Core</h1>
   <div class="sub" id="status-line">Initializing neural network...</div>
 </div>
 <div id="stats-bar">
   <div class="stat-item"><div class="stat-val" id="s-nodes" style="color:#00d4ff;">--</div><div class="stat-label">Nodes</div></div>
   <div class="stat-item"><div class="stat-val" id="s-active" style="color:#00ff88;">--</div><div class="stat-label">Active</div></div>
   <div class="stat-item"><div class="stat-val" id="s-trades" style="color:#ffaa00;">--</div><div class="stat-label">In Trade</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-families" style="color:#a78bfa;">--</div><div class="stat-label">Families</div></div>
   <div class="stat-item"><div class="stat-val" id="s-signals" style="color:#7b8ab8;">--</div><div class="stat-label">Signals/min</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-guard" style="color:#00ff88;">--</div><div class="stat-label">Port. Guard</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-drift" style="color:#00ff88;">--</div><div class="stat-label">Drift</div></div>
 </div>
-<div id="nav"><a href="/">Fleet Dashboard</a></div>
+<div id="nav">
+  <a href="/">Fleet</a>
+  <button class="toggle-btn active" onclick="togglePanel('decision-flow',this)" title="Decision Pipeline">Pipeline</button>
+  <button class="toggle-btn active" onclick="togglePanel('system-health',this)" title="System Health">Health</button>
+  <button class="toggle-btn active" onclick="togglePanel('signal-panel',this)" title="Signal Feed">Signals</button>
+</div>
 
-<div id="decision-flow">
+<div id="decision-flow" class="panel">
   <h3>Decision Pipeline</h3>
   <div class="gate-chain" id="gate-chain"></div>
 </div>
 
-<div id="signal-panel">
+<div id="system-health" class="panel">
+  <h3>SYSTEM HEALTH</h3>
+  <div id="health-items" style="display:flex;flex-direction:column;gap:6px;font-size:0.62em;"></div>
+</div>
+
+<div id="signal-panel" class="panel">
   <h3>Signal Feed</h3>
   <div id="signal-feed">Waiting for neural activity...</div>
 </div>
 
 <canvas id="brain"></canvas>
 <div id="ticker"><div id="ticker-inner"></div></div>
+<div id="zoom-hint">SCROLL TO ZOOM &middot; DRAG TO PAN</div>
 
 <script>
 const canvas = document.getElementById('brain');
 const ctx = canvas.getContext('2d');
 let W, H, cX, cY, t = 0;
-let nodes = [], particles = [], pulses = [];
+let nodes = [], particles = [], pulses = [], nebulae = [];
 let hoveredNode = null, selectedNode = null;
 
-function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; cX = W/2; cY = H/2; }
+// --- Camera / zoom / pan ---
+let camX = 0, camY = 0, camZoom = 1, targetZoom = 1, targetCX = 0, targetCY = 0;
+let isDragging = false, dragStartX = 0, dragStartY = 0, dragCamX = 0, dragCamY = 0;
+
+// Panel toggle
+function togglePanel(id, btn) {
+  const el = document.getElementById(id);
+  const isMobile = window.innerWidth <= 768;
+  if (isMobile) {
+    el.classList.toggle('shown');
+    el.style.display = el.classList.contains('shown') ? 'block' : 'none';
+  } else {
+    el.classList.toggle('hidden');
+  }
+  btn.classList.toggle('active');
+}
+
+// Hide zoom hint after 5 seconds
+setTimeout(() => { document.getElementById('zoom-hint').style.opacity = '0'; }, 5000);
+
+function resize() {
+  W = canvas.width = innerWidth; H = canvas.height = innerHeight;
+  cX = W/2; cY = H/2;
+}
 addEventListener('resize', resize); resize();
+
+// --- Zoom (mouse wheel + pinch) ---
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const zoomFactor = e.deltaY > 0 ? 0.92 : 1.08;
+  targetZoom = Math.max(0.3, Math.min(4, targetZoom * zoomFactor));
+}, { passive: false });
+
+// --- Pan (mouse drag) ---
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  isDragging = true; dragStartX = e.clientX; dragStartY = e.clientY;
+  dragCamX = camX; dragCamY = camY;
+  canvas.style.cursor = 'grabbing';
+});
+addEventListener('mousemove', e => {
+  if (!isDragging) return;
+  targetCX = dragCamX + (e.clientX - dragStartX) / camZoom;
+  targetCY = dragCamY + (e.clientY - dragStartY) / camZoom;
+});
+addEventListener('mouseup', () => { isDragging = false; canvas.style.cursor = hoveredNode ? 'pointer' : 'default'; });
+
+// --- Touch: pinch zoom + drag pan ---
+let touches = [], lastPinchDist = 0;
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  touches = [...e.touches];
+  if (touches.length === 1) {
+    isDragging = true; dragStartX = touches[0].clientX; dragStartY = touches[0].clientY;
+    dragCamX = camX; dragCamY = camY;
+  } else if (touches.length === 2) {
+    isDragging = false;
+    lastPinchDist = Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+  }
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const ct = [...e.touches];
+  if (ct.length === 1 && isDragging) {
+    targetCX = dragCamX + (ct[0].clientX - dragStartX) / camZoom;
+    targetCY = dragCamY + (ct[0].clientY - dragStartY) / camZoom;
+  } else if (ct.length === 2) {
+    const dist = Math.hypot(ct[0].clientX - ct[1].clientX, ct[0].clientY - ct[1].clientY);
+    if (lastPinchDist > 0) {
+      targetZoom = Math.max(0.3, Math.min(4, targetZoom * (dist / lastPinchDist)));
+    }
+    lastPinchDist = dist;
+  }
+}, { passive: false });
+canvas.addEventListener('touchend', () => { isDragging = false; lastPinchDist = 0; });
+
+// Double-tap/click to reset view
+canvas.addEventListener('dblclick', () => { targetZoom = 1; targetCX = 0; targetCY = 0; });
+
+// --- Nebula (depth background clouds) ---
+class Nebula {
+  constructor() {
+    this.x = Math.random() * 2 - 0.5; this.y = Math.random() * 2 - 0.5;
+    this.r = 80 + Math.random() * 200;
+    this.hue = [200, 160, 270, 30][Math.floor(Math.random() * 4)];
+    this.alpha = 0.008 + Math.random() * 0.012;
+    this.depth = 0.3 + Math.random() * 0.7; // parallax depth
+    this.phase = Math.random() * Math.PI * 2;
+  }
+  draw(t) {
+    const breath = Math.sin(t * 0.005 + this.phase) * 0.3 + 1;
+    const px = this.x * W + camX * this.depth * 0.3;
+    const py = this.y * H + camY * this.depth * 0.3;
+    const g = ctx.createRadialGradient(px, py, 0, px, py, this.r * breath);
+    g.addColorStop(0, `hsla(${this.hue},60%,40%,${this.alpha * breath})`);
+    g.addColorStop(1, `hsla(${this.hue},60%,20%,0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, this.r * breath, 0, Math.PI * 2); ctx.fill();
+  }
+}
+for (let i = 0; i < 8; i++) nebulae.push(new Nebula());
 
 // Subtle grid background
 function drawGrid() {
-  const spacing = 40;
-  ctx.strokeStyle = 'rgba(26,35,50,0.4)';
+  const spacing = 40 * camZoom;
+  if (spacing < 10) return; // too zoomed out, skip grid
+  ctx.strokeStyle = 'rgba(26,35,50,0.3)';
   ctx.lineWidth = 0.5;
-  for (let x = 0; x < W; x += spacing) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
-  for (let y = 0; y < H; y += spacing) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  const ox = (camX * camZoom) % spacing;
+  const oy = (camY * camZoom) % spacing;
+  for (let x = ox; x < W; x += spacing) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = oy; y < H; y += spacing) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
 }
 
 // Ambient particles
 class Particle {
   constructor() { this.reset(); }
   reset() {
-    this.x = Math.random()*W; this.y = Math.random()*H;
-    this.vx = (Math.random()-0.5)*0.15; this.vy = (Math.random()-0.5)*0.15;
+    this.x = (Math.random()-0.5)*2; this.y = (Math.random()-0.5)*2;
+    this.vx = (Math.random()-0.5)*0.0008; this.vy = (Math.random()-0.5)*0.0008;
     this.life = Math.random()*400+200; this.max = this.life;
     this.r = Math.random()*1.2+0.3;
-    this.hue = Math.random() > 0.7 ? 160 : 200; // mix of cyan and green tints
+    this.hue = Math.random() > 0.7 ? 160 : 200;
+    this.depth = 0.5 + Math.random() * 0.5;
   }
-  update() { this.x+=this.vx; this.y+=this.vy; this.life--; if(this.life<=0||this.x<0||this.x>W||this.y<0||this.y>H) this.reset(); }
+  update() { this.x+=this.vx; this.y+=this.vy; this.life--; if(this.life<=0||Math.abs(this.x)>1.5||Math.abs(this.y)>1.5) this.reset(); }
   draw() {
-    const a = (this.life/this.max)*0.2;
+    const a = (this.life/this.max)*0.25;
+    const sx = cX + this.x * W * 0.5 * camZoom + camX * camZoom * this.depth;
+    const sy = cY + this.y * H * 0.5 * camZoom + camY * camZoom * this.depth;
     ctx.fillStyle = `hsla(${this.hue},80%,60%,${a})`;
-    ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx,sy,this.r*camZoom,0,Math.PI*2); ctx.fill();
   }
 }
-for(let i=0;i<200;i++) particles.push(new Particle());
+for(let i=0;i<250;i++) particles.push(new Particle());
 
 // Energy pulse along connections
 class Pulse {
@@ -8859,15 +9138,14 @@ class Pulse {
   update() { this.p+=this.speed; return this.p<1; }
   draw() {
     const x=this.ax+(this.bx-this.ax)*this.p, y=this.ay+(this.by-this.ay)*this.p;
-    const a=Math.sin(this.p*Math.PI); // fade in and out
-    // Glow
-    const g=ctx.createRadialGradient(x,y,0,x,y,8);
+    const a=Math.sin(this.p*Math.PI);
+    const sr = 8 * camZoom;
+    const g=ctx.createRadialGradient(x,y,0,x,y,sr);
     g.addColorStop(0,this.color.replace('1)',a*0.9+')'));
     g.addColorStop(1,this.color.replace('1)','0)'));
-    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill();
-    // Core
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,sr*1.5,0,Math.PI*2); ctx.fill();
     ctx.fillStyle=this.color.replace('1)',Math.min(1,a*1.3)+')');
-    ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x,y,3*camZoom,0,Math.PI*2); ctx.fill();
   }
 }
 
@@ -8879,31 +9157,70 @@ function drawHex(x,y,r,rot) {
 }
 
 function layoutNodes(data) {
-  const paper=data.filter(n=>n.stage==='paper');
-  const watcher=data.filter(n=>n.stage==='watcher');
-  const real=data.filter(n=>n.stage==='real'||n.stage==='quarantine');
-  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
+  const argusNodes=data.filter(n=>n.family==='argus'||!n.family);
+  const familyNodes=data.filter(n=>n.family&&n.family!=='argus');
+  const paper=argusNodes.filter(n=>n.stage==='paper');
+  const watcher=argusNodes.filter(n=>n.stage==='watcher');
+  const real=argusNodes.filter(n=>n.stage==='real'||n.stage==='quarantine');
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.30;
+  const fR=Math.min(W,H)*0.42;
+
   real.forEach((n,i)=>{const a=(i/Math.max(1,real.length))*Math.PI*2; n.x=cX+Math.cos(a)*45; n.y=cY+Math.sin(a)*45; n.ring='core'; n.radius=30;});
   paper.forEach((n,i)=>{const a=(i/Math.max(1,paper.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*iR; n.y=cY+Math.sin(a)*iR; n.ring='inner'; n.radius=24;});
   watcher.forEach((n,i)=>{const a=(i/Math.max(1,watcher.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*oR; n.y=cY+Math.sin(a)*oR; n.ring='outer'; n.radius=14;});
-  nodes=[...real,...paper,...watcher];
+
+  const famColors={helio:'#ffaa00',hermes:'#ff6b6b',apollo:'#a78bfa'};
+  // Group family nodes by family for arc segmentation
+  const famGroups={};
+  familyNodes.forEach(n=>{const f=n.family||'helio'; if(!famGroups[f])famGroups[f]=[]; famGroups[f].push(n);});
+  const famOrder=['helio','hermes','apollo'];
+  let idx=0;
+  const total=familyNodes.length;
+  famOrder.forEach(fam=>{
+    const group=famGroups[fam]||[];
+    group.forEach((n,i)=>{
+      const a=(idx/Math.max(1,total))*Math.PI*2-Math.PI/4;
+      n.x=cX+Math.cos(a)*fR; n.y=cY+Math.sin(a)*fR;
+      n.ring='family'; n.radius=12; n.famColor=famColors[n.family]||'#4a5568';
+      idx++;
+    });
+  });
+
+  nodes=[...real,...paper,...watcher,...familyNodes];
+  // Add breathing offset seeds
+  nodes.forEach((n,i)=>{ n._breathSeed=i*1.7; n._orbitSeed=i*0.37; });
 }
 
 function drawNode(n) {
-  const x=n.x, y=n.y, r=n.radius;
-  const inTrade=n.position!=='FLAT';
-  const heat=n.heat||0;
-  const colors={paper:'#00d4ff',watcher:'#4a5568',real:'#00ff88',quarantine:'#ff9800'};
-  const baseC=colors[n.stage]||'#333';
-  const rot=t*0.001; // slow rotation
+  // Breathing animation — nodes gently pulse
+  const breathe = Math.sin(t * 0.02 + n._breathSeed) * 0.08 + 1;
+  const orbit = Math.sin(t * 0.008 + n._orbitSeed) * 2; // subtle wobble
+  const x = n.x + orbit * (n.ring === 'family' ? 0.5 : 0.3);
+  const y = n.y + Math.cos(t * 0.006 + n._orbitSeed) * 1.5 * (n.ring === 'family' ? 0.5 : 0.3);
+  const r = n.radius * breathe;
+  const inTrade = n.position !== 'FLAT';
+  const heat = n.heat || 0;
+  const colors = {paper:'#00d4ff',watcher:'#4a5568',real:'#00ff88',quarantine:'#ff9800'};
+  const baseC = n.famColor || colors[n.stage] || '#333';
+  const rot = t * 0.001;
 
-  // Outer glow
-  if(heat>0.3||inTrade||n.active){
+  // Outer glow — more dramatic
+  if(heat>0.2||inTrade||n.active){
     const gc=inTrade?'rgba(0,255,136,':'rgba(0,212,255,';
-    const gs=inTrade?25:heat*18;
-    const g=ctx.createRadialGradient(x,y,r*0.5,x,y,r+gs);
-    g.addColorStop(0,gc+'0.15)'); g.addColorStop(1,gc+'0)');
+    const gs=inTrade?30*breathe:Math.max(8,heat*22)*breathe;
+    const g=ctx.createRadialGradient(x,y,r*0.3,x,y,r+gs);
+    g.addColorStop(0,gc+(inTrade?'0.2':'0.12')+')'); g.addColorStop(1,gc+'0)');
     ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r+gs,0,Math.PI*2); ctx.fill();
+  }
+
+  // Family node aura
+  if(n.ring==='family'&&n.famColor){
+    const ac=n.famColor.replace('#','');
+    const rr=parseInt(ac.substring(0,2),16), gg=parseInt(ac.substring(2,4),16), bb=parseInt(ac.substring(4,6),16);
+    const aura=ctx.createRadialGradient(x,y,r*0.5,x,y,r+15*breathe);
+    aura.addColorStop(0,`rgba(${rr},${gg},${bb},0.08)`);
+    aura.addColorStop(1,`rgba(${rr},${gg},${bb},0)`);
+    ctx.fillStyle=aura; ctx.beginPath(); ctx.arc(x,y,r+15*breathe,0,Math.PI*2); ctx.fill();
   }
 
   // Hex body
@@ -8913,6 +9230,13 @@ function drawNode(n) {
   ctx.strokeStyle=inTrade?(n.position==='LONG'?'#00ff88':'#ff4444'):baseC;
   ctx.lineWidth=inTrade?2.5:(n.ring==='inner'?1.5:0.8);
   ctx.stroke();
+
+  // Inner hex wireframe (depth effect)
+  if(r>=18){
+    drawHex(x,y,r*0.6,rot+0.5);
+    ctx.strokeStyle=baseC.replace ? baseC : '#333';
+    ctx.globalAlpha=0.08; ctx.lineWidth=0.5; ctx.stroke(); ctx.globalAlpha=1;
+  }
 
   // Feature radar (inner nodes only)
   if(n.features&&r>=20){
@@ -8943,7 +9267,7 @@ function drawNode(n) {
   }
 
   // Label
-  ctx.fillStyle=n.ring==='inner'?'#c8d6e5':'#4a5568';
+  ctx.fillStyle=n.ring==='inner'?'#c8d6e5':(n.ring==='family'?(n.famColor||'#4a5568'):'#4a5568');
   ctx.font=(r>=20?'600 10':'400 7')+'px JetBrains Mono, monospace';
   ctx.textAlign='center';
   ctx.fillText(n.symbol,x,y+r+15);
@@ -8956,18 +9280,21 @@ function drawNode(n) {
     ctx.fillRect(x-bw/2,by,bw*n.conviction,bh);
   }
 
-  // PnL micro text (paper nodes)
+  // PnL micro text
   if(r>=20&&n.closed_trades>0){
     const pnlC=n.pnl>=0?'#00ff88':'#ff4444';
     ctx.fillStyle=pnlC; ctx.font='500 8px JetBrains Mono';
     ctx.fillText((n.pnl>=0?'+':'')+Number(n.pnl).toFixed(1),x,y+4);
   }
+
+  // Store screen coords for hover detection
+  n._sx=x; n._sy=y; n._sr=r;
 }
 
 function drawConnections() {
   const groups={USD:['EURUSD','GBPUSD','AUDUSD'],JPY:['EURJPY','GBPJPY','AUDJPY','CADJPY','USDJPY']};
   for(const[,syms] of Object.entries(groups)){
-    const gn=nodes.filter(n=>syms.includes(n.symbol));
+    const gn=nodes.filter(n=>syms.includes(n.symbol)&&n.ring!=='family');
     for(let i=0;i<gn.length;i++) for(let j=i+1;j<gn.length;j++){
       const a=gn[i],b=gn[j];
       const active=a.active&&b.active;
@@ -8977,86 +9304,136 @@ function drawConnections() {
       ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(mx,my,b.x,b.y); ctx.stroke();
     }
   }
+  // Greek family connections
+  const famGroups={};
+  nodes.filter(n=>n.ring==='family').forEach(n=>{
+    const f=n.symbol.split(':')[0]||'HELIO';
+    if(!famGroups[f])famGroups[f]=[];
+    famGroups[f].push(n);
+  });
+  const famC={HELIO:'rgba(255,170,0,',HERMES:'rgba(255,107,107,',APOLLO:'rgba(167,139,250,'};
+  for(const[fam,gn] of Object.entries(famGroups)){
+    const c=famC[fam]||'rgba(74,85,104,';
+    for(let i=0;i<gn.length;i++) for(let j=i+1;j<gn.length;j++){
+      ctx.strokeStyle=c+'0.1)'; ctx.lineWidth=0.5;
+      ctx.beginPath(); ctx.moveTo(gn[i].x,gn[i].y); ctx.lineTo(gn[j].x,gn[j].y); ctx.stroke();
+    }
+  }
+  // Cross-family connections
+  nodes.filter(n=>n.ring==='family').forEach(fn=>{
+    const baseSym=fn.symbol.includes(':')?fn.symbol.split(':')[1]:'';
+    const argusMatch=nodes.find(n=>n.ring!=='family'&&n.symbol===baseSym);
+    if(argusMatch){
+      ctx.strokeStyle=(famC[fn.symbol.split(':')[0]]||'rgba(74,85,104,')+'0.06)';
+      ctx.lineWidth=0.4;
+      ctx.setLineDash([2,6]);
+      ctx.beginPath(); ctx.moveTo(fn.x,fn.y); ctx.lineTo(argusMatch.x,argusMatch.y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  });
 }
 
 function drawCore() {
   const pulse=(Math.sin(t*0.03)+1)/2;
+  const breathe=Math.sin(t*0.015)*3;
   // Outer ring
-  ctx.strokeStyle=`rgba(0,212,255,${0.05+pulse*0.05})`;
-  ctx.lineWidth=1;
-  ctx.beginPath(); ctx.arc(cX,cY,35+pulse*3,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle=`rgba(0,212,255,${0.06+pulse*0.06})`;
+  ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(cX,cY,38+pulse*4+breathe,0,Math.PI*2); ctx.stroke();
+  // Second ring
+  ctx.strokeStyle=`rgba(0,212,255,${0.03+pulse*0.02})`;
+  ctx.lineWidth=0.8;
+  ctx.beginPath(); ctx.arc(cX,cY,28+pulse*2,0,Math.PI*2); ctx.stroke();
   // Inner glow
-  const g=ctx.createRadialGradient(cX,cY,0,cX,cY,30+pulse*5);
-  g.addColorStop(0,`rgba(0,212,255,${0.08+pulse*0.04})`);
+  const g=ctx.createRadialGradient(cX,cY,0,cX,cY,35+pulse*8+breathe);
+  g.addColorStop(0,`rgba(0,212,255,${0.1+pulse*0.06})`);
+  g.addColorStop(0.5,`rgba(0,212,255,${0.03+pulse*0.02})`);
   g.addColorStop(1,'rgba(0,212,255,0)');
-  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cX,cY,30+pulse*5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cX,cY,35+pulse*8+breathe,0,Math.PI*2); ctx.fill();
   // Label
-  ctx.fillStyle=`rgba(0,212,255,${0.5+pulse*0.3})`;
-  ctx.font='900 11px Orbitron, sans-serif';
+  ctx.fillStyle=`rgba(0,212,255,${0.6+pulse*0.3})`;
+  ctx.font='900 12px Orbitron, sans-serif';
   ctx.textAlign='center';
-  ctx.fillText('ARGUS',cX,cY+4);
+  ctx.fillText('HELIO',cX,cY+4);
   // Ring labels
-  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.30;
+  const fR=Math.min(W,H)*0.42;
   ctx.strokeStyle='rgba(0,212,255,0.07)'; ctx.lineWidth=0.6;
   ctx.setLineDash([3,9]);
   ctx.beginPath(); ctx.arc(cX,cY,iR,0,Math.PI*2); ctx.stroke();
   ctx.beginPath(); ctx.arc(cX,cY,oR,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle='rgba(255,170,0,0.1)'; ctx.lineWidth=0.8;
+  ctx.beginPath(); ctx.arc(cX,cY,fR,0,Math.PI*2); ctx.stroke();
   ctx.setLineDash([]);
-  ctx.fillStyle='rgba(74,85,104,0.25)'; ctx.font='400 8px JetBrains Mono';
-  ctx.fillText('PAPER QA',cX,cY-iR-6);
+  ctx.fillStyle='rgba(74,85,104,0.3)'; ctx.font='400 8px JetBrains Mono';
+  ctx.fillText('PAPER',cX,cY-iR-6);
   ctx.fillText('WATCHERS',cX,cY-oR-6);
+  ctx.fillStyle='rgba(255,170,0,0.3)';
+  ctx.fillText('GREEK FAMILY',cX,cY-fR-6);
 }
 
-// Hover tooltip
+// Hover tooltip (uses screen-space coords from _sx/_sy)
 canvas.addEventListener('mousemove',e=>{
+  if(isDragging) return;
   hoveredNode=null;
-  for(const n of nodes){const dx=e.clientX-n.x,dy=e.clientY-n.y;if(Math.sqrt(dx*dx+dy*dy)<n.radius+5){hoveredNode=n;break;}}
-  canvas.style.cursor=hoveredNode?'pointer':'default';
+  const mx=(e.clientX-W/2)/camZoom+cX-camX, my=(e.clientY-H/2)/camZoom+cY-camY;
+  for(const n of nodes){
+    const sx=n._sx||n.x, sy=n._sy||n.y, sr=n._sr||n.radius;
+    const dx=e.clientX-((sx-cX)*camZoom+W/2+camX*camZoom);
+    const dy=e.clientY-((sy-cY)*camZoom+H/2+camY*camZoom);
+    if(Math.sqrt(dx*dx+dy*dy)<(sr*camZoom+8)){hoveredNode=n;break;}
+  }
+  if(!isDragging) canvas.style.cursor=hoveredNode?'pointer':'default';
 });
 
 function drawTooltip(){
   if(!hoveredNode)return;
   const n=hoveredNode;
+  const sx=(n._sx-cX)*camZoom+W/2+camX*camZoom;
+  const sy=(n._sy-cY)*camZoom+H/2+camY*camZoom;
   const lines=[
     n.name+' ('+n.stage.toUpperCase()+')',
+    (n.family||'argus').toUpperCase()+' Family',
     n.position+(n.position!=='FLAT'?' @ '+n.entry_price:''),
     'PnL: '+(n.pnl>=0?'+':'')+Number(n.pnl).toFixed(1)+' '+n.unit,
-    'WR: '+(n.win_rate*100).toFixed(0)+'% | T: '+n.closed_trades,
+    'WR: '+(n.win_rate*100).toFixed(0)+'% | Trades: '+n.closed_trades,
     'Conv: '+(n.conviction||0).toFixed(2)+' | Sess: '+n.session,
     'Heat: '+(n.heat||0).toFixed(2)+' | Blk24h: '+(n.blocked_24h||0),
   ];
-  const lw=220, lh=lines.length*16+16;
-  let rx=n.x+n.radius+18, ry=n.y-lh/2;
-  if(rx+lw>W-10)rx=n.x-n.radius-18-lw;
+  const lw=230, lh=lines.length*16+16;
+  let rx=sx+20, ry=sy-lh/2;
+  if(rx+lw>W-10)rx=sx-20-lw;
   ry=Math.max(10,Math.min(ry,H-lh-10));
-  // Glassmorphism tooltip
-  ctx.fillStyle='rgba(6,10,18,0.92)';
-  ctx.strokeStyle='rgba(0,212,255,0.2)';
+  // Save transform for tooltip (drawn in screen space)
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='rgba(6,10,18,0.94)';
+  ctx.strokeStyle='rgba(0,212,255,0.25)';
   ctx.lineWidth=1;
   ctx.beginPath(); ctx.roundRect(rx,ry,lw,lh,6); ctx.fill(); ctx.stroke();
   ctx.textAlign='left'; ctx.font='500 10px JetBrains Mono';
+  const lColors=['#00d4ff','#a78bfa',null,'#c8d6e5','#c8d6e5','#c8d6e5','#c8d6e5'];
   lines.forEach((l,i)=>{
-    ctx.fillStyle=i===0?'#00d4ff':i===1?(n.position==='LONG'?'#00ff88':n.position==='SHORT'?'#ff4444':'#4a5568'):'#c8d6e5';
+    ctx.fillStyle=lColors[i]||(i===2?(n.position==='LONG'?'#00ff88':n.position==='SHORT'?'#ff4444':'#4a5568'):'#c8d6e5');
     ctx.fillText(l,rx+10,ry+16+i*16);
   });
+  ctx.restore();
 }
 
 // Scanning radar line
 function drawRadar(){
   const angle=t*0.008;
-  const len=Math.min(W,H)*0.42;
+  const len=Math.min(W,H)*0.45;
   const ex=cX+Math.cos(angle)*len, ey=cY+Math.sin(angle)*len;
   const g=ctx.createLinearGradient(cX,cY,ex,ey);
   g.addColorStop(0,'rgba(0,212,255,0)');
-  g.addColorStop(0.5,'rgba(0,212,255,0.03)');
+  g.addColorStop(0.6,'rgba(0,212,255,0.04)');
   g.addColorStop(1,'rgba(0,212,255,0)');
-  ctx.strokeStyle=g; ctx.lineWidth=1;
+  ctx.strokeStyle=g; ctx.lineWidth=1.5;
   ctx.beginPath(); ctx.moveTo(cX,cY); ctx.lineTo(ex,ey); ctx.stroke();
-  // Sweep cone (fading trail)
-  for(let i=1;i<=12;i++){
-    const ta=angle-i*0.008;
+  for(let i=1;i<=16;i++){
+    const ta=angle-i*0.007;
     const tx=cX+Math.cos(ta)*len, ty=cY+Math.sin(ta)*len;
-    ctx.strokeStyle=`rgba(0,212,255,${0.015-i*0.001})`;
+    ctx.strokeStyle=`rgba(0,212,255,${0.018-i*0.001})`;
     ctx.lineWidth=0.5;
     ctx.beginPath(); ctx.moveTo(cX,cY); ctx.lineTo(tx,ty); ctx.stroke();
   }
@@ -9064,51 +9441,81 @@ function drawRadar(){
 
 // Orbital ring particles
 function drawOrbitals(){
-  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.34;
-  // Inner orbit dots
-  for(let i=0;i<8;i++){
-    const a=t*0.005+i*Math.PI/4;
+  const iR=Math.min(W,H)*0.17, oR=Math.min(W,H)*0.30, fR=Math.min(W,H)*0.42;
+  for(let i=0;i<10;i++){
+    const a=t*0.005+i*Math.PI/5;
+    const br=1+Math.sin(t*0.02+i)*0.3;
     const x=cX+Math.cos(a)*(iR+3), y=cY+Math.sin(a)*(iR+3);
-    ctx.fillStyle=`rgba(0,212,255,${0.15+Math.sin(t*0.02+i)*0.1})`;
-    ctx.beginPath(); ctx.arc(x,y,1.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=`rgba(0,212,255,${0.18+Math.sin(t*0.02+i)*0.12})`;
+    ctx.beginPath(); ctx.arc(x,y,1.5*br,0,Math.PI*2); ctx.fill();
   }
-  // Outer orbit dots
-  for(let i=0;i<16;i++){
-    const a=-t*0.003+i*Math.PI/8;
+  for(let i=0;i<20;i++){
+    const a=-t*0.003+i*Math.PI/10;
     const x=cX+Math.cos(a)*(oR+3), y=cY+Math.sin(a)*(oR+3);
-    ctx.fillStyle=`rgba(74,85,104,${0.12+Math.sin(t*0.015+i)*0.08})`;
+    ctx.fillStyle=`rgba(74,85,104,${0.14+Math.sin(t*0.015+i)*0.1})`;
     ctx.beginPath(); ctx.arc(x,y,1,0,Math.PI*2); ctx.fill();
+  }
+  for(let i=0;i<14;i++){
+    const a=t*0.002+i*Math.PI*2/14;
+    const br=1+Math.sin(t*0.008+i*0.5)*0.2;
+    const x=cX+Math.cos(a)*(fR+4), y=cY+Math.sin(a)*(fR+4);
+    ctx.fillStyle=`rgba(255,170,0,${0.12+Math.sin(t*0.01+i)*0.08})`;
+    ctx.beginPath(); ctx.arc(x,y,1.2*br,0,Math.PI*2); ctx.fill();
   }
 }
 
 // Ambient corner glow
 function drawAmbient(){
-  // Top-left cyan glow
-  const g1=ctx.createRadialGradient(0,0,0,0,0,W*0.35);
-  g1.addColorStop(0,'rgba(0,212,255,0.015)');
+  const pulse=Math.sin(t*0.008)*0.5+0.5;
+  const g1=ctx.createRadialGradient(0,0,0,0,0,W*0.4);
+  g1.addColorStop(0,`rgba(0,212,255,${0.012+pulse*0.005})`);
   g1.addColorStop(1,'rgba(0,212,255,0)');
   ctx.fillStyle=g1; ctx.fillRect(0,0,W,H);
-  // Bottom-right green glow
-  const g2=ctx.createRadialGradient(W,H,0,W,H,W*0.3);
-  g2.addColorStop(0,'rgba(0,255,136,0.008)');
+  const g2=ctx.createRadialGradient(W,H,0,W,H,W*0.35);
+  g2.addColorStop(0,`rgba(0,255,136,${0.008+pulse*0.003})`);
   g2.addColorStop(1,'rgba(0,255,136,0)');
   ctx.fillStyle=g2; ctx.fillRect(0,0,W,H);
+  // Golden accent for family ring
+  const g3=ctx.createRadialGradient(W*0.7,H*0.2,0,W*0.7,H*0.2,W*0.25);
+  g3.addColorStop(0,`rgba(255,170,0,${0.004+pulse*0.002})`);
+  g3.addColorStop(1,'rgba(255,170,0,0)');
+  ctx.fillStyle=g3; ctx.fillRect(0,0,W,H);
 }
 
 // Main loop
 function render(){
   t++;
+  // Smooth camera
+  camZoom += (targetZoom - camZoom) * 0.08;
+  camX += (targetCX - camX) * 0.08;
+  camY += (targetCY - camY) * 0.08;
+
   ctx.clearRect(0,0,W,H);
+
+  // Draw nebulae (background, no transform)
+  nebulae.forEach(n=>n.draw(t));
   drawAmbient();
   drawGrid();
   particles.forEach(p=>{p.update();p.draw();});
+
+  // Apply camera transform for world-space elements
+  ctx.save();
+  ctx.translate(W/2, H/2);
+  ctx.scale(camZoom, camZoom);
+  ctx.translate(-cX + camX, -cY + camY);
+
   drawRadar();
   drawConnections();
   drawOrbitals();
   drawCore();
   pulses=pulses.filter(p=>{p.draw();return p.update();});
   nodes.forEach(drawNode);
+
+  ctx.restore();
+
+  // Tooltip in screen space
   drawTooltip();
+
   requestAnimationFrame(render);
 }
 
@@ -9119,15 +9526,18 @@ async function fetchBrainState(){
     const d=await r.json();
     layoutNodes(d.nodes);
 
-    // Stats bar
     const act=d.nodes.filter(n=>n.active).length;
     const trades=d.nodes.filter(n=>n.position!=='FLAT').length;
+    const famCount=d.families?Object.keys(d.families).length:1;
+    const argusN=d.nodes.filter(n=>n.family==='argus'||!n.family).length;
+    const greekN=d.nodes.filter(n=>n.family&&n.family!=='argus').length;
     document.getElementById('s-nodes').textContent=d.nodes.length;
     document.getElementById('s-active').textContent=act;
     document.getElementById('s-trades').textContent=trades;
+    document.getElementById('s-families').textContent=famCount;
     document.getElementById('s-signals').textContent=d.recent_signals.length;
     document.getElementById('status-line').textContent=
-      d.nodes.length+' neural nodes | '+act+' firing | '+new Date().toISOString().substring(11,19)+' UTC';
+      argusN+' Argus + '+greekN+' Greek nodes | '+act+' firing | '+famCount+' families | '+new Date().toISOString().substring(11,19)+' UTC';
 
     // Fire pulses for active nodes
     for(const n of d.nodes){
@@ -9142,22 +9552,20 @@ async function fetchBrainState(){
       }
     }
 
-    // Fire cross-pair pulses for correlated active nodes
     const activeSyms=d.nodes.filter(n=>n.active).map(n=>n.symbol);
-    if(activeSyms.length>=2&&Math.random()<0.1){
-      const a=nodes.find(n=>n.symbol===activeSyms[0]);
-      const b=nodes.find(n=>n.symbol===activeSyms[1]);
-      if(a&&b) pulses.push(new Pulse(a.x,a.y,b.x,b.y,'rgba(0,212,255,1)',0.01));
+    if(activeSyms.length>=2&&Math.random()<0.12){
+      const a=nodes.find(n=>n.symbol===activeSyms[Math.floor(Math.random()*activeSyms.length)]);
+      const b=nodes.find(n=>n.symbol===activeSyms[Math.floor(Math.random()*activeSyms.length)]);
+      if(a&&b&&a!==b) pulses.push(new Pulse(a.x,a.y,b.x,b.y,'rgba(0,212,255,1)',0.01));
     }
 
-    // Decision flow panel — real gate data from most recent active signal
+    // Decision flow panel
     const gateKeys=[
       ['session','Session'],['range_pct','Range Pct'],['direction','Direction'],
       ['regime','Regime'],['maintenance','Maint.'],['mtf','MTF Align'],
       ['spread','Spread'],['news','News'],['sequencing','Sequencing'],
       ['sizing','Sizing'],['risk_gate','Risk Gate']
     ];
-    // Find the most recent gate decision from any active node
     let latestGates = {};
     let latestGateSymbol = '';
     for (const n of d.nodes) {
@@ -9194,6 +9602,40 @@ async function fetchBrainState(){
         +(s.direction?'<span style="color:#4a5568;">'+s.direction+'</span>':'')+'</div>';
     }).join('')||'<div style="color:#333;">No recent signals</div>';
 
+    // System health panel
+    const hp=document.getElementById('health-items');
+    let hHtml='';
+    const pg=d.portfolio_guard||{};
+    const pgMetrics=pg.metrics||{};
+    const pgOpen=pgMetrics.total_open_positions||0;
+    const pgMax=pgMetrics.max_total_positions||6;
+    const pgOk=pg.allowed!==false;
+    const pgColor=pgOk?'#00ff88':'#ff4444';
+    const pgWarn=pg.warnings||[];
+    document.getElementById('s-guard').textContent=pgOpen+'/'+pgMax;
+    document.getElementById('s-guard').style.color=pgOk?(pgWarn.length?'#ffaa00':'#00ff88'):'#ff4444';
+    hHtml+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #0d1420;"><span style="color:#4a5568;">Portfolio Guard</span><span style="color:'+pgColor+';">'+(pgOk?'CLEAR':'BLOCKED')+'</span></div>';
+    hHtml+='<div style="padding:2px 0 6px;color:#333;">Positions: '+pgOpen+'/'+pgMax+'</div>';
+    if(pgWarn.length){hHtml+='<div style="padding:2px 0 6px;color:#ffaa00;font-size:0.9em;">'+pgWarn[0]+'</div>';}
+    const dr=d.drift||{};
+    const drHealth=dr.overall_health||'UNKNOWN';
+    const drColor=drHealth==='GREEN'?'#00ff88':drHealth==='YELLOW'?'#ffaa00':drHealth==='RED'?'#ff4444':'#4a5568';
+    const drChecked=dr.features_checked||0;
+    const drDrifted=(dr.drifted_features||[]).length;
+    document.getElementById('s-drift').textContent=drHealth;
+    document.getElementById('s-drift').style.color=drColor;
+    hHtml+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #0d1420;margin-top:4px;"><span style="color:#4a5568;">Feature Drift</span><span style="color:'+drColor+';">'+drHealth+'</span></div>';
+    hHtml+='<div style="padding:2px 0 6px;color:#333;">'+drChecked+' features | '+drDrifted+' drifted</div>';
+    const fams=d.families||{};
+    hHtml+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1a2332;">';
+    const famColors={argus:'#00d4ff',helio:'#ffaa00',hermes:'#ff6b6b',apollo:'#a78bfa'};
+    for(const[f,info] of Object.entries(fams)){
+      const fc=famColors[f]||'#4a5568';
+      hHtml+='<div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:'+fc+';text-transform:uppercase;">'+f+'</span><span style="color:#4a5568;">'+info.count+' nodes | '+info.trades+' trades</span></div>';
+    }
+    hHtml+='</div>';
+    hp.innerHTML=hHtml;
+
     // Ticker
     const ti=document.getElementById('ticker-inner');
     const items=d.nodes.map(n=>{
@@ -9203,7 +9645,7 @@ async function fetchBrainState(){
         +'<span style="color:'+hc+';">'+n.symbol+'</span>'
         +'<span style="color:'+pc+';">'+n.position+'</span></span>';
     }).join('');
-    ti.innerHTML=items+items; // duplicate for seamless scroll
+    ti.innerHTML=items+items;
   }catch(e){document.getElementById('status-line').textContent='Neural link error: '+e.message;}
 }
 

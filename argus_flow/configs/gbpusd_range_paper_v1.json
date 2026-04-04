@@ -8,7 +8,8 @@
         "range_pct_min": 0.0012,
         "range_accel_min": 0.0,
         "session_start_utc": 8,
-        "session_end_utc": 20
+        "session_end_utc": 20,
+        "blocked_hours_utc": [[15, 19]]
     },
     "risk": {
         "stop_pips": 30,

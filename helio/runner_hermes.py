@@ -21,6 +21,11 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
 load_dotenv()
 
 HELIO_ROOT = Path(__file__).resolve().parent
@@ -137,7 +142,26 @@ def evaluate(state: HermesState, df: pd.DataFrame, cfg: dict, today_str: str, lo
     range_low = float(window["Low"].min())
     vol_ok = row["Volume"] > row["avg_vol"] * vol_mult
 
+    # Determine breakout direction (if any)
+    _breakout_dir = None
     if close > range_high and vol_ok:
+        _breakout_dir = "LONG"
+    elif close < range_low and vol_ok:
+        _breakout_dir = "SHORT"
+
+    if _breakout_dir is None:
+        return
+
+    # Portfolio guard — check cross-family limits before new entry
+    if _pg_check_new_entry is not None:
+        pg_check = _pg_check_new_entry("hermes", cfg["symbol"], _breakout_dir)
+        if not pg_check.allowed:
+            log.info(f"{cfg['symbol']}: BLOCKED by portfolio guard — {pg_check.reason}")
+            return
+        if pg_check.warnings:
+            log.info(f"{cfg['symbol']}: portfolio guard warnings: {pg_check.warnings}")
+
+    if _breakout_dir == "LONG":
         stop = close - atr * atr_stop
         target = close + atr * atr_target
         state.position = "LONG"
@@ -151,7 +175,7 @@ def evaluate(state: HermesState, df: pd.DataFrame, cfg: dict, today_str: str, lo
         _log_signal(log_dir, today_str, "LONG", close, stop, target, atr, window_range)
         log.info(f"{cfg['symbol']}: BREAKOUT LONG @ {close:.2f} | range={range_high:.2f}-{range_low:.2f} | stop={stop:.2f} target={target:.2f}")
 
-    elif close < range_low and vol_ok:
+    else:  # SHORT
         stop = close + atr * atr_stop
         target = close - atr * atr_target
         state.position = "SHORT"
@@ -191,7 +215,26 @@ def _log_signal(log_dir, ts, direction, entry, stop, target, atr, consol_range):
 
 
 def run_live(configs: list[Path]):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from ops.process_lock import ProcessLock, ProcessLockError
     from ib_insync import IB, Future, Contract
+
+    # --- Process lock: prevent duplicate launches ---
+    lock_name = f"hermes_momentum_{os.getpid()}"
+    lock = ProcessLock(lock_name)
+    try:
+        lock.acquire(metadata={"family": "hermes", "strategy": "momentum_breakout", "configs": [str(c) for c in configs]})
+    except ProcessLockError as e:
+        log.error(f"Cannot start: {e}")
+        return
+    log.info(f"Process lock acquired: {lock_name}")
+
+    # --- Stage enforcement ---
+    first_cfg = json.loads(configs[0].read_text())
+    stage = first_cfg.get("deployment", {}).get("stage", "watcher")
+    log.info(f"Stage: {stage} | execution_allowed={stage in ('paper', 'real')}")
+
     ib = IB()
     ib.connect(os.getenv("IBKR_HOST", "127.0.0.1"), int(os.getenv("IBKR_PORT", "7496")), clientId=210, timeout=15)
     log.info(f"Connected. Account: {ib.managedAccounts()}")
@@ -240,14 +283,30 @@ def run_live(configs: list[Path]):
                     df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
                                         "Close": b.close, "Volume": getattr(b, "volume", 0)} for b in bars])
                     df = compute_indicators(df, cfg)
+
+                    # --- Regime classification ---
+                    from helio.regime_router import classify as classify_regime
+                    regime_info = classify_regime(df)
+                    log.info(f"{cfg['symbol']}: REGIME {regime_info['regime']} (conf={regime_info['confidence']:.3f}) | priority={regime_info['family_priority']} | sizing_mod={regime_info['sizing_modifier']}")
+
                     # Write heartbeat
                     latest = df.iloc[-1]
                     (inst["log_dir"] / "heartbeat.json").write_text(json.dumps({
-                        "ts": now.isoformat(), "symbol": cfg["symbol"], "family": "hermes",
+                        "ts": now.isoformat(), "system": "helio", "family": "hermes",
+                        "stage": cfg.get("deployment", {}).get("stage", "watcher"),
+                        "symbol": cfg["symbol"],
                         "position": inst["state"].position, "close": float(latest["Close"]),
                         "atr": float(latest["atr"]), "trade_count": inst["state"].trade_count,
+                        "regime": regime_info["regime"],
+                        "regime_confidence": regime_info["confidence"],
                     }, indent=2, default=str))
-                    evaluate(inst["state"], df, cfg, today, inst["log_dir"])
+
+                    # Regime depriority gate — only block new entries in watcher stage
+                    _stage = cfg.get("deployment", {}).get("stage", "watcher")
+                    if _stage == "watcher" and "hermes" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
+                        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY hermes not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
+                    else:
+                        evaluate(inst["state"], df, cfg, today, inst["log_dir"])
                 except Exception as e:
                     log.error(f"{inst['config']['symbol']}: {e}")
     except KeyboardInterrupt:
@@ -255,6 +314,8 @@ def run_live(configs: list[Path]):
         for inst in instruments:
             inst["state"].save()
         ib.disconnect()
+        lock.release()
+        log.info("Process lock released.")
 
 
 def main():

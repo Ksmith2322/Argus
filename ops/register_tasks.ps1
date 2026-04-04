@@ -62,6 +62,21 @@ $tasks = @(
         Description = "Weekly FX discovery + onboarding into watcher lane"
     },
     @{
+        Name = "ArgusCalendarUpdate"
+        Script = "C:\Argus\repo\ops\run_calendar_update.ps1"
+        Schedule = "WEEKLY"
+        Time = "20:00"
+        Day = "SUN"
+        Description = "Weekly economic calendar refresh"
+    },
+    @{
+        Name = "ArgusDriftCheck"
+        Script = "C:\Argus\repo\ops\run_drift_check.ps1"
+        Schedule = "DAILY"
+        Time = "06:00"
+        Description = "Daily feature drift detection"
+    },
+    @{
         Name = "ArgusWatchdog"
         Script = "C:\Argus\repo\ops\watchdog_managed.ps1"
         Schedule = "ONSTART"

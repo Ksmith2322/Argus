@@ -63,10 +63,14 @@ def _load_csv(path: Path) -> list[dict]:
 
 
 def _config_hash(path: Path) -> str:
-    """SHA256 hash (first 16 chars) of a config file."""
+    """SHA256 hash (first 16 chars) of a config file.
+
+    Uses read_text().encode() to match runner_unified._config_short_hash
+    (avoids \\r\\n vs \\n divergence on Windows).
+    """
     if not path.exists():
         return ""
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    return hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()[:16]
 
 
 def _git_sha() -> str:

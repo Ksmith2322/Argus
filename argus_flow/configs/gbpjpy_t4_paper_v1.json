@@ -9,7 +9,8 @@
         "range_accel_min": 0.0,
         "vol_z_min": null,
         "session_start_utc": 8,
-        "session_end_utc": 19
+        "session_end_utc": 19,
+        "blocked_hours_utc": [[15, 19]]
     },
     "risk": {
         "stop_pips": 15,

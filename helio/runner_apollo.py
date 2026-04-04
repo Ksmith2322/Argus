@@ -22,6 +22,11 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
 load_dotenv()
 
 HELIO_ROOT = Path(__file__).resolve().parent
@@ -138,7 +143,27 @@ def evaluate(state: ApolloState, row, cfg: dict, today_str: str, log_dir: Path):
         return
 
     close = float(row["Close"])
+
+    # Determine entry direction (if any)
+    _entry_dir = None
     if row["dist_from_ema"] > 0 and row["rsi"] > rsi_ob:
+        _entry_dir = "SHORT"
+    elif row["dist_from_ema"] < 0 and row["rsi"] < rsi_os:
+        _entry_dir = "LONG"
+
+    if _entry_dir is None:
+        return
+
+    # Portfolio guard — check cross-family limits before new entry
+    if _pg_check_new_entry is not None:
+        pg_check = _pg_check_new_entry("apollo", cfg["symbol"], _entry_dir)
+        if not pg_check.allowed:
+            log.info(f"{cfg['symbol']}: BLOCKED by portfolio guard — {pg_check.reason}")
+            return
+        if pg_check.warnings:
+            log.info(f"{cfg['symbol']}: portfolio guard warnings: {pg_check.warnings}")
+
+    if _entry_dir == "SHORT":
         # SHORT — overextended up
         stop = close + atr * stop_mult
         target = ema + atr * target_mult
@@ -153,7 +178,7 @@ def evaluate(state: ApolloState, row, cfg: dict, today_str: str, log_dir: Path):
         _log_signal(log_dir, today_str, "SHORT", close, stop, target, row)
         log.info(f"{cfg['symbol']}: ENTRY SHORT @ {close:.5f} | stop={stop:.5f} target={target:.5f} | RSI={row['rsi']:.0f} dist={row['dist_atr']:.1f}ATR")
 
-    elif row["dist_from_ema"] < 0 and row["rsi"] < rsi_os:
+    else:  # LONG
         # LONG — overextended down
         stop = close - atr * stop_mult
         target = ema - atr * target_mult
@@ -195,7 +220,26 @@ def _log_signal(log_dir, ts, direction, entry, stop, target, row):
 
 
 def run_live(configs: list[Path]):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from ops.process_lock import ProcessLock, ProcessLockError
     from ib_insync import IB, Forex
+
+    # --- Process lock: prevent duplicate launches ---
+    lock_name = f"apollo_reversion_{os.getpid()}"
+    lock = ProcessLock(lock_name)
+    try:
+        lock.acquire(metadata={"family": "apollo", "strategy": "mean_reversion", "configs": [str(c) for c in configs]})
+    except ProcessLockError as e:
+        log.error(f"Cannot start: {e}")
+        return
+    log.info(f"Process lock acquired: {lock_name}")
+
+    # --- Stage enforcement ---
+    first_cfg = json.loads(configs[0].read_text())
+    stage = first_cfg.get("deployment", {}).get("stage", "watcher")
+    log.info(f"Stage: {stage} | execution_allowed={stage in ('paper', 'real')}")
+
     ib = IB()
     ib.connect(os.getenv("IBKR_HOST", "127.0.0.1"), int(os.getenv("IBKR_PORT", "7496")), clientId=220, timeout=15)
     log.info(f"Connected. Account: {ib.managedAccounts()}")
@@ -236,15 +280,31 @@ def run_live(configs: list[Path]):
                     df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
                                         "Close": b.close, "Volume": getattr(b, "volume", 0)} for b in bars])
                     df = compute_indicators(df, cfg)
+
+                    # --- Regime classification ---
+                    from helio.regime_router import classify as classify_regime
+                    regime_info = classify_regime(df)
+                    log.info(f"{cfg['symbol']}: REGIME {regime_info['regime']} (conf={regime_info['confidence']:.3f}) | priority={regime_info['family_priority']} | sizing_mod={regime_info['sizing_modifier']}")
+
                     latest = df.iloc[-1]
                     # Write heartbeat
                     (inst["log_dir"] / "heartbeat.json").write_text(json.dumps({
-                        "ts": now.isoformat(), "symbol": cfg["symbol"], "family": "apollo",
+                        "ts": now.isoformat(), "system": "helio", "family": "apollo",
+                        "stage": cfg.get("deployment", {}).get("stage", "watcher"),
+                        "symbol": cfg["symbol"],
                         "position": inst["state"].position, "close": float(latest["Close"]),
                         "rsi": float(latest["rsi"]), "dist_atr": float(latest["dist_atr"]),
                         "trade_count": inst["state"].trade_count,
+                        "regime": regime_info["regime"],
+                        "regime_confidence": regime_info["confidence"],
                     }, indent=2, default=str))
-                    evaluate(inst["state"], latest, cfg, today, inst["log_dir"])
+
+                    # Regime depriority gate — only block new entries in watcher stage
+                    _stage = cfg.get("deployment", {}).get("stage", "watcher")
+                    if _stage == "watcher" and "apollo" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
+                        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY apollo not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
+                    else:
+                        evaluate(inst["state"], latest, cfg, today, inst["log_dir"])
                 except Exception as e:
                     log.error(f"{inst['config']['symbol']}: {e}")
     except KeyboardInterrupt:
@@ -252,6 +312,8 @@ def run_live(configs: list[Path]):
         for inst in instruments:
             inst["state"].save()
         ib.disconnect()
+        lock.release()
+        log.info("Process lock released.")
 
 
 def main():

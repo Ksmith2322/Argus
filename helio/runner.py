@@ -25,6 +25,11 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
 load_dotenv()
 
 REPO = Path(__file__).resolve().parents[1]
@@ -240,7 +245,26 @@ def log_trade(log_dir: Path, state: SwingState, exit_price: float, exit_reason: 
 
 def run_live(configs: list[Path]):
     """Run Helio with live IBKR data. Evaluates once per day at market close."""
+    import sys
+    sys.path.insert(0, str(REPO))
+    from ops.process_lock import ProcessLock, ProcessLockError
     from ib_insync import IB, Stock
+
+    # --- Process lock: prevent duplicate launches ---
+    lock_name = f"helio_swing_{os.getpid()}"
+    lock = ProcessLock(lock_name)
+    try:
+        lock.acquire(metadata={"family": "helio", "strategy": "swing_trend", "configs": [str(c) for c in configs]})
+    except ProcessLockError as e:
+        log.error(f"Cannot start: {e}")
+        return
+    log.info(f"Process lock acquired: {lock_name}")
+
+    # --- Stage enforcement: read from first config ---
+    first_cfg = json.loads(configs[0].read_text())
+    stage = first_cfg.get("deployment", {}).get("stage", "watcher")
+    can_execute = stage in ("paper", "real")
+    log.info(f"Stage: {stage} | execution_allowed={can_execute}")
 
     ib = IB()
     host = os.getenv("IBKR_HOST", "127.0.0.1")
@@ -305,6 +329,8 @@ def run_live(configs: list[Path]):
         for inst in instruments:
             inst["state"].save()
         ib.disconnect()
+        lock.release()
+        log.info("Process lock released.")
 
 
 def _evaluate_instrument(ib, inst: dict, now: datetime):
@@ -333,12 +359,21 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
     } for b in bars])
 
     df = compute_indicators(df, cfg)
+
+    # --- Regime classification ---
+    from helio.regime_router import classify as classify_regime
+    regime_info = classify_regime(df)
+    log.info(f"{symbol}: REGIME {regime_info['regime']} (conf={regime_info['confidence']:.3f}) | priority={regime_info['family_priority']} | sizing_mod={regime_info['sizing_modifier']}")
+
     latest = df.iloc[-1]
     today_str = str(latest["Date"])[:10]
 
-    # Write heartbeat
+    # Write heartbeat (schema: system + family + stage for cross-family visibility)
     hb = {
         "ts": now.isoformat(),
+        "system": "helio",
+        "family": "helio",
+        "stage": inst["config"].get("deployment", {}).get("stage", "watcher"),
         "symbol": symbol,
         "position": state.position,
         "close": float(latest["Close"]),
@@ -350,6 +385,8 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
         "bars_held": state.bars_held,
         "trade_count": state.trade_count,
         "pnl_total": state.pnl_total,
+        "regime": regime_info["regime"],
+        "regime_confidence": regime_info["confidence"],
     }
     (log_dir / "heartbeat.json").write_text(json.dumps(hb, indent=2, default=str))
 
@@ -376,6 +413,12 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
             state.save()
         return
 
+    # Regime depriority gate — only block new entries in watcher stage
+    _stage = cfg.get("deployment", {}).get("stage", "watcher")
+    if _stage == "watcher" and "helio" not in regime_info["family_priority"][:2]:
+        log.info(f"{symbol}: REGIME_DEPRIORITY helio not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
+        return
+
     # Entry check
     direction = check_entry(latest, cfg)
     if direction:
@@ -389,6 +432,15 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
             stop = entry_price + atr * risk_cfg.get("atr_stop_mult", 2.0)
 
         entry_type = "A" if latest["range_expanded"] and latest["vol_surge"] else "B"
+
+        # Portfolio guard — check cross-family limits before new entry
+        if _pg_check_new_entry is not None:
+            pg_check = _pg_check_new_entry("helio_swing", cfg["symbol"], direction)
+            if not pg_check.allowed:
+                log.info(f"{symbol}: BLOCKED by portfolio guard — {pg_check.reason}")
+                return
+            if pg_check.warnings:
+                log.info(f"{symbol}: portfolio guard warnings: {pg_check.warnings}")
 
         state.position = direction
         state.entry_price = entry_price

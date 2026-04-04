@@ -386,13 +386,15 @@ REPO = Path(__file__).resolve().parents[1]
 NEWS_SCHEDULE_PATH = REPO / "data" / "economic_calendar.json"
 
 # Built-in high-impact events (UTC hours, recurring weekly)
-HIGH_IMPACT_RECURRING = {
-    # Day of week (0=Mon) -> list of (hour_utc, duration_minutes, label)
+# NOTE: Only truly recurring events belong here.  ECB/FOMC/NFP are NOT every
+# week — use data/economic_calendar.json for actual dates.  The old recurring
+# table was blocking EUR/USD on 4 out of 5 weekdays, killing signal frequency.
+HIGH_IMPACT_RECURRING: dict[int, list[tuple[int, int, str]]] = {
     0: [],  # Monday
-    1: [(14, 60, "US_Data_Tue")],  # Common US data
-    2: [(14, 60, "US_Data_Wed"), (18, 90, "FOMC_Window")],  # FOMC often Wed
-    3: [(12, 60, "ECB_Window"), (14, 60, "US_Data_Thu")],  # ECB often Thu
-    4: [(12, 30, "NFP_Window"), (14, 60, "US_Data_Fri")],  # NFP first Friday
+    1: [],  # Tuesday  — US data varies; use calendar file
+    2: [],  # Wednesday — FOMC ~8x/year; use calendar file
+    3: [],  # Thursday  — ECB ~8x/year; use calendar file
+    4: [],  # Friday    — NFP first Friday only; use calendar file
 }
 
 # Currencies affected by each event type
