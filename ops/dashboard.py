@@ -2977,6 +2977,61 @@ async def api_runner_chart(symbol: str):
     })
 
 
+@app.get("/api/greek_family")
+async def api_greek_family():
+    """Greek family status — all strategy runners across Helio/Apollo/Hermes."""
+    import time as _time
+    helio_logs = REPO / "helio" / "logs"
+    strategies = []
+    if helio_logs.exists():
+        for d in sorted(helio_logs.iterdir()):
+            if not d.is_dir() or d.name.startswith("_"):
+                continue
+            hb_file = d / "heartbeat.json"
+            state_file = d / "state.json"
+            trades_file = d / "trades.csv"
+            hb = {}
+            state = {}
+            trade_count = 0
+            if hb_file.exists():
+                try:
+                    hb = json.loads(hb_file.read_text())
+                except Exception:
+                    pass
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                except Exception:
+                    pass
+            if trades_file.exists():
+                try:
+                    trade_count = sum(1 for _ in open(trades_file)) - 1
+                except Exception:
+                    pass
+            hb_age = int(_time.time() - hb_file.stat().st_mtime) if hb_file.exists() else None
+            strategies.append({
+                "name": d.name,
+                "family": hb.get("family", d.name.split("_")[0] if "_" in d.name else "helio"),
+                "symbol": hb.get("symbol", d.name.upper()),
+                "stage": hb.get("stage", "watcher"),
+                "position": state.get("position", hb.get("position", "FLAT")),
+                "entry_price": state.get("entry_price", 0),
+                "pnl_total": state.get("pnl_total", 0),
+                "trade_count": trade_count,
+                "bars_held": state.get("bars_held", 0),
+                "regime": hb.get("regime", ""),
+                "hb_age_s": hb_age,
+                "alive": hb_age is not None and hb_age < 7200,
+            })
+    return JSONResponse({
+        "strategies": strategies,
+        "total": len(strategies),
+        "alive": sum(1 for s in strategies if s["alive"]),
+        "in_trade": sum(1 for s in strategies if s["position"] != "FLAT"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 @app.get("/api/qa_learning")
 async def api_qa_learning():
     """QA learning insights — regime, session, exit quality, variant comparison."""
@@ -3838,6 +3893,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div id="ibkr-analytics" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin:12px 0;"></div>
+
+<!-- Greek Family (Helio/Apollo/Hermes) -->
+<div style="margin:16px 0 14px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h2 style="font-size:0.95em;color:#ff9800;margin:0;letter-spacing:2px;">GREEK FAMILY</h2>
+    <span style="font-size:0.72em;color:#7b8ab8;">Swing (Helio) + Momentum (Hermes) + Mean Reversion (Apollo)</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:6px;margin-bottom:12px;" id="greek-family-cards"></div>
+</div>
 
 <!-- Watcher section -->
 <div style="margin:16px 0 14px 0;">
@@ -8362,6 +8426,48 @@ function populateChartSelector(runners) {
   _updateChartFollowButton();
 }
 
+// ── Greek Family loader ───────────────────────────────
+async function loadGreekFamily() {
+  try {
+    const resp = await fetch('/api/greek_family');
+    const data = await resp.json();
+    const el = document.getElementById('greek-family-cards');
+    if (!el) return;
+    const strats = data.strategies || [];
+    if (!strats.length) {
+      el.innerHTML = '<div style="color:#7b8ab8;padding:12px;background:#141b2d;border:1px dashed #1e2a42;border-radius:6px;">Helio family runners starting up. First signals after market close evaluation.</div>';
+      return;
+    }
+    const familyColors = {helio:'#ffaa00',apollo:'#00d4ff',hermes:'#ff6b6b'};
+    const familyIcons = {helio:'&#9788;',apollo:'&#9790;',hermes:'&#9889;'};
+    el.innerHTML = strats.map(s => {
+      const fc = familyColors[s.family] || '#7b8ab8';
+      const icon = familyIcons[s.family] || '&#9679;';
+      const alive = s.alive;
+      const posColor = s.position === 'LONG' ? '#00ff88' : s.position === 'SHORT' ? '#ff4444' : '#555';
+      const pnlColor = s.pnl_total >= 0 ? '#00ff88' : '#ff4444';
+      const ageStr = s.hb_age_s != null ? (s.hb_age_s < 60 ? s.hb_age_s + 's' : Math.round(s.hb_age_s/60) + 'm') : '?';
+      const regimeStr = s.regime ? s.regime : '-';
+      return '<div style="background:#141b2d;border:1px solid ' + (alive ? fc + '44' : '#1e2a42') + ';border-radius:6px;padding:10px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
+        + '<div><span style="color:' + fc + ';font-weight:bold;font-size:0.85em;">' + icon + ' ' + s.symbol + '</span>'
+        + ' <span style="color:#555;font-size:0.6em;">' + s.family.toUpperCase() + '</span></div>'
+        + '<span style="color:' + (alive ? '#00ff88' : '#ff4444') + ';font-size:0.55em;">' + (alive ? 'LIVE' : 'STALE') + ' ' + ageStr + '</span>'
+        + '</div>'
+        + '<div style="display:flex;justify-content:space-between;font-size:0.72em;margin-bottom:3px;">'
+        + '<span style="color:' + posColor + ';">' + s.position + (s.position !== 'FLAT' ? ' @ ' + Number(s.entry_price).toFixed(2) : '') + '</span>'
+        + '<span style="color:#888;">T:' + s.trade_count + '</span>'
+        + '</div>'
+        + '<div style="display:flex;justify-content:space-between;font-size:0.65em;color:#7b8ab8;">'
+        + '<span>PnL: <span style="color:' + pnlColor + ';">' + (s.pnl_total >= 0 ? '+' : '') + Number(s.pnl_total).toFixed(2) + '%</span></span>'
+        + '<span>Regime: ' + regimeStr + '</span>'
+        + '<span>' + s.stage + '</span>'
+        + '</div>'
+        + '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
 // ── QA Learning loader ────────────────────────────────
 async function loadQALearning() {
   try {
@@ -8486,6 +8592,8 @@ try {
   setInterval(loadIBKRFleet, 10000);
   loadGovernanceHealth();
   setInterval(loadGovernanceHealth, 30000);
+  loadGreekFamily();
+  setInterval(loadGreekFamily, 30000);
   loadQALearning();
   setInterval(loadQALearning, 60000);
   setInterval(function() {

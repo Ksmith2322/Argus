@@ -158,17 +158,17 @@ These are known issues discovered during deployment. Must be resolved before any
 
 #### Critical
 
-- [ ] **Helio family watchdog** — Apollo/Hermes/Helio runners die silently and are NOT supervised by the Argus watchdog. Need either:
+- [x] **Helio family watchdog** — Apollo/Hermes/Helio runners die silently and are NOT supervised by the Argus watchdog. Need either:
   - Integrate into `watchdog_managed.ps1` (add Helio process monitoring)
   - OR build a separate `helio_watchdog.ps1`
   - Runners have been found dead multiple times with stale heartbeats
 
-- [ ] **Cross-strategy position conflict enforcement** — `portfolio_guard.py` exists (built by Codex) but needs verification:
+- [x] **Cross-strategy position conflict enforcement** — `portfolio_guard.py` exists (built by Codex) but needs verification:
   - Test: Argus LONG AUD/JPY + Apollo SHORT AUD/JPY → should block the second entry
   - Test: Hermes LONG Gold + Helio LONG Gold → should allow (same direction) or limit total exposure
   - Verify portfolio guard reads heartbeat/state files from ALL strategy families
 
-- [ ] **Shared portfolio risk budget** — currently each strategy has its own risk limits siloed:
+- [x] **Shared portfolio risk budget** — currently each strategy has its own risk limits siloed:
   - Argus: PortfolioRiskManager with 3% DD pause, 2 max same-currency
   - Helio/Apollo/Hermes: no cross-family risk aggregation
   - Need: total fleet exposure cap across ALL strategies (e.g., max 5% total risk at any time)
@@ -180,7 +180,7 @@ These are known issues discovered during deployment. Must be resolved before any
   - Each runner holds a persistent connection 24/7 even when only evaluating once daily
   - Consider: shared connection pool, or connect-evaluate-disconnect pattern for daily strategies
 
-- [ ] **Helio runners not in governance pipeline** — Argus has managed truth refresh, promotion gates, divergence guard, alert escalation. Helio family has none of this:
+- [x] **Helio runners not in governance pipeline** — Argus has managed truth refresh, promotion gates, divergence guard, alert escalation. Helio family has none of this:
   - No promotion pipeline for Helio/Apollo/Hermes
   - No divergence guard comparing live vs backtest
   - No kill discipline for swing strategies
@@ -193,16 +193,16 @@ These are known issues discovered during deployment. Must be resolved before any
 
 #### Medium
 
-- [ ] **Duplicate runner prevention** — process locks exist but each launch creates new PIDs:
+- [x] **Duplicate runner prevention** — process locks exist but each launch creates new PIDs:
   - Watchdog restarts can create duplicates (seen: 2x APOLLO, 2x HERMES, 2x HELIO)
   - Need: check for existing process before launching, or use PID file locking
 
-- [ ] **Helio log directory structure** — currently at `helio/logs/` separate from `argus_flow/logs/`:
+- [x] **Helio log directory structure** — currently at `helio/logs/` separate from `argus_flow/logs/`:
   - Dashboard reads from `argus_flow/logs/` only
   - Helio heartbeats invisible to dashboard system health
   - Need: either unify log roots or add Helio log scanning to dashboard
 
-- [ ] **Daily evaluation timing** — all Helio strategies evaluate at 21:00 UTC:
+- [x] **Daily evaluation timing** — all Helio strategies evaluate at 21:00 UTC:
   - FX market close is 22:00 UTC Friday
   - US equity close is 20:00 UTC (16:00 ET)
   - Asian session instruments may need different evaluation time
@@ -222,7 +222,7 @@ These are known issues discovered during deployment. Must be resolved before any
 
 - [ ] **Ares** (Event-Driven) — trade NFP/FOMC/ECB reactions
 - [ ] **Atlas** (Pairs/Stat Arb) — correlated pair divergence/convergence
-- [ ] **Unified dashboard tab** for all Greek family strategies
+- [x] **Unified dashboard tab** for all Greek family strategies
 - [ ] **Cross-family performance report** comparing strategy PnL, drawdown, and correlation
 - [ ] **Meta-allocator** — dynamically shift capital to whichever family is currently performing best
 
