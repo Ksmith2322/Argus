@@ -86,15 +86,37 @@
 **Direction**: Both (breakout direction)
 **Key difference from Argus**: Fixed session window, fixed range definition, simpler logic.
 
-### ARES — The Warrior (Event-Driven) [FUTURE]
+### ARES — The Warrior (Event-Driven) [ROADMAP — Phase 2]
 **Role**: Trade the reaction to scheduled high-impact economic events
-**Status**: FUTURE — after other strategies prove themselves
-**Edge**: Market overreacts to NFP/FOMC/ECB → fade or ride the move based on deviation from consensus
+**Status**: ROADMAP — build after Hermes/Apollo prove themselves in paper
+**Timeframe**: 5min-1hr bars, 1-24 hour holds around events
+**Edge**: Market overreacts to NFP/FOMC/ECB → fade or ride based on deviation from consensus
+**Prerequisites**:
+- Economic calendar API integration (scheduled event times + consensus estimates)
+- Deviation detection (actual vs consensus → magnitude of surprise)
+- Pre-event positioning logic (straddle or directional based on vol regime)
+- Post-event fade/ride classifier
+**Instruments**: EUR/USD (ECB, NFP), USD/JPY (FOMC, BOJ), GBP/USD (BOE)
+**Estimated build**: 1-2 weeks after Phase 1 strategies validated
+**Risk**: Events are binary — high reward but tail risk. Needs strict sizing (0.25% max per event trade)
 
-### ATLAS — The Titan (Pairs/Stat Arb) [FUTURE]
+### ATLAS — The Titan (Pairs/Stat Arb) [ROADMAP — Phase 2]
 **Role**: Trade correlated pair divergence/convergence
-**Status**: FUTURE — needs cointegration research
-**Edge**: When EUR/USD and GBP/USD diverge beyond normal range, trade the convergence
+**Status**: ROADMAP — needs cointegration research + spread modeling
+**Timeframe**: 1hr-daily bars, 1-10 day holds
+**Edge**: When EUR/USD and GBP/USD diverge beyond 2 standard deviations of historical spread, trade convergence
+**Prerequisites**:
+- Cointegration test (Engle-Granger or Johansen) on pair combinations
+- Rolling z-score of spread
+- Half-life estimation for mean reversion speed
+- Simultaneous long/short execution on both legs
+**Candidate pairs**:
+- EUR/USD vs GBP/USD (USD factor)
+- AUD/JPY vs NZD/JPY (risk sentiment)
+- EUR/JPY vs GBP/JPY (JPY factor)
+- Gold vs Silver (metals spread)
+**Estimated build**: 2-3 weeks, research-heavy
+**Risk**: Spreads can blow out during crises (correlation breakdown). Need regime filter.
 
 ---
 
