@@ -321,6 +321,19 @@ def check_new_entry(
     simulated = positions + [proposed]
     metrics = compute_metrics(simulated)
 
+    # Block opposite-direction trades on the same instrument across families
+    # (hedging against yourself = paying spread both ways for zero net exposure)
+    proposed_norm = _normalise_symbol(symbol)
+    for existing in positions:
+        if existing.symbol_norm == proposed_norm and existing.direction != direction.upper():
+            return PortfolioCheck(
+                allowed=False,
+                reason=f"opposite_direction_conflict: {existing.family} is {existing.direction} {existing.symbol}, "
+                       f"cannot open {direction.upper()} from {family}",
+                metrics=compute_metrics(simulated),
+                warnings=[],
+            )
+
     allowed, reason, warnings = check_limits(
         metrics,
         max_total=max_total,
