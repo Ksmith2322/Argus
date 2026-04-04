@@ -2582,9 +2582,32 @@ async def api_system_health():
                     connected += 1
             except Exception:
                 pass
+    # Also scan Helio family heartbeats
+    helio_logs = REPO / "helio" / "logs"
+    helio_alive = 0
+    helio_total = 0
+    if helio_logs.exists():
+        for hb_dir in sorted(helio_logs.iterdir()):
+            if not hb_dir.is_dir() or hb_dir.name.startswith("_"):
+                continue
+            hb_file = hb_dir / "heartbeat.json"
+            if hb_file.exists():
+                try:
+                    hb = json.loads(hb_file.read_text())
+                    helio_total += 1
+                    hb_age = _time.time() - hb_file.stat().st_mtime
+                    if hb_age < 7200:  # daily strategies: 2hr freshness
+                        helio_alive += 1
+                        connected += 1
+                except Exception:
+                    pass
+                total_runners += 1
+
     health["broker_connected"] = connected > 0
     health["runners_alive"] = connected
     health["runners_total"] = total_runners
+    health["helio_alive"] = helio_alive
+    health["helio_total"] = helio_total
     if not health["broker_connected"]:
         health["status"] = "WARN"
         health["warnings"].append("Broker disconnected")

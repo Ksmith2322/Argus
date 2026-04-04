@@ -265,7 +265,8 @@ def run_live(configs: list[Path]):
             ib.sleep(60)
             now = datetime.now(timezone.utc)
             today = now.strftime("%Y-%m-%d")
-            if today == last_eval or now.hour < 21:
+            # Apollo FX evaluates at London close (17:00 UTC), not US close
+            if today == last_eval or now.hour < 17:
                 continue
             last_eval = today
             log.info(f"=== Apollo daily evaluation {today} ===")
