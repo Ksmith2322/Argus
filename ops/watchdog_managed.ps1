@@ -334,6 +334,7 @@ $failureCounts = @{
 $script:portWarnSent = $false
 $script:gatewayDownCount = 0
 $script:gatewayWarnSent = $false
+$script:helioLastCheck = Get-Date "2000-01-01T00:00:00Z"
 $script:staleWarnSent = $false
 $script:staleWarnTime = $null
 $script:tradeCounts = @{}
@@ -477,6 +478,50 @@ while ($true) {
         }
     } else {
         $script:maxRestartAlertSent = $false
+    }
+
+    # ── Helio family supervision (Apollo, Hermes, Helio swing) ──────────
+    # Check every 5 minutes. Restart dead runners. Uses heartbeat staleness.
+    $helioCheckInterval = 300
+    if (((Get-Date) - $script:helioLastCheck).TotalSeconds -ge $helioCheckInterval) {
+        $script:helioLastCheck = Get-Date
+        $helioRunners = @(
+            @{ Name = "helio";   Module = "helio.runner";         HbDirs = @("gld","spy","mgc","mnq","mes","mym"); StaleS = 7200 },
+            @{ Name = "apollo";  Module = "helio.runner_apollo";  HbDirs = @("apollo_audjpy","apollo_eurusd","apollo_usdjpy","apollo_gbpusd"); StaleS = 7200 },
+            @{ Name = "hermes";  Module = "helio.runner_hermes";  HbDirs = @("hermes_gold_f"); StaleS = 7200 }
+        )
+        $helioLogsRoot = "C:\Argus\repo\helio\logs"
+        foreach ($hr in $helioRunners) {
+            $alive = $false
+            foreach ($hdir in $hr.HbDirs) {
+                $hbPath = Join-Path $helioLogsRoot "$hdir\heartbeat.json"
+                if (Test-Path $hbPath) {
+                    $hbAge = ((Get-Date) - (Get-Item $hbPath).LastWriteTime).TotalSeconds
+                    if ($hbAge -lt $hr.StaleS) { $alive = $true; break }
+                }
+            }
+            # Check if process is running regardless of heartbeat
+            $procRunning = $false
+            Get-Process python* -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
+                    if ($cmd -match $hr.Module.Replace(".", "\.")) { $procRunning = $true }
+                } catch {}
+            }
+            if (-not $procRunning -and -not $alive) {
+                # Skip restart on weekends for market-dependent runners
+                $dow = (Get-Date).DayOfWeek
+                $utcHour = (Get-Date).ToUniversalTime().Hour
+                $isWeekend = ($dow -eq "Saturday") -or ($dow -eq "Sunday" -and $utcHour -lt 21)
+                if (-not $isWeekend) {
+                    Log ("HELIO: {0} is dead (no process, heartbeat stale). Restarting..." -f $hr.Name)
+                    # Clean stale locks
+                    Get-ChildItem "C:\Argus\repo\argus_flow\logs\_locks" -Filter "$($hr.Name)_*" -ErrorAction SilentlyContinue | Remove-Item -Force
+                    Start-Process -FilePath $python -ArgumentList "-m", $hr.Module -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
+                    Log ("HELIO: {0} restarted" -f $hr.Name)
+                }
+            }
+        }
     }
 
     $portListening = $false
