@@ -1,43 +1,57 @@
 {
-    "strategy": "range_accel",
-    "version": "paper_v2",
-    "symbol": "GBPUSD",
-    "instrument_type": "forex",
-    "ibkr_client_id": 12,
-    "trigger": {
-        "range_pct_min": 0.0010,
-        "range_accel_min": 0.0,
-        "session_start_utc": 7,
-        "session_end_utc": 17,
-        "blocked_hours_utc": [[15, 17]],
-        "sequencing_gap_minutes": 10
-    },
-    "risk": {
-        "stop_pips": 25,
-        "target_pips": 50,
-        "timeout_minutes": 90,
-        "min_signal_gap_minutes": 10,
-        "lot_size": 66000,
-        "risk_pct": 0.02
-    },
-    "direction": {
-        "dist_long_threshold": 0.35,
-        "dist_short_threshold": 0.65
-    },
-    "replay_expectations": {
-        "signals_per_day": 18.9,
-        "signals_per_day_range": [8, 35],
-        "win_rate": 0.515,
-        "win_rate_range": [0.38, 0.6],
-        "stop_rate": 0.032,
-        "target_rate": 0.005,
-        "timeout_rate": 0.963,
-        "exp_pips_per_trade": 0.87
-    },
-    "deployment": {
-        "managed": true,
-        "stage": "paper",
-        "onboarded_at": "2026-04-05T22:00:00+00:00",
-        "onboarded_by": "v2_performance_fix"
+  "strategy": "range_accel",
+  "version": "paper_v2",
+  "symbol": "GBPUSD",
+  "instrument_type": "forex",
+  "ibkr_client_id": 12,
+  "trigger": {
+    "range_pct_min": 0.001,
+    "range_accel_min": 0.0,
+    "session_start_utc": 7,
+    "session_end_utc": 17,
+    "blocked_hours_utc": [
+      [
+        15,
+        17
+      ]
+    ],
+    "sequencing_gap_minutes": 10
+  },
+  "risk": {
+    "stop_pips": 25,
+    "target_pips": 50,
+    "timeout_minutes": 90,
+    "min_signal_gap_minutes": 10,
+    "lot_size": 66000,
+    "risk_pct": 0.02
+  },
+  "direction": {
+    "dist_long_threshold": 0.35,
+    "dist_short_threshold": 0.65
+  },
+  "replay_expectations": {
+    "signals_per_day": 18.9,
+    "signals_per_day_range": [
+      8,
+      35
+    ],
+    "win_rate": 0.515,
+    "win_rate_range": [
+      0.38,
+      0.6
+    ],
+    "stop_rate": 0.032,
+    "target_rate": 0.005,
+    "timeout_rate": 0.963,
+    "exp_pips_per_trade": 0.87
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "paper",
+    "onboarded_at": "2026-04-05T22:00:00+00:00",
+    "onboarded_by": "v2_performance_fix",
+    "risk_policy": {
+      "model_start_equity_usd": 10000
     }
+  }
 }

@@ -1,40 +1,49 @@
 {
-    "strategy": "range_accel_NY",
-    "version": "paper_v2",
-    "symbol": "AUDUSD",
-    "instrument_type": "forex",
-    "ibkr_client_id": 14,
-    "trigger": {
-        "range_pct_min": 0.0010,
-        "range_accel_min": 0.0,
-        "vol_z_min": null,
-        "session_start_utc": 22,
-        "session_end_utc": 8,
-        "sequencing_gap_minutes": 10
-    },
-    "risk": {
-        "stop_pips": 20,
-        "target_pips": 50,
-        "timeout_minutes": 90,
-        "min_signal_gap_minutes": 10,
-        "lot_size": 100000,
-        "risk_pct": 0.02
-    },
-    "direction": {
-        "dist_long_threshold": 0.35,
-        "dist_short_threshold": 0.65
-    },
-    "replay_expectations": {
-        "signals_per_day": 8.0,
-        "signals_per_day_range": [2, 15],
-        "win_rate": 0.505,
-        "win_rate_range": [0.38, 0.6],
-        "exp_pips_per_trade": 1.08
-    },
-    "deployment": {
-        "managed": true,
-        "stage": "paper",
-        "onboarded_at": "2026-04-05T22:00:00+00:00",
-        "onboarded_by": "v2_performance_fix"
+  "strategy": "range_accel_NY",
+  "version": "paper_v2",
+  "symbol": "AUDUSD",
+  "instrument_type": "forex",
+  "ibkr_client_id": 14,
+  "trigger": {
+    "range_pct_min": 0.001,
+    "range_accel_min": 0.0,
+    "vol_z_min": null,
+    "session_start_utc": 22,
+    "session_end_utc": 8,
+    "sequencing_gap_minutes": 10
+  },
+  "risk": {
+    "stop_pips": 20,
+    "target_pips": 50,
+    "timeout_minutes": 90,
+    "min_signal_gap_minutes": 10,
+    "lot_size": 100000,
+    "risk_pct": 0.02
+  },
+  "direction": {
+    "dist_long_threshold": 0.35,
+    "dist_short_threshold": 0.65
+  },
+  "replay_expectations": {
+    "signals_per_day": 8.0,
+    "signals_per_day_range": [
+      2,
+      15
+    ],
+    "win_rate": 0.505,
+    "win_rate_range": [
+      0.38,
+      0.6
+    ],
+    "exp_pips_per_trade": 1.08
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "paper",
+    "onboarded_at": "2026-04-05T22:00:00+00:00",
+    "onboarded_by": "v2_performance_fix",
+    "risk_policy": {
+      "model_start_equity_usd": 10000
     }
+  }
 }
