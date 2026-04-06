@@ -290,6 +290,37 @@ def resolve_risk_policy(config: dict, config_path: Path, stage: str | None = Non
     }
 
 
+def validate_risk_policy_for_execution(config: dict, config_path: Path, stage: str | None = None) -> str | None:
+    """Return an error message if risk policy is invalid for execution, or None if OK.
+
+    Paper and watcher stages MUST have explicit model_start_equity_usd to prevent
+    sizing against real broker equity.
+    """
+    resolved_stage = normalize_stage(stage) or infer_stage(config, config_path)
+    if resolved_stage not in (STAGE_PAPER, STAGE_WATCHER):
+        return None
+
+    deployment = config.get("deployment", {}) if isinstance(config.get("deployment", {}), dict) else {}
+    risk_policy = deployment.get("risk_policy", {}) if isinstance(deployment.get("risk_policy", {}), dict) else {}
+    raw_value = risk_policy.get("model_start_equity_usd")
+
+    if raw_value is None or raw_value == "" or raw_value == 0:
+        return (
+            f"model_start_equity_usd is required for {resolved_stage} stage but is "
+            f"{'missing' if raw_value is None else f'zero/empty ({raw_value!r})'}. "
+            f"Add deployment.risk_policy.model_start_equity_usd to {config_path.name}. "
+            f"Without it, sizing will use real broker equity and block all trades."
+        )
+    try:
+        val = float(raw_value)
+        if val <= 0:
+            return f"model_start_equity_usd must be positive, got {val} in {config_path.name}"
+    except (TypeError, ValueError):
+        return f"model_start_equity_usd is not a valid number: {raw_value!r} in {config_path.name}"
+
+    return None
+
+
 def load_existing_registry_entry(config_file: str) -> dict | None:
     report = _load_json(DEPLOYMENT_REGISTRY_FILE)
     if not isinstance(report, dict):

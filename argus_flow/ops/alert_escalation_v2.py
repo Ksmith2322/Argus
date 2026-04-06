@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+import csv
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -437,6 +438,117 @@ def _check_position_monitor() -> list[dict[str, Any]]:
     return issues
 
 
+def _check_trade_drought() -> list[dict[str, Any]]:
+    """Detect runners alive with signals but zero trades, or excessive block rate."""
+    issues: list[dict[str, Any]] = []
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = now_utc - timedelta(hours=24)
+    BLOCK_RATE_THRESHOLD = 0.95
+    BLOCK_RATE_MIN_SIGNALS = 10
+
+    # Scan paper-stage runner log directories
+    for log_dir in sorted(LOGS.iterdir()):
+        if not log_dir.is_dir() or log_dir.name.startswith("_"):
+            continue
+        hb_path = log_dir / "heartbeat.json"
+        hb = _load_json(hb_path)
+        if not isinstance(hb, dict):
+            continue
+        stage = str(hb.get("deployment_stage", ""))
+        if stage not in ("paper", "real"):
+            continue
+        # Only check runners that are alive (heartbeat < 10 min old)
+        hb_age = _file_age_s(hb_path)
+        if hb_age is None or hb_age > 600:
+            continue
+
+        symbol = str(hb.get("instrument", log_dir.name)).upper()
+        signals_path = log_dir / "signals.csv"
+        trades_path = log_dir / "trades.csv"
+
+        # Count triggered (non-NO_TRIGGER) signals and blocked signals in last 24h
+        triggered = 0
+        blocked = 0
+        if signals_path.exists():
+            try:
+                with open(signals_path, newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if header:
+                        action_idx = header.index("action") if "action" in header else 8
+                        for row in reader:
+                            if len(row) <= action_idx:
+                                continue
+                            try:
+                                row_ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+                            except (ValueError, IndexError):
+                                continue
+                            if row_ts < cutoff_24h:
+                                continue
+                            action = row[action_idx]
+                            if not action or action == "NO_TRIGGER":
+                                continue
+                            triggered += 1
+                            if "RISK_BLOCKED" in action or action == "SIZE_BELOW_FLOOR":
+                                blocked += 1
+            except OSError:
+                pass
+
+        # Count trades in last 48h
+        recent_trades = 0
+        cutoff_48h = now_utc - timedelta(hours=48)
+        if trades_path.exists():
+            try:
+                with open(trades_path, newline="") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)  # skip header
+                    for row in reader:
+                        if not row:
+                            continue
+                        try:
+                            row_ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+                            if row_ts >= cutoff_48h:
+                                recent_trades += 1
+                        except (ValueError, IndexError):
+                            continue
+            except OSError:
+                pass
+
+        # (a) Trade drought: signals flowing but zero trades
+        if triggered > 0 and recent_trades == 0:
+            severity = "CRITICAL" if triggered > 20 else "WARNING"
+            issues.append(_issue(
+                key=f"trade_drought:{symbol}:zero_trades",
+                category="trade_drought",
+                scope=symbol,
+                severity=severity,
+                message=(
+                    f"Zero trades for {symbol} despite {triggered} triggered signals in 24h "
+                    f"({blocked} blocked)"
+                ),
+                source_report="signals.csv",
+                requires_manual_action=severity == "CRITICAL",
+            ))
+
+        # (b) Block rate: almost all signals blocked
+        if triggered >= BLOCK_RATE_MIN_SIGNALS:
+            block_rate = blocked / triggered
+            if block_rate >= BLOCK_RATE_THRESHOLD:
+                issues.append(_issue(
+                    key=f"trade_drought:{symbol}:high_block_rate",
+                    category="trade_drought",
+                    scope=symbol,
+                    severity="WARNING",
+                    message=(
+                        f"Block rate {block_rate:.0%} for {symbol}: "
+                        f"{blocked}/{triggered} signals blocked in 24h"
+                    ),
+                    source_report="signals.csv",
+                ))
+
+    return issues
+
+
 def _load_alert_history() -> dict[str, float]:
     data = _load_json(ALERT_HISTORY_PATH)
     return data if isinstance(data, dict) else {}
@@ -535,6 +647,7 @@ def run() -> None:
         _check_kill_discipline,
         _check_divergence,
         _check_artifact_divergence,
+        _check_trade_drought,
     ):
         try:
             current_issues.extend(checker())

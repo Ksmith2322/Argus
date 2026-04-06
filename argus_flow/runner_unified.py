@@ -47,6 +47,7 @@ from argus_flow.ops.fleet_registry import (
     stage_account,
     stage_execution_mode,
 )
+from argus_flow.ops.fleet_registry import validate_risk_policy_for_execution
 from argus_flow.ops.trade_artifact_schema import ensure_trade_csv_schema
 from argus_flow.schemas import signal_header, build_signal_row
 from argus_flow.sizing import (
@@ -970,6 +971,11 @@ class InstrumentRunner:
             merged_risk.update({k: v for k, v in registry_risk.items() if v is not None})
             merged_risk["stage"] = self.deployment_stage
             self.risk_policy = merged_risk
+        # Validate model equity for paper/watcher stages
+        equity_error = validate_risk_policy_for_execution(config, Path(config_path), stage=self.deployment_stage)
+        if equity_error:
+            raise ValueError(f"[{self.label}] {equity_error}")
+
         self.stage_account = stage_account(self.deployment_stage)
         self.execution_mode = stage_execution_mode(self.deployment_stage)
         self.trade_enabled = self.execution_mode in ("paper", "real")
@@ -3069,7 +3075,12 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             continue
 
         ldir = log_dir_for(cfg)
-        runner = InstrumentRunner(cfg, contract, ticker, ldir, str(cfg_path))
+        try:
+            runner = InstrumentRunner(cfg, contract, ticker, ldir, str(cfg_path))
+        except ValueError as e:
+            log.critical(f"CONFIG ERROR: {e}")
+            ib.disconnect()
+            return False
         runner.state.load(runner.label)
         if not runner.trade_enabled and runner.state.position != "FLAT":
             runner._log.warning(
@@ -3200,6 +3211,33 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     for inst in instruments:
         inst.seed(ib)
         ib.sleep(0.5)  # rate-limit historical data requests
+
+    # -- Sizing validation gate ----------------------------------------
+    sizing_failures = []
+    for inst in instruments:
+        if not inst.trade_enabled:
+            continue
+        mid = inst._get_mid()
+        if not mid or mid <= 0:
+            log.warning(f"  [{inst.label}] No mid price for sizing validation — skipping")
+            continue
+        stop_px, _ = inst._compute_stops(mid, "long")
+        size, risk_usd, policy = inst._resolve_position_size(mid, stop_px)
+        equity = inst._get_account_equity()
+        if size <= 0:
+            log.critical(
+                f"FATAL SIZING: [{inst.label}] dry-run size=0 | equity=${equity:,.2f} "
+                f"risk_pct={inst.risk_pct} policy={policy} "
+                f"model_equity={inst.risk_policy.get('model_start_equity_usd', 'MISSING')} "
+                f"stage={inst.deployment_stage}"
+            )
+            sizing_failures.append(inst.label)
+        else:
+            log.info(f"  Sizing OK {inst.label}: size={size} risk=${risk_usd:.2f} equity=${equity:,.2f}")
+    if sizing_failures:
+        log.critical(f"STARTUP ABORTED: {len(sizing_failures)} instrument(s) would never trade: {sizing_failures}")
+        ib.disconnect()
+        return False
 
     # -- Main loop ---------------------------------------------------���───────────────
     log.info("Starting main loop (Ctrl+C to stop)...")
