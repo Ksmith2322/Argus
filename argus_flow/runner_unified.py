@@ -261,6 +261,16 @@ class State:
         if self.position != "FLAT" and self.timeout_time is None:
             log.warning(f"[{sym_label}] Restored {self.position} but timeout_time missing — trade validity compromised")
             self.had_zero_stops = True  # triggers invalid flag on close
+        # Safety: validate internal consistency of in-position state
+        if self.position != "FLAT":
+            if self.entry_price <= 0:
+                log.error(f"[{sym_label}] CORRUPT STATE: {self.position} but entry_price={self.entry_price} — forcing FLAT")
+                self.had_zero_stops = True
+                self.position = "FLAT"
+            elif self.position_size <= 0:
+                log.error(f"[{sym_label}] CORRUPT STATE: {self.position} but position_size={self.position_size} — forcing FLAT")
+                self.had_zero_stops = True
+                self.position = "FLAT"
         if self.position != "FLAT":
             self.restored_this_session = True
             log.info(
@@ -273,16 +283,27 @@ class State:
 class AccountEquityTracker:
     """Caches account equity so sizing/risk checks don't spam the API."""
 
+    STALE_THRESHOLD_S = 600  # warn if equity hasn't refreshed in 10 minutes
+    _consecutive_failures: int = 0
+
     def __init__(self, ib: IB, account: str | None = None, refresh_sec: int = 60):
         self.ib = ib
         self.account = account
         self.refresh_sec = refresh_sec
         self._equity_usd = DEFAULT_ACCOUNT_EQUITY_USD
         self._last_refresh = 0.0
+        self._last_successful_refresh = 0.0
+        self._consecutive_failures = 0
 
     @property
     def equity_usd(self) -> float:
         return self._equity_usd
+
+    @property
+    def is_stale(self) -> bool:
+        if self._last_successful_refresh == 0.0:
+            return False  # never refreshed yet
+        return (time.time() - self._last_successful_refresh) > self.STALE_THRESHOLD_S
 
     def refresh(self, force: bool = False) -> float:
         now = time.time()
@@ -292,7 +313,12 @@ class AccountEquityTracker:
         try:
             rows = self.ib.accountSummary(account=self.account or "")
         except Exception as exc:
-            log.warning(f"ACCOUNT_EQUITY refresh failed: {exc}")
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                log.warning(
+                    f"ACCOUNT_EQUITY refresh failed {self._consecutive_failures}x: {exc} "
+                    f"(last success {now - self._last_successful_refresh:.0f}s ago)"
+                )
             self._last_refresh = now
             return self._equity_usd
 
@@ -321,6 +347,8 @@ class AccountEquityTracker:
 
         if best and best > 0:
             self._equity_usd = best
+            self._last_successful_refresh = now
+            self._consecutive_failures = 0
         self._last_refresh = now
         return self._equity_usd
 
@@ -1079,6 +1107,33 @@ class InstrumentRunner:
                 return (bid + ask) / 2
             return None
 
+    def _check_ticker_staleness(self) -> bool:
+        """Return True if ticker data is fresh, False if stale. Logs warning on staleness."""
+        t = self.ticker
+        tick_time = getattr(t, "time", None)
+        if tick_time is None:
+            return True  # no timestamp available, can't check
+        try:
+            if isinstance(tick_time, (int, float)):
+                last_tick = datetime.fromtimestamp(tick_time, tz=timezone.utc)
+            else:
+                last_tick = tick_time if tick_time.tzinfo else tick_time.replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - last_tick).total_seconds()
+            if age_s > 120:
+                if not getattr(self, '_stale_warned', False):
+                    self._log.warning(
+                        f"STALE TICKER: {self.symbol} last tick {age_s:.0f}s ago — "
+                        f"blocking entries until fresh data resumes"
+                    )
+                    self._stale_warned = True
+                return False
+            if getattr(self, '_stale_warned', False):
+                self._log.info(f"Ticker {self.symbol} fresh again (age={age_s:.0f}s)")
+                self._stale_warned = False
+        except Exception:
+            pass
+        return True
+
     def _get_volume(self) -> float:
         """Get INCREMENTAL volume since last read (not cumulative session volume).
 
@@ -1253,12 +1308,27 @@ class InstrumentRunner:
             pnl_points = s.entry_price - px
         return pnl_points * self.multiplier * s.position_size
 
+    _SIGNAL_ROTATE_BYTES = 50 * 1024 * 1024  # 50MB
+
     def _ensure_signal_header(self) -> None:
         if not self.signal_log.exists():
             with open(self.signal_log, "w", newline="") as f:
                 csv.writer(f).writerow(signal_header(self.instrument_type))
 
+    def _rotate_signal_log_if_needed(self) -> None:
+        try:
+            if self.signal_log.exists() and self.signal_log.stat().st_size > self._SIGNAL_ROTATE_BYTES:
+                rotated = self.signal_log.with_name(
+                    f"signals_rotated_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.csv"
+                )
+                self.signal_log.rename(rotated)
+                self._log.info(f"Rotated signals.csv -> {rotated.name}")
+                self._ensure_signal_header()
+        except OSError as exc:
+            self._log.warning(f"Signal log rotation failed: {exc}")
+
     def _log_signal(self, features: dict, direction: Optional[str], action: str) -> None:
+        self._rotate_signal_log_if_needed()
         self._ensure_signal_header()
         features["ts"] = datetime.now(timezone.utc).isoformat()
         with open(self.signal_log, "a", newline="") as f:
@@ -1781,7 +1851,7 @@ class InstrumentRunner:
             return False
 
     def _cancel_order_by_id(self, order_id: str, label: str) -> None:
-        """Cancel an open order by ID. Best-effort, logs warnings on failure."""
+        """Cancel an open order by ID. Verifies cancellation after attempt."""
         if not order_id:
             return
         ib = getattr(self, '_ib', None)
@@ -1791,7 +1861,23 @@ class InstrumentRunner:
             for trade in ib.openTrades():
                 if str(getattr(trade.order, 'orderId', '')) == order_id:
                     ib.cancelOrder(trade.order)
-                    self._log.info(f"CANCELLED {label} order {order_id}")
+                    self._log.info(f"CANCEL REQUESTED {label} order {order_id}")
+                    # Brief wait then verify cancellation
+                    try:
+                        ib.sleep(2)
+                        still_open = any(
+                            str(getattr(t.order, 'orderId', '')) == order_id
+                            for t in ib.openTrades()
+                        )
+                        if still_open:
+                            self._log.warning(
+                                f"CANCEL UNCONFIRMED: {label} order {order_id} still in open trades — "
+                                f"orphaned order may fill later"
+                            )
+                        else:
+                            self._log.info(f"CANCEL CONFIRMED {label} order {order_id}")
+                    except Exception:
+                        pass
                     return
             self._log.debug(f"Cancel {label} order {order_id}: not found in open trades (may already be done)")
         except Exception as exc:
@@ -1838,6 +1924,11 @@ class InstrumentRunner:
             s.trade_count += 1
             s.direction_str = direction
             s.position_size = fill_qty  # Use actual filled quantity, not requested size
+            if fill_qty != size and size > 0:
+                self._log.warning(
+                    f"PARTIAL FILL: requested={size} filled={fill_qty} "
+                    f"({fill_qty/size:.0%}) — position smaller than intended"
+                )
             s.entry_risk_usd = self._risk_usd_for_size(fill_px, stop_px, fill_qty)
             s.sizing_policy = getattr(self, '_pending_sizing_policy', 'dynamic')
             s.account_equity_at_entry = self._get_account_equity()
@@ -2112,6 +2203,11 @@ class InstrumentRunner:
             return
 
         direction = self._check_trigger(features)
+
+        # ── Stale ticker gate ────────────────────────────────
+        if direction and not self._check_ticker_staleness():
+            self._log_signal(features, direction, "STALE_TICKER_BLOCKED")
+            direction = None
 
         # ── Gate decision tracking (for brain visualization) ──
         _trigger_fired = direction is not None
@@ -2769,7 +2865,10 @@ class PortfolioRiskManager:
             "daily_paused": list(self._daily_paused),
             "portfolio_daily_paused": self._portfolio_daily_paused,
         }
-        atomic_write_json(self._STATE_FILE, data)
+        try:
+            atomic_write_json(self._STATE_FILE, data)
+        except Exception as exc:
+            log.error(f"RISK_MGR: failed to save persistent state: {exc} — state may be stale on restart")
 
     def update(self, instruments: list) -> None:
         """Update portfolio PnL tracking.

@@ -489,7 +489,10 @@ def _check_trade_drought() -> list[dict[str, Any]]:
                             if not action or action == "NO_TRIGGER":
                                 continue
                             triggered += 1
-                            if "RISK_BLOCKED" in action or action == "SIZE_BELOW_FLOOR":
+                            if ("BLOCKED" in action or action in (
+                                "SIZE_BELOW_FLOOR", "MAINTENANCE_BLACKOUT",
+                                "STALE_TICKER_BLOCKED",
+                            )):
                                 blocked += 1
             except OSError:
                 pass
