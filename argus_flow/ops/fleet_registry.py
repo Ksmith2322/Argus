@@ -297,8 +297,8 @@ def validate_risk_policy_for_execution(config: dict, config_path: Path, stage: s
     sizing against real broker equity.
     """
     resolved_stage = normalize_stage(stage) or infer_stage(config, config_path)
-    if resolved_stage not in (STAGE_PAPER, STAGE_WATCHER):
-        return None
+    if resolved_stage != STAGE_PAPER:
+        return None  # only paper stage trades; watchers observe, real uses broker equity
 
     deployment = config.get("deployment", {}) if isinstance(config.get("deployment", {}), dict) else {}
     risk_policy = deployment.get("risk_policy", {}) if isinstance(deployment.get("risk_policy", {}), dict) else {}
