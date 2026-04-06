@@ -111,7 +111,8 @@ function Test-LockMetadataProcessAlive([string]$metaPath, [string]$expectedKind 
 
 function Get-AliveRunnerLocks() {
     $results = @()
-    $lockFiles = Get-ChildItem "argus_flow/logs/_locks" -Filter "runner_*.json" -ErrorAction SilentlyContinue
+    # Only scan Argus runner locks — Helio family (helio_*, apollo_*, hermes_*) are managed separately
+    $lockFiles = Get-ChildItem "argus_flow/logs/_locks" -Filter "runner_*.json" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch "^(helio|apollo|hermes)_" }
     foreach ($file in $lockFiles) {
         try {
             $lock = Get-Content $file.FullName -Raw | ConvertFrom-Json
@@ -134,6 +135,8 @@ function Is-Running($pattern) {
     $procs = Get-Process python* -ErrorAction SilentlyContinue | Where-Object {
         try {
             $cmd = Get-ProcessCommandLine $_.Id
+            # Exclude Helio family processes from Argus fleet matching
+            if ($cmd -match "helio\.(runner|watchdog)|runner_apollo|runner_hermes") { return $false }
             $cmd -match $pattern
         } catch { $false }
     }
