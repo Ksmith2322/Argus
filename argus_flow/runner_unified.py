@@ -1047,7 +1047,7 @@ class InstrumentRunner:
         self._mtf_enabled = bool(trigger_cfg.get("mtf_enabled", True))
         self._spread_gate_enabled = bool(trigger_cfg.get("spread_gate_enabled", True))
         self._news_filter_enabled = bool(trigger_cfg.get("news_filter_enabled", True))
-        self._sequencing_gap_minutes = float(trigger_cfg.get("sequencing_gap_minutes", 30))
+        self._sequencing_gap_minutes = float(trigger_cfg.get("sequencing_gap_minutes", 10))
 
     # ── Price extraction ─────────────────────────────────────
     def _get_mid(self) -> Optional[float]:
@@ -2153,8 +2153,8 @@ class InstrumentRunner:
             h_utc = now.hour
             m_utc = now.minute
             utc_minutes = h_utc * 60 + m_utc
-            blackout_start = 1 * 60 + 30   # 01:30 UTC
-            blackout_end = 4 * 60 + 30     # 04:30 UTC
+            blackout_start = 3 * 60 + 0    # 03:00 UTC (actual TWS restart)
+            blackout_end = 3 * 60 + 45     # 03:45 UTC (was 01:30-04:30, blocked 3hrs unnecessarily)
             if blackout_start <= utc_minutes <= blackout_end:
                 self._log.info(f"MAINTENANCE_BLACKOUT: {direction.upper()} blocked during TWS restart window")
                 self._log_signal(features, direction, "MAINTENANCE_BLACKOUT")
@@ -3161,13 +3161,13 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     # -- Portfolio risk manager ----------------------------------------
     # Determine drawdown limit based on fleet stage
     any_real = any(inst.execution_mode == "real" for inst in instruments)
-    dd_limit = 0.02 if any_real else 0.03  # 2% for prod, 3% for paper
+    dd_limit = 0.02 if any_real else 0.05  # 2% for prod, 5% for paper (was 3%, triggered too early for 8-pair portfolio)
     risk_mgr = PortfolioRiskManager(
         max_same_currency=2,
         max_drawdown_pct=dd_limit,
         daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
-        max_total_open_risk_pct=0.10,  # 10% for paper fleet (was 5%, blocked EUR/USD when other pairs held positions)
+        max_total_open_risk_pct=0.20,  # 20% for 8-pair paper fleet (was 10%, still blocked 47-54% of signals)
     )
     risk_mgr.set_account_equity(equity_tracker.equity_usd)
     for inst in instruments:
