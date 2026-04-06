@@ -87,6 +87,24 @@ DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD",
 AUTO_GROUP_CLIENT_ID_BASE = 1000
 AUTO_GROUP_CLIENT_ID_SPAN = 8000
 
+# FX market hours (UTC): Sunday 21:00 → Friday 21:00
+# Close positions 15 min before Friday close to avoid weekend gap risk
+FX_FRIDAY_CLOSE_MINUTE = 20 * 60 + 45  # 20:45 UTC Friday (15 min before 21:00 close)
+FX_FRIDAY_HARD_CLOSE_MINUTE = 20 * 60 + 55  # 20:55 UTC — emergency flatten if still open
+
+
+def _fx_market_open(now: datetime) -> bool:
+    """Return True if FX market is currently open (Sunday 21:00 → Friday 21:00 UTC)."""
+    wd = now.weekday()  # 0=Mon .. 6=Sun
+    utc_minutes = now.hour * 60 + now.minute
+    if wd == 4 and utc_minutes >= 21 * 60:  # Friday after 21:00
+        return False
+    if wd == 5:  # Saturday
+        return False
+    if wd == 6 and utc_minutes < 21 * 60:  # Sunday before 21:00
+        return False
+    return True
+
 
 # ═════════════════════════════════════════════════════════════
 # BarBuffer — rolling 1-minute bar window
@@ -1224,6 +1242,21 @@ class InstrumentRunner:
             policy = "fixed"
 
         size = float(size or 0)
+
+        # Hard cap: never exceed max_lot_size / max_contracts
+        if self.uses_pips and self.max_lot_size and size > self.max_lot_size:
+            self._log.warning(f"SIZE_CAP: {size} > max_lot_size {self.max_lot_size}")
+            size = float(self.max_lot_size)
+        elif not self.uses_pips and self.max_contracts and size > self.max_contracts:
+            self._log.warning(f"SIZE_CAP: {size} > max_contracts {self.max_contracts}")
+            size = float(self.max_contracts)
+
+        # Sanity cap: never exceed 10x the configured lot_size (catch config errors)
+        base_size = self.lot_size if self.uses_pips else self.num_contracts
+        if base_size > 0 and size > base_size * 10:
+            self._log.error(f"SIZE_OVERFLOW: {size} > 10x base {base_size} — capping")
+            size = float(base_size)
+
         risk_usd = self._risk_usd_for_size(entry_price, stop_price, size)
         return size, risk_usd, policy
 
@@ -1951,6 +1984,7 @@ class InstrumentRunner:
         if order_id == s.exit_order_id and s.exit_pending:
             s.exit_pending = False
             s.exit_fill_px = fill_px
+            self._exit_retry_count = 0  # reset escalation
             exit_reason = getattr(self, '_pending_exit_reason', 'exit')
             self._finalize_real_exit(fill_px, exit_reason, now)
             return
@@ -2024,6 +2058,55 @@ class InstrumentRunner:
         s.exit_submitted_ts = ""
         s.save()
 
+    _BRACKET_CHECK_INTERVAL_S = 60  # check bracket health every 60s
+
+    def _check_bracket_health(self, now: datetime) -> None:
+        """Verify bracket orders (stop/target) are still alive in IBKR.
+
+        TWS restarts cancel all open orders. If stop/target vanish while
+        in position, resubmit them immediately.
+        """
+        last_check = getattr(self, '_last_bracket_check', 0.0)
+        if time.time() - last_check < self._BRACKET_CHECK_INTERVAL_S:
+            return
+        self._last_bracket_check = time.time()
+
+        s = self.state
+        if not s.stop_order_id and not s.target_order_id:
+            return  # no brackets to check
+
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            return
+
+        try:
+            open_ids = {str(getattr(t.order, 'orderId', '')) for t in ib.openTrades()}
+        except Exception:
+            return
+
+        stop_alive = s.stop_order_id in open_ids if s.stop_order_id else True
+        target_alive = s.target_order_id in open_ids if s.target_order_id else True
+
+        if not stop_alive or not target_alive:
+            missing = []
+            if not stop_alive:
+                missing.append(f"stop({s.stop_order_id})")
+            if not target_alive:
+                missing.append(f"target({s.target_order_id})")
+            self._log.warning(
+                f"BRACKET ORPHANED: {', '.join(missing)} not found in open orders — "
+                f"resubmitting brackets for {s.position} position"
+            )
+            ok = self._submit_bracket_orders(s.stop_price, s.target_price)
+            if not ok:
+                self._log.critical(
+                    f"BRACKET RESUBMIT FAILED — position {s.position} UNHEDGED. "
+                    f"Submitting emergency exit."
+                )
+                mid = self._get_mid()
+                if mid:
+                    self._submit_real_exit("bracket_orphaned", mid)
+
     def _check_order_timeouts(self, now: datetime) -> None:
         """Cancel stuck orders after timeout. Entry: 60s, Exit: 30s."""
         s = self.state
@@ -2047,7 +2130,8 @@ class InstrumentRunner:
             try:
                 submitted = datetime.fromisoformat(s.exit_submitted_ts)
                 elapsed = (now - submitted).total_seconds()
-                if elapsed > 30:
+                exit_retry_count = getattr(self, '_exit_retry_count', 0)
+                if elapsed > 30 and exit_retry_count == 0:
                     self._log.warning(
                         f"EXIT TIMEOUT: order {s.exit_order_id} pending >30s — "
                         f"cancelling and retrying with aggressive MKT"
@@ -2064,14 +2148,44 @@ class InstrumentRunner:
                         s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
                         s.exit_submitted_ts = now.isoformat()
                         s.save()
+                        self._exit_retry_count = 1
                         self._log.info(
                             f"EXIT RETRY (IOC MKT) orderId={s.exit_order_id}"
                         )
-                    else:
-                        s.exit_pending = False
-                        s.exit_order_id = ""
-                        s.exit_submitted_ts = ""
+                elif elapsed > 60 and exit_retry_count == 1:
+                    # Tertiary: IOC failed too. Try GTC market order.
+                    self._log.error(
+                        f"EXIT STUCK: IOC retry also failed after 60s — "
+                        f"submitting GTC MKT as last resort"
+                    )
+                    self._cancel_order_by_id(s.exit_order_id, "exit_stuck")
+                    ib = getattr(self, '_ib', None)
+                    if ib is not None and s.position != "FLAT":
+                        close_action = "SELL" if s.position == "LONG" else "BUY"
+                        order = MarketOrder(close_action, abs(s.position_size))
+                        order.account = getattr(self, 'stage_account', '') or ''
+                        order.tif = "GTC"
+                        trade = ib.placeOrder(self.contract, order)
+                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                        s.exit_submitted_ts = now.isoformat()
                         s.save()
+                        self._exit_retry_count = 2
+                        self._log.info(f"EXIT RETRY (GTC MKT) orderId={s.exit_order_id}")
+                elif elapsed > 120 and exit_retry_count >= 2:
+                    # All retries exhausted — force FLAT locally + incident
+                    self._log.critical(
+                        f"EXIT FAILED: all retries exhausted after 120s. "
+                        f"Forcing local FLAT — MANUAL BROKER CHECK REQUIRED"
+                    )
+                    _write_incident(self, "EXIT_FAILED",
+                                    f"All exit retries exhausted, forced local FLAT",
+                                    s.position, {"direction": s.position, "qty": s.position_size})
+                    s.exit_pending = False
+                    s.exit_order_id = ""
+                    s.exit_submitted_ts = ""
+                    s.position = "FLAT"
+                    s.save()
+                    self._exit_retry_count = 0
             except (ValueError, TypeError):
                 pass
 
@@ -2121,6 +2235,9 @@ class InstrumentRunner:
         s = self.state
         if self.execution_mode == "real":
             self._check_order_timeouts(now)
+            # Check if bracket orders (stop/target) are still alive
+            if s.position != "FLAT" and not s.exit_pending:
+                self._check_bracket_health(now)
             # While orders are pending, skip normal paper stop/target checks
             if s.entry_pending or s.exit_pending:
                 return
@@ -2148,6 +2265,16 @@ class InstrumentRunner:
                 self._check_trailing_stop(mid)
 
             if exit_reason and self.execution_mode == "real" and not s.exit_pending:
+                # Market-hours guard: don't submit orders into closed FX market
+                if self.instrument_type == "forex" and not _fx_market_open(now):
+                    if not getattr(self, '_market_closed_warned', False):
+                        self._log.warning(
+                            f"EXIT DEFERRED: {exit_reason} for {self.symbol} — "
+                            f"FX market closed, will execute at open"
+                        )
+                        self._market_closed_warned = True
+                    return  # defer until market reopens
+                self._market_closed_warned = False
                 # Real execution: submit exit order, don't log trade yet
                 self._submit_real_exit(exit_reason, mid)
                 return  # wait for fill callback
@@ -3396,6 +3523,41 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
             now = datetime.now(timezone.utc)
 
+            # ── Friday auto-close: flatten all positions before weekend ──
+            if now.weekday() == 4:  # Friday
+                utc_min = now.hour * 60 + now.minute
+                if utc_min >= FX_FRIDAY_CLOSE_MINUTE:
+                    for inst in instruments:
+                        if inst.instrument_type != "forex":
+                            continue
+                        inst._entries_blocked = True
+                        s = inst.state
+                        if s.position != "FLAT" and not s.exit_pending:
+                            reason = "friday_close"
+                            if utc_min >= FX_FRIDAY_HARD_CLOSE_MINUTE:
+                                reason = "friday_hard_close"
+                            mid = inst._get_mid()
+                            if not getattr(inst, '_friday_close_logged', False):
+                                inst._log.warning(
+                                    f"FRIDAY CLOSE: flattening {s.position} position before weekend "
+                                    f"(mid={mid}, reason={reason})"
+                                )
+                                inst._friday_close_logged = True
+                            if inst.execution_mode == "real" and mid:
+                                inst._submit_real_exit(reason, mid)
+                            elif mid:
+                                pnl, pnl_usd = inst._log_trade(mid, reason, now)
+                                if inst.uses_pips:
+                                    s.pnl_pips += pnl
+                                else:
+                                    s.pnl_points += pnl
+                                s.pnl_usd += pnl_usd
+                                s.position = "FLAT"
+                                s.save()
+                else:
+                    for inst in instruments:
+                        inst._friday_close_logged = False
+
             risk_mgr.set_account_equity(equity_tracker.refresh())
             risk_mgr.update(instruments)
 
@@ -3434,11 +3596,17 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         if broker_flat != local_flat:
                             log.warning(
                                 f"RECON_DRIFT: {inst.symbol} local={local_pos} "
-                                f"broker_qty={bp} key={ib_key} — mismatch detected"
+                                f"broker_qty={bp} key={ib_key} — BLOCKING ENTRIES"
                             )
+                            inst._entries_blocked = True
                             _write_incident(inst, "RECON_DRIFT",
                                             f"local={local_pos} broker_qty={bp}",
                                             local_pos, {"direction": "unknown", "qty": bp})
+                        else:
+                            # Clear recon-based entry block if positions agree
+                            if getattr(inst, '_recon_blocked', False):
+                                inst._entries_blocked = False
+                                inst._recon_blocked = False
                 except Exception as e:
                     log.warning(f"Periodic reconciliation failed: {e}")
 
