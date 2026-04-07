@@ -41,8 +41,14 @@
     },
     "deployment": {
         "managed": true,
-        "stage": "watcher",
+        "stage": "paper",
+        "tier": "B",
         "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
-        "onboarded_by": "auto_onboard_cleanup"
+        "onboarded_by": "auto_onboard_cleanup",
+        "promoted_at": "2026-04-07T03:00:00+00:00",
+        "promoted_by": "sweep_backtest_pf_1.36",
+        "risk_policy": {
+            "model_start_equity_usd": 10000
+        }
     }
 }
