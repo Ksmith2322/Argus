@@ -1,0 +1,44 @@
+{
+  "strategy": "T4_full_stack",
+  "version": "paper_v2",
+  "symbol": "EURAUD",
+  "instrument_type": "forex",
+  "ibkr_client_id": 37,
+  "trigger": {
+    "range_pct_min": 0.001,
+    "range_accel_min": 0.0,
+    "vol_z_min": null,
+    "session_start_utc": 7,
+    "session_end_utc": 16,
+    "sequencing_gap_minutes": 10
+  },
+  "risk": {
+    "stop_pips": 20,
+    "target_pips": 50,
+    "timeout_minutes": 60,
+    "min_signal_gap_minutes": 10,
+    "lot_size": 100000,
+    "risk_pct": 0.015
+  },
+  "direction": {
+    "dist_long_threshold": 0.35,
+    "dist_short_threshold": 0.65
+  },
+  "replay_expectations": {
+    "signals_per_day": 4.0,
+    "signals_per_day_range": [1, 8],
+    "win_rate": 0.51,
+    "win_rate_range": [0.40, 0.60],
+    "exp_pips_per_trade": 3.9
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "paper",
+    "onboarded_at": "2026-04-06T23:00:00+00:00",
+    "onboarded_by": "sweep_backtest_pf_1.52",
+    "risk_policy": {
+      "model_start_equity_usd": 10000
+    },
+    "tier": "A"
+  }
+}
