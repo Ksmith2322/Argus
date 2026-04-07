@@ -4,6 +4,8 @@
   "symbol": "GBPJPY",
   "instrument_type": "forex",
   "ibkr_client_id": 13,
+  "eval_timeframe": "5m",
+  "strategy_variant": "breakeven",
   "trigger": {
     "range_pct_min": 0.001,
     "range_accel_min": 0.0,
@@ -18,7 +20,8 @@
     "timeout_minutes": 60,
     "min_signal_gap_minutes": 10,
     "lot_size": 100000,
-    "risk_pct": 0.02
+    "risk_pct": 0.02,
+    "breakeven_trigger_pips": 10
   },
   "direction": {
     "dist_long_threshold": 0.35,

@@ -1064,6 +1064,21 @@ class InstrumentRunner:
         # Uses pips (FX) or bps (futures/crypto)?
         self.uses_pips = self.instrument_type == "forex" and self.stop_pips > 0
 
+        # Multi-timeframe evaluation: only fire signals on higher-TF bar closes
+        self.eval_timeframe = config.get("eval_timeframe", "1m")  # 1m|5m|15m|30m|1h
+        self._eval_tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}.get(self.eval_timeframe, 1)
+        self._last_eval_tf_boundary: Optional[datetime] = None
+
+        # Strategy variant: controls exit management style
+        self.strategy_variant = config.get("strategy_variant", "default")
+        # Trailing stop: lock in profits by trailing N pips behind peak
+        self._trailing_pips = float(risk.get("trailing_pips", 0))
+        self._trailing_active = self._trailing_pips > 0
+        self._peak_favorable_pips: float = 0.0
+        # Breakeven stop: move stop to entry+1pip after N pips favorable
+        self._breakeven_trigger_pips = float(risk.get("breakeven_trigger_pips", 0))
+        self._breakeven_activated = False
+
         # Pyramiding / scale-in (opt-in, defaults OFF — does not affect cohort)
         pyramid = config.get("pyramid", {})
         self.pyramid_enabled = pyramid.get("enabled", False)
@@ -1679,41 +1694,72 @@ class InstrumentRunner:
             return entry_px + stop_dist, entry_px - target_dist
 
     def _check_trailing_stop(self, mid: float) -> None:
-        """Move stop to breakeven after price moves 1R in our favor.
+        """Dynamic stop management: R-based trailing + config-based trailing/breakeven.
 
-        1R = original risk distance (entry to stop).
-        After 1.5R, trail at entry + 0.5R.
+        Supports three modes (can stack):
+        1. R-based: move to BE after 1R, trail at +0.5R after 1.5R (always active)
+        2. Pip-based trailing: trail N pips behind peak favorable (from config trailing_pips)
+        3. Breakeven trigger: move to entry+1pip after N pips favorable (from config breakeven_trigger_pips)
         """
         s = self.state
         if s.entry_price == 0 or s.stop_price == 0:
             return
 
         risk_dist = abs(s.entry_price - s.stop_price)
-        if risk_dist == 0:
+        pip = self.pip_size
+
+        # Track peak favorable movement
+        if s.position == "LONG":
+            favorable_pips = (mid - s.entry_price) / pip
+        elif s.position == "SHORT":
+            favorable_pips = (s.entry_price - mid) / pip
+        else:
             return
 
-        if s.position == "LONG":
-            favorable = mid - s.entry_price
-            if favorable >= risk_dist * 1.5:
-                # Trail at entry + 0.5R
-                new_stop = s.entry_price + risk_dist * 0.5
-                if new_stop > s.stop_price:
-                    s.stop_price = new_stop
-            elif favorable >= risk_dist:
-                # Move to breakeven
-                if s.stop_price < s.entry_price:
-                    self._log.info(f"TRAILING: stop moved to breakeven {s.entry_price:.5f}")
-                    s.stop_price = s.entry_price
-        elif s.position == "SHORT":
-            favorable = s.entry_price - mid
-            if favorable >= risk_dist * 1.5:
-                new_stop = s.entry_price - risk_dist * 0.5
-                if new_stop < s.stop_price:
-                    s.stop_price = new_stop
-            elif favorable >= risk_dist:
-                if s.stop_price > s.entry_price:
-                    self._log.info(f"TRAILING: stop moved to breakeven {s.entry_price:.5f}")
-                    s.stop_price = s.entry_price
+        self._peak_favorable_pips = max(self._peak_favorable_pips, favorable_pips)
+
+        # --- Breakeven trigger (config-based) ---
+        if self._breakeven_trigger_pips > 0 and not self._breakeven_activated:
+            if self._peak_favorable_pips >= self._breakeven_trigger_pips:
+                be_stop = s.entry_price + pip if s.position == "LONG" else s.entry_price - pip
+                if (s.position == "LONG" and be_stop > s.stop_price) or \
+                   (s.position == "SHORT" and be_stop < s.stop_price):
+                    self._log.info(f"BREAKEVEN: triggered at {self._peak_favorable_pips:.1f} pips favorable")
+                    s.stop_price = be_stop
+                    self._breakeven_activated = True
+
+        # --- Pip-based trailing (config-based) ---
+        if self._trailing_active and self._peak_favorable_pips > self._trailing_pips:
+            if s.position == "LONG":
+                trail_stop = s.entry_price + (self._peak_favorable_pips - self._trailing_pips) * pip
+                if trail_stop > s.stop_price:
+                    s.stop_price = trail_stop
+            elif s.position == "SHORT":
+                trail_stop = s.entry_price - (self._peak_favorable_pips - self._trailing_pips) * pip
+                if trail_stop < s.stop_price:
+                    s.stop_price = trail_stop
+
+        # --- R-based trailing (always active as fallback) ---
+        if risk_dist > 0:
+            favorable_r = favorable_pips * pip / risk_dist if risk_dist > 0 else 0
+            if s.position == "LONG":
+                if favorable_r >= 1.5:
+                    new_stop = s.entry_price + risk_dist * 0.5
+                    if new_stop > s.stop_price:
+                        s.stop_price = new_stop
+                elif favorable_r >= 1.0:
+                    if s.stop_price < s.entry_price:
+                        self._log.info(f"TRAILING_R: stop moved to breakeven {s.entry_price:.5f}")
+                        s.stop_price = s.entry_price
+            elif s.position == "SHORT":
+                if favorable_r >= 1.5:
+                    new_stop = s.entry_price - risk_dist * 0.5
+                    if new_stop < s.stop_price:
+                        s.stop_price = new_stop
+                elif favorable_r >= 1.0:
+                    if s.stop_price > s.entry_price:
+                        self._log.info(f"TRAILING_R: stop moved to breakeven {s.entry_price:.5f}")
+                        s.stop_price = s.entry_price
 
     # ── Pyramiding / scale-in ────────────────────────────────
     def _check_pyramid(self, mid: float, now: datetime) -> None:
@@ -1961,6 +2007,9 @@ class InstrumentRunner:
             s.trade_count += 1
             s.direction_str = direction
             s.position_size = fill_qty  # Use actual filled quantity, not requested size
+            # Reset trailing/breakeven state for new position
+            self._peak_favorable_pips = 0.0
+            self._breakeven_activated = False
             if fill_qty != size and size > 0:
                 self._log.warning(
                     f"PARTIAL FILL: requested={size} filled={fill_qty} "
@@ -2329,6 +2378,13 @@ class InstrumentRunner:
         if len(self.buf) < 60:
             return
 
+        # Higher-TF eval gate: only evaluate on timeframe boundary
+        if self._eval_tf_minutes > 1 and bar_minute is not None:
+            tf_boundary = bar_minute.replace(minute=(bar_minute.minute // self._eval_tf_minutes) * self._eval_tf_minutes, second=0, microsecond=0)
+            if tf_boundary == self._last_eval_tf_boundary:
+                return
+            self._last_eval_tf_boundary = tf_boundary
+
         self._last_eval_minute = bar_minute
         features = self._compute_features()
         if features is None:
@@ -2645,6 +2701,9 @@ class InstrumentRunner:
             s.position_size = entry_plan["size"]
             s.entry_risk_usd = entry_plan["risk_usd"]
             s.sizing_policy = entry_plan["sizing_policy"]
+            # Reset trailing/breakeven state for new position
+            self._peak_favorable_pips = 0.0
+            self._breakeven_activated = False
             s.account_equity_at_entry = self._get_account_equity()
             s.entry_regime = features.get("regime", "")
 

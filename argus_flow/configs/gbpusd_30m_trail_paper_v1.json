@@ -1,11 +1,11 @@
 {
-  "strategy": "range_accel_NY",
+  "strategy": "range_accel",
   "version": "paper_v2",
-  "symbol": "EURGBP",
+  "symbol": "GBPUSD",
   "instrument_type": "forex",
-  "ibkr_client_id": 36,
-  "eval_timeframe": "5m",
-  "strategy_variant": "breakeven",
+  "ibkr_client_id": 40,
+  "eval_timeframe": "30m",
+  "strategy_variant": "trailing_30m",
   "trigger": {
     "range_pct_min": 0.001,
     "range_accel_min": 0.0,
@@ -15,30 +15,25 @@
     "sequencing_gap_minutes": 10
   },
   "risk": {
-    "stop_pips": 20,
-    "target_pips": 50,
+    "stop_pips": 60,
+    "target_pips": 150,
     "timeout_minutes": 90,
-    "min_signal_gap_minutes": 10,
+    "min_signal_gap_minutes": 30,
     "lot_size": 100000,
     "risk_pct": 0.015,
-    "breakeven_trigger_pips": 10
+    "trailing_pips": 30,
+    "breakeven_trigger_pips": 30
   },
   "direction": {
     "dist_long_threshold": 0.35,
     "dist_short_threshold": 0.65
   },
-  "replay_expectations": {
-    "signals_per_day": 4.0,
-    "signals_per_day_range": [1, 8],
-    "win_rate": 0.62,
-    "win_rate_range": [0.45, 0.75],
-    "exp_pips_per_trade": 1.0
-  },
   "deployment": {
     "managed": true,
     "stage": "paper",
-    "onboarded_at": "2026-04-06T22:00:00+00:00",
-    "onboarded_by": "sweep_backtest_pf_1.50",
+    "log_dir": "argus_flow/logs/gbpusd_30m",
+    "onboarded_at": "2026-04-07T20:00:00+00:00",
+    "onboarded_by": "strategy_sweep_pf_2.12_30m",
     "risk_policy": {
       "model_start_equity_usd": 10000
     },

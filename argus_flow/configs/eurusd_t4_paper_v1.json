@@ -4,6 +4,8 @@
   "symbol": "EURUSD",
   "instrument_type": "forex",
   "ibkr_client_id": 10,
+  "eval_timeframe": "5m",
+  "strategy_variant": "breakeven",
   "trigger": {
     "range_pct_min": 0.001,
     "range_accel_min": 0.0,
@@ -24,7 +26,8 @@
     "timeout_minutes": 90,
     "min_signal_gap_minutes": 10,
     "lot_size": 57000,
-    "risk_pct": 0.015
+    "risk_pct": 0.015,
+    "breakeven_trigger_pips": 10
   },
   "direction": {
     "dist_long_threshold": 0.35,
