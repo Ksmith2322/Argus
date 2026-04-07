@@ -96,7 +96,7 @@ def evaluate(state: ApolloState, row, cfg: dict, today_str: str, log_dir: Path):
     rsi_os = entry_cfg.get("rsi_oversold", 30)
     stop_mult = risk_cfg.get("atr_stop_mult", 0.5)
     target_mult = risk_cfg.get("reversion_target_mult", 0.5)
-    max_hold = risk_cfg.get("max_hold_days", 5)
+    max_hold = risk_cfg.get("max_hold_bars", risk_cfg.get("max_hold_days", 5))
 
     atr = float(row["atr"])
     ema = float(row["ema"])
@@ -219,6 +219,38 @@ def _log_signal(log_dir, ts, direction, entry, stop, target, row):
                      "ema": f"{float(row['ema']):.5f}", "atr": f"{float(row['atr']):.5f}"})
 
 
+def _eval_instrument(ib, inst: dict, bars, now: datetime, cfg: dict):
+    """Evaluate one Apollo instrument given its historical bars."""
+    df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
+                        "Close": b.close, "Volume": getattr(b, "volume", 0)} for b in bars])
+    df = compute_indicators(df, cfg)
+
+    from helio.regime_router import classify as classify_regime
+    regime_info = classify_regime(df)
+    log.info(f"{cfg['symbol']}: REGIME {regime_info['regime']} (conf={regime_info['confidence']:.3f}) | priority={regime_info['family_priority']} | sizing_mod={regime_info['sizing_modifier']}")
+
+    latest = df.iloc[-1]
+    today_str = now.strftime("%Y-%m-%d")
+
+    # Write heartbeat
+    (inst["log_dir"] / "heartbeat.json").write_text(json.dumps({
+        "ts": now.isoformat(), "system": "helio", "family": "apollo",
+        "stage": cfg.get("deployment", {}).get("stage", "watcher"),
+        "symbol": cfg["symbol"], "position": inst["state"].position,
+        "close": float(latest["Close"]), "rsi": float(latest["rsi"]),
+        "dist_atr": float(latest["dist_atr"]), "trade_count": inst["state"].trade_count,
+        "regime": regime_info["regime"], "regime_confidence": regime_info["confidence"],
+    }, indent=2, default=str))
+
+    # Regime depriority gate
+    _stage = cfg.get("deployment", {}).get("stage", "watcher")
+    if _stage == "watcher" and "apollo" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
+        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY — skipping entry eval")
+        return
+
+    evaluate(inst["state"], latest, cfg, today_str, inst["log_dir"])
+
+
 def run_live(configs: list[Path]):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -257,57 +289,51 @@ def run_live(configs: list[Path]):
         instruments.append({"config": cfg, "state": state, "contract": contract, "log_dir": log_dir})
         log.info(f"  {sym}: {state.position} | trades={state.trade_count}")
 
-    log.info(f"Apollo running with {len(instruments)} instruments")
-    last_eval = ""
+    # Group instruments by timeframe for different eval intervals
+    hourly_instruments = [i for i in instruments if i["config"].get("timeframe", {}).get("primary") == "1h"]
+    daily_instruments = [i for i in instruments if i["config"].get("timeframe", {}).get("primary") != "1h"]
+    log.info(f"Apollo running: {len(hourly_instruments)} hourly + {len(daily_instruments)} daily instruments")
+    last_daily_eval = ""
+    last_hourly_eval = ""
 
     try:
         while True:
             ib.sleep(60)
             now = datetime.now(timezone.utc)
             today = now.strftime("%Y-%m-%d")
-            # Apollo FX evaluates at London close (17:00 UTC), not US close
-            if today == last_eval or now.hour < 17:
-                continue
-            last_eval = today
-            log.info(f"=== Apollo daily evaluation {today} ===")
+            hour_key = now.strftime("%Y-%m-%d-%H")
 
-            for inst in instruments:
-                try:
-                    cfg = inst["config"]
-                    bars = ib.reqHistoricalData(inst["contract"], endDateTime="", durationStr="120 D",
-                                                barSizeSetting="1 day", whatToShow="MIDPOINT", useRTH=False)
-                    if not bars or len(bars) < 40:
-                        log.warning(f"{cfg['symbol']}: insufficient bars"); continue
-                    df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
-                                        "Close": b.close, "Volume": getattr(b, "volume", 0)} for b in bars])
-                    df = compute_indicators(df, cfg)
+            # --- Hourly evaluation (1H instruments) ---
+            if hourly_instruments and hour_key != last_hourly_eval and now.minute >= 5:
+                last_hourly_eval = hour_key
+                log.info(f"=== Apollo hourly evaluation {hour_key} ===")
+                for inst in hourly_instruments:
+                    try:
+                        cfg = inst["config"]
+                        bars = ib.reqHistoricalData(inst["contract"], endDateTime="", durationStr="30 D",
+                                                    barSizeSetting="1 hour", whatToShow="MIDPOINT", useRTH=False)
+                        if not bars or len(bars) < 40:
+                            log.warning(f"{cfg['symbol']}: insufficient hourly bars"); continue
+                        _eval_instrument(ib, inst, bars, now, cfg)
+                    except Exception as e:
+                        log.error(f"Apollo hourly {inst['config']['symbol']}: {e}")
+                    ib.sleep(1)
 
-                    # --- Regime classification ---
-                    from helio.regime_router import classify as classify_regime
-                    regime_info = classify_regime(df)
-                    log.info(f"{cfg['symbol']}: REGIME {regime_info['regime']} (conf={regime_info['confidence']:.3f}) | priority={regime_info['family_priority']} | sizing_mod={regime_info['sizing_modifier']}")
-
-                    latest = df.iloc[-1]
-                    # Write heartbeat
-                    (inst["log_dir"] / "heartbeat.json").write_text(json.dumps({
-                        "ts": now.isoformat(), "system": "helio", "family": "apollo",
-                        "stage": cfg.get("deployment", {}).get("stage", "watcher"),
-                        "symbol": cfg["symbol"],
-                        "position": inst["state"].position, "close": float(latest["Close"]),
-                        "rsi": float(latest["rsi"]), "dist_atr": float(latest["dist_atr"]),
-                        "trade_count": inst["state"].trade_count,
-                        "regime": regime_info["regime"],
-                        "regime_confidence": regime_info["confidence"],
-                    }, indent=2, default=str))
-
-                    # Regime depriority gate — only block new entries in watcher stage
-                    _stage = cfg.get("deployment", {}).get("stage", "watcher")
-                    if _stage == "watcher" and "apollo" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
-                        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY apollo not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
-                    else:
-                        evaluate(inst["state"], latest, cfg, today, inst["log_dir"])
-                except Exception as e:
-                    log.error(f"{inst['config']['symbol']}: {e}")
+            # --- Daily evaluation (daily instruments) ---
+            if daily_instruments and today != last_daily_eval and now.hour >= 17:
+                last_daily_eval = today
+                log.info(f"=== Apollo daily evaluation {today} ===")
+                for inst in daily_instruments:
+                    try:
+                        cfg = inst["config"]
+                        bars = ib.reqHistoricalData(inst["contract"], endDateTime="", durationStr="120 D",
+                                                    barSizeSetting="1 day", whatToShow="MIDPOINT", useRTH=False)
+                        if not bars or len(bars) < 40:
+                            log.warning(f"{cfg['symbol']}: insufficient daily bars"); continue
+                        _eval_instrument(ib, inst, bars, now, cfg)
+                    except Exception as e:
+                        log.error(f"Apollo daily {inst['config']['symbol']}: {e}")
+                    ib.sleep(1)
     except KeyboardInterrupt:
         log.info("Shutting down...")
         for inst in instruments:

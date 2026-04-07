@@ -18,7 +18,7 @@
     "timeout_minutes": 60,
     "min_signal_gap_minutes": 10,
     "lot_size": 100000,
-    "risk_pct": 0.015
+    "risk_pct": 0.0
   },
   "direction": {
     "dist_long_threshold": 0.35,
@@ -39,11 +39,12 @@
   },
   "deployment": {
     "managed": true,
-    "stage": "paper",
+    "stage": "killed",
     "onboarded_at": "2026-04-05T22:00:00+00:00",
     "onboarded_by": "v2_performance_fix",
     "risk_policy": {
       "model_start_equity_usd": 10000
-    }
+    },
+    "tier": "KILL"
   }
 }

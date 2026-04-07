@@ -44,6 +44,7 @@
     "onboarded_by": "v2_performance_fix",
     "risk_policy": {
       "model_start_equity_usd": 10000
-    }
+    },
+    "tier": "B"
   }
 }

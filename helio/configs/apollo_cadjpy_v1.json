@@ -1,0 +1,38 @@
+{
+  "strategy": "mean_reversion",
+  "family": "apollo",
+  "version": "paper_v1",
+  "symbol": "CADJPY",
+  "name": "Apollo CADJPY MR",
+  "instrument_type": "forex",
+  "ibkr_symbol": "CAD",
+  "ibkr_sec_type": "CASH",
+  "ibkr_exchange": "IDEALPRO",
+  "ibkr_currency": "JPY",
+  "ibkr_client_id": 226,
+  "timeframe": {
+    "primary": "daily",
+    "ema_period": 20
+  },
+  "entry": {
+    "extension_atr_mult": 2.0,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30
+  },
+  "risk": {
+    "atr_stop_mult": 0.5,
+    "reversion_target_mult": 0.5,
+    "max_hold_days": 5,
+    "risk_pct": 0,
+    "max_hold_bars": 5
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "killed",
+    "system": "apollo",
+    "tier": "X",
+    "risk_policy": {
+      "model_start_equity_usd": 10000
+    }
+  }
+}
