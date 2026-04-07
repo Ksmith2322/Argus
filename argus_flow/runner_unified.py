@@ -1092,6 +1092,8 @@ class InstrumentRunner:
         # Advanced features: multi-timeframe, spread gate, session scoring, sequencing
         from argus_flow.advanced_features import MultiTimeframeBuffer, SpreadTracker, SessionScorer
         self._mtf = MultiTimeframeBuffer()
+        from argus_flow.mtf_analysis import MTFAnalysisEngine
+        self._mtf_engine = MTFAnalysisEngine(self.symbol, config)
         self._spread_tracker = SpreadTracker(window=120)
         self._session_scorer = SessionScorer(self.symbol)
         trigger_cfg = config.get("trigger", {})
@@ -1213,6 +1215,8 @@ class InstrumentRunner:
 
     def _resolve_position_size(self, entry_price: float, stop_price: float) -> tuple[float, float, str]:
         equity_usd = self._get_account_equity()
+        if equity_usd < 100:
+            self._log.warning(f"LOW_EQUITY_DEBUG: equity={equity_usd} stage={self.deployment_stage} model={self.risk_policy.get('model_start_equity_usd')} risk_pct={self.risk_pct}")
 
         if self.dynamic_position_sizing and equity_usd > 0:
             if self.uses_pips:
@@ -2218,6 +2222,7 @@ class InstrumentRunner:
             self.current_bar["ts"] = str(self.current_bar_minute)
             self.buf.add(self.current_bar)
             self._mtf.on_bar_close(self.current_bar)
+            self._mtf_engine.on_bar({"t": self.current_bar.get("ts"), **self.current_bar})
             new_bar_closed = True
             self.current_bar_minute = bar_minute
             self.current_bar = {
@@ -2407,6 +2412,50 @@ class InstrumentRunner:
                     self._log.info(f"MTF_SHADOW_BLOCK {direction.upper()} | {mtf_reason}")
                     features["mtf_shadow_blocked"] = True
                     _gate_log["mtf"] = "SHADOW"
+
+        # 1b. New MTF Analysis Engine — HARD GATE (blocks counter-trend entries)
+        if direction:
+            try:
+                mtf_result = self._mtf_engine.analyze(mid)
+                features["mtf_bias"] = mtf_result.directional_bias
+                features["mtf_confidence"] = round(mtf_result.confidence, 3)
+                features["mtf_consensus"] = round(mtf_result.trend_consensus_score, 3)
+                features["mtf_4h"] = mtf_result.trend_4h.direction
+                features["mtf_1h"] = mtf_result.trend_1h.direction
+                features["mtf_rsi"] = round(mtf_result.rsi_14, 1)
+                features["mtf_bb_pos"] = round(mtf_result.bb_position, 2)
+                features["mtf_vwap_pos"] = mtf_result.vwap_position
+                features["mtf_at_support"] = mtf_result.at_support
+                features["mtf_at_resistance"] = mtf_result.at_resistance
+                features["mtf_patterns"] = len(mtf_result.active_patterns)
+                features["mtf_breakout"] = mtf_result.breakout.is_breakout
+
+                # Hard gate: block entries against strong opposing bias
+                blocked = False
+                if mtf_result.directional_bias == "NONE":
+                    blocked = True
+                    block_reason = "MTF_CONFLICTING_SIGNALS"
+                elif mtf_result.directional_bias == "LONG_ONLY" and direction == "short":
+                    blocked = True
+                    block_reason = "MTF_SHORT_AGAINST_UPTREND"
+                elif mtf_result.directional_bias == "SHORT_ONLY" and direction == "long":
+                    blocked = True
+                    block_reason = "MTF_LONG_AGAINST_DOWNTREND"
+
+                if blocked:
+                    self._log.info(
+                        f"MTF_BLOCK {direction.upper()} | {block_reason} "
+                        f"bias={mtf_result.directional_bias} conf={mtf_result.confidence:.2f} "
+                        f"4h={mtf_result.trend_4h.direction} 1h={mtf_result.trend_1h.direction}"
+                    )
+                    self._log_signal(features, direction, f"MTF_BLOCKED_{block_reason}")
+                    _gate_log["mtf_engine"] = "BLOCKED"
+                    direction = None
+                else:
+                    _gate_log["mtf_engine"] = "PASS"
+            except Exception as _mtf_err:
+                self._log.warning(f"MTF engine error: {_mtf_err}")
+                _gate_log["mtf_engine"] = "ERROR"
 
         if direction:
             # 2. Spread gate
@@ -2649,6 +2698,7 @@ class InstrumentRunner:
         except Exception as e:
             self._log.warning(f"Historical data request failed: {e}")
             bars = []
+        seed_rows = []
         for b in bars:
             raw_volume = getattr(b, "volume", 0)
             try:
@@ -2662,13 +2712,27 @@ class InstrumentRunner:
                 ticks = int(raw_ticks)
             except (TypeError, ValueError):
                 ticks = 0
-            self.buf.add({
+            row = {
                 "ts": str(b.date),
                 "open": b.open, "high": b.high,
                 "low": b.low, "close": b.close,
                 "volume": volume,
                 "ticks": max(ticks, 0),
-            })
+            }
+            self.buf.add(row)
+            seed_rows.append(row)
+
+        # Seed MTF analysis engine with full history
+        if seed_rows:
+            try:
+                import pandas as _pd
+                _seed_df = _pd.DataFrame(seed_rows)
+                _seed_df["ts"] = _pd.to_datetime(_seed_df["ts"], utc=True)
+                _seed_df = _seed_df.set_index("ts").sort_index()
+                self._mtf_engine.on_seed(_seed_df)
+            except Exception as _e:
+                self._log.warning(f"MTF engine seed failed: {_e}")
+
         self._log.info(f"Seeded {len(self.buf)} bars")
 
 
