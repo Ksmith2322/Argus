@@ -1088,9 +1088,10 @@ class InstrumentRunner:
             self._profitable_hours = set(hour_cfg.get("hours", default_hours))
 
         # Entry confirmation: wait for N confirming bars before entering
-        # Shorts require 1 extra bar (live data: shorts PF 0.52 vs longs PF 2.56)
-        self._confirm_bars_long = int(config.get("entry_confirm_bars", 2))
-        self._confirm_bars_short = int(config.get("entry_confirm_bars_short", self._confirm_bars_long + 1))
+        # DISABLED by default — backtested well individually but stacked with other gates
+        # it cuts volume by 55% and total PnL by 55%. Only use if explicitly enabled.
+        self._confirm_bars_long = int(config.get("entry_confirm_bars", 0))
+        self._confirm_bars_short = int(config.get("entry_confirm_bars_short", self._confirm_bars_long + 1 if self._confirm_bars_long > 0 else 0))
         self._confirm_bars = self._confirm_bars_long  # default, overridden per direction below
         self._pending_entry: dict | None = None  # {"direction", "features", "bars_confirmed", "trigger_price"}
 
