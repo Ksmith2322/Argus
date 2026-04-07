@@ -38,7 +38,7 @@
     },
     "deployment": {
         "managed": true,
-        "stage": "watcher",
+        "stage": "killed",
         "variant_of": "cadjpy_t4_paper_v1.json",
         "variant_type": "conservative",
         "variant_label": "Conservative",
