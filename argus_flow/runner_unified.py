@@ -3406,7 +3406,11 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
         max_total_open_risk_pct=0.20,  # 20% for 8-pair paper fleet (was 10%, still blocked 47-54% of signals)
     )
-    risk_mgr.set_account_equity(equity_tracker.equity_usd)
+    # Use model equity for paper fleet, broker equity for real
+    _model_equities = [inst._get_account_equity() for inst in instruments if inst.trade_enabled]
+    _fleet_equity = max(_model_equities) if _model_equities else equity_tracker.equity_usd
+    risk_mgr.set_account_equity(_fleet_equity)
+    log.info(f"Risk manager equity: ${_fleet_equity:,.2f} (broker=${equity_tracker.equity_usd:,.2f})")
     for inst in instruments:
         inst._risk_mgr = risk_mgr
         inst._all_instruments = instruments  # reference for correlation checks
@@ -3558,7 +3562,11 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     for inst in instruments:
                         inst._friday_close_logged = False
 
-            risk_mgr.set_account_equity(equity_tracker.refresh())
+            # Use model equity for paper fleet, broker equity for real
+            equity_tracker.refresh()
+            _model_equities = [inst._get_account_equity() for inst in instruments if inst.trade_enabled]
+            _fleet_equity = max(_model_equities) if _model_equities else equity_tracker.equity_usd
+            risk_mgr.set_account_equity(_fleet_equity)
             risk_mgr.update(instruments)
 
             for inst in instruments:
