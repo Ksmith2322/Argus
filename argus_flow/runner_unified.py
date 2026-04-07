@@ -1084,11 +1084,14 @@ class InstrumentRunner:
         self._profitable_hours: set[int] | None = None
         hour_cfg = config.get("hour_filter", {})
         if hour_cfg.get("enabled", True):
-            default_hours = [0, 1, 2, 5, 10, 12, 14, 20, 21, 22, 23]
+            default_hours = [0, 2, 5, 10, 12, 20, 21, 22, 23]  # removed 1,14 (toxic in live data), 9 already excluded
             self._profitable_hours = set(hour_cfg.get("hours", default_hours))
 
         # Entry confirmation: wait for N confirming bars before entering
-        self._confirm_bars = int(config.get("entry_confirm_bars", 2))
+        # Shorts require 1 extra bar (live data: shorts PF 0.52 vs longs PF 2.56)
+        self._confirm_bars_long = int(config.get("entry_confirm_bars", 2))
+        self._confirm_bars_short = int(config.get("entry_confirm_bars_short", self._confirm_bars_long + 1))
+        self._confirm_bars = self._confirm_bars_long  # default, overridden per direction below
         self._pending_entry: dict | None = None  # {"direction", "features", "bars_confirmed", "trigger_price"}
 
         # Pyramiding / scale-in (opt-in, defaults OFF — does not affect cohort)
@@ -2412,7 +2415,9 @@ class InstrumentRunner:
                 direction = None
 
         # ── Entry confirmation gate (backtested +37% PF) ────
-        if direction and self._confirm_bars > 0:
+        # Shorts need extra confirmation (live data: shorts PF 0.52)
+        _required_confirms = self._confirm_bars_short if direction == "short" else self._confirm_bars_long
+        if direction and _required_confirms > 0:
             if self._pending_entry is None:
                 # First signal — start confirmation countdown
                 self._pending_entry = {
@@ -2445,12 +2450,12 @@ class InstrumentRunner:
                     if confirmed:
                         pe["bars_confirmed"] += 1
                         pe["trigger_price"] = mid
-                        if pe["bars_confirmed"] >= self._confirm_bars:
+                        if pe["bars_confirmed"] >= _required_confirms:
                             # Confirmed — allow entry to proceed
                             self._pending_entry = None
                             # direction stays set
                         else:
-                            self._log_signal(features, direction, f"CONFIRMING_{pe['bars_confirmed']}/{self._confirm_bars}")
+                            self._log_signal(features, direction, f"CONFIRMING_{pe['bars_confirmed']}/{_required_confirms}")
                             direction = None
                     else:
                         # Price didn't confirm — kill the pending

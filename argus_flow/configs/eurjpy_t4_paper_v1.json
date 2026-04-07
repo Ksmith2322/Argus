@@ -42,7 +42,7 @@
   },
   "deployment": {
     "managed": true,
-    "stage": "paper",
+    "stage": "killed",
     "onboarded_at": "2026-04-05T22:00:00+00:00",
     "onboarded_by": "v2_performance_fix",
     "risk_policy": {
