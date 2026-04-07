@@ -3149,7 +3149,7 @@ class PortfolioRiskManager:
 
     # London cluster: these pairs are ~0.97 correlated, treat as one macro trade
     LONDON_CLUSTER = {"GBPUSD", "EURJPY", "GBPJPY", "CADJPY"}
-    MAX_LONDON_CLUSTER_POSITIONS = 2
+    MAX_LONDON_CLUSTER_POSITIONS = 3
 
     # Persistent state file for drawdown pause (survives restart)
     _STATE_FILE = REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
@@ -3612,12 +3612,14 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     # Determine drawdown limit based on fleet stage
     any_real = any(inst.execution_mode == "real" for inst in instruments)
     dd_limit = 0.02 if any_real else 0.05  # 2% for prod, 5% for paper (was 3%, triggered too early for 8-pair portfolio)
+    _fleet_size = sum(1 for inst in instruments if inst.trade_enabled)
+    _currency_limit = 4 if _fleet_size > 10 else (3 if _fleet_size > 6 else 2)
     risk_mgr = PortfolioRiskManager(
-        max_same_currency=2,
+        max_same_currency=_currency_limit,  # scale with fleet size (was 2, blocked 50%+ of signals)
         max_drawdown_pct=dd_limit,
-        daily_max_loss=3.0,           # per instrument: 3R/day (3 full stop-losses)
-        portfolio_daily_max_loss=10.0, # fleet-wide: 10R/day total across all instruments
-        max_total_open_risk_pct=0.20,  # 20% for 8-pair paper fleet (was 10%, still blocked 47-54% of signals)
+        daily_max_loss=5.0,           # per instrument: 5R/day (was 3, too tight for 5m eval)
+        portfolio_daily_max_loss=15.0, # fleet-wide: 15R/day for 16-pair fleet (was 10)
+        max_total_open_risk_pct=0.30,  # 30% for 16-pair paper fleet (was 20%)
     )
     # Use model equity for paper fleet, broker equity for real
     _model_equities = [inst._get_account_equity() for inst in instruments if inst.trade_enabled]
