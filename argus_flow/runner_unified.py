@@ -1221,9 +1221,9 @@ class InstrumentRunner:
                 state_dir=log_dir,
             )
             self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
-            # Local LLM reasoning layer (optional — works without ollama)
-            from argus_flow.strategies.llm_reasoning import LocalLLMReasoner
-            self._llm_reasoner = LocalLLMReasoner(symbol=self.symbol, log_dir=log_dir)
+            # LLM reasoning moved to nightly analysis (ops/nightly_analysis.py)
+            # Real-time LLM gating disabled — adds latency, governor is better
+            self._llm_reasoner = None
         self._bars_since_last_trade: int = 999
         self._consecutive_losses: int = 0
         self._spread_tracker = SpreadTracker(window=120)

@@ -25,6 +25,17 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running nightly analysis..."
+    $analysisOutput = & $python -m argus_flow.ops.nightly_analysis --no-llm 2>&1
+    foreach ($line in @($analysisOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] nightly_analysis: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] nightly_analysis WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Add-Content -Path $logFile -Value "[$timestamp] === Nightly cohort report complete ==="
 } catch {
     Add-Content -Path $logFile -Value "[$timestamp] refresh_managed_truth ERROR: $_"
