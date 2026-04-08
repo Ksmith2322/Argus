@@ -1,50 +1,52 @@
 {
-    "strategy": "range_accel_var_a",
-    "version": "watcher_v1_var_a",
-    "symbol": "GBPUSD",
-    "instrument_type": "forex",
-    "ibkr_client_id": 102,
-    "trigger": {
-        "range_pct_min": 0.00084,
-        "range_accel_min": 0.0,
-        "session_start_utc": 6,
-        "session_end_utc": 22
-    },
-    "risk": {
-        "stop_pips": 36,
-        "target_pips": 50,
-        "timeout_minutes": 90,
-        "min_signal_gap_minutes": 10,
-        "lot_size": 0,
-        "risk_pct": 0
-    },
-    "direction": {
-        "dist_long_threshold": 0.4,
-        "dist_short_threshold": 0.6
-    },
-    "replay_expectations": {
-        "signals_per_day": 18.9,
-        "signals_per_day_range": [
-            8,
-            35
-        ],
-        "win_rate": 0.515,
-        "win_rate_range": [
-            0.38,
-            0.6
-        ],
-        "stop_rate": 0.032,
-        "target_rate": 0.005,
-        "timeout_rate": 0.963,
-        "exp_pips_per_trade": 0.87
-    },
-    "deployment": {
-        "managed": true,
-        "stage": "watcher",
-        "variant_of": "gbpusd_range_paper_v1.json",
-        "variant_type": "aggressive",
-        "variant_label": "Aggressive",
-        "variant_description": "wider session, looser range gate, shorter gap, wider stop",
-        "created_at": "2026-04-02T03:43:26.465534+00:00"
-    }
+  "strategy": "range_accel_var_a",
+  "version": "watcher_v1_var_a",
+  "symbol": "GBPUSD",
+  "instrument_type": "forex",
+  "ibkr_client_id": 102,
+  "trigger": {
+    "range_pct_min": 0.00084,
+    "range_accel_min": 0.0,
+    "session_start_utc": 6,
+    "session_end_utc": 22
+  },
+  "risk": {
+    "stop_pips": 36,
+    "target_pips": 50,
+    "timeout_minutes": 90,
+    "min_signal_gap_minutes": 10,
+    "lot_size": 0,
+    "risk_pct": 0
+  },
+  "direction": {
+    "dist_long_threshold": 0.4,
+    "dist_short_threshold": 0.6
+  },
+  "replay_expectations": {
+    "signals_per_day": 18.9,
+    "signals_per_day_range": [
+      8,
+      35
+    ],
+    "win_rate": 0.515,
+    "win_rate_range": [
+      0.38,
+      0.6
+    ],
+    "stop_rate": 0.032,
+    "target_rate": 0.005,
+    "timeout_rate": 0.963,
+    "exp_pips_per_trade": 0.87
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "watcher",
+    "variant_of": "gbpusd_range_paper_v1.json",
+    "variant_type": "aggressive",
+    "variant_label": "Aggressive",
+    "variant_description": "wider session, looser range gate, shorter gap, wider stop",
+    "created_at": "2026-04-02T03:43:26.465534+00:00"
+  },
+  "stage": "killed",
+  "_killed_reason": "Duplicate/variant. Primary MTF config active. 2026-04-07."
 }

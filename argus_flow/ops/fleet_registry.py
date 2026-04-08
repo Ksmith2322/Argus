@@ -239,12 +239,16 @@ def is_managed_config(config: dict, config_path: Path) -> bool:
         return True
     if config_path.name in LEGACY_MANAGED_CONFIGS:
         return True
+    # Configs with explicit stage field are managed
+    if config.get("stage") in ("paper", "watcher", "killed", "real", "discovery"):
+        return True
     return is_live_config(config, config_path)
 
 
 def infer_stage(config: dict, config_path: Path, sticky_stage: str | None = None) -> str:
     deployment = config.get("deployment", {}) if isinstance(config.get("deployment", {}), dict) else {}
-    configured_stage = normalize_stage(deployment.get("stage"))
+    # Top-level stage field takes priority (set by fleet management), then deployment.stage
+    configured_stage = normalize_stage(config.get("stage")) or normalize_stage(deployment.get("stage"))
     if configured_stage:
         base_stage = configured_stage
     elif is_live_config(config, config_path):

@@ -49,5 +49,7 @@
       "model_start_equity_usd": 10000
     },
     "tier": "B"
-  }
+  },
+  "stage": "killed",
+  "_killed_reason": "Fleet consolidation 2026-04-07. Not in focused winner fleet."
 }

@@ -1,48 +1,50 @@
 {
-    "strategy": "T4_full_stack_var_a",
-    "version": "watcher_v1_var_a",
-    "symbol": "EURJPY",
-    "instrument_type": "forex",
-    "ibkr_client_id": 104,
-    "trigger": {
-        "range_pct_min": 0.00084,
-        "range_accel_min": 0.0,
-        "vol_z_min": null,
-        "session_start_utc": 6,
-        "session_end_utc": 21
-    },
-    "risk": {
-        "stop_pips": 18,
-        "target_pips": 40,
-        "timeout_minutes": 30,
-        "min_signal_gap_minutes": 10,
-        "lot_size": 0,
-        "risk_pct": 0
-    },
-    "direction": {
-        "dist_long_threshold": 0.4,
-        "dist_short_threshold": 0.6
-    },
-    "replay_expectations": {
-        "signals_per_day": 5.0,
-        "win_rate": 0.55,
-        "exp_pips_per_trade": 1.5,
-        "signals_per_day_range": [
-            1,
-            20
-        ],
-        "win_rate_range": [
-            0.35,
-            0.65
-        ]
-    },
-    "deployment": {
-        "managed": true,
-        "stage": "watcher",
-        "variant_of": "eurjpy_t4_paper_v1.json",
-        "variant_type": "aggressive",
-        "variant_label": "Aggressive",
-        "variant_description": "wider session, looser range gate, shorter gap, wider stop",
-        "created_at": "2026-04-02T03:43:26.468537+00:00"
-    }
+  "strategy": "T4_full_stack_var_a",
+  "version": "watcher_v1_var_a",
+  "symbol": "EURJPY",
+  "instrument_type": "forex",
+  "ibkr_client_id": 104,
+  "trigger": {
+    "range_pct_min": 0.00084,
+    "range_accel_min": 0.0,
+    "vol_z_min": null,
+    "session_start_utc": 6,
+    "session_end_utc": 21
+  },
+  "risk": {
+    "stop_pips": 18,
+    "target_pips": 40,
+    "timeout_minutes": 30,
+    "min_signal_gap_minutes": 10,
+    "lot_size": 0,
+    "risk_pct": 0
+  },
+  "direction": {
+    "dist_long_threshold": 0.4,
+    "dist_short_threshold": 0.6
+  },
+  "replay_expectations": {
+    "signals_per_day": 5.0,
+    "win_rate": 0.55,
+    "exp_pips_per_trade": 1.5,
+    "signals_per_day_range": [
+      1,
+      20
+    ],
+    "win_rate_range": [
+      0.35,
+      0.65
+    ]
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "watcher",
+    "variant_of": "eurjpy_t4_paper_v1.json",
+    "variant_type": "aggressive",
+    "variant_label": "Aggressive",
+    "variant_description": "wider session, looser range gate, shorter gap, wider stop",
+    "created_at": "2026-04-02T03:43:26.468537+00:00"
+  },
+  "stage": "killed",
+  "_killed_reason": "Parent pair killed. Fleet consolidation 2026-04-07."
 }

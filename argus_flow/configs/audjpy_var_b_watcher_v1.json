@@ -1,48 +1,50 @@
 {
-    "strategy": "T4_full_stack_var_b",
-    "version": "watcher_v1_var_b",
-    "symbol": "AUDJPY",
-    "instrument_type": "forex",
-    "ibkr_client_id": 115,
-    "trigger": {
-        "range_pct_min": 0.00156,
-        "range_accel_min": 0.0,
-        "vol_z_min": null,
-        "session_start_utc": 23,
-        "session_end_utc": 24
-    },
-    "risk": {
-        "stop_pips": 16,
-        "target_pips": 20,
-        "timeout_minutes": 58,
-        "min_signal_gap_minutes": 25,
-        "lot_size": 0,
-        "risk_pct": 0
-    },
-    "direction": {
-        "dist_long_threshold": 0.4,
-        "dist_short_threshold": 0.6
-    },
-    "replay_expectations": {
-        "signals_per_day": 5.0,
-        "win_rate": 0.52,
-        "exp_pips_per_trade": 1.0,
-        "signals_per_day_range": [
-            1,
-            20
-        ],
-        "win_rate_range": [
-            0.35,
-            0.65
-        ]
-    },
-    "deployment": {
-        "managed": true,
-        "stage": "watcher",
-        "variant_of": "audjpy_t4_paper_v1.json",
-        "variant_type": "conservative",
-        "variant_label": "Conservative",
-        "variant_description": "tighter session, stricter range gate, longer gap, tighter stop, longer timeout",
-        "created_at": "2026-04-02T03:43:26.488469+00:00"
-    }
+  "strategy": "T4_full_stack_var_b",
+  "version": "watcher_v1_var_b",
+  "symbol": "AUDJPY",
+  "instrument_type": "forex",
+  "ibkr_client_id": 115,
+  "trigger": {
+    "range_pct_min": 0.00156,
+    "range_accel_min": 0.0,
+    "vol_z_min": null,
+    "session_start_utc": 23,
+    "session_end_utc": 24
+  },
+  "risk": {
+    "stop_pips": 16,
+    "target_pips": 20,
+    "timeout_minutes": 58,
+    "min_signal_gap_minutes": 25,
+    "lot_size": 0,
+    "risk_pct": 0
+  },
+  "direction": {
+    "dist_long_threshold": 0.4,
+    "dist_short_threshold": 0.6
+  },
+  "replay_expectations": {
+    "signals_per_day": 5.0,
+    "win_rate": 0.52,
+    "exp_pips_per_trade": 1.0,
+    "signals_per_day_range": [
+      1,
+      20
+    ],
+    "win_rate_range": [
+      0.35,
+      0.65
+    ]
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "watcher",
+    "variant_of": "audjpy_t4_paper_v1.json",
+    "variant_type": "conservative",
+    "variant_label": "Conservative",
+    "variant_description": "tighter session, stricter range gate, longer gap, tighter stop, longer timeout",
+    "created_at": "2026-04-02T03:43:26.488469+00:00"
+  },
+  "stage": "killed",
+  "_killed_reason": "Duplicate/variant. Primary MTF config active. 2026-04-07."
 }

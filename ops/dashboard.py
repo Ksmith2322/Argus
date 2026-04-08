@@ -1176,7 +1176,15 @@ async def ibkr_status_stream(request: Request):
         if await request.is_disconnected():
             break
         try:
-            runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
+            raw_runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
+            # Deduplicate shared log dirs (prefer active over killed)
+            _seen: dict[str, dict] = {}
+            for _r in raw_runners:
+                _ld = _r.get("log_dir", "")
+                _ex = _seen.get(_ld)
+                if _ex is None or (_r.get("current_stage") != "killed" and _ex.get("current_stage") == "killed"):
+                    _seen[_ld] = _r
+            runners = list(_seen.values())
             total_trades = sum(r["closed_trades"] for r in runners)
             total_signals = sum(r["signal_count"] for r in runners)
 
@@ -2643,7 +2651,21 @@ async def api_ops_overview():
 async def api_ibkr_fleet():
     """IBKR fleet status for all runners."""
     deployment = _load_deployment_registry()
-    runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
+    raw_runners = [_read_ibkr_runner(r) for r in _managed_ibkr_runners()]
+    # Deduplicate: when multiple configs share a log_dir, keep the non-killed one
+    seen_dirs: dict[str, dict] = {}
+    for r in raw_runners:
+        ld = r.get("log_dir", "")
+        existing = seen_dirs.get(ld)
+        if existing is None:
+            seen_dirs[ld] = r
+        elif r.get("current_stage") != "killed" and existing.get("current_stage") == "killed":
+            seen_dirs[ld] = r  # prefer active over killed
+        elif r.get("current_stage") == existing.get("current_stage"):
+            # Same stage — prefer the one with more trades
+            if r.get("closed_trades", 0) > existing.get("closed_trades", 0):
+                seen_dirs[ld] = r
+    runners = list(seen_dirs.values())
     total_trades = sum(r["closed_trades"] for r in runners)
     total_signals = sum(r["signal_count"] for r in runners)
     account = _load_fleet_account_truth()

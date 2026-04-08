@@ -29,9 +29,15 @@
   },
   "replay_expectations": {
     "signals_per_day": 4.0,
-    "signals_per_day_range": [1, 8],
+    "signals_per_day_range": [
+      1,
+      8
+    ],
     "win_rate": 0.62,
-    "win_rate_range": [0.45, 0.75],
+    "win_rate_range": [
+      0.45,
+      0.75
+    ],
     "exp_pips_per_trade": 1.0
   },
   "deployment": {
@@ -43,5 +49,7 @@
       "model_start_equity_usd": 10000
     },
     "tier": "A"
-  }
+  },
+  "stage": "killed",
+  "_killed_reason": "Fleet consolidation 2026-04-07. Not in focused winner fleet."
 }

@@ -51,5 +51,5 @@
     }
   },
   "stage": "killed",
-  "_killed_reason": "No edge in backtests (PF < 1.0). Futures graveyard 2026-04-07."
+  "_killed_reason": "Fleet consolidation 2026-04-07. Not in focused winner fleet."
 }
