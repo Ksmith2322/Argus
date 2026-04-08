@@ -1,158 +1,158 @@
 {
   "T02_kfold_cv_5fold": {
-    "value": "3/5 profitable",
+    "value": "4/5 profitable",
     "pass": true,
     "detail": {
       "folds": [
         {
           "fold": 1,
-          "mean_pnl": 8.350000000000001,
-          "win_rate": 0.8,
-          "n": 5
+          "mean_pnl": 3.068651315789474,
+          "win_rate": 0.5355263157894737,
+          "n": 1520
         },
         {
           "fold": 2,
-          "mean_pnl": -3.69,
-          "win_rate": 0.0,
-          "n": 5
+          "mean_pnl": 7.867203947368422,
+          "win_rate": 0.5039473684210526,
+          "n": 1520
         },
         {
           "fold": 3,
-          "mean_pnl": 2.12,
-          "win_rate": 0.6,
-          "n": 5
+          "mean_pnl": -2.2921710526315784,
+          "win_rate": 0.48026315789473684,
+          "n": 1520
         },
         {
           "fold": 4,
-          "mean_pnl": 1.0399999999999998,
-          "win_rate": 0.6,
-          "n": 5
+          "mean_pnl": 0.6741315789473683,
+          "win_rate": 0.4513157894736842,
+          "n": 1520
         },
         {
           "fold": 5,
-          "mean_pnl": -0.18000000000000047,
-          "win_rate": 0.6,
-          "n": 5
+          "mean_pnl": 1.4544736842105264,
+          "win_rate": 0.48947368421052634,
+          "n": 1520
         }
       ],
-      "profitable_folds": 3,
+      "profitable_folds": 4,
       "total_folds": 5
     }
   },
   "T06_buy_hold_benchmark": {
-    "value": "strategy=+9.6pip over 8d, 27 trades",
+    "value": "strategy=+16451.9pip over 8d, 7604 trades",
     "pass": true,
     "detail": {
-      "total_pnl_pips": 9.550000000000002,
+      "total_pnl_pips": 16451.88,
       "n_days": 8,
-      "trades": 27,
-      "pnl_per_day": 1.1937500000000003
+      "trades": 7604,
+      "pnl_per_day": 2056.485
     }
   },
   "T10_cpcv_simplified": {
-    "value": "7/10 combos profitable (70%)",
+    "value": "8/10 combos profitable (80%)",
     "pass": true,
     "detail": {
-      "profitable_combos": 7,
+      "profitable_combos": 8,
       "total_combos": 10,
-      "ratio": 0.7
+      "ratio": 0.8
     }
   },
   "T13_entry_timing_efficiency": {
-    "value": "50.0% avg efficiency",
+    "value": "49.2% avg efficiency",
     "pass": true,
     "detail": {
-      "avg": 0.5,
-      "median": 0.5,
-      "n": 26
+      "avg": 0.49243520589396134,
+      "median": 0.0,
+      "n": 7601
     }
   },
   "T16_false_signal_rate": {
-    "value": "0.0% (0/27 trades reversed in <5min)",
+    "value": "9.0% (686/7604 trades reversed in <5min)",
     "pass": true,
     "detail": {
-      "rate": 0.0,
-      "count": 0
+      "rate": 0.09021567596002104,
+      "count": 686
     }
   },
   "T18_optimal_stop_mae": {
-    "value": "p50=13.6 p75=15.3 pips",
+    "value": "p50=15.3 p75=27.0 pips",
     "pass": true,
     "detail": {
-      "p25": 2.45,
-      "p50": 13.55,
-      "p75": 15.3,
-      "p90": 20.1
+      "p25": 5.0,
+      "p50": 15.3,
+      "p75": 27.0,
+      "p90": 128.25
     }
   },
   "T19_optimal_target_mfe": {
-    "value": "p50=6.5 p75=10.9 pips",
+    "value": "p50=13.6 p75=41.2 pips",
     "pass": true,
     "detail": {
-      "p25": 2.2,
-      "p50": 6.55,
-      "p75": 10.95,
-      "p90": 18.740000000000006
+      "p25": 4.55,
+      "p50": 13.6,
+      "p75": 41.150000000000006,
+      "p90": 140.0
     }
   },
   "T20_optimal_hold_time": {
-    "value": "best=60-90m avg_pnl=+2.0pip",
+    "value": "best=90+m avg_pnl=+5.5pip",
     "pass": true,
     "detail": {
       "<30m": {
-        "n": 5,
-        "wr": 0.4,
-        "avg_pnl": -0.36000000000000015
+        "n": 1749,
+        "wr": 0.3733562035448828,
+        "avg_pnl": -3.356403659233848
       },
       "30-60m": {
-        "n": 11,
-        "wr": 0.5454545454545454,
-        "avg_pnl": 0.40909090909090895
+        "n": 613,
+        "wr": 0.24143556280587275,
+        "avg_pnl": -11.25389885807504
       },
       "60-90m": {
-        "n": 5,
-        "wr": 0.4,
-        "avg_pnl": 2.05
+        "n": 2832,
+        "wr": 0.5603813559322034,
+        "avg_pnl": 4.20406779661017
       },
       "90+m": {
-        "n": 6,
-        "wr": 0.5,
-        "avg_pnl": -0.5666666666666664
+        "n": 1868,
+        "wr": 0.5572805139186295,
+        "avg_pnl": 5.519700214132762
       }
     }
   },
   "T21_trailing_vs_fixed_stop": {
-    "value": "fixed=+9.6 trail_sim=-24.3",
+    "value": "fixed=+16451.9 trail_sim=-43944.1",
     "pass": true,
     "detail": {
-      "fixed": 9.550000000000002,
-      "trailing_sim": -24.250000000000007
+      "fixed": 16451.88,
+      "trailing_sim": -43944.105
     }
   },
   "T22_partial_profit_sim": {
-    "value": "partial=+57.9 vs full=+9.6",
+    "value": "partial=+103402.0 vs full=+16451.9",
     "pass": true,
     "detail": {
-      "partial": 57.925,
-      "full": 9.550000000000002
+      "partial": 103401.955,
+      "full": 16451.88
     }
   },
   "T23_breakeven_stop_sim": {
-    "value": "BE_sim=+9.6 vs original=+9.6",
+    "value": "BE_sim=+16451.9 vs original=+16451.9",
     "pass": true,
     "detail": {
-      "breakeven": 9.550000000000002,
-      "original": 9.550000000000002
+      "breakeven": 16451.88,
+      "original": 16451.88
     }
   },
   "T24_multi_exit_comparison": {
-    "value": "best=partial (+57.9pip)",
+    "value": "best=partial (+103402.0pip)",
     "pass": true,
     "detail": {
-      "fixed": 9.550000000000002,
-      "trailing": -24.250000000000007,
-      "partial": 57.925,
-      "breakeven": 9.550000000000002
+      "fixed": 16451.88,
+      "trailing": -43944.105,
+      "partial": 103401.955,
+      "breakeven": 16451.88
     }
   },
   "T27_session_breakdown": {
@@ -230,23 +230,23 @@
     }
   },
   "T33_volatility_bucket_perf": {
-    "value": "{'low': 'wr=33%', 'med': 'wr=67%', 'high': 'wr=44%'}",
+    "value": "{'low': 'wr=50%', 'med': 'wr=42%', 'high': 'wr=55%'}",
     "pass": true,
     "detail": {
       "low": {
-        "n": 9,
-        "wr": 0.3333333333333333,
-        "avg_pnl": 0.4833333333333334
+        "n": 2512,
+        "wr": 0.5047770700636943,
+        "avg_pnl": 0.11983678343949043
       },
       "med": {
-        "n": 9,
-        "wr": 0.6666666666666666,
-        "avg_pnl": 2.7500000000000004
+        "n": 2506,
+        "wr": 0.4245810055865922,
+        "avg_pnl": -2.9423982442138867
       },
       "high": {
-        "n": 9,
-        "wr": 0.4444444444444444,
-        "avg_pnl": -2.1722222222222234
+        "n": 2586,
+        "wr": 0.545630317092034,
+        "avg_pnl": 9.096867749419953
       }
     }
   },
@@ -270,66 +270,216 @@
     }
   },
   "T36_regime_transition": {
-    "value": "24 transitions in 27 trades",
+    "value": "7601 transitions in 7604 trades",
     "pass": true,
     "detail": {
-      "transitions": 24,
-      "trades": 27
+      "transitions": 7601,
+      "trades": 7604
     }
   },
   "T41_calmar_ratio": {
-    "value": "11.26 (ann_ret=436pip, maxDD=38.7pip)",
+    "value": "87.03 (ann_ret=750617pip, maxDD=8625.0pip)",
     "pass": "True",
     "detail": {
-      "calmar": 11.258882428940572,
-      "ann_return": 435.7187500000001,
-      "max_dd": 38.699999999999996
+      "calmar": 87.02806086956522,
+      "ann_return": 750617.025,
+      "max_dd": 8625.0
     }
   },
   "T42_ulcer_index": {
-    "value": "11.10",
+    "value": "22.03",
     "pass": false,
     "detail": {
-      "ulcer_index": 11.101257646629048
+      "ulcer_index": 22.02531912687436
     }
   },
   "T46_drawdown_at_risk_95": {
-    "value": "27.6 pips",
-    "pass": true,
+    "value": "4489.2 pips",
+    "pass": false,
     "detail": {
-      "p95": 27.554999999999996,
-      "max": 38.699999999999996
+      "p95": 4489.249999999997,
+      "max": 8625.0
     }
   },
   "T48_cross_pair_correlation": {
-    "value": "{'audjpy/audusd': 0.483, 'audjpy/mgc': nan, 'audusd/mgc': nan}",
+    "value": "{'audjpy/audusd': 0.483, 'audjpy/mgc': nan, 'audjpy/AUDJPY': -0.165, 'audjpy/AUDUSD': 0.215, 'audjpy/CADJPY': -0.102, 'audjpy/EURJPY': -0.237, 'audjpy/EURUSD': -0.753, 'audjpy/GBPJPY': -0.147, 'audjpy/GBPUSD': 0.338, 'audjpy/M2K': -0.132, 'audjpy/MCL': -0.247, 'audjpy/MES': 0.45, 'audjpy/MGC': 0.416, 'audjpy/MNQ': 0.317, 'audjpy/MYM': 0.354, 'audjpy/USDCHF': -0.258, 'audjpy/USDJPY': 0.325, 'audusd/mgc': nan, 'audusd/AUDJPY': -0.819, 'audusd/AUDUSD': 0.205, 'audusd/CADJPY': 0.379, 'audusd/EURJPY': 0.16, 'audusd/EURUSD': -0.539, 'audusd/GBPJPY': 0.199, 'audusd/GBPUSD': 0.718, 'audusd/M2K': -0.112, 'audusd/MCL': 0.622, 'audusd/MES': 0.24, 'audusd/MGC': 0.406, 'audusd/MNQ': 0.528, 'audusd/MYM': 0.243, 'audusd/USDCHF': -0.128, 'audusd/USDJPY': -0.085, 'mgc/AUDJPY': nan, 'mgc/AUDUSD': nan, 'mgc/CADJPY': nan, 'mgc/EURJPY': nan, 'mgc/EURUSD': nan, 'mgc/GBPJPY': nan, 'mgc/GBPUSD': nan, 'mgc/M2K': nan, 'mgc/MCL': nan, 'mgc/MES': nan, 'mgc/MGC': nan, 'mgc/MNQ': nan, 'mgc/MYM': nan, 'mgc/USDCHF': nan, 'mgc/USDJPY': nan, 'AUDJPY/AUDUSD': -0.042, 'AUDJPY/CADJPY': -0.021, 'AUDJPY/EURJPY': 0.09, 'AUDJPY/EURUSD': 0.019, 'AUDJPY/GBPJPY': 0.043, 'AUDJPY/GBPUSD': -0.034, 'AUDJPY/M2K': -0.108, 'AUDJPY/MCL': 0.026, 'AUDJPY/MES': 0.08, 'AUDJPY/MGC': 0.073, 'AUDJPY/MNQ': -0.031, 'AUDJPY/MYM': 0.04, 'AUDJPY/USDCHF': 0.076, 'AUDJPY/USDJPY': -0.028, 'AUDUSD/CADJPY': 0.016, 'AUDUSD/EURJPY': -0.038, 'AUDUSD/EURUSD': 0.024, 'AUDUSD/GBPJPY': 0.019, 'AUDUSD/GBPUSD': -0.006, 'AUDUSD/M2K': 0.1, 'AUDUSD/MCL': -0.211, 'AUDUSD/MES': -0.171, 'AUDUSD/MGC': -0.016, 'AUDUSD/MNQ': 0.007, 'AUDUSD/MYM': 0.088, 'AUDUSD/USDCHF': -0.019, 'AUDUSD/USDJPY': 0.042, 'CADJPY/EURJPY': -0.056, 'CADJPY/EURUSD': 0.014, 'CADJPY/GBPJPY': -0.061, 'CADJPY/GBPUSD': -0.061, 'CADJPY/M2K': 0.064, 'CADJPY/MCL': 0.039, 'CADJPY/MES': -0.02, 'CADJPY/MGC': 0.01, 'CADJPY/MNQ': -0.015, 'CADJPY/MYM': -0.162, 'CADJPY/USDCHF': 0.074, 'CADJPY/USDJPY': -0.068, 'EURJPY/EURUSD': -0.032, 'EURJPY/GBPJPY': -0.107, 'EURJPY/GBPUSD': -0.031, 'EURJPY/M2K': -0.03, 'EURJPY/MCL': -0.15, 'EURJPY/MES': -0.039, 'EURJPY/MGC': -0.069, 'EURJPY/MNQ': -0.127, 'EURJPY/MYM': 0.171, 'EURJPY/USDCHF': 0.019, 'EURJPY/USDJPY': 0.094, 'EURUSD/GBPJPY': 0.028, 'EURUSD/GBPUSD': 0.015, 'EURUSD/M2K': 0.167, 'EURUSD/MCL': 0.108, 'EURUSD/MES': 0.067, 'EURUSD/MGC': 0.143, 'EURUSD/MNQ': 0.058, 'EURUSD/MYM': -0.051, 'EURUSD/USDCHF': 0.149, 'EURUSD/USDJPY': 0.051, 'GBPJPY/GBPUSD': -0.053, 'GBPJPY/M2K': -0.101, 'GBPJPY/MCL': 0.126, 'GBPJPY/MES': -0.119, 'GBPJPY/MGC': -0.117, 'GBPJPY/MNQ': -0.023, 'GBPJPY/MYM': -0.038, 'GBPJPY/USDCHF': 0.09, 'GBPJPY/USDJPY': -0.044, 'GBPUSD/M2K': 0.208, 'GBPUSD/MCL': 0.015, 'GBPUSD/MES': -0.002, 'GBPUSD/MGC': -0.13, 'GBPUSD/MNQ': -0.053, 'GBPUSD/MYM': 0.051, 'GBPUSD/USDCHF': -0.055, 'GBPUSD/USDJPY': 0.078, 'M2K/MCL': 0.035, 'M2K/MES': 0.053, 'M2K/MGC': 0.035, 'M2K/MNQ': 0.129, 'M2K/MYM': 0.062, 'M2K/USDCHF': 0.115, 'M2K/USDJPY': 0.114, 'MCL/MES': -0.049, 'MCL/MGC': 0.082, 'MCL/MNQ': 0.02, 'MCL/MYM': -0.015, 'MCL/USDCHF': 0.071, 'MCL/USDJPY': -0.089, 'MES/MGC': -0.065, 'MES/MNQ': -0.068, 'MES/MYM': 0.138, 'MES/USDCHF': -0.081, 'MES/USDJPY': 0.009, 'MGC/MNQ': 0.085, 'MGC/MYM': -0.125, 'MGC/USDCHF': 0.003, 'MGC/USDJPY': -0.02, 'MNQ/MYM': -0.056, 'MNQ/USDCHF': -0.21, 'MNQ/USDJPY': -0.063, 'MYM/USDCHF': -0.091, 'MYM/USDJPY': -0.003, 'USDCHF/USDJPY': -0.04}",
     "pass": false,
     "detail": {
       "audjpy/audusd": 0.483,
       "audjpy/mgc": NaN,
-      "audusd/mgc": NaN
+      "audjpy/AUDJPY": -0.165,
+      "audjpy/AUDUSD": 0.215,
+      "audjpy/CADJPY": -0.102,
+      "audjpy/EURJPY": -0.237,
+      "audjpy/EURUSD": -0.753,
+      "audjpy/GBPJPY": -0.147,
+      "audjpy/GBPUSD": 0.338,
+      "audjpy/M2K": -0.132,
+      "audjpy/MCL": -0.247,
+      "audjpy/MES": 0.45,
+      "audjpy/MGC": 0.416,
+      "audjpy/MNQ": 0.317,
+      "audjpy/MYM": 0.354,
+      "audjpy/USDCHF": -0.258,
+      "audjpy/USDJPY": 0.325,
+      "audusd/mgc": NaN,
+      "audusd/AUDJPY": -0.819,
+      "audusd/AUDUSD": 0.205,
+      "audusd/CADJPY": 0.379,
+      "audusd/EURJPY": 0.16,
+      "audusd/EURUSD": -0.539,
+      "audusd/GBPJPY": 0.199,
+      "audusd/GBPUSD": 0.718,
+      "audusd/M2K": -0.112,
+      "audusd/MCL": 0.622,
+      "audusd/MES": 0.24,
+      "audusd/MGC": 0.406,
+      "audusd/MNQ": 0.528,
+      "audusd/MYM": 0.243,
+      "audusd/USDCHF": -0.128,
+      "audusd/USDJPY": -0.085,
+      "mgc/AUDJPY": NaN,
+      "mgc/AUDUSD": NaN,
+      "mgc/CADJPY": NaN,
+      "mgc/EURJPY": NaN,
+      "mgc/EURUSD": NaN,
+      "mgc/GBPJPY": NaN,
+      "mgc/GBPUSD": NaN,
+      "mgc/M2K": NaN,
+      "mgc/MCL": NaN,
+      "mgc/MES": NaN,
+      "mgc/MGC": NaN,
+      "mgc/MNQ": NaN,
+      "mgc/MYM": NaN,
+      "mgc/USDCHF": NaN,
+      "mgc/USDJPY": NaN,
+      "AUDJPY/AUDUSD": -0.042,
+      "AUDJPY/CADJPY": -0.021,
+      "AUDJPY/EURJPY": 0.09,
+      "AUDJPY/EURUSD": 0.019,
+      "AUDJPY/GBPJPY": 0.043,
+      "AUDJPY/GBPUSD": -0.034,
+      "AUDJPY/M2K": -0.108,
+      "AUDJPY/MCL": 0.026,
+      "AUDJPY/MES": 0.08,
+      "AUDJPY/MGC": 0.073,
+      "AUDJPY/MNQ": -0.031,
+      "AUDJPY/MYM": 0.04,
+      "AUDJPY/USDCHF": 0.076,
+      "AUDJPY/USDJPY": -0.028,
+      "AUDUSD/CADJPY": 0.016,
+      "AUDUSD/EURJPY": -0.038,
+      "AUDUSD/EURUSD": 0.024,
+      "AUDUSD/GBPJPY": 0.019,
+      "AUDUSD/GBPUSD": -0.006,
+      "AUDUSD/M2K": 0.1,
+      "AUDUSD/MCL": -0.211,
+      "AUDUSD/MES": -0.171,
+      "AUDUSD/MGC": -0.016,
+      "AUDUSD/MNQ": 0.007,
+      "AUDUSD/MYM": 0.088,
+      "AUDUSD/USDCHF": -0.019,
+      "AUDUSD/USDJPY": 0.042,
+      "CADJPY/EURJPY": -0.056,
+      "CADJPY/EURUSD": 0.014,
+      "CADJPY/GBPJPY": -0.061,
+      "CADJPY/GBPUSD": -0.061,
+      "CADJPY/M2K": 0.064,
+      "CADJPY/MCL": 0.039,
+      "CADJPY/MES": -0.02,
+      "CADJPY/MGC": 0.01,
+      "CADJPY/MNQ": -0.015,
+      "CADJPY/MYM": -0.162,
+      "CADJPY/USDCHF": 0.074,
+      "CADJPY/USDJPY": -0.068,
+      "EURJPY/EURUSD": -0.032,
+      "EURJPY/GBPJPY": -0.107,
+      "EURJPY/GBPUSD": -0.031,
+      "EURJPY/M2K": -0.03,
+      "EURJPY/MCL": -0.15,
+      "EURJPY/MES": -0.039,
+      "EURJPY/MGC": -0.069,
+      "EURJPY/MNQ": -0.127,
+      "EURJPY/MYM": 0.171,
+      "EURJPY/USDCHF": 0.019,
+      "EURJPY/USDJPY": 0.094,
+      "EURUSD/GBPJPY": 0.028,
+      "EURUSD/GBPUSD": 0.015,
+      "EURUSD/M2K": 0.167,
+      "EURUSD/MCL": 0.108,
+      "EURUSD/MES": 0.067,
+      "EURUSD/MGC": 0.143,
+      "EURUSD/MNQ": 0.058,
+      "EURUSD/MYM": -0.051,
+      "EURUSD/USDCHF": 0.149,
+      "EURUSD/USDJPY": 0.051,
+      "GBPJPY/GBPUSD": -0.053,
+      "GBPJPY/M2K": -0.101,
+      "GBPJPY/MCL": 0.126,
+      "GBPJPY/MES": -0.119,
+      "GBPJPY/MGC": -0.117,
+      "GBPJPY/MNQ": -0.023,
+      "GBPJPY/MYM": -0.038,
+      "GBPJPY/USDCHF": 0.09,
+      "GBPJPY/USDJPY": -0.044,
+      "GBPUSD/M2K": 0.208,
+      "GBPUSD/MCL": 0.015,
+      "GBPUSD/MES": -0.002,
+      "GBPUSD/MGC": -0.13,
+      "GBPUSD/MNQ": -0.053,
+      "GBPUSD/MYM": 0.051,
+      "GBPUSD/USDCHF": -0.055,
+      "GBPUSD/USDJPY": 0.078,
+      "M2K/MCL": 0.035,
+      "M2K/MES": 0.053,
+      "M2K/MGC": 0.035,
+      "M2K/MNQ": 0.129,
+      "M2K/MYM": 0.062,
+      "M2K/USDCHF": 0.115,
+      "M2K/USDJPY": 0.114,
+      "MCL/MES": -0.049,
+      "MCL/MGC": 0.082,
+      "MCL/MNQ": 0.02,
+      "MCL/MYM": -0.015,
+      "MCL/USDCHF": 0.071,
+      "MCL/USDJPY": -0.089,
+      "MES/MGC": -0.065,
+      "MES/MNQ": -0.068,
+      "MES/MYM": 0.138,
+      "MES/USDCHF": -0.081,
+      "MES/USDJPY": 0.009,
+      "MGC/MNQ": 0.085,
+      "MGC/MYM": -0.125,
+      "MGC/USDCHF": 0.003,
+      "MGC/USDJPY": -0.02,
+      "MNQ/MYM": -0.056,
+      "MNQ/USDCHF": -0.21,
+      "MNQ/USDJPY": -0.063,
+      "MYM/USDCHF": -0.091,
+      "MYM/USDJPY": -0.003,
+      "USDCHF/USDJPY": -0.04
     }
   },
   "T49_portfolio_equity_curve": {
-    "value": "final=+9.6pip peak=+48.3pip trough=+9.6pip",
+    "value": "final=+16451.9pip peak=+17258.3pip trough=-2269.0pip",
     "pass": "True",
     "detail": {
-      "final": 9.55000000000001,
-      "peak": 48.25000000000001,
-      "trough": 9.55000000000001,
-      "n_trades": 27
+      "final": 16451.88000000004,
+      "peak": 17258.349999999973,
+      "trough": -2269.049999999992,
+      "n_trades": 7604
     }
   },
   "T50_kelly_criterion": {
-    "value": "kelly=-20.0% (wr=48% W/L=0.76)",
-    "pass": false,
+    "value": "kelly=4.0% (wr=49% W/L=1.12)",
+    "pass": true,
     "detail": {
-      "kelly": -0.20020208355109576,
-      "half_kelly": -0.10010104177554788,
-      "wr": 0.48148148148148145,
-      "avg_win": 8.176923076923078,
-      "avg_loss": 10.75,
-      "wl_ratio": 0.7606440071556352
+      "kelly": 0.04020218417400179,
+      "half_kelly": 0.020101092087000894,
+      "wr": 0.4922409258285113,
+      "avg_win": 50.855471546887514,
+      "avg_loss": 45.27470710752408,
+      "wl_ratio": 1.1232645067390394
     }
   },
   "T51_diversification_ratio": {
@@ -345,131 +495,159 @@
         "eurjpy": -30.4,
         "cadjpy": -0.7,
         "gbpusd": 7.3500000000000005,
-        "eurusd": -13.55
+        "eurusd": -13.55,
+        "AUDJPY": 458.24999999999994,
+        "AUDUSD": 16113.95,
+        "CADJPY": 23.299999999999955,
+        "EURJPY": -88.70000000000005,
+        "EURUSD": -3377.05,
+        "GBPJPY": 474.43999999999994,
+        "GBPUSD": 593.9000000000001,
+        "M2K": -25.90000000000001,
+        "MCL": -18.909999999999997,
+        "MES": -16.75,
+        "MGC": 380.9,
+        "MNQ": -155.0,
+        "MYM": -645.0,
+        "USDCHF": -48.59999999999995,
+        "USDJPY": 2773.5
       }
     }
   },
   "T52_currency_exposure": {
-    "value": "{'aud': 15, 'jpy': 14, 'usd': 11, 'mgc': 4, '': 4, 'eur': 3, 'cad': 1, 'gbp': 2}",
+    "value": "{'aud': 15, 'jpy': 14, 'usd': 11, 'mgc': 4, '': 935, 'eur': 3, 'cad': 1, 'gbp': 2, 'AUD': 2517, 'JPY': 2704, 'USD': 4729, 'CAD': 518, 'EUR': 1404, 'GBP': 1294, 'M2K': 104, 'MCL': 150, 'MES': 173, 'MGC': 146, 'MNQ': 179, 'MYM': 179, 'CHF': 126}",
     "pass": true,
     "detail": {
       "aud": 15,
       "jpy": 14,
       "usd": 11,
       "mgc": 4,
-      "": 4,
+      "": 935,
       "eur": 3,
       "cad": 1,
-      "gbp": 2
+      "gbp": 2,
+      "AUD": 2517,
+      "JPY": 2704,
+      "USD": 4729,
+      "CAD": 518,
+      "EUR": 1404,
+      "GBP": 1294,
+      "M2K": 104,
+      "MCL": 150,
+      "MES": 173,
+      "MGC": 146,
+      "MNQ": 179,
+      "MYM": 179,
+      "CHF": 126
     }
   },
   "T56_spread_widening_stress": {
-    "value": "1x=+9.6 3x=-44.5",
-    "pass": false,
+    "value": "1x=+16451.9 3x=+1243.9",
+    "pass": true,
     "detail": {
       "1.0x": {
-        "total_pnl": 9.550000000000002,
-        "wr": 0.48148148148148145
+        "total_pnl": 16451.88,
+        "wr": 0.4922409258285113
       },
       "1.5x": {
-        "total_pnl": -3.9500000000000046,
-        "wr": 0.48148148148148145
+        "total_pnl": 12649.880000000001,
+        "wr": 0.46094160967911624
       },
       "2.0x": {
-        "total_pnl": -17.450000000000006,
-        "wr": 0.48148148148148145
+        "total_pnl": 8847.880000000001,
+        "wr": 0.44463440294581796
       },
       "3.0x": {
-        "total_pnl": -44.45,
-        "wr": 0.37037037037037035
+        "total_pnl": 1243.88,
+        "wr": 0.4224092582851131
       }
     }
   },
   "T57_execution_delay_sim": {
-    "value": "0bar=+9.6 3bar=-31.0",
-    "pass": false,
+    "value": "0bar=+16451.9 3bar=+5045.9",
+    "pass": true,
     "detail": {
       "1bar": {
-        "total_pnl": -3.9500000000000046,
-        "wr": 0.48148148148148145
+        "total_pnl": 12649.880000000001,
+        "wr": 0.46094160967911624
       },
       "2bar": {
-        "total_pnl": -17.450000000000006,
-        "wr": 0.48148148148148145
+        "total_pnl": 8847.880000000001,
+        "wr": 0.44463440294581796
       },
       "3bar": {
-        "total_pnl": -30.950000000000003,
-        "wr": 0.4444444444444444
+        "total_pnl": 5045.880000000001,
+        "wr": 0.4333245660178853
       },
       "5bar": {
-        "total_pnl": -57.95000000000001,
-        "wr": 0.3333333333333333
+        "total_pnl": -2558.119999999999,
+        "wr": 0.4112309310889006
       }
     }
   },
   "T58_partial_fill_impact": {
-    "value": "100%=+9.6 60%=+5.7",
+    "value": "100%=+16451.9 60%=+9871.1",
     "pass": true,
     "detail": {
-      "100%": 9.550000000000002,
-      "80%": 7.639999999999999,
-      "60%": 5.730000000000002,
-      "40%": 3.8199999999999994
+      "100%": 16451.88,
+      "80%": 13161.503999999997,
+      "60%": 9871.128,
+      "40%": 6580.751999999999
     }
   },
   "T59_requote_rejection_model": {
-    "value": "0%rej=+9.5 10%rej=-30.6",
+    "value": "0%rej=+16451.9 10%rej=-133417.0",
     "pass": false,
     "detail": {
-      "0%": 9.549999999999997,
-      "5%": -10.550000000000004,
-      "10%": -30.60000000000001,
-      "20%": -65.75
+      "0%": 16451.880000000005,
+      "5%": -99200.47000000002,
+      "10%": -133417.02,
+      "20%": -158583.11999999997
     }
   },
   "T69_degrees_of_freedom": {
-    "value": "2.2 trades/param (need >10, have 27 trades / 12 params)",
-    "pass": false,
+    "value": "633.7 trades/param (need >10, have 7604 trades / 12 params)",
+    "pass": true,
     "detail": {
-      "trades": 27,
+      "trades": 7604,
       "params": 12,
-      "ratio": 2.25
+      "ratio": 633.6666666666666
     }
   },
   "T70_whites_reality_check": {
-    "value": "p=0.498 (NOT significant)",
+    "value": "p=0.499 (NOT significant)",
     "pass": false,
     "detail": {
-      "p_value": 0.4978,
+      "p_value": 0.4992,
       "n_bootstrap": 5000
     }
   },
   "T71_haircut_in_sample": {
-    "value": "raw=+9.6pip after 30% haircut=+6.7pip",
+    "value": "raw=+16451.9pip after 30% haircut=+11516.3pip",
     "pass": true,
     "detail": {
-      "raw": 9.550000000000002,
+      "raw": 16451.88,
       "haircut_pct": 0.3,
-      "adjusted": 6.685000000000001
+      "adjusted": 11516.316
     }
   },
   "T72_blind_oos_test": {
-    "value": "IS(70%)=+48.2pip OOS(30%)=-38.7pip",
-    "pass": false,
+    "value": "IS(70%)=+14056.4pip OOS(30%)=+2395.5pip",
+    "pass": true,
     "detail": {
-      "in_sample": 48.25,
-      "out_of_sample": -38.7,
-      "is_n": 18,
-      "oos_n": 9
+      "in_sample": 14056.39,
+      "out_of_sample": 2395.49,
+      "is_n": 5322,
+      "oos_n": 2282
     }
   },
   "T73_strategy_decay": {
-    "value": "1st_half=+2.06 2nd_half=-1.23 decay=-160%",
+    "value": "1st_half=+4.46 2nd_half=-0.14 decay=-103%",
     "pass": false,
     "detail": {
-      "first_half_avg": 2.0576923076923084,
-      "second_half_avg": -1.2285714285714289,
-      "decay_pct": -1.5970627503337782
+      "first_half_avg": 4.462322461862178,
+      "second_half_avg": -0.13515781167806426,
+      "decay_pct": -1.0302886698200786
     }
   }
 }

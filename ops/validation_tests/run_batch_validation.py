@@ -20,6 +20,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 # ── Load all trades ──────────────────────────────────────────
 def load_all_trades() -> pd.DataFrame:
     frames = []
+    # Live trades from per-instrument logs
     for d in sorted(LOGS.iterdir()):
         tf = d / "trades.csv"
         if not tf.exists():
@@ -29,9 +30,27 @@ def load_all_trades() -> pd.DataFrame:
             if df.empty:
                 continue
             df["symbol"] = d.name
+            df["source"] = "live"
             frames.append(df)
         except Exception:
             continue
+    # Backtest trades from backtest_results (different schema: pnl vs pnl_pips)
+    bt_dir = REPO / "argus_flow" / "data" / "backtest_results"
+    if bt_dir.exists():
+        for f in sorted(bt_dir.glob("*.csv")):
+            try:
+                bt = pd.read_csv(f)
+                if bt.empty or "pnl" not in bt.columns:
+                    continue
+                # Normalize: rename pnl -> pnl_pips for consistency
+                bt = bt.rename(columns={"pnl": "pnl_pips"})
+                # Extract symbol from filename (e.g. audjpy_20260406T183718.csv)
+                sym = f.stem.split("_")[0].upper()
+                bt["symbol"] = sym
+                bt["source"] = "backtest"
+                frames.append(bt)
+            except Exception:
+                continue
     if not frames:
         print("ERROR: No trade data found"); sys.exit(1)
     df = pd.concat(frames, ignore_index=True)
@@ -252,9 +271,11 @@ record(27, "session_breakdown", {"value": f"best={best_sess[0]} avg={best_sess[1
 
 # T28: Month-of-year
 month_stats = {}
-for m in sorted(df["month"].unique()):
+for m in sorted(df["month"].dropna().unique()):
+    if np.isnan(m):
+        continue
     sub = df[df["month"] == m]
-    month_stats[f"M{m:02d}"] = {"n": len(sub), "wr": float(sub["win"].mean()),
+    month_stats[f"M{int(m):02d}"] = {"n": len(sub), "wr": float(sub["win"].mean()),
                                  "avg_pnl": float(sub["pnl_pips"].mean())}
 record(28, "month_seasonality", {"value": f"{len(month_stats)} months analyzed",
        "pass": True, "detail": month_stats})
