@@ -84,6 +84,7 @@ CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
 DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
+GOVERNOR_MODEL_PATH = Path("argus_flow/data/fx_governor.pkl")
 AUTO_GROUP_CLIENT_ID_BASE = 1000
 AUTO_GROUP_CLIENT_ID_SPAN = 8000
 
@@ -640,6 +641,69 @@ def _write_heartbeat_files(
             })
         except Exception:
             pass
+
+
+def _load_governor():
+    """Load the FX governor model if available. Returns (model, metadata) or (None, None)."""
+    if not GOVERNOR_MODEL_PATH.exists():
+        return None, None
+    try:
+        import pickle
+        with open(GOVERNOR_MODEL_PATH, "rb") as f:
+            artifact = pickle.load(f)
+        log.info(f"Governor model loaded: {artifact.get('training_stats', {}).get('n_trades', '?')} trades, "
+                 f"{len(artifact.get('feature_names', []))} features")
+        return artifact, artifact.get("training_stats", {})
+    except Exception as e:
+        log.warning(f"Governor model load failed: {e}")
+        return None, None
+
+
+def _governor_score(artifact: dict, features: dict, direction: str, symbol: str) -> float | None:
+    """Score a signal using the governor model. Returns P(win) or None on error."""
+    try:
+        import math as _math
+        import numpy as _np
+        model = artifact["model"]
+        imputer = artifact["imputer"]
+        encoders = artifact["encoders"]
+        numeric_features = artifact["numeric_features"]
+        categorical_features = artifact["categorical_features"]
+
+        hour = features.get("hour", 12)
+        hour_f = float(hour) if hour else 12.0
+
+        # Build feature vector matching training order
+        row_numeric = []
+        for f in numeric_features:
+            if f == "hour_sin":
+                row_numeric.append(_math.sin(2 * _math.pi * hour_f / 24))
+            elif f == "hour_cos":
+                row_numeric.append(_math.cos(2 * _math.pi * hour_f / 24))
+            else:
+                val = features.get(f)
+                row_numeric.append(float(val) if val is not None and val != "" else _np.nan)
+
+        row_cat = []
+        for f in categorical_features:
+            if f == "direction":
+                val = direction or "unknown"
+            elif f == "symbol":
+                val = symbol.upper()
+            else:
+                val = str(features.get(f, "unknown") or "unknown")
+            le = encoders.get(f)
+            if le is not None and val in le.classes_:
+                row_cat.append(le.transform([val])[0])
+            else:
+                row_cat.append(0)  # unknown category -> 0
+
+        X = _np.array([row_numeric + row_cat], dtype=float)
+        X = imputer.transform(X)
+        proba = model.predict_proba(X)[0, 1]  # P(win)
+        return float(proba)
+    except Exception:
+        return None
 
 
 def _config_short_hash(path: Path) -> str:
@@ -1456,6 +1520,13 @@ class InstrumentRunner:
         self._rotate_signal_log_if_needed()
         self._ensure_signal_header()
         features["ts"] = datetime.now(timezone.utc).isoformat()
+        # Governor scoring (LOG_ONLY — stamps P(win) without blocking)
+        gov = getattr(self, '_governor', None)
+        if gov is not None and direction:
+            score = _governor_score(gov, features, direction, self.symbol)
+            if score is not None:
+                features["gov_score"] = round(score, 3)
+                features["gov_action"] = "TAKE" if score >= 0.5 else "SKIP"
         with open(self.signal_log, "a", newline="") as f:
             csv.writer(f).writerow(build_signal_row(
                 features, direction, action, self.instrument_type,
@@ -1639,6 +1710,12 @@ class InstrumentRunner:
             try:
                 self._ai_overlay.learn(pnl_pips)
                 self._bars_since_last_trade = 0
+                # Re-pool weights across all symbols after learning
+                pool = getattr(self, '_ai_pool', None)
+                overlays = getattr(self, '_ai_overlays', None)
+                if pool and overlays:
+                    pool.update(overlays)
+                    pool.sync_to_overlays(overlays, blend=0.3)
             except Exception as e:
                 self._log.warning(f"AI overlay learn error: {e}")
 
@@ -3961,6 +4038,34 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         return False
 
     # -- Main loop ---------------------------------------------------���───────────────
+    # -- FX Governor (LOG_ONLY — stamps P(win) on every signal) ──
+    gov_artifact, gov_stats = _load_governor()
+    for inst in instruments:
+        inst._governor = gov_artifact
+
+    # -- AI Weight Pool (cross-pair learning) ─────────────────────
+    try:
+        from argus_flow.strategies.ai_overlay import AIWeightPool
+        _ai_pool = AIWeightPool(state_dir=LOGS_ROOT)
+        _ai_overlays = {
+            inst.symbol: inst._ai_overlay
+            for inst in instruments
+            if getattr(inst, '_ai_overlay', None) is not None
+        }
+        if _ai_overlays:
+            _ai_pool.update(_ai_overlays)
+            _ai_pool.sync_to_overlays(_ai_overlays, blend=0.3)
+            log.info(f"AI weight pool: {len(_ai_overlays)} overlays synced (blend=0.3)")
+        # Attach pool + overlay map so learn callbacks can trigger re-pool
+        for inst in instruments:
+            inst._ai_pool = _ai_pool
+            inst._ai_overlays = _ai_overlays
+    except Exception as e:
+        log.warning(f"AI weight pool init failed (non-fatal): {e}")
+        for inst in instruments:
+            inst._ai_pool = None
+            inst._ai_overlays = {}
+
     log.info("Starting main loop (Ctrl+C to stop)...")
     heartbeat_interval = 300  # full broker/account heartbeat every 5 min
     heartbeat_file_interval = 60  # lightweight chart/state heartbeat every 1 min

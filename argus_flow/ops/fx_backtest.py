@@ -20,6 +20,14 @@ sys.path.insert(0, str(REPO))
 
 from argus_flow.runner_unified import BarBuffer, compute_features_fx, compute_features_futures, check_trigger_fx, check_trigger_futures
 
+# Optional MTF imports (only needed for --mtf mode)
+try:
+    from argus_flow.strategies.mtf_engine import MTFStrategyEngine
+    from argus_flow.strategies.ai_overlay import AdaptiveOverlay, MarketState
+    _MTF_AVAILABLE = True
+except ImportError:
+    _MTF_AVAILABLE = False
+
 
 def load_bars(csv_path: Path) -> list[dict]:
     """Load historical bars from CSV."""
@@ -38,7 +46,7 @@ def load_bars(csv_path: Path) -> list[dict]:
 
 
 class BacktestRunner:
-    def __init__(self, config: dict, enable_pyramid: bool = False):
+    def __init__(self, config: dict, enable_pyramid: bool = False, enable_mtf: bool = False):
         self.cfg = config
         self.buf = BarBuffer(300)
         self.symbol = config["symbol"]
@@ -62,6 +70,35 @@ class BacktestRunner:
         self.pyramid_max_adds = pyramid.get("max_adds", 1)
         self.pyramid_move_stop_be = pyramid.get("move_stop_breakeven", True)
 
+        # MTF strategy + AI overlay
+        self.mtf_enabled = enable_mtf and _MTF_AVAILABLE and config.get("strategy") == "mtf_trend"
+        self._mtf_engine = None
+        self._ai_overlay = None
+        self._mtf_min_confidence = 0.5
+        self._bars_since_last_trade = 999
+        self._consecutive_losses = 0
+        if self.mtf_enabled:
+            mtf_cfg = config.get("mtf", {})
+            self._mtf_engine = MTFStrategyEngine(
+                symbol=self.symbol,
+                pip_size=self.pip_size,
+                trend_ema_fast=mtf_cfg.get("trend_ema_fast", 8),
+                trend_ema_slow=mtf_cfg.get("trend_ema_slow", 21),
+                rsi_period=mtf_cfg.get("rsi_period", 14),
+                min_trend_strength=mtf_cfg.get("min_trend_strength", 0.5),
+            )
+            self._mtf_min_confidence = mtf_cfg.get("min_confidence", 0.5)
+            self._ai_overlay = AdaptiveOverlay(
+                symbol=self.symbol,
+                pip_size=self.pip_size,
+                state_dir=Path("argus_flow/data/backtest_results"),
+            )
+
+        # Hour filter
+        hf = config.get("hour_filter", {})
+        self.hour_filter_enabled = hf.get("enabled", False)
+        self.profitable_hours = set(hf.get("hours", []))
+
         # State
         self.position = "FLAT"
         self.entry_price = 0
@@ -72,6 +109,8 @@ class BacktestRunner:
         self.last_signal_time = None
         self.pyramid_adds = 0
         self.avg_entry = 0
+        self._entry_direction = None
+        self._last_entry_features = {}
 
         # Results
         self.trades = []
@@ -129,6 +168,10 @@ class BacktestRunner:
         except Exception:
             bar_time = datetime.now(timezone.utc)
 
+        # Feed MTF engine every 1m bar
+        if self._mtf_engine is not None:
+            self._mtf_engine.update_bar(bar)
+
         # Exit check
         if self.position != "FLAT":
             exit_reason = None
@@ -147,7 +190,7 @@ class BacktestRunner:
                 else:
                     pnl = (mid - self.entry_price) if self.position == "LONG" else (self.entry_price - mid)
                 dur = (bar_time - self.entry_time).total_seconds() / 60 if self.entry_time else 0
-                self.trades.append({
+                trade_record = {
                     "ts": bar_time.isoformat(),
                     "direction": self.position.lower(),
                     "entry_px": self.entry_price,
@@ -156,13 +199,29 @@ class BacktestRunner:
                     "exit_reason": exit_reason,
                     "duration_min": round(dur, 1),
                     "pyramid_adds": self.pyramid_adds,
-                })
+                }
+                # Capture MTF features at exit for governor training data
+                if self._last_entry_features:
+                    trade_record.update(self._last_entry_features)
+                trade_record["win"] = 1 if pnl > 0 else 0
+                self.trades.append(trade_record)
+
+                # AI overlay learning
+                if self._ai_overlay is not None:
+                    self._ai_overlay.learn(pnl)
+                    self._bars_since_last_trade = 0
+                    self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
+
                 self.position = "FLAT"
                 self.pyramid_adds = 0
+                self._entry_direction = None
                 return
 
             self._check_pyramid(mid)
+            self._bars_since_last_trade += 1
             return
+
+        self._bars_since_last_trade += 1
 
         # Signal evaluation
         if len(self.buf) < 60:
@@ -172,7 +231,62 @@ class BacktestRunner:
         if features is None:
             return
 
-        direction = self._check_trigger(features)
+        direction = None
+        mtf_features = {}
+
+        # MTF strategy path
+        if self.mtf_enabled and self._mtf_engine is not None:
+            mtf_signal = self._mtf_engine.evaluate(mid)
+            if mtf_signal is not None and mtf_signal.confidence >= self._mtf_min_confidence:
+                direction = mtf_signal.direction
+                mtf_features = {
+                    "mtf_trend_4h": mtf_signal.trend_4h,
+                    "mtf_setup_1h": mtf_signal.setup_1h,
+                    "mtf_trigger_5m": mtf_signal.trigger_5m,
+                    "mtf_confidence": round(mtf_signal.confidence, 3),
+                    "mtf_support": round(mtf_signal.support, 5),
+                    "mtf_resistance": round(mtf_signal.resistance, 5),
+                    "mtf_rsi_1h": round(mtf_signal.rsi_1h, 1),
+                }
+
+                # AI overlay gate
+                if self._ai_overlay is not None and direction:
+                    recent_trades = self.trades[-10:]
+                    recent_wr = sum(1 for t in recent_trades if t["pnl"] > 0) / max(len(recent_trades), 1)
+                    ai_state = MarketState(
+                        price=mid,
+                        atr_14=features.get("atr_14", 0.0),
+                        rsi_14=features.get("rsi_14", 50.0),
+                        spread_pips=0.5,  # simulated tight spread for backtest
+                        volume_ratio=features.get("vol_z", 0.0) + 1.0,
+                        dist_from_high_20=1.0 - features.get("dist_from_low", 0.5),
+                        dist_from_low_20=features.get("dist_from_low", 0.5),
+                        ema_8_slope=features.get("trend_strength", 0.0),
+                        ema_21_slope=features.get("efficiency_ratio", 0.0),
+                        hour=bar_time.hour,
+                        day_of_week=bar_time.weekday(),
+                        bars_since_last_trade=self._bars_since_last_trade,
+                        recent_win_rate=recent_wr,
+                        recent_pnl=sum(t["pnl"] for t in recent_trades),
+                        consecutive_losses=self._consecutive_losses,
+                        trend_strength_4h=abs(mtf_signal.ema_8_4h - mtf_signal.ema_21_4h) / self.pip_size if self.pip_size > 0 else 0.0,
+                        rsi_1h=mtf_signal.rsi_1h,
+                        confidence_mtf=mtf_signal.confidence,
+                    )
+                    overlay_decision = self._ai_overlay.evaluate(direction, ai_state)
+                    mtf_features["ai_action"] = overlay_decision.action
+                    mtf_features["ai_consensus"] = round(overlay_decision.consensus_score, 3)
+                    mtf_features["ai_confidence"] = round(overlay_decision.confidence, 3)
+                    if overlay_decision.action == "SKIP":
+                        direction = None
+        else:
+            # Fallback: original range_accel trigger
+            direction = self._check_trigger(features)
+
+        # Hour filter
+        if direction and self.hour_filter_enabled and self.profitable_hours:
+            if bar_time.hour not in self.profitable_hours:
+                direction = None
 
         if direction and self.last_signal_time:
             gap = (bar_time - self.last_signal_time).total_seconds() / 60
@@ -189,7 +303,20 @@ class BacktestRunner:
             self.timeout_time = bar_time + timedelta(minutes=self.timeout_min)
             self.last_signal_time = bar_time
             self.position = direction.upper()
+            self._entry_direction = direction
             self.pyramid_adds = 0
+            # Capture MTF features at entry for governor training data
+            self._last_entry_features = {
+                **mtf_features,
+                "range_pct": features.get("range_pct", 0),
+                "vol_z": features.get("vol_z", 0),
+                "range_accel": features.get("range_accel", 0),
+                "dist_from_low": features.get("dist_from_low", 0),
+                "hour": bar_time.hour,
+                "regime": features.get("regime", ""),
+                "trend_strength": features.get("trend_strength", 0),
+                "efficiency_ratio": features.get("efficiency_ratio", 0),
+            }
 
     def summary(self) -> dict:
         if not self.trades:
@@ -236,6 +363,7 @@ def main():
     parser.add_argument("--config", required=True, help="Path to config JSON")
     parser.add_argument("--data", required=True, help="Path to bar data CSV")
     parser.add_argument("--pyramid", action="store_true", help="Enable pyramiding")
+    parser.add_argument("--mtf", action="store_true", help="Enable MTF strategy + AI overlay (for mtf_trend configs)")
     parser.add_argument("--output", help="Output trades CSV path")
     args = parser.parse_args()
 
@@ -246,8 +374,13 @@ def main():
     print(f"Data: {len(bars)} bars from {args.data}")
     if args.pyramid:
         print(f"Pyramiding: ENABLED")
+    if args.mtf:
+        if not _MTF_AVAILABLE:
+            print("ERROR: MTF modules not available")
+            return
+        print(f"MTF Strategy + AI Overlay: ENABLED")
 
-    bt = BacktestRunner(config, enable_pyramid=args.pyramid)
+    bt = BacktestRunner(config, enable_pyramid=args.pyramid, enable_mtf=args.mtf)
 
     for i, bar in enumerate(bars):
         bt.process_bar(bar)
@@ -290,6 +423,19 @@ def main():
             w.writeheader()
             w.writerows(bt.trades)
     print(f"\n  Trades saved: {out_path}")
+
+    # Export training data with MTF features for governor retraining
+    if args.mtf and bt.trades:
+        train_path = out_dir / f"{config['symbol'].lower()}_train_{ts}.csv"
+        # Filter to only trades with MTF features
+        train_trades = [t for t in bt.trades if t.get("mtf_confidence")]
+        if train_trades:
+            with open(train_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=train_trades[0].keys())
+                w.writeheader()
+                w.writerows(train_trades)
+            print(f"  Training data: {train_path} ({len(train_trades)} trades with MTF features)")
+
     print(json.dumps(s))
 
 

@@ -56,5 +56,12 @@
     "target_rate": 0.54,
     "timeout_rate": 0.31,
     "exp_pips_per_trade": 1.17
+  },
+  "deployment": {
+    "managed": true,
+    "stage": "paper",
+    "risk_policy": {
+      "model_start_equity_usd": 10000
+    }
   }
 }

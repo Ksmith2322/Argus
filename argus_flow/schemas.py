@@ -9,23 +9,38 @@ Rules:
 """
 
 # Schema version — bump when columns change
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # ── Signal CSV ─────────────────────────────────────────────────
+
+# MTF + AI overlay fields (v5) — previously computed but silently dropped
+_MTF_AI_FIELDS = [
+    # MTF strategy signal
+    "mtf_trend_4h", "mtf_setup_1h", "mtf_trigger_5m",
+    "mtf_confidence", "mtf_support", "mtf_resistance",
+    # MTF analysis engine
+    "mtf_bias", "mtf_consensus", "mtf_4h", "mtf_1h",
+    "mtf_rsi", "mtf_bb_pos", "mtf_vwap_pos",
+    "mtf_at_support", "mtf_at_resistance", "mtf_patterns", "mtf_breakout",
+    # AI overlay
+    "ai_action", "ai_consensus", "ai_confidence", "ai_for", "ai_against",
+    # Governor
+    "gov_score", "gov_action",
+]
 
 SIGNAL_FIELDS_FX = [
     "ts", "price", "range_pct", "vol_z", "range_accel",
     "dist_from_low", "hour", "direction", "action",
     "config_hash", "session_id",
     "regime", "trend_strength", "efficiency_ratio",
-]
+] + _MTF_AI_FIELDS
 
 SIGNAL_FIELDS_FUTURES = [
     "ts", "price", "range_pct", "vol_z", "range_accel",
     "vol_burst_z", "dist_from_low", "hour", "direction", "action",
     "config_hash", "session_id",
     "regime", "trend_strength", "efficiency_ratio",
-]
+] + _MTF_AI_FIELDS
 
 
 def signal_header(instrument_type: str) -> list[str]:
@@ -58,6 +73,15 @@ def build_signal_row(features: dict, direction: str | None, action: str,
         f"{features.get('trend_strength', 0):.4f}",
         f"{features.get('efficiency_ratio', 0):.4f}",
     ]
+    # MTF + AI overlay fields (v5)
+    for field in _MTF_AI_FIELDS:
+        val = features.get(field, "")
+        if isinstance(val, float):
+            row.append(f"{val:.4f}")
+        elif isinstance(val, bool):
+            row.append("1" if val else "0")
+        else:
+            row.append(str(val) if val != "" else "")
     return row
 
 

@@ -477,3 +477,128 @@ class AdaptiveOverlay:
             "trades_in_memory": len(self._trade_history),
             "recent_wr": sum(1 for t in self._trade_history[-10:] if t["pnl"] > 0) / max(len(self._trade_history[-10:]), 1),
         }
+
+    def get_weights(self) -> dict[str, float]:
+        """Return raw weights dict for pooling."""
+        return dict(self._weights)
+
+    def get_trade_history(self) -> list[dict]:
+        """Return trade history for pooling."""
+        return list(self._trade_history)
+
+    def apply_pooled_weights(self, pooled: dict[str, float], blend: float = 0.3) -> None:
+        """Blend pooled fleet weights into this symbol's weights.
+
+        blend=0.3 means 70% symbol-specific + 30% fleet consensus.
+        Only applies to voters that exist in both sets.
+        """
+        for name in self._weights:
+            if name in pooled:
+                self._weights[name] = (
+                    (1.0 - blend) * self._weights[name]
+                    + blend * pooled[name]
+                )
+        self._save_state()
+
+
+class AIWeightPool:
+    """Fleet-level weight aggregation across all symbol overlays.
+
+    Computes a trade-count-weighted average of voter weights across all pairs,
+    then lets each pair blend the pooled weights into its own via apply_pooled_weights().
+
+    This accelerates learning: a pair with 1 trade benefits from the 18-trade fleet.
+    """
+
+    def __init__(self, state_dir: Path | None = None):
+        self._state_dir = state_dir or Path("argus_flow/logs")
+        self._pool_file = self._state_dir / "ai_weight_pool.json"
+        self._log = logging.getLogger("ai.pool")
+        self._pooled_weights: dict[str, float] = {}
+        self._contributions: dict[str, int] = {}  # symbol -> trade count
+        self._load()
+
+    def update(self, overlays: dict[str, AdaptiveOverlay]) -> dict[str, float]:
+        """Recompute pooled weights from all overlays weighted by trade count.
+
+        Returns the new pooled weights dict.
+        """
+        if not overlays:
+            return self._pooled_weights
+
+        # Gather per-symbol weights + trade counts
+        all_voter_names: set[str] = set()
+        symbol_data: list[tuple[dict[str, float], int]] = []
+        self._contributions = {}
+
+        for symbol, overlay in overlays.items():
+            weights = overlay.get_weights()
+            n_trades = len(overlay.get_trade_history())
+            all_voter_names.update(weights.keys())
+            symbol_data.append((weights, max(n_trades, 1)))  # min 1 to include all
+            self._contributions[symbol] = n_trades
+
+        total_trades = sum(n for _, n in symbol_data)
+        if total_trades == 0:
+            return self._pooled_weights
+
+        # Weighted average per voter
+        pooled: dict[str, float] = {}
+        for voter in all_voter_names:
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for weights, n_trades in symbol_data:
+                if voter in weights:
+                    weighted_sum += weights[voter] * n_trades
+                    weight_total += n_trades
+            if weight_total > 0:
+                pooled[voter] = weighted_sum / weight_total
+
+        self._pooled_weights = pooled
+        self._save()
+
+        self._log.info(
+            f"Pool updated: {len(overlays)} symbols, {total_trades} total trades. "
+            f"Top: {sorted(pooled.items(), key=lambda x: x[1], reverse=True)[:3]}"
+        )
+        return pooled
+
+    def sync_to_overlays(self, overlays: dict[str, AdaptiveOverlay], blend: float = 0.3) -> None:
+        """Push pooled weights to all overlays with blending."""
+        if not self._pooled_weights:
+            self.update(overlays)
+        if not self._pooled_weights:
+            return
+
+        for symbol, overlay in overlays.items():
+            overlay.apply_pooled_weights(self._pooled_weights, blend=blend)
+            self._log.info(f"Synced pool -> {symbol} (blend={blend})")
+
+    def get_summary(self) -> dict:
+        """Return pool state for dashboard."""
+        return {
+            "pooled_weights": {k: round(v, 3) for k, v in self._pooled_weights.items()},
+            "contributions": self._contributions,
+            "total_trades": sum(self._contributions.values()),
+        }
+
+    def _save(self) -> None:
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            self._pool_file.write_text(json.dumps({
+                "pooled_weights": self._pooled_weights,
+                "contributions": self._contributions,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, indent=2))
+        except Exception as e:
+            self._log.warning(f"Failed to save pool: {e}")
+
+    def _load(self) -> None:
+        if not self._pool_file.exists():
+            return
+        try:
+            data = json.loads(self._pool_file.read_text())
+            self._pooled_weights = data.get("pooled_weights", {})
+            self._contributions = data.get("contributions", {})
+        except Exception as e:
+            self._log.warning(f"Failed to load pool: {e}")
