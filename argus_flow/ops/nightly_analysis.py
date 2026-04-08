@@ -117,8 +117,8 @@ def send_discord(content="", embeds=None):
 
 # ── Job 1: LLM Trade Review ──────────────────────────────────────
 
-def job_llm_trade_review(days=1):
-    """Use local LLM to analyze today's trades."""
+def _build_claude_prompt(days=1):
+    """Build a comprehensive prompt for Claude analysis. Saved to file for manual paste."""
     all_trades = []
     for sym in FX_PAIRS:
         trades = _recent_trades(sym, days=days)
@@ -126,54 +126,153 @@ def job_llm_trade_review(days=1):
             t["_symbol"] = sym.upper()
         all_trades.extend(trades)
 
-    if not all_trades:
-        return "**LLM Review:** No trades in the last 24h to analyze."
+    # Gather all context data
+    trade_lines = []
+    for t in all_trades:
+        pnl = _safe_float(t.get("pnl_pips", t.get("pnl_pts", 0)))
+        gov = t.get("gov_score", t.get("conviction_score", ""))
+        trade_lines.append(
+            f"  {t['_symbol']:8s} {t.get('direction','?').upper():5s} | "
+            f"PnL: {pnl:+.1f} pip | Exit: {t.get('exit_reason','?'):7s} | "
+            f"Dur: {t.get('duration_min','?')}min | "
+            f"Hour: {t.get('ts', '?')[11:13]} | "
+            f"Spread: {t.get('entry_spread', '?')} | "
+            f"MTF: {t.get('mtf_score', t.get('bias_4h', '?'))} | "
+            f"Gov: {gov}"
+        )
 
-    # Check ollama availability
+    # Pair health data
+    pair_lines = []
+    for sym in FX_PAIRS:
+        trades = _all_valid_trades(sym)
+        if not trades:
+            pair_lines.append(f"  {sym.upper()}: no trades")
+            continue
+        recent = trades[-20:]
+        pnls = [_safe_float(t.get("pnl_pips", t.get("pnl_pts", 0))) for t in recent]
+        wins = sum(1 for p in pnls if p > 0)
+        wr = wins / len(pnls) * 100 if pnls else 0
+        total = sum(pnls)
+        gross_w = sum(p for p in pnls if p > 0)
+        gross_l = abs(sum(p for p in pnls if p <= 0))
+        pf = round(gross_w / gross_l, 2) if gross_l > 0 else 999
+        exits = defaultdict(int)
+        for t in recent:
+            exits[t.get("exit_reason", "?")] += 1
+        pair_lines.append(
+            f"  {sym.upper():8s} | {len(recent):2d} trades | WR {wr:.0f}% | PF {pf} | "
+            f"PnL {total:+.1f} | Exits: {dict(exits)}"
+        )
+
+    # AI overlay weights
+    weight_lines = []
+    for sym in FX_PAIRS:
+        state_path = LOGS_DIR / sym / "ai_overlay_state.json"
+        if not state_path.exists():
+            continue
+        try:
+            state = json.loads(state_path.read_text())
+            weights = state.get("weights", {})
+            sorted_w = sorted(weights.items(), key=lambda x: x[1], reverse=True)
+            top = ", ".join(f"{n}={w:.2f}" for n, w in sorted_w[:3])
+            bot = ", ".join(f"{n}={w:.2f}" for n, w in sorted_w[-3:])
+            weight_lines.append(f"  {sym.upper()}: top=[{top}] bottom=[{bot}]")
+        except Exception:
+            continue
+
+    # Governor summary
+    gov_lines = []
+    for sym in FX_PAIRS:
+        signals = _recent_signals(sym, days=days)
+        entry_sigs = [s for s in signals if s.get("action") == "ENTRY" and s.get("gov_score")]
+        skip_sigs = [s for s in signals if "BLOCKED" in s.get("action", "") and s.get("gov_score")]
+        if entry_sigs or skip_sigs:
+            gov_lines.append(f"  {sym.upper()}: {len(entry_sigs)} entries scored, {len(skip_sigs)} blocks scored")
+
+    # Signal block reasons
+    block_lines = []
+    for sym in FX_PAIRS:
+        signals = _recent_signals(sym, days=days)
+        blocks = defaultdict(int)
+        for s in signals:
+            action = s.get("action", "")
+            if action not in ("ENTRY", "NO_TRIGGER", ""):
+                blocks[action] += 1
+        if blocks:
+            top_blocks = sorted(blocks.items(), key=lambda x: -x[1])[:5]
+            block_lines.append(f"  {sym.upper()}: " + ", ".join(f"{k}={v}" for k, v in top_blocks))
+
+    prompt = f"""You are a quantitative trading analyst reviewing an automated FX trading system (Argus).
+The system trades 4 pairs (AUDJPY, USDJPY, GBPUSD, CADJPY) using a multi-timeframe strategy with an AI overlay.
+
+## Today's Trades ({len(all_trades)} trades, last {days} day(s))
+{chr(10).join(trade_lines) if trade_lines else "  No trades in this period."}
+
+## Pair Health (rolling last 20 trades each)
+{chr(10).join(pair_lines)}
+
+## AI Overlay Voter Weights
+{chr(10).join(weight_lines) if weight_lines else "  No weight data."}
+
+## Governor Scores
+{chr(10).join(gov_lines) if gov_lines else "  No governor scores yet."}
+
+## Signal Blocks (last {days} day(s))
+{chr(10).join(block_lines) if block_lines else "  No blocks recorded."}
+
+## Analysis Request
+Please provide:
+1. **Trade Pattern Analysis** — What patterns do you see in winners vs losers? Direction bias? Session/hour issues?
+2. **Pair Assessment** — Which pairs should be kept, killed, or need parameter changes? Why?
+3. **AI Overlay Review** — Are the voter weights converging sensibly? Any voters that should be reweighted?
+4. **Governor Validation** — If governor scores are available, are SKIP signals actually losing trades?
+5. **Signal Block Review** — Are the right signals being blocked? Is the system too restrictive or too loose?
+6. **Top 3 Concrete Actions** — Specific, implementable changes ranked by expected impact.
+
+Be direct and specific to THIS data. No generic trading advice."""
+
+    return prompt, all_trades
+
+
+def job_llm_trade_review(days=1):
+    """Generate analysis prompt and optionally run through Ollama."""
+    prompt, all_trades = _build_claude_prompt(days=days)
+
+    # Always save the prompt for manual Claude paste
+    prompt_path = LOGS_DIR / "claude_analysis_prompt.md"
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    if not all_trades:
+        return "**Trade Review:** No trades in the last 24h. Prompt saved for when trades accumulate."
+
+    # Try Ollama for an automated quick review
     try:
         req = Request(f"{OLLAMA_URL}/api/version", method="GET")
         urlopen(req, timeout=3)
-    except Exception:
-        return _fallback_trade_review(all_trades)
 
-    # Build prompt
-    trade_summary = []
-    for t in all_trades:
-        pnl = _safe_float(t.get("pnl_pips", t.get("pnl_pts", 0)))
-        trade_summary.append(
-            f"  {t['_symbol']} {t.get('direction','?').upper()} | "
-            f"PnL: {pnl:+.1f} pip | Exit: {t.get('exit_reason','?')} | "
-            f"Duration: {t.get('duration_min','?')}min | "
-            f"MTF: {t.get('mtf_score', t.get('bias_4h', '?'))} | "
-            f"Hour: {t.get('ts', '?')[11:13]}"
-        )
+        # Shorter prompt for Ollama (it can't handle the full analysis request well)
+        short_prompt = prompt.split("## Analysis Request")[0] + \
+            "\nIn 3-4 sentences: What patterns in winners vs losers? Any hour/direction issues? One concrete suggestion."
 
-    prompt = f"""You are analyzing today's FX trading results for an automated system.
-Here are the {len(all_trades)} trades from the last 24 hours:
-
-{chr(10).join(trade_summary)}
-
-In 3-4 sentences, analyze:
-1. What patterns do you see in the winners vs losers?
-2. Any specific session/hour/direction issues?
-3. One concrete suggestion to improve tomorrow.
-
-Be direct and specific. No generic advice."""
-
-    try:
         payload = json.dumps({
             "model": OLLAMA_MODEL,
-            "prompt": prompt,
+            "prompt": short_prompt,
             "stream": False,
-            "options": {"temperature": 0.3, "num_predict": 250},
+            "options": {"temperature": 0.3, "num_predict": 300},
         }).encode()
         req = Request(f"{OLLAMA_URL}/api/generate", data=payload,
                       headers={"Content-Type": "application/json"}, method="POST")
-        resp = json.loads(urlopen(req, timeout=30).read())
-        analysis = resp.get("response", "").strip()
-        return f"**LLM Trade Review ({len(all_trades)} trades):**\n{analysis}"
-    except Exception as e:
-        return _fallback_trade_review(all_trades) + f"\n_(LLM error: {e})_"
+        resp = json.loads(urlopen(req, timeout=45).read())
+        llm_review = resp.get("response", "").strip()
+    except Exception:
+        llm_review = None
+
+    # Build output
+    result = _fallback_trade_review(all_trades)
+    if llm_review:
+        result += f"\n\n**Ollama Quick Take:**\n{llm_review}"
+    result += f"\n\n_Full analysis prompt saved to `argus_flow/logs/claude_analysis_prompt.md` — paste into claude.ai for deep analysis._"
+    return result
 
 
 def _fallback_trade_review(trades):
