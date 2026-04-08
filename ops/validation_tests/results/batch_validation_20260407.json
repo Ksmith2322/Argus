@@ -1,0 +1,475 @@
+{
+  "T02_kfold_cv_5fold": {
+    "value": "3/5 profitable",
+    "pass": true,
+    "detail": {
+      "folds": [
+        {
+          "fold": 1,
+          "mean_pnl": 8.350000000000001,
+          "win_rate": 0.8,
+          "n": 5
+        },
+        {
+          "fold": 2,
+          "mean_pnl": -3.69,
+          "win_rate": 0.0,
+          "n": 5
+        },
+        {
+          "fold": 3,
+          "mean_pnl": 2.12,
+          "win_rate": 0.6,
+          "n": 5
+        },
+        {
+          "fold": 4,
+          "mean_pnl": 1.0399999999999998,
+          "win_rate": 0.6,
+          "n": 5
+        },
+        {
+          "fold": 5,
+          "mean_pnl": -0.18000000000000047,
+          "win_rate": 0.6,
+          "n": 5
+        }
+      ],
+      "profitable_folds": 3,
+      "total_folds": 5
+    }
+  },
+  "T06_buy_hold_benchmark": {
+    "value": "strategy=+9.6pip over 8d, 27 trades",
+    "pass": true,
+    "detail": {
+      "total_pnl_pips": 9.550000000000002,
+      "n_days": 8,
+      "trades": 27,
+      "pnl_per_day": 1.1937500000000003
+    }
+  },
+  "T10_cpcv_simplified": {
+    "value": "7/10 combos profitable (70%)",
+    "pass": true,
+    "detail": {
+      "profitable_combos": 7,
+      "total_combos": 10,
+      "ratio": 0.7
+    }
+  },
+  "T13_entry_timing_efficiency": {
+    "value": "50.0% avg efficiency",
+    "pass": true,
+    "detail": {
+      "avg": 0.5,
+      "median": 0.5,
+      "n": 26
+    }
+  },
+  "T16_false_signal_rate": {
+    "value": "0.0% (0/27 trades reversed in <5min)",
+    "pass": true,
+    "detail": {
+      "rate": 0.0,
+      "count": 0
+    }
+  },
+  "T18_optimal_stop_mae": {
+    "value": "p50=13.6 p75=15.3 pips",
+    "pass": true,
+    "detail": {
+      "p25": 2.45,
+      "p50": 13.55,
+      "p75": 15.3,
+      "p90": 20.1
+    }
+  },
+  "T19_optimal_target_mfe": {
+    "value": "p50=6.5 p75=10.9 pips",
+    "pass": true,
+    "detail": {
+      "p25": 2.2,
+      "p50": 6.55,
+      "p75": 10.95,
+      "p90": 18.740000000000006
+    }
+  },
+  "T20_optimal_hold_time": {
+    "value": "best=60-90m avg_pnl=+2.0pip",
+    "pass": true,
+    "detail": {
+      "<30m": {
+        "n": 5,
+        "wr": 0.4,
+        "avg_pnl": -0.36000000000000015
+      },
+      "30-60m": {
+        "n": 11,
+        "wr": 0.5454545454545454,
+        "avg_pnl": 0.40909090909090895
+      },
+      "60-90m": {
+        "n": 5,
+        "wr": 0.4,
+        "avg_pnl": 2.05
+      },
+      "90+m": {
+        "n": 6,
+        "wr": 0.5,
+        "avg_pnl": -0.5666666666666664
+      }
+    }
+  },
+  "T21_trailing_vs_fixed_stop": {
+    "value": "fixed=+9.6 trail_sim=-24.3",
+    "pass": true,
+    "detail": {
+      "fixed": 9.550000000000002,
+      "trailing_sim": -24.250000000000007
+    }
+  },
+  "T22_partial_profit_sim": {
+    "value": "partial=+57.9 vs full=+9.6",
+    "pass": true,
+    "detail": {
+      "partial": 57.925,
+      "full": 9.550000000000002
+    }
+  },
+  "T23_breakeven_stop_sim": {
+    "value": "BE_sim=+9.6 vs original=+9.6",
+    "pass": true,
+    "detail": {
+      "breakeven": 9.550000000000002,
+      "original": 9.550000000000002
+    }
+  },
+  "T24_multi_exit_comparison": {
+    "value": "best=partial (+57.9pip)",
+    "pass": true,
+    "detail": {
+      "fixed": 9.550000000000002,
+      "trailing": -24.250000000000007,
+      "partial": 57.925,
+      "breakeven": 9.550000000000002
+    }
+  },
+  "T27_session_breakdown": {
+    "value": "best=London(7-15) avg=+0.4pip",
+    "pass": true,
+    "detail": {
+      "Asian(0-7)": {
+        "n": 7,
+        "wr": 0.42857142857142855,
+        "avg_pnl": -0.7928571428571435,
+        "total_pnl": -5.550000000000004
+      },
+      "London(7-15)": {
+        "n": 17,
+        "wr": 0.4117647058823529,
+        "avg_pnl": 0.38823529411764685,
+        "total_pnl": 6.599999999999996
+      },
+      "NY(13-21)": {
+        "n": 5,
+        "wr": 0.6,
+        "avg_pnl": -2.95,
+        "total_pnl": -14.750000000000002
+      }
+    }
+  },
+  "T28_month_seasonality": {
+    "value": "2 months analyzed",
+    "pass": true,
+    "detail": {
+      "M03": {
+        "n": 21,
+        "wr": 0.47619047619047616,
+        "avg_pnl": 0.9047619047619044
+      },
+      "M04": {
+        "n": 6,
+        "wr": 0.5,
+        "avg_pnl": -1.5750000000000002
+      }
+    }
+  },
+  "T30_london_first_hour": {
+    "value": "n=2 wr=100% avg=+14.2pip",
+    "pass": "True",
+    "detail": {
+      "n": 2,
+      "wr": 1.0,
+      "avg_pnl": 14.225000000000001
+    }
+  },
+  "T31_ny_overlap": {
+    "value": "n=4 wr=50% avg=-5.0pip",
+    "pass": "False",
+    "detail": {
+      "n": 4,
+      "wr": 0.5,
+      "avg_pnl": -5.0375
+    }
+  },
+  "T32_regime_performance": {
+    "value": "2 regimes analyzed",
+    "pass": true,
+    "detail": {
+      "CHOPPY": {
+        "n": 4,
+        "wr": 0.75,
+        "avg_pnl": 1.4124999999999996
+      },
+      "RANGING": {
+        "n": 2,
+        "wr": 0.0,
+        "avg_pnl": -7.55
+      }
+    }
+  },
+  "T33_volatility_bucket_perf": {
+    "value": "{'low': 'wr=33%', 'med': 'wr=67%', 'high': 'wr=44%'}",
+    "pass": true,
+    "detail": {
+      "low": {
+        "n": 9,
+        "wr": 0.3333333333333333,
+        "avg_pnl": 0.4833333333333334
+      },
+      "med": {
+        "n": 9,
+        "wr": 0.6666666666666666,
+        "avg_pnl": 2.7500000000000004
+      },
+      "high": {
+        "n": 9,
+        "wr": 0.4444444444444444,
+        "avg_pnl": -2.1722222222222234
+      }
+    }
+  },
+  "T34_spread_bucket_perf": {
+    "status": "INSUFFICIENT_DATA"
+  },
+  "T35_trend_strength_perf": {
+    "value": "{'weak': {'n': 4, 'wr': 0.5, 'avg_pnl': -5.0375}, 'strong': {'n': 2, 'wr': 0.5, 'avg_pnl': 5.35}}",
+    "pass": true,
+    "detail": {
+      "weak": {
+        "n": 4,
+        "wr": 0.5,
+        "avg_pnl": -5.0375
+      },
+      "strong": {
+        "n": 2,
+        "wr": 0.5,
+        "avg_pnl": 5.35
+      }
+    }
+  },
+  "T36_regime_transition": {
+    "value": "24 transitions in 27 trades",
+    "pass": true,
+    "detail": {
+      "transitions": 24,
+      "trades": 27
+    }
+  },
+  "T41_calmar_ratio": {
+    "value": "11.26 (ann_ret=436pip, maxDD=38.7pip)",
+    "pass": "True",
+    "detail": {
+      "calmar": 11.258882428940572,
+      "ann_return": 435.7187500000001,
+      "max_dd": 38.699999999999996
+    }
+  },
+  "T42_ulcer_index": {
+    "value": "11.10",
+    "pass": false,
+    "detail": {
+      "ulcer_index": 11.101257646629048
+    }
+  },
+  "T46_drawdown_at_risk_95": {
+    "value": "27.6 pips",
+    "pass": true,
+    "detail": {
+      "p95": 27.554999999999996,
+      "max": 38.699999999999996
+    }
+  },
+  "T48_cross_pair_correlation": {
+    "value": "{'audjpy/audusd': 0.483, 'audjpy/mgc': nan, 'audusd/mgc': nan}",
+    "pass": false,
+    "detail": {
+      "audjpy/audusd": 0.483,
+      "audjpy/mgc": NaN,
+      "audusd/mgc": NaN
+    }
+  },
+  "T49_portfolio_equity_curve": {
+    "value": "final=+9.6pip peak=+48.3pip trough=+9.6pip",
+    "pass": "True",
+    "detail": {
+      "final": 9.55000000000001,
+      "peak": 48.25000000000001,
+      "trough": 9.55000000000001,
+      "n_trades": 27
+    }
+  },
+  "T50_kelly_criterion": {
+    "value": "kelly=-20.0% (wr=48% W/L=0.76)",
+    "pass": false,
+    "detail": {
+      "kelly": -0.20020208355109576,
+      "half_kelly": -0.10010104177554788,
+      "wr": 0.48148148148148145,
+      "avg_win": 8.176923076923078,
+      "avg_loss": 10.75,
+      "wl_ratio": 0.7606440071556352
+    }
+  },
+  "T51_diversification_ratio": {
+    "value": "nan (>1 = diversified)",
+    "pass": "False",
+    "detail": {
+      "ratio": NaN,
+      "pair_pnl": {
+        "audjpy": 40.15,
+        "audusd": -17.750000000000004,
+        "usdjpy": 24.45,
+        "mgc": 0.0,
+        "eurjpy": -30.4,
+        "cadjpy": -0.7,
+        "gbpusd": 7.3500000000000005,
+        "eurusd": -13.55
+      }
+    }
+  },
+  "T52_currency_exposure": {
+    "value": "{'aud': 15, 'jpy': 14, 'usd': 11, 'mgc': 4, '': 4, 'eur': 3, 'cad': 1, 'gbp': 2}",
+    "pass": true,
+    "detail": {
+      "aud": 15,
+      "jpy": 14,
+      "usd": 11,
+      "mgc": 4,
+      "": 4,
+      "eur": 3,
+      "cad": 1,
+      "gbp": 2
+    }
+  },
+  "T56_spread_widening_stress": {
+    "value": "1x=+9.6 3x=-44.5",
+    "pass": false,
+    "detail": {
+      "1.0x": {
+        "total_pnl": 9.550000000000002,
+        "wr": 0.48148148148148145
+      },
+      "1.5x": {
+        "total_pnl": -3.9500000000000046,
+        "wr": 0.48148148148148145
+      },
+      "2.0x": {
+        "total_pnl": -17.450000000000006,
+        "wr": 0.48148148148148145
+      },
+      "3.0x": {
+        "total_pnl": -44.45,
+        "wr": 0.37037037037037035
+      }
+    }
+  },
+  "T57_execution_delay_sim": {
+    "value": "0bar=+9.6 3bar=-31.0",
+    "pass": false,
+    "detail": {
+      "1bar": {
+        "total_pnl": -3.9500000000000046,
+        "wr": 0.48148148148148145
+      },
+      "2bar": {
+        "total_pnl": -17.450000000000006,
+        "wr": 0.48148148148148145
+      },
+      "3bar": {
+        "total_pnl": -30.950000000000003,
+        "wr": 0.4444444444444444
+      },
+      "5bar": {
+        "total_pnl": -57.95000000000001,
+        "wr": 0.3333333333333333
+      }
+    }
+  },
+  "T58_partial_fill_impact": {
+    "value": "100%=+9.6 60%=+5.7",
+    "pass": true,
+    "detail": {
+      "100%": 9.550000000000002,
+      "80%": 7.639999999999999,
+      "60%": 5.730000000000002,
+      "40%": 3.8199999999999994
+    }
+  },
+  "T59_requote_rejection_model": {
+    "value": "0%rej=+9.5 10%rej=-30.6",
+    "pass": false,
+    "detail": {
+      "0%": 9.549999999999997,
+      "5%": -10.550000000000004,
+      "10%": -30.60000000000001,
+      "20%": -65.75
+    }
+  },
+  "T69_degrees_of_freedom": {
+    "value": "2.2 trades/param (need >10, have 27 trades / 12 params)",
+    "pass": false,
+    "detail": {
+      "trades": 27,
+      "params": 12,
+      "ratio": 2.25
+    }
+  },
+  "T70_whites_reality_check": {
+    "value": "p=0.498 (NOT significant)",
+    "pass": false,
+    "detail": {
+      "p_value": 0.4978,
+      "n_bootstrap": 5000
+    }
+  },
+  "T71_haircut_in_sample": {
+    "value": "raw=+9.6pip after 30% haircut=+6.7pip",
+    "pass": true,
+    "detail": {
+      "raw": 9.550000000000002,
+      "haircut_pct": 0.3,
+      "adjusted": 6.685000000000001
+    }
+  },
+  "T72_blind_oos_test": {
+    "value": "IS(70%)=+48.2pip OOS(30%)=-38.7pip",
+    "pass": false,
+    "detail": {
+      "in_sample": 48.25,
+      "out_of_sample": -38.7,
+      "is_n": 18,
+      "oos_n": 9
+    }
+  },
+  "T73_strategy_decay": {
+    "value": "1st_half=+2.06 2nd_half=-1.23 decay=-160%",
+    "pass": false,
+    "detail": {
+      "first_half_avg": 2.0576923076923084,
+      "second_half_avg": -1.2285714285714289,
+      "decay_pct": -1.5970627503337782
+    }
+  }
+}

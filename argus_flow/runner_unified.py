@@ -1157,6 +1157,9 @@ class InstrumentRunner:
                 state_dir=log_dir,
             )
             self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
+            # Local LLM reasoning layer (optional — works without ollama)
+            from argus_flow.strategies.llm_reasoning import LocalLLMReasoner
+            self._llm_reasoner = LocalLLMReasoner(symbol=self.symbol, log_dir=log_dir)
         self._bars_since_last_trade: int = 999
         self._consecutive_losses: int = 0
         self._spread_tracker = SpreadTracker(window=120)
@@ -2566,6 +2569,40 @@ class InstrumentRunner:
                         )
                         self._log_signal(features, direction, "AI_OVERLAY_SKIP")
                         direction = None
+                    elif direction and getattr(self, '_llm_reasoner', None) is not None:
+                        # LLM second opinion (non-blocking, optional)
+                        try:
+                            llm_opinion = self._llm_reasoner.evaluate(
+                                direction=direction,
+                                market_state={
+                                    "price": mid, "rsi_14": features.get("rsi_14", 50),
+                                    "rsi_1h": mtf_signal.rsi_1h, "atr_14": features.get("atr_14", 0),
+                                    "spread_pips": getattr(self, '_last_spread_pips', 1.0),
+                                    "volume_ratio": features.get("vol_z", 0) + 1.0,
+                                    "hour": features.get("hour", 12), "day_of_week": now.weekday(),
+                                    "recent_wr": self._recent_win_rate(),
+                                    "consecutive_losses": getattr(self, '_consecutive_losses', 0),
+                                },
+                                mtf_info={
+                                    "trend_4h": mtf_signal.trend_4h, "setup_1h": mtf_signal.setup_1h,
+                                    "trigger_5m": mtf_signal.trigger_5m, "confidence": mtf_signal.confidence,
+                                },
+                                overlay_info={
+                                    "consensus": overlay_decision.consensus_score,
+                                    "voters_for": overlay_decision.voters_for,
+                                    "voters_against": overlay_decision.voters_against,
+                                    "top_reasons": overlay_decision.reason[:100],
+                                },
+                            )
+                            features["llm_action"] = llm_opinion.action
+                            features["llm_confidence"] = llm_opinion.confidence
+                            features["llm_latency_ms"] = llm_opinion.latency_ms
+                            if llm_opinion.available and llm_opinion.action == "SKIP" and llm_opinion.confidence >= 70:
+                                self._log.info(f"LLM VETO: {llm_opinion.reasoning}")
+                                self._log_signal(features, direction, "LLM_VETO")
+                                direction = None
+                        except Exception as _llm_err:
+                            pass  # LLM failure never blocks trading
             else:
                 direction = None
                 if mtf_signal:
