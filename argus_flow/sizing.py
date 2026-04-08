@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger("argus.sizing")
 
 DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD = 0.000067
 
@@ -55,6 +58,11 @@ def fx_units_for_risk(
     raw_units = risk_amount / (stop_pips * pip_value)
     sized = int(raw_units // min_units) * min_units
     if sized < min_units:
+        _log.warning(
+            f"SIZING_ZERO: equity={equity_usd:.2f} risk_pct={risk_pct} "
+            f"stop_pips={stop_pips} raw_units={raw_units:.0f} min_units={min_units} "
+            f"symbol={symbol}"
+        )
         return 0
     if max_units is not None:
         sized = min(sized, max_units)

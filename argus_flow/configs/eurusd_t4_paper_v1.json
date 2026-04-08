@@ -3,6 +3,8 @@
   "version": "paper_v2",
   "symbol": "EURUSD",
   "instrument_type": "forex",
+  "regime_gate": "GATE",
+  "_hour_filter_note": "Effective window: intersection of session [7-17] and profitable_hours. Review with backtest.",
   "ibkr_client_id": 10,
   "eval_timeframe": "5m",
   "strategy_variant": "breakeven",

@@ -14,6 +14,11 @@ def find_swings(
     on each side.  A swing low is a bar whose Low is the lowest Low within
     *order* bars on each side.
 
+    Confirmation is **causal** (no look-ahead): the swing at bar ``i`` is only
+    confirmed once bar ``i + order`` is available -- i.e. after *order* bars of
+    subsequent data confirm that bar ``i`` was indeed the local extremum.
+    At any bar ``j``, only data from bars ``<= j`` is used.
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -33,17 +38,21 @@ def find_swings(
     swing_highs: list[dict] = []
     swing_lows: list[dict] = []
 
-    for i in range(order, n - order):
-        window_h = highs[i - order : i + order + 1]
-        if highs[i] == window_h.max() and np.sum(window_h == highs[i]) == 1:
+    # Iterate j = "current bar" from 2*order onward.  The candidate swing
+    # point is at (j - order), the centre of the window [j - 2*order .. j].
+    # All bars in the window are <= j, so no future data is used.
+    for j in range(2 * order, n):
+        candidate = j - order
+        window_h = highs[j - 2 * order : j + 1]
+        if highs[candidate] == window_h.max() and np.sum(window_h == highs[candidate]) == 1:
             swing_highs.append(
-                {"idx": df.index[i], "price": float(highs[i]), "bar_index": i}
+                {"idx": df.index[candidate], "price": float(highs[candidate]), "bar_index": candidate}
             )
 
-        window_l = lows[i - order : i + order + 1]
-        if lows[i] == window_l.min() and np.sum(window_l == lows[i]) == 1:
+        window_l = lows[j - 2 * order : j + 1]
+        if lows[candidate] == window_l.min() and np.sum(window_l == lows[candidate]) == 1:
             swing_lows.append(
-                {"idx": df.index[i], "price": float(lows[i]), "bar_index": i}
+                {"idx": df.index[candidate], "price": float(lows[candidate]), "bar_index": candidate}
             )
 
     return swing_highs, swing_lows

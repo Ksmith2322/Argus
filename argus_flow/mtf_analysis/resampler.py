@@ -126,8 +126,21 @@ class Resampler:
         bar : dict
             Keys: t (datetime), o, h, l, c, v.
         """
-        t: datetime = bar["t"]
-        o, h, l, c, v = bar["o"], bar["h"], bar["l"], bar["c"], bar["v"]
+        raw_t = bar["t"]
+        if isinstance(raw_t, str):
+            try:
+                t = datetime.fromisoformat(raw_t)
+            except ValueError:
+                t = datetime.strptime(raw_t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+        else:
+            t = raw_t
+        o = bar.get("o", bar.get("open", 0))
+        h = bar.get("h", bar.get("high", 0))
+        l = bar.get("l", bar.get("low", 0))
+        c = bar.get("c", bar.get("close", 0))
+        v = bar.get("v", bar.get("volume", 0))
 
         for tf in TIMEFRAMES:
             minutes = _TF_MINUTES[tf]

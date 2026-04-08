@@ -124,6 +124,10 @@ class BarBuffer:
     def to_df(self) -> pd.DataFrame:
         return pd.DataFrame(self.bars) if self.bars else pd.DataFrame()
 
+    def last(self):
+        """Return the most recent bar, or None if buffer empty."""
+        return self.bars[-1] if self.bars else None
+
     def __len__(self) -> int:
         return len(self.bars)
 
@@ -1056,6 +1060,7 @@ class InstrumentRunner:
         self.min_contracts = int(risk.get("min_contracts", 1))
         self.max_contracts = risk.get("max_contracts")
         self.risk_pct = float(self.risk_policy.get("active_risk_pct", risk.get("risk_pct", 0)) or 0)
+        self.risk_pct = min(self.risk_pct, 0.10)  # Hard cap at 10% per-trade risk
         self.dynamic_position_sizing = self.risk_pct > 0
 
         # Derived: pip size for FX
@@ -1117,14 +1122,43 @@ class InstrumentRunner:
         # Track last feature eval minute to avoid double-evaluation
         self._last_eval_minute: Optional[datetime] = None
 
-        # Fill deduplication
+        # Fill deduplication — persisted to disk for dedup across restarts
         self._processed_fill_ids: set[str] = set()
+        self._fill_ids_file = log_dir / "processed_fill_ids.json"
+        self._load_processed_fill_ids()
 
         # Advanced features: multi-timeframe, spread gate, session scoring, sequencing
         from argus_flow.advanced_features import MultiTimeframeBuffer, SpreadTracker, SessionScorer
         self._mtf = MultiTimeframeBuffer()
         from argus_flow.mtf_analysis import MTFAnalysisEngine
         self._mtf_engine = MTFAnalysisEngine(self.symbol, config)
+
+        # MTF Trend Strategy engine (4H/1H/5M)
+        self._mtf_strategy = None
+        self._ai_overlay = None
+        mtf_cfg = config.get("mtf", {})
+        if mtf_cfg.get("enabled") and config.get("strategy") == "mtf_trend":
+            from argus_flow.strategies.mtf_engine import MTFStrategyEngine
+            self._mtf_strategy = MTFStrategyEngine(
+                symbol=self.symbol,
+                pip_size=self.pip_size,
+                trend_ema_fast=mtf_cfg.get("trend_ema_fast", 8),
+                trend_ema_slow=mtf_cfg.get("trend_ema_slow", 21),
+                rsi_period=mtf_cfg.get("rsi_period", 14),
+                min_trend_strength=mtf_cfg.get("min_trend_strength", 0.5),
+            )
+            self._mtf_min_confidence = mtf_cfg.get("min_confidence", 0.5)
+            self._log.info(f"MTF Trend Strategy enabled (4H/1H/5M, min_conf={self._mtf_min_confidence})")
+            # AI Overlay — adaptive ensemble voter layer on top of MTF signals
+            from argus_flow.strategies.ai_overlay import AdaptiveOverlay
+            self._ai_overlay = AdaptiveOverlay(
+                symbol=self.symbol,
+                pip_size=self.pip_size,
+                state_dir=log_dir,
+            )
+            self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
+        self._bars_since_last_trade: int = 999
+        self._consecutive_losses: int = 0
         self._spread_tracker = SpreadTracker(window=120)
         self._session_scorer = SessionScorer(self.symbol)
         trigger_cfg = config.get("trigger", {})
@@ -1158,6 +1192,25 @@ class InstrumentRunner:
                 return (bid + ask) / 2
             return None
 
+    def _load_processed_fill_ids(self) -> None:
+        """Load previously processed fill IDs from disk for dedup across restarts."""
+        if self._fill_ids_file.exists():
+            try:
+                data = json.loads(self._fill_ids_file.read_text())
+                if isinstance(data, list):
+                    self._processed_fill_ids = set(data[-1000:])
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    def _persist_fill_id(self, fill_id: str) -> None:
+        """Persist fill ID to disk, keeping bounded to last 1000."""
+        self._processed_fill_ids.add(fill_id)
+        bounded = list(self._processed_fill_ids)[-1000:]
+        try:
+            self._fill_ids_file.write_text(json.dumps(bounded))
+        except OSError:
+            pass
+
     def _check_ticker_staleness(self) -> bool:
         """Return True if ticker data is fresh, False if stale. Logs warning on staleness."""
         t = self.ticker
@@ -1170,7 +1223,8 @@ class InstrumentRunner:
             else:
                 last_tick = tick_time if tick_time.tzinfo else tick_time.replace(tzinfo=timezone.utc)
             age_s = (datetime.now(timezone.utc) - last_tick).total_seconds()
-            if age_s > 120:
+            _stale_threshold = int(os.getenv("STALE_TICK_SECONDS", "120"))
+            if age_s > _stale_threshold:
                 if not getattr(self, '_stale_warned', False):
                     self._log.warning(
                         f"STALE TICKER: {self.symbol} last tick {age_s:.0f}s ago — "
@@ -1404,6 +1458,8 @@ class InstrumentRunner:
                 features, direction, action, self.instrument_type,
                 getattr(self, '_config_hash', ''), getattr(self, '_session_id', ''),
             ))
+            f.flush()
+            os.fsync(f.fileno())
         # Log blocked signals as shadow opportunities for counterfactual analysis
         if "BLOCKED" in action or action == "MAINTENANCE_BLACKOUT":
             self._log_opportunity(features, direction, action)
@@ -1557,6 +1613,31 @@ class InstrumentRunner:
         s.had_zero_stops = False
 
         return pnl, pnl_usd
+
+    def _recent_win_rate(self, lookback: int = 10) -> float:
+        """Win rate of last N trades from trade log (for AI overlay)."""
+        trades_file = self.log_dir / "trades.csv"
+        if not trades_file.exists():
+            return 0.5
+        try:
+            with open(trades_file, "r") as f:
+                rows = list(csv.DictReader(f))
+            if not rows:
+                return 0.5
+            recent = rows[-lookback:]
+            wins = sum(1 for r in recent if float(r.get("pnl_pips", r.get("pnl_pts", "0"))) > 0)
+            return wins / len(recent)
+        except Exception:
+            return 0.5
+
+    def _ai_overlay_learn(self, pnl_pips: float) -> None:
+        """Notify the AI overlay of a closed trade so it can update weights."""
+        if self._ai_overlay is not None:
+            try:
+                self._ai_overlay.learn(pnl_pips)
+                self._bars_since_last_trade = 0
+            except Exception as e:
+                self._log.warning(f"AI overlay learn error: {e}")
 
     # ── Feature & trigger dispatch ───────────────────────────
     def _compute_features(self) -> Optional[dict]:
@@ -1949,13 +2030,13 @@ class InstrumentRunner:
             self._log.error(f"REAL_EXIT FAILED: {exc}", exc_info=True)
             return False
 
-    def _cancel_order_by_id(self, order_id: str, label: str) -> None:
-        """Cancel an open order by ID. Verifies cancellation after attempt."""
+    def _cancel_order_by_id(self, order_id: str, label: str) -> bool:
+        """Cancel an open order by ID. Verifies cancellation after attempt. Returns True if confirmed."""
         if not order_id:
-            return
+            return True
         ib = getattr(self, '_ib', None)
         if ib is None:
-            return
+            return False
         try:
             for trade in ib.openTrades():
                 if str(getattr(trade.order, 'orderId', '')) == order_id:
@@ -1973,14 +2054,17 @@ class InstrumentRunner:
                                 f"CANCEL UNCONFIRMED: {label} order {order_id} still in open trades — "
                                 f"orphaned order may fill later"
                             )
+                            return False
                         else:
                             self._log.info(f"CANCEL CONFIRMED {label} order {order_id}")
+                            return True
                     except Exception:
-                        pass
-                    return
+                        return False
             self._log.debug(f"Cancel {label} order {order_id}: not found in open trades (may already be done)")
+            return True
         except Exception as exc:
             self._log.warning(f"Cancel {label} order {order_id} failed: {exc}")
+            return False
 
     def _on_fill(self, trade, fill) -> None:
         """Callback when an order fills. Routes to entry/exit handling."""
@@ -1989,7 +2073,7 @@ class InstrumentRunner:
         if fill_id in self._processed_fill_ids:
             self._log.warning(f"Duplicate fill ignored: {fill_id}")
             return
-        self._processed_fill_ids.add(fill_id)
+        self._persist_fill_id(fill_id)
 
         s = self.state
         order_id = str(getattr(trade.order, 'orderId', ''))
@@ -2002,8 +2086,8 @@ class InstrumentRunner:
             f"symbol={self.symbol}"
         )
 
-        # ── Entry fill ──
-        if order_id == s.entry_order_id and s.entry_pending:
+        # ── Entry fill (including subsequent partial fills on same order) ──
+        if order_id == s.entry_order_id and (s.entry_pending or s.position != "FLAT"):
             s.entry_pending = False
             s.entry_fill_px = fill_px
             direction = getattr(self, '_pending_direction', 'long')
@@ -2022,7 +2106,20 @@ class InstrumentRunner:
             s.last_signal_time = now
             s.trade_count += 1
             s.direction_str = direction
-            s.position_size = fill_qty  # Use actual filled quantity, not requested size
+            # Handle partial fills: accumulate if position already open, else first fill
+            if s.position_size > 0 and s.entry_price > 0:
+                # Subsequent partial fill — accumulate
+                old_qty = s.position_size
+                s.entry_price = ((old_qty * s.entry_price) + (fill_qty * fill_px)) / (old_qty + fill_qty)
+                s.avg_entry_price = s.entry_price
+                s.position_size = old_qty + fill_qty
+                self._log.info(
+                    f"PARTIAL FILL ACCUMULATED: +{fill_qty} -> total={s.position_size} "
+                    f"avg_entry={s.entry_price:.5f}"
+                )
+            else:
+                # First fill
+                s.position_size = fill_qty
             # Reset trailing/breakeven state for new position
             self._peak_favorable_pips = 0.0
             self._breakeven_activated = False
@@ -2103,6 +2200,11 @@ class InstrumentRunner:
             f"pnl={pnl:+.2f}{unit} (${pnl_usd:+.2f}) total={total:+.2f}{unit} "
             f"trades={s.trade_count}"
         )
+
+        # AI overlay learning — update voter weights from trade outcome
+        if self.uses_pips:
+            self._ai_overlay_learn(pnl)
+            self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
 
         # Flatten state
         s.position = "FLAT"
@@ -2288,6 +2390,10 @@ class InstrumentRunner:
             self.buf.add(self.current_bar)
             self._mtf.on_bar_close(self.current_bar)
             self._mtf_engine.on_bar({"t": self.current_bar.get("ts"), **self.current_bar})
+            # Feed MTF Trend Strategy engine (resamples 1m -> 5m/1H/4H internally)
+            if self._mtf_strategy is not None:
+                self._mtf_strategy.update_bar(self.current_bar)
+            self._bars_since_last_trade += 1
             new_bar_closed = True
             self.current_bar_minute = bar_minute
             self.current_bar = {
@@ -2370,6 +2476,10 @@ class InstrumentRunner:
                     f"pnl={pnl:+.2f}{unit} (${pnl_usd:+.2f}) total={total:+.2f}{unit} "
                     f"trades={s.trade_count}"
                 )
+                # AI overlay learning — update voter weights from trade outcome
+                if self.uses_pips:
+                    self._ai_overlay_learn(pnl)
+                    self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
                 s.position = "FLAT"
                 s.entry_time = None
                 s.timeout_time = None
@@ -2406,7 +2516,62 @@ class InstrumentRunner:
         if features is None:
             return
 
-        direction = self._check_trigger(features)
+        # MTF Trend Strategy: use 4H/1H/5M engine instead of range_accel trigger
+        if self._mtf_strategy is not None:
+            mtf_signal = self._mtf_strategy.evaluate(mid)
+            if mtf_signal is not None and mtf_signal.confidence >= self._mtf_min_confidence:
+                direction = mtf_signal.direction
+                features["mtf_trend_4h"] = mtf_signal.trend_4h
+                features["mtf_setup_1h"] = mtf_signal.setup_1h
+                features["mtf_trigger_5m"] = mtf_signal.trigger_5m
+                features["mtf_confidence"] = mtf_signal.confidence
+                features["mtf_reason"] = mtf_signal.reason
+                features["mtf_support"] = mtf_signal.support
+                features["mtf_resistance"] = mtf_signal.resistance
+                self._log.info(f"MTF SIGNAL: {direction} {mtf_signal.reason}")
+
+                # ── AI Overlay gate ──────────────────────────────
+                if self._ai_overlay is not None and direction is not None:
+                    from argus_flow.strategies.ai_overlay import MarketState
+                    ai_state = MarketState(
+                        price=mid,
+                        atr_14=features.get("atr_14", 0.0),
+                        rsi_14=features.get("rsi_14", 50.0),
+                        spread_pips=getattr(self, '_last_spread_pips', 1.0),
+                        volume_ratio=features.get("vol_z", 0.0) + 1.0,
+                        dist_from_high_20=1.0 - features.get("dist_from_low", 0.5),
+                        dist_from_low_20=features.get("dist_from_low", 0.5),
+                        ema_8_slope=features.get("trend_strength", 0.0),
+                        ema_21_slope=features.get("efficiency_ratio", 0.0),
+                        hour=features.get("hour", 12),
+                        day_of_week=now.weekday(),
+                        bars_since_last_trade=getattr(self, '_bars_since_last_trade', 999),
+                        recent_win_rate=self._recent_win_rate(),
+                        recent_pnl=self.state.pnl_pips,
+                        consecutive_losses=getattr(self, '_consecutive_losses', 0),
+                        trend_strength_4h=abs(mtf_signal.ema_8_4h - mtf_signal.ema_21_4h) / self.pip_size if self.pip_size > 0 else 0.0,
+                        rsi_1h=mtf_signal.rsi_1h,
+                        confidence_mtf=mtf_signal.confidence,
+                    )
+                    overlay_decision = self._ai_overlay.evaluate(direction, ai_state)
+                    features["ai_action"] = overlay_decision.action
+                    features["ai_consensus"] = overlay_decision.consensus_score
+                    features["ai_confidence"] = overlay_decision.confidence
+                    features["ai_for"] = overlay_decision.voters_for
+                    features["ai_against"] = overlay_decision.voters_against
+                    if overlay_decision.action == "SKIP":
+                        self._log.info(
+                            f"AI OVERLAY SKIP: consensus={overlay_decision.consensus_score:+.2f} "
+                            f"({overlay_decision.voters_for}v{overlay_decision.voters_against}) | {overlay_decision.reason}"
+                        )
+                        self._log_signal(features, direction, "AI_OVERLAY_SKIP")
+                        direction = None
+            else:
+                direction = None
+                if mtf_signal:
+                    features["mtf_blocked"] = f"low_conf={mtf_signal.confidence:.0%}"
+        else:
+            direction = self._check_trigger(features)
 
         # ── Hour filter gate (backtested +144% PnL) ──────────
         if direction and self._profitable_hours is not None:
@@ -2880,6 +3045,11 @@ class InstrumentRunner:
             except Exception as _e:
                 self._log.warning(f"MTF engine seed failed: {_e}")
 
+        # Seed MTF Trend Strategy engine with historical bars
+        if self._mtf_strategy is not None and seed_rows:
+            self._mtf_strategy.seed(seed_rows)
+            self._log.info(f"MTF Trend Strategy seeded with {len(seed_rows)} bars")
+
         self._log.info(f"Seeded {len(self.buf)} bars")
 
 
@@ -3263,9 +3433,20 @@ class PortfolioRiskManager:
                     log.warning(f"DRAWDOWN BREAKER: {dd:.1%} from peak. ALL entries paused.")
                     self._drawdown_pause = True
                 return False, "DRAWDOWN_PAUSE"
-            if self._drawdown_pause and dd < 0.01:
-                log.info("DRAWDOWN BREAKER: recovered. Entries resumed.")
-                self._drawdown_pause = False
+            if self._drawdown_pause:
+                # Only reset at session boundary (midnight UTC) or via manual flag file
+                reset_file = REPO / "RESET_DRAWDOWN"
+                now_utc = datetime.now(timezone.utc)
+                session_reset = (now_utc.hour == 0 and now_utc.minute < 2)
+                manual_reset = reset_file.exists()
+                if session_reset or manual_reset:
+                    log.info(f"DRAWDOWN BREAKER: reset ({'session_boundary' if session_reset else 'manual_flag'}). Entries resumed.")
+                    self._drawdown_pause = False
+                    if manual_reset:
+                        try:
+                            reset_file.unlink()
+                        except OSError:
+                            pass
         if self._drawdown_pause:
             return False, "DRAWDOWN_PAUSE"
 
@@ -3590,10 +3771,16 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
     if runtime_mode == RuntimeMode.RECOVERY_REQUIRED:
         log.error("RECOVERY REQUIRED: unresolved broker mismatch detected")
-        log.error("New entries BLOCKED until manual review. Monitor will continue.")
-        # Don't exit -- keep running for monitoring, but block entries
+        log.error("Mismatched instruments BLOCKED until manual review. Monitor will continue.")
+        # Only block the specific instruments with mismatches (not entire fleet)
         for inst in instruments:
-            inst._entries_blocked = True
+            r = recon_results.get(inst.symbol, {})
+            r_result = r.get("result", "") if isinstance(r, dict) else getattr(r, "result", "")
+            if str(r_result) in ("LOCAL_FLAT_BROKER_OPEN", "UNRESOLVED", "RECOVERY_REQUIRED"):
+                inst._entries_blocked = True
+                log.error(f"  BLOCKED: {inst.symbol} ({r_result})")
+            else:
+                inst._entries_blocked = False
     else:
         for inst in instruments:
             inst._entries_blocked = False
@@ -3656,6 +3843,52 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                 break
 
     ib.execDetailsEvent += _route_fill_to_runner
+
+    def _route_order_status_to_runner(trade):
+        """Route IB order status events (Rejected/Cancelled) to correct runner."""
+        status_str = getattr(trade.orderStatus, 'status', '') if trade.orderStatus else ''
+        if status_str not in ('Rejected', 'Cancelled'):
+            return
+        trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
+        order_id = str(getattr(trade.order, 'orderId', ''))
+        for inst in instruments:
+            if inst.execution_mode != "real":
+                continue
+            inst_key = _runner_to_ib_key(inst)
+            if trade_key != inst_key:
+                continue
+            s = inst.state
+            if order_id == s.entry_order_id:
+                inst._log.critical(
+                    f"ORDER {status_str.upper()}: entry order {order_id} — "
+                    f"clearing entry_pending, forcing FLAT"
+                )
+                s.entry_pending = False
+                s.entry_order_id = ""
+                s.entry_submitted_ts = ""
+                s.position = "FLAT"
+                s.save()
+            elif order_id in (s.stop_order_id, s.target_order_id):
+                inst._log.critical(
+                    f"ORDER {status_str.upper()}: bracket order {order_id} — "
+                    f"position {s.position} may be unhedged, resubmitting brackets"
+                )
+                ok = inst._submit_bracket_orders(s.stop_price, s.target_price)
+                if not ok:
+                    inst._log.critical("BRACKET RESUBMIT FAILED — submitting emergency exit")
+                    mid = inst._get_mid()
+                    if mid:
+                        inst._submit_real_exit("bracket_rejected", mid)
+            elif order_id == s.exit_order_id:
+                inst._log.critical(
+                    f"ORDER {status_str.upper()}: exit order {order_id} — retrying exit"
+                )
+                mid = inst._get_mid()
+                if mid:
+                    inst._submit_real_exit("exit_retry_after_reject", mid)
+            break
+
+    ib.orderStatusEvent += _route_order_status_to_runner
 
     # -- Seed historical data -----------------------------------------
     log.info("Seeding historical bars...")

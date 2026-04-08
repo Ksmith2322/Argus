@@ -23,6 +23,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import math
+
+import numpy as np
 import pandas as pd
 
 # Import EXACT same logic as the live runner
@@ -79,6 +82,11 @@ def run_backtest(
     config: dict,
     bars: pd.DataFrame,
     override_params: dict | None = None,
+    *,
+    slippage_pips: float = 1.0,
+    commission_per_lot_usd: float = 2.0,
+    friday_close: bool = True,
+    initial_equity: float = 10000.0,
 ) -> dict:
     """Run a single backtest.
 
@@ -123,13 +131,50 @@ def run_backtest(
     from argus_flow.runner_unified import InstrumentRunner
     regime_compatible = InstrumentRunner._regime_compatible
 
+    # Backtest cost model: slippage applied to fills, commission deducted from PnL
+    bt_cfg = cfg.get("backtest", {})
+    _slippage_pips = bt_cfg.get("slippage_pips", slippage_pips)
+    _commission_usd = bt_cfg.get("commission_per_lot_usd", commission_per_lot_usd)
+    _friday_close = bt_cfg.get("friday_close", friday_close)
+    _initial_equity = bt_cfg.get("initial_equity", initial_equity)
+    _FRIDAY_CLOSE_MINUTE = 20 * 60 + 45  # 20:45 UTC — matches live runner
+
+    def _apply_slippage(price: float, direction: str, side: str) -> float:
+        """Worsen fill price by slippage. side='entry' or 'exit'."""
+        if _slippage_pips <= 0:
+            return price
+        slip = _slippage_pips * pip_size if is_fx else price * (_slippage_pips / 10000)
+        if side == "entry":
+            return price + slip if direction == "long" else price - slip
+        else:  # exit
+            return price - slip if direction == "long" else price + slip
+
     buf = BarBuffer(maxlen=300)
     state = BacktestState()
     trades: list[BacktestTrade] = []
     signals_log: list[dict] = []
+    skipped_bars = 0
+    gap_count = 0
 
     bars = bars.reset_index(drop=True)
     total_bars = len(bars)
+
+    # Candle gap detection
+    if total_bars > 1:
+        try:
+            ts_series = pd.to_datetime(bars["ts"], utc=True)
+            diffs = ts_series.diff().dt.total_seconds()
+            gaps = diffs[diffs > 120]  # gaps > 2 minutes
+            gap_count = len(gaps)
+            if gap_count > 0:
+                import logging
+                _bt_log = logging.getLogger("argus.backtest")
+                for idx, gap_s in list(gaps.items())[:10]:
+                    _bt_log.warning(f"CANDLE_GAP: {gap_s:.0f}s gap at row {idx} ({bars['ts'].iloc[idx]})")
+                if gap_count > 10:
+                    _bt_log.warning(f"... and {gap_count - 10} more gaps")
+        except Exception:
+            pass
 
     def compute_features():
         if instrument_type in ("future", "crypto"):
@@ -189,14 +234,22 @@ def run_backtest(
 
     for i in range(total_bars):
         row = bars.iloc[i]
-        bar = {
-            "ts": str(row["ts"]),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-            "volume": float(row.get("volume", 0)),
-        }
+        try:
+            bar = {
+                "ts": str(row["ts"]),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0)),
+            }
+        except (ValueError, TypeError):
+            skipped_bars += 1
+            continue
+        # Price validation
+        if bar["high"] < bar["low"] or bar["close"] <= 0 or bar["open"] <= 0:
+            skipped_bars += 1
+            continue
         buf.add(bar)
 
         try:
@@ -210,7 +263,7 @@ def run_backtest(
         # ── Execute pending entry at this bar's OPEN ──
         # Signal was from PRIOR bar. Entry at THIS bar's open = no look-ahead.
         if pending_direction is not None and state.position == "FLAT":
-            entry_px = bar["open"]
+            entry_px = _apply_slippage(bar["open"], pending_direction, "entry")
             direction = pending_direction
             stop_px, target_px = compute_stops(entry_px, direction)
 
@@ -261,6 +314,14 @@ def run_backtest(
                 exit_reason = "timeout"
                 exit_px = bar["close"]
 
+            # FX Friday close: force-exit before weekend (matches live runner)
+            if not exit_reason and _friday_close and is_fx:
+                if now.weekday() == 4:  # Friday
+                    utc_min = now.hour * 60 + now.minute
+                    if utc_min >= _FRIDAY_CLOSE_MINUTE:
+                        exit_reason = "friday_close"
+                        exit_px = bar["close"]
+
             # Trailing stop (uses close, matching live mid-based logic)
             if not exit_reason and state.initial_risk > 0:
                 risk_dist = state.initial_risk
@@ -280,8 +341,15 @@ def run_backtest(
                         state.stop_price = min(state.stop_price, state.entry_price)
 
             if exit_reason:
+                # Apply slippage to exit (stop/target fill at stated price + slip)
+                if exit_reason not in ("stop", "target"):
+                    exit_px = _apply_slippage(exit_px, state.direction, "exit")
                 if is_fx:
                     pnl = (exit_px - state.entry_price) / pip_size if state.position == "LONG" else (state.entry_price - exit_px) / pip_size
+                    # Deduct commission (convert USD commission to pips for a standard 100K lot)
+                    # $2 commission on EURUSD 100K lot: 1 pip = $10, so $2 = 0.2 pips
+                    if _commission_usd > 0:
+                        pnl -= _commission_usd / (pip_size * 100000)
                 else:
                     pnl = exit_px - state.entry_price if state.position == "LONG" else state.entry_price - exit_px
 
@@ -374,6 +442,24 @@ def run_backtest(
         dd = peak - equity
         max_dd = max(max_dd, dd)
 
+    # Sharpe and Sortino ratios (annualized, using trade returns)
+    sharpe = 0.0
+    sortino = 0.0
+    if len(pnls) >= 2:
+        pnl_arr = np.array(pnls, dtype=float)
+        mean_ret = float(np.mean(pnl_arr))
+        std_ret = float(np.std(pnl_arr, ddof=1))
+        if std_ret > 0:
+            sharpe = (mean_ret / std_ret) * math.sqrt(252)
+        downside = pnl_arr[pnl_arr < 0]
+        if len(downside) > 0:
+            downside_std = float(np.std(downside, ddof=1)) if len(downside) > 1 else abs(float(downside[0]))
+            if downside_std > 0:
+                sortino = (mean_ret / downside_std) * math.sqrt(252)
+
+    # Equity-based max drawdown percentage
+    max_dd_pct = (max_dd / _initial_equity * 100) if _initial_equity > 0 else 0.0
+
     metrics = {
         "count": len(trades),
         "net_pnl": round(net, 2),
@@ -383,8 +469,16 @@ def run_backtest(
         "avg_win": round(avg_win, 2),
         "avg_loss": round(avg_loss, 2),
         "max_drawdown": round(max_dd, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "sharpe": round(sharpe, 4),
+        "sortino": round(sortino, 4),
         "exits": exit_counts,
         "avg_duration_min": round(sum(t.duration_min for t in trades) / len(trades), 1),
+        "slippage_pips": _slippage_pips,
+        "commission_per_lot_usd": _commission_usd,
+        "initial_equity": _initial_equity,
+        "gap_count": gap_count,
+        "skipped_bars": skipped_bars,
     }
 
     return {
