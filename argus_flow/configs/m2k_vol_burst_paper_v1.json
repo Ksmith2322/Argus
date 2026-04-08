@@ -1,45 +1,47 @@
 {
-    "strategy": "vol_burst",
-    "version": "paper_v1",
-    "symbol": "M2K",
-    "instrument_type": "future",
-    "ibkr_client_id": 27,
-    "trigger": {
-        "vol_burst_z_min": 1.0,
-        "range_accel_min": 0.0,
-        "session_start_utc": 13,
-        "session_end_utc": 20
-    },
-    "risk": {
-        "stop_bps": 50,
-        "target_bps": 100,
-        "timeout_minutes": 60,
-        "min_signal_gap_minutes": 15,
-        "num_contracts": 1
-    },
-    "direction": {
-        "dist_long_threshold": 0.4,
-        "dist_short_threshold": 0.6
-    },
-    "replay_expectations": {
-        "signals_per_day": 5.0,
-        "win_rate": 0.48,
-        "exp_bps_per_trade": 1.5,
-        "signals_per_day_range": [
-            1,
-            20
-        ],
-        "win_rate_range": [
-            0.35,
-            0.65
-        ]
-    },
-    "exchange": "CME",
-    "expiry": "202606",
-    "deployment": {
-        "managed": true,
-        "stage": "killed",
-        "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
-        "onboarded_by": "auto_onboard_cleanup"
-    }
+  "strategy": "vol_burst",
+  "version": "paper_v1",
+  "symbol": "M2K",
+  "instrument_type": "future",
+  "ibkr_client_id": 27,
+  "trigger": {
+    "vol_burst_z_min": 1.0,
+    "range_accel_min": 0.0,
+    "session_start_utc": 13,
+    "session_end_utc": 20
+  },
+  "risk": {
+    "stop_bps": 50,
+    "target_bps": 100,
+    "timeout_minutes": 60,
+    "min_signal_gap_minutes": 15,
+    "num_contracts": 1
+  },
+  "direction": {
+    "dist_long_threshold": 0.4,
+    "dist_short_threshold": 0.6
+  },
+  "replay_expectations": {
+    "signals_per_day": 5.0,
+    "win_rate": 0.48,
+    "exp_bps_per_trade": 1.5,
+    "signals_per_day_range": [
+      1,
+      20
+    ],
+    "win_rate_range": [
+      0.35,
+      0.65
+    ]
+  },
+  "exchange": "CME",
+  "expiry": "202606",
+  "deployment": {
+    "managed": true,
+    "stage": "killed",
+    "onboarded_at": "2026-04-02T21:22:29.679185+00:00",
+    "onboarded_by": "auto_onboard_cleanup"
+  },
+  "stage": "killed",
+  "_killed_reason": "No edge in backtests (PF < 1.0). Futures graveyard 2026-04-07."
 }

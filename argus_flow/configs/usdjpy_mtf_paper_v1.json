@@ -5,11 +5,11 @@
   "instrument_type": "forex",
   "ibkr_client_id": 53,
   "direction": "both",
-  "stage": "watcher",
+  "stage": "paper",
   "eval_timeframe": "5m",
   "strategy_variant": "mtf_4h_1h_5m",
   "regime_gate": "LOG_ONLY",
-  "_note": "MTF strategy watcher. Consistently profitable across R:R configs (PF 1.31-1.55).",
+  "_note": "PROMOTED: BT PF 1.39 on 787 trades. +24.4pip live. MTF+AI overlay active.",
   "mtf": {
     "enabled": true,
     "trend_ema_fast": 8,
@@ -36,7 +36,18 @@
   },
   "hour_filter": {
     "enabled": true,
-    "hours": [0, 1, 3, 4, 7, 8, 14, 15, 20, 22]
+    "hours": [
+      0,
+      1,
+      3,
+      4,
+      7,
+      8,
+      14,
+      15,
+      20,
+      22
+    ]
   },
   "replay_expectations": {
     "signals_per_day": 1.5,

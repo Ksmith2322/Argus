@@ -8,8 +8,8 @@
   "eval_timeframe": "5m",
   "strategy_variant": "mtf_4h_1h_5m",
   "regime_gate": "LOG_ONLY",
-  "stage": "watcher",
-  "_note": "MTF strategy: 4H trend + 1H confirmation + 5M execution. Observation-only until validated.",
+  "stage": "paper",
+  "_note": "PROMOTED: Best live performer +40.1pip 78% WR on 9 trades. MTF+AI overlay active.",
   "mtf": {
     "enabled": true,
     "trend_ema_fast": 8,
@@ -36,14 +36,25 @@
   },
   "hour_filter": {
     "enabled": true,
-    "hours": [0, 1, 3, 4, 7, 8, 14, 15, 20, 22]
+    "hours": [
+      0,
+      1,
+      3,
+      4,
+      7,
+      8,
+      14,
+      15,
+      20,
+      22
+    ]
   },
   "replay_expectations": {
     "signals_per_day": 1.0,
     "win_rate": 0.47,
     "stop_rate": 0.47,
     "target_rate": 0.33,
-    "timeout_rate": 0.20,
+    "timeout_rate": 0.2,
     "exp_pips_per_trade": 4.28
   }
 }

@@ -9,7 +9,7 @@
   "strategy_variant": "mtf_4h_1h_5m",
   "regime_gate": "LOG_ONLY",
   "stage": "watcher",
-  "_note": "MTF strategy: 4H trend + 1H confirmation + 5M execution. Observation-only until validated.",
+  "_note": "WATCHER: Only 1 trade. Keep observing. BT PF 1.01, high WR but thin edge.",
   "mtf": {
     "enabled": true,
     "trend_ema_fast": 8,
@@ -36,7 +36,15 @@
   },
   "hour_filter": {
     "enabled": true,
-    "hours": [0, 1, 4, 8, 14, 15, 20]
+    "hours": [
+      0,
+      1,
+      4,
+      8,
+      14,
+      15,
+      20
+    ]
   },
   "replay_expectations": {
     "signals_per_day": 1.0,
