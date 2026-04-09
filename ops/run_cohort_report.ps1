@@ -25,6 +25,17 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running Ares sector rotation..."
+    $aresOutput = & $python -m ares.runner --dry-run 2>&1
+    foreach ($line in @($aresOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] ares: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] ares WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Titan scanner (refresh + long-only)..."
     $titanOutput = & $python -m titan.ops.scanner --refresh --long-only 2>&1
     foreach ($line in @($titanOutput)) {
