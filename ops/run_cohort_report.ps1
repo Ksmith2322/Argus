@@ -25,6 +25,17 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running Hermes gap scanner..."
+    $hermesOutput = & $python -m hermes.runner --dry-run --min-score 75 2>&1
+    foreach ($line in @($hermesOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] hermes: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] hermes WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Ares sector rotation..."
     $aresOutput = & $python -m ares.runner --dry-run 2>&1
     foreach ($line in @($aresOutput)) {
