@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 REPO = Path(__file__).resolve().parents[2]
@@ -28,6 +29,7 @@ load_dotenv(REPO / ".env")
 
 from titan.ops.data_pipeline import UNIVERSE, download_universe, get_data
 from titan.strategies.swing_engine import SwingEngine
+from titan.strategies.ai_overlay import SwingOverlay, SwingMarketState
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 LOGS_DIR = REPO / "titan" / "logs"
@@ -39,8 +41,9 @@ FOCUS_SYMBOLS = ["GLD", "GDX", "PLTR", "MRNA", "QQQ", "SPY", "SLV", "TSLA", "MAR
 def scan_signals(symbols: list[str] | None = None,
                  long_only: bool = False,
                  min_strength: int = 60) -> list[dict]:
-    """Evaluate all symbols and return active signals."""
+    """Evaluate all symbols and return active signals with AI overlay scoring."""
     engine = SwingEngine({"min_signal_strength": min_strength})
+    overlay = SwingOverlay(symbol="FLEET", state_dir=LOGS_DIR)
     syms = symbols or FOCUS_SYMBOLS
     signals = []
 
@@ -58,6 +61,37 @@ def scan_signals(symbols: list[str] | None = None,
         if long_only and signal.direction == "short":
             continue
 
+        # AI overlay evaluation
+        close = daily["Close"].values
+        volume = daily["Volume"].values if "Volume" in daily.columns else [0]
+        vol_20 = pd.Series(volume).rolling(20).mean().values
+        ema_50 = pd.Series(close).ewm(span=50).mean().values
+        ema_200 = pd.Series(close).ewm(span=200).mean().values
+        i = len(close) - 1
+        vol_ratio = volume[i] / vol_20[i] if vol_20[i] > 0 and not np.isnan(vol_20[i]) else 1.0
+        dist_ema50 = (close[i] - ema_50[i]) / ema_50[i] * 100 if ema_50[i] > 0 else 0
+        ret_5d = (close[i] / close[max(0, i - 5)] - 1) * 100 if i >= 5 else 0
+        ret_20d = (close[i] / close[max(0, i - 20)] - 1) * 100 if i >= 20 else 0
+
+        ai_state = SwingMarketState(
+            price=signal.entry_price,
+            atr_pct=signal.atr_pct,
+            rsi_daily=signal.rsi_daily,
+            volume_ratio=vol_ratio,
+            bb_pctile=signal.bb_pctile,
+            dist_from_ema50_pct=dist_ema50,
+            ema_aligned=signal.daily_trend == "UP",
+            above_ema200=close[i] > ema_200[i] if i < len(ema_200) else False,
+            adx=0,  # ADX computed inside engine, use signal context
+            day_of_week=datetime.now().weekday(),
+            signal_strength=signal.strength,
+            strategy_type=signal.strategy,
+            sector=UNIVERSE.get(sym, {}).get("sector", "") if isinstance(UNIVERSE.get(sym), dict) else UNIVERSE.get(sym, ""),
+            return_5d=ret_5d,
+            return_20d=ret_20d,
+        )
+        ai_decision = overlay.evaluate(signal.direction, ai_state)
+
         signals.append({
             "symbol": signal.symbol,
             "direction": signal.direction.upper(),
@@ -70,8 +104,13 @@ def scan_signals(symbols: list[str] | None = None,
             "daily_trend": signal.daily_trend,
             "rsi": signal.rsi_daily,
             "atr_pct": signal.atr_pct,
-            "volume": signal.volume_ratio,
+            "volume": vol_ratio,
             "reason": signal.reason,
+            "ai_action": ai_decision.action,
+            "ai_consensus": ai_decision.consensus_score,
+            "ai_for": ai_decision.voters_for,
+            "ai_against": ai_decision.voters_against,
+            "ai_reason": ai_decision.reason,
         })
 
     signals.sort(key=lambda s: s["strength"], reverse=True)
@@ -94,9 +133,10 @@ def format_discord(signals: list[dict]) -> str:
         lines.append(f"**ACTIVE SIGNALS ({len(hot)}):**")
         for s in hot:
             risk_pct = abs(s["entry"] - s["stop"]) / s["entry"] * 100
+            ai_tag = f"AI:{s.get('ai_action','?')}({s.get('ai_consensus',0):+.2f})"
             lines.append(
                 f"  **{s['symbol']}** {s['direction']} [{s['strategy']}] "
-                f"score={s['strength']}\n"
+                f"score={s['strength']} {ai_tag}\n"
                 f"    Entry: ${s['entry']} | Stop: ${s['stop']} ({risk_pct:.1f}% risk) | "
                 f"Target: ${s['target']} | R:R {s['rr']}\n"
                 f"    RSI={s['rsi']:.0f} | ATR={s['atr_pct']:.1f}% | {s['reason']}"

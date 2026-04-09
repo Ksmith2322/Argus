@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO))
 
 from titan.ops.data_pipeline import UNIVERSE, DATA_DIR, get_data
 from titan.strategies.swing_engine import SwingEngine, SwingSignal
+from titan.strategies.ai_overlay import SwingOverlay, SwingMarketState
 
 RESULTS_DIR = REPO / "titan" / "data" / "backtest_results"
 
@@ -37,6 +38,8 @@ class SwingBacktester:
         self.min_strength = cfg.get("min_strength", 60)
         self.max_hold_days = cfg.get("max_hold_days", 20)
         self.warmup_bars = cfg.get("warmup_bars", 60)
+        self.use_ai = cfg.get("use_ai", False)
+        self._overlay = SwingOverlay(symbol="BACKTEST", state_dir=RESULTS_DIR) if self.use_ai else None
 
     def run(self, symbol: str, daily: pd.DataFrame,
             h4: pd.DataFrame | None = None,
@@ -103,6 +106,9 @@ class SwingBacktester:
                         "risk_reward": position["risk_reward"],
                         "reason": position["reason"],
                     })
+                    # AI overlay learning
+                    if self._overlay is not None:
+                        self._overlay.learn(pnl_pct)
                     position = None
 
             # Evaluate for new entry (only if flat)
@@ -129,6 +135,30 @@ class SwingBacktester:
                 if signal and signal.strength >= self.min_strength:
                     if strategy_filter and signal.strategy != strategy_filter:
                         continue
+
+                    # AI overlay gate
+                    ai_action = "TAKE"
+                    if self._overlay is not None:
+                        close_arr = daily_slice["Close"].values
+                        ema_50 = pd.Series(close_arr).ewm(span=50).mean().values
+                        ema_200 = pd.Series(close_arr).ewm(span=200).mean().values
+                        ai_state = SwingMarketState(
+                            price=signal.entry_price,
+                            atr_pct=signal.atr_pct,
+                            rsi_daily=signal.rsi_daily,
+                            volume_ratio=signal.volume_ratio,
+                            bb_pctile=signal.bb_pctile,
+                            dist_from_ema50_pct=(close_arr[-1] - ema_50[-1]) / ema_50[-1] * 100 if ema_50[-1] > 0 else 0,
+                            ema_aligned=signal.daily_trend == "UP",
+                            above_ema200=close_arr[-1] > ema_200[-1] if len(ema_200) > 0 else False,
+                            signal_strength=signal.strength,
+                            strategy_type=signal.strategy,
+                            day_of_week=bar_date.weekday() if hasattr(bar_date, 'weekday') else 2,
+                        )
+                        ai_decision = self._overlay.evaluate(signal.direction, ai_state)
+                        ai_action = ai_decision.action
+                        if ai_action == "SKIP":
+                            continue
 
                     position = {
                         "direction": signal.direction,
@@ -192,12 +222,13 @@ def main():
     parser.add_argument("--strategy", help="Filter to one strategy (TREND_FOLLOW, BREAKOUT, MEAN_REVERSION, TRENDLINE)")
     parser.add_argument("--min-strength", type=int, default=60, help="Min signal strength (default: 60)")
     parser.add_argument("--max-hold", type=int, default=20, help="Max hold days (default: 20)")
+    parser.add_argument("--ai", action="store_true", help="Enable AI overlay filtering")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     symbols = args.symbols or [s for s, info in UNIVERSE.items() if info["tier"] <= 2]
-    config = {"min_strength": args.min_strength, "max_hold_days": args.max_hold}
+    config = {"min_strength": args.min_strength, "max_hold_days": args.max_hold, "use_ai": args.ai}
     bt = SwingBacktester(config)
 
     print(f"{'=' * 70}")

@@ -25,6 +25,28 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running Titan scanner (refresh + long-only)..."
+    $titanOutput = & $python -m titan.ops.scanner --refresh --long-only 2>&1
+    foreach ($line in @($titanOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] titan_scanner: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] titan_scanner WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running Titan runner (check exits + evaluate entries)..."
+    $titanRunnerOutput = & $python -m titan.runner --dry-run 2>&1
+    foreach ($line in @($titanRunnerOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] titan_runner: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] titan_runner WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running nightly analysis..."
     $analysisOutput = & $python -m argus_flow.ops.nightly_analysis --no-llm 2>&1
     foreach ($line in @($analysisOutput)) {
