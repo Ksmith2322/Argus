@@ -35,7 +35,8 @@
     "max_lot_size": 50000
   },
   "hour_filter": {
-    "enabled": true,
+    "enabled": false,
+    "_note": "Disabled 2026-04-09: calibrated for range_accel not MTF. Re-enable after 50+ trades.",
     "hours": [
       0,
       1,

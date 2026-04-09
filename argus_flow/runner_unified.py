@@ -1123,7 +1123,8 @@ class InstrumentRunner:
         self.num_contracts = risk.get("num_contracts", 1)
         self.min_contracts = int(risk.get("min_contracts", 1))
         self.max_contracts = risk.get("max_contracts")
-        self.risk_pct = float(self.risk_policy.get("active_risk_pct", risk.get("risk_pct", 0)) or 0)
+        # Use config risk_pct for sizing (not registry active_risk_pct which is a fleet policy)
+        self.risk_pct = float(risk.get("risk_pct", 0) or self.risk_policy.get("configured_risk_pct", 0) or 0)
         self.risk_pct = min(self.risk_pct, 0.10)  # Hard cap at 10% per-trade risk
         self.dynamic_position_sizing = self.risk_pct > 0
 
@@ -2961,6 +2962,15 @@ class InstrumentRunner:
             entry_px = mid
             stop_px, target_px = self._compute_stops(entry_px, direction)
             size, risk_usd, sizing_policy = self._resolve_position_size(entry_px, stop_px)
+            if size <= 0:
+                eq = self._get_account_equity()
+                self._log.warning(
+                    f"SIZING_DEBUG: size=0 entry={entry_px} stop={stop_px} "
+                    f"equity={eq} stage={self.deployment_stage} "
+                    f"risk_pct={self.risk_pct} stop_pips={self.stop_pips} "
+                    f"lot={self.lot_size} min={self.min_lot_size} max={self.max_lot_size} "
+                    f"policy={sizing_policy} usd_jpy_ref={self._reference_usd_jpy()}"
+                )
 
             # Drawdown-scaled sizing: linear ramp-down with floor at 0.2x
             if hasattr(self, '_risk_mgr') and self._risk_mgr._drawdown_pause:
