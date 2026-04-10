@@ -36,6 +36,11 @@ from ares.strategies.rotation import (
     DEFAULT_UNIVERSE, EXTENDED_UNIVERSE,
     generate_signal, backtest, rank_sectors,
 )
+try:
+    from helio.ibkr_executor import IBKRExecutor, CLIENT_IDS
+    _IBKR_AVAILABLE = True
+except ImportError:
+    _IBKR_AVAILABLE = False
 
 DATA_DIR = REPO / "ares" / "data"
 LOGS_DIR = REPO / "ares" / "logs"
@@ -103,12 +108,60 @@ def send_discord(content: str) -> bool:
         return False
 
 
-def run_evaluation(universe: list[str], dry_run: bool = True):
-    """Run monthly evaluation and post signal."""
-    print(f"Downloading data for {len(universe)} ETFs...")
-    data = download_data(universe)
+def execute_rotation(signal, data, executor, equity_per_slot: float):
+    """Execute Ares rotation via IBKR. Sells positions to exit, buys top N."""
+    if executor is None:
+        print("  [DRY] No IBKR executor — skipping execution")
+        return False
+
+    # Sells first
+    for sym in signal.sell:
+        executor.close_position(sym)
+        print(f"  EXECUTED CLOSE: {sym}")
+
+    # Buys
+    for sym in signal.buy:
+        sym_df = data.get(sym)
+        if sym_df is None:
+            continue
+        price = float(sym_df["Close"].iloc[-1])
+        shares = int(equity_per_slot / price)
+        if shares <= 0:
+            print(f"  SKIP {sym}: insufficient equity per slot for ${price:.2f}")
+            continue
+        order_id = executor.submit_market(symbol=sym, direction="long", quantity=shares)
+        print(f"  EXECUTED BUY: {sym} {shares} shares @ ~${price:.2f} order={order_id}")
+
+    return True
+
+
+def run_evaluation(universe: list[str], dry_run: bool = True, force: bool = False):
+    """Run monthly evaluation and post signal.
+
+    Only rebalances on the first trading day of the month unless --force.
+    """
     positions = load_positions()
     current_holdings = list(positions.get("holdings", {}).keys())
+
+    # Monthly rebalance guard
+    last_rebalance = positions.get("last_rebalance", "")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not force and last_rebalance:
+        try:
+            last_dt = datetime.fromisoformat(last_rebalance.replace("Z", "+00:00"))
+            days_since = (datetime.now(timezone.utc) - last_dt).days
+            if days_since < 25:
+                print(f"  Last rebalance: {last_rebalance[:10]} ({days_since}d ago) — skipping (monthly cadence)")
+                # Still post current holdings to Discord for awareness
+                if current_holdings:
+                    msg = f"**ARES Status -- {today}**\nCurrent holdings: {', '.join(current_holdings)}\nNext rebalance: in {25 - days_since}d"
+                    send_discord(msg)
+                return
+        except Exception:
+            pass
+
+    print(f"Downloading data for {len(universe)} ETFs...")
+    data = download_data(universe)
 
     signal = generate_signal(data, current_holdings=current_holdings, top_n=2, universe=universe)
 
@@ -157,7 +210,24 @@ def run_evaluation(universe: list[str], dry_run: bool = True):
     report = "\n".join(lines)
 
     if not dry_run:
-        # Update positions
+        # IBKR execution
+        executor = None
+        if _IBKR_AVAILABLE and (signal.buy or signal.sell):
+            executor = IBKRExecutor(
+                client_id=CLIENT_IDS["ares"],
+                system="ares",
+                model_equity_usd=10000,
+            )
+            if executor.connect():
+                # Equal weight across top N
+                equity_per_slot = 10000 / 2  # top 2 holdings
+                execute_rotation(signal, data, executor, equity_per_slot)
+                executor.disconnect()
+            else:
+                print("  IBKR connection failed — positions tracked but not executed")
+                executor = None
+
+        # Update positions tracking
         holdings = positions.get("holdings", {})
         for sym in signal.sell:
             holdings.pop(sym, None)
@@ -243,7 +313,8 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="Run backtest")
     parser.add_argument("--extended", action="store_true", help="Use extended 12-ETF universe")
     parser.add_argument("--dry-run", action="store_true", default=True)
-    parser.add_argument("--execute", action="store_true", help="Actually update positions + Discord")
+    parser.add_argument("--execute", action="store_true", help="Actually update positions + Discord + IBKR")
+    parser.add_argument("--force", action="store_true", help="Force rebalance even if not month-end")
     args = parser.parse_args()
 
     universe = EXTENDED_UNIVERSE if args.extended else DEFAULT_UNIVERSE
@@ -255,7 +326,7 @@ def main():
         print(f"{'=' * 60}")
         print(f"ARES Sector Rotation -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
         print(f"{'=' * 60}")
-        run_evaluation(universe, dry_run=dry_run)
+        run_evaluation(universe, dry_run=dry_run, force=args.force)
 
 
 if __name__ == "__main__":

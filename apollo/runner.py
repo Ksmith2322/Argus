@@ -467,6 +467,9 @@ def send_discord(content: str) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Apollo Earnings Scanner")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--live", action="store_true", help="Live IBKR execution")
+    parser.add_argument("--loop", action="store_true", help="Run continuously")
+    parser.add_argument("--interval-min", type=int, default=240, help="Loop interval (default 4hr)")
     parser.add_argument("--days", type=int, default=10, help="Look ahead days (default: 10)")
     parser.add_argument("--backtest", action="store_true", help="Run earnings drift backtest")
     parser.add_argument("--broad", action="store_true", help="Backtest across full 110-stock universe")
@@ -612,6 +615,66 @@ def main():
     log_path.write_text(json.dumps(results, indent=2, default=str))
     print(f"Saved: {log_path}")
 
+    # Auto-execute high-conviction post-ER plays if --live
+    if args.live:
+        from apollo.ops.trade_manager import add_position, check_exits
+        check_exits()  # close any due exits first
+
+        for r in results:
+            if r.get("post_er_play") and r["score"] >= 75 and r.get("direction") in ("long", "short"):
+                add_position(
+                    symbol=r["symbol"],
+                    direction=r["direction"],
+                    entry_price=r["price"],
+                    score=r["score"],
+                    conviction=r.get("conviction", "medium"),
+                    earnings_date=r["earnings_date"],
+                    beat_rate=r.get("beat_rate", 0),
+                    stop_pct=5.0,
+                    target_pct=20.0,
+                    risk_pct=0.02 if r.get("conviction") == "high" else 0.01,
+                    live=True,
+                )
+
+    # Heartbeat
+    try:
+        hb_path = LOGS_DIR / "heartbeat.json"
+        hb_path.write_text(json.dumps({
+            "system": "apollo",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scanned": len(UNIVERSE),
+            "actionable": sum(1 for r in results if r.get("post_er_play")),
+            "watchlist": len(results),
+        }, indent=2))
+    except Exception:
+        pass
+
+
+def run_apollo_cycle(args):
+    """One scan + execute cycle for loop mode."""
+    main_args = args
+    # Re-call main logic — Apollo's main() does it all
+    # For simplicity, just inline the key parts
+    pass
+
 
 if __name__ == "__main__":
-    main()
+    if "--loop" in sys.argv:
+        # Loop mode: run main repeatedly
+        import argparse as _ap
+        _parser = _ap.ArgumentParser()
+        _parser.add_argument("--interval-min", type=int, default=240)
+        _known, _ = _parser.parse_known_args()
+        interval = _known.interval_min
+
+        while True:
+            try:
+                main()
+            except SystemExit:
+                pass
+            except Exception as e:
+                print(f"Apollo cycle error: {e}")
+            print(f"\nApollo sleeping {interval}min...")
+            time.sleep(interval * 60)
+    else:
+        main()

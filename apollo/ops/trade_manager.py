@@ -34,10 +34,31 @@ sys.path.insert(0, str(REPO))
 from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
+try:
+    from helio.ibkr_executor import IBKRExecutor, CLIENT_IDS
+    _IBKR_AVAILABLE = True
+except ImportError:
+    _IBKR_AVAILABLE = False
+
 LOGS_DIR = REPO / "apollo" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
 TRADES_FILE = LOGS_DIR / "trades.csv"
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+_executor = None  # global IBKR executor (lazy)
+
+
+def get_executor():
+    """Lazy-init IBKR executor."""
+    global _executor
+    if _executor is None and _IBKR_AVAILABLE:
+        _executor = IBKRExecutor(
+            client_id=CLIENT_IDS["apollo"],
+            system="apollo",
+            model_equity_usd=10000,
+        )
+        if not _executor.connect():
+            _executor = None
+    return _executor
 
 _log = logging.getLogger("apollo.manager")
 
@@ -66,8 +87,10 @@ def save_positions(data: dict):
 def add_position(symbol: str, direction: str, entry_price: float,
                  score: int = 0, conviction: str = "medium",
                  earnings_date: str = "", beat_rate: float = 0,
-                 stop_pct: float = 5.0, target_pct: float = 15.0):
-    """Record a new position entry."""
+                 stop_pct: float = 5.0, target_pct: float = 15.0,
+                 risk_pct: float = 0.02, model_equity: float = 10000,
+                 live: bool = False):
+    """Record a new position entry. If live=True, also submits IBKR bracket order."""
     data = load_positions()
     if symbol in data["positions"]:
         print(f"  Already have position in {symbol}")
@@ -80,6 +103,22 @@ def add_position(symbol: str, direction: str, entry_price: float,
         stop_price = entry_price * (1 + stop_pct / 100)
         target_price = entry_price * (1 - target_pct / 100)
 
+    # Calculate position size
+    risk_amount = model_equity * risk_pct
+    risk_per_share = abs(entry_price - stop_price)
+    shares = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+
+    # IBKR submission if live
+    order_id = None
+    if live and shares > 0:
+        executor = get_executor()
+        if executor:
+            order_id = executor.submit_bracket(
+                symbol=symbol, direction=direction, quantity=shares,
+                entry_price=entry_price, stop_price=stop_price,
+                target_price=target_price, order_type="MKT",
+            )
+
     data["positions"][symbol] = {
         "direction": direction,
         "entry_price": round(entry_price, 2),
@@ -91,13 +130,17 @@ def add_position(symbol: str, direction: str, entry_price: float,
         "conviction": conviction,
         "earnings_date": earnings_date,
         "beat_rate": beat_rate,
+        "shares": shares,
+        "risk_usd": round(risk_amount, 2),
+        "ibkr_order_id": order_id,
         "days_held": 0,
         "peak_price": entry_price,
         "trough_price": entry_price,
         "status": "OPEN",
     }
     save_positions(data)
-    print(f"  ENTERED: {symbol} {direction.upper()} @ ${entry_price:.2f} | "
+    live_tag = " [LIVE]" if order_id else ""
+    print(f"  ENTERED{live_tag}: {symbol} {direction.upper()} {shares} @ ${entry_price:.2f} | "
           f"Stop ${stop_price:.2f} | Target ${target_price:.2f}")
 
 
@@ -201,6 +244,13 @@ def check_exits():
                 pnl_pct = (exit_price - entry) / entry * 100
             else:
                 pnl_pct = (entry - exit_price) / entry * 100
+
+            # Close IBKR position if there was one
+            if pos.get("ibkr_order_id"):
+                executor = get_executor()
+                if executor:
+                    executor.close_position(sym)
+                    print(f"  {sym}: IBKR position closed")
 
             print(f"  {sym}: EXIT ({exit_reason}) | {pnl_pct:+.1f}% | {days_held}d held")
 

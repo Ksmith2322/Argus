@@ -34,6 +34,11 @@ load_dotenv(REPO / ".env")
 
 from titan.ops.data_pipeline import UNIVERSE, get_data
 from titan.strategies.ai_overlay import SwingOverlay
+try:
+    from helio.ibkr_executor import IBKRExecutor, CLIENT_IDS
+    _IBKR_AVAILABLE = True
+except ImportError:
+    _IBKR_AVAILABLE = False
 
 LOGS_DIR = REPO / "titan" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
@@ -72,8 +77,21 @@ class TitanRunner:
         self.overlay = SwingOverlay(symbol="FLEET", state_dir=LOGS_DIR)
         self.positions = self._load_positions()
         self._ib = None
+        self._executor = None
 
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Connect to IBKR if not in dry run
+        if not self.dry_run and _IBKR_AVAILABLE:
+            self._executor = IBKRExecutor(
+                client_id=CLIENT_IDS["titan"],
+                system="titan",
+                model_equity_usd=self.model_equity,
+            )
+            if not self._executor.connect():
+                log.error("IBKR connection failed — falling back to dry run mode")
+                self._executor = None
+                self.dry_run = True
 
     def _load_positions(self) -> dict:
         if POSITIONS_FILE.exists():
@@ -307,13 +325,27 @@ class TitanRunner:
 
     def _submit_order(self, sym, direction, entry, stop, target, shares):
         """Submit bracket order to IBKR. Returns True on success."""
-        # TODO: Wire IBKR ib_insync order submission
-        log.info(f"  [IBKR] Would submit {direction} {shares} {sym} @ ${entry:.2f}")
-        return True
+        if self._executor is None:
+            log.info(f"  [DRY] Would submit {direction} {shares} {sym} @ ${entry:.2f}")
+            return True
+
+        order_id = self._executor.submit_bracket(
+            symbol=sym,
+            direction=direction,
+            quantity=shares,
+            entry_price=entry,
+            stop_price=stop,
+            target_price=target,
+            order_type="MKT",  # market entry, then bracket protection
+        )
+        return order_id is not None
 
     def _close_position(self, sym):
         """Close IBKR position."""
-        log.info(f"  [IBKR] Would close {sym}")
+        if self._executor is None:
+            log.info(f"  [DRY] Would close {sym}")
+            return
+        self._executor.close_position(sym)
 
     def _send_discord(self, message):
         if not WEBHOOK_URL:
@@ -329,6 +361,8 @@ def main():
     parser = argparse.ArgumentParser(description="Titan Swing Runner")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Paper mode (default)")
     parser.add_argument("--live", action="store_true", help="Live IBKR execution")
+    parser.add_argument("--loop", action="store_true", help="Run continuously (24/7 mode)")
+    parser.add_argument("--interval-min", type=int, default=60, help="Loop interval in minutes (default 60)")
     parser.add_argument("--check", action="store_true", help="Check positions only")
     parser.add_argument("--close", help="Close a specific symbol")
     parser.add_argument("--max-positions", type=int, default=5)
@@ -377,18 +411,45 @@ def main():
             print(f"{args.close} not in positions")
         return
 
-    # Normal flow: check exits first, then evaluate new entries
-    print("\n[1] Checking exits on open positions...")
-    runner.check_exits()
+    def run_cycle():
+        print(f"\n=== TITAN cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
+        print("\n[1] Checking exits on open positions...")
+        runner.check_exits()
+        print("\n[2] Evaluating new entries from scanner...")
+        runner.evaluate_entries()
+        print("\n[3] Current portfolio:")
+        runner.status()
+        print(f"\nAI Overlay: {runner.overlay.get_weight_summary()}")
+        # Update heartbeat
+        try:
+            hb_path = LOGS_DIR / "heartbeat.json"
+            hb_path.parent.mkdir(parents=True, exist_ok=True)
+            hb_path.write_text(json.dumps({
+                "system": "titan",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "mode": mode,
+                "open_positions": len(runner.positions),
+                "ibkr_connected": runner._executor.is_connected() if runner._executor else False,
+            }, indent=2))
+        except Exception:
+            pass
 
-    print("\n[2] Evaluating new entries from scanner...")
-    runner.evaluate_entries()
-
-    print("\n[3] Current portfolio:")
-    runner.status()
-
-    # Save AI overlay state
-    print(f"\nAI Overlay: {runner.overlay.get_weight_summary()}")
+    if args.loop:
+        log.info(f"Starting Titan loop (interval={args.interval_min}min, mode={mode})")
+        try:
+            while True:
+                run_cycle()
+                log.info(f"Sleeping {args.interval_min}min until next cycle...")
+                time.sleep(args.interval_min * 60)
+        except KeyboardInterrupt:
+            log.info("Titan loop stopped by user")
+        finally:
+            if runner._executor:
+                runner._executor.disconnect()
+    else:
+        run_cycle()
+        if runner._executor:
+            runner._executor.disconnect()
 
 
 if __name__ == "__main__":

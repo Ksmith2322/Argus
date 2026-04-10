@@ -34,10 +34,20 @@ from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
 from hermes.strategies.gap_fill import detect_gaps, backtest_gaps, GapSignal
+try:
+    from helio.ibkr_executor import IBKRExecutor, CLIENT_IDS
+    _IBKR_AVAILABLE = True
+except ImportError:
+    _IBKR_AVAILABLE = False
 
 DATA_DIR = REPO / "hermes" / "data"
 LOGS_DIR = REPO / "hermes" / "logs"
+POSITIONS_FILE = LOGS_DIR / "positions.json"
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+MODEL_EQUITY = 10000
+MAX_RISK_PCT = 0.01  # 1% per gap fill trade (smaller than Titan)
+MIN_SCORE_TO_ENTER = 80  # Only score 80+ from backtest validation
+MAX_HOLD_DAYS = 3
 
 # Scan universe — volatile stocks with frequent gaps
 SCAN_UNIVERSE = [
@@ -78,6 +88,122 @@ def download_data(symbols: list[str], period: str = "1y") -> dict[str, pd.DataFr
         except Exception:
             continue
     return data
+
+
+def load_positions() -> dict:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    if POSITIONS_FILE.exists():
+        try:
+            return json.loads(POSITIONS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_positions(positions: dict):
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    POSITIONS_FILE.write_text(json.dumps(positions, indent=2, default=str))
+
+
+def execute_entries(gaps: list[dict], executor, positions: dict) -> int:
+    """Enter new gap fill trades. Only score 80+, gap-down direction."""
+    if executor is None:
+        return 0
+
+    # Filter to only gap-DOWN long fills (proven edge)
+    actionable = [g for g in gaps if g["score"] >= MIN_SCORE_TO_ENTER and g["direction"] == "long"]
+    if not actionable:
+        return 0
+
+    entered = 0
+    for g in actionable[:3]:  # max 3 new positions per scan
+        sym = g["symbol"]
+        if sym in positions:
+            continue
+        risk_amount = MODEL_EQUITY * MAX_RISK_PCT
+        risk_per_share = abs(g["entry_price"] - g["stop_price"])
+        if risk_per_share <= 0:
+            continue
+        shares = int(risk_amount / risk_per_share)
+        if shares <= 0:
+            continue
+
+        order_id = executor.submit_bracket(
+            symbol=sym, direction="long", quantity=shares,
+            entry_price=g["entry_price"], stop_price=g["stop_price"],
+            target_price=g["target_price"], order_type="MKT",
+        )
+        if order_id:
+            positions[sym] = {
+                "direction": "long",
+                "entry_price": g["entry_price"],
+                "stop_price": g["stop_price"],
+                "target_price": g["target_price"],
+                "shares": shares,
+                "entry_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "score": g["score"],
+                "gap_pct": g["gap_pct"],
+                "order_id": order_id,
+            }
+            entered += 1
+            send_discord(
+                f"**HERMES ENTRY: {sym} LONG (gap fill)**\n"
+                f"Score {g['score']} | Gap {g['gap_pct']}% | "
+                f"${g['entry_price']:.2f} → ${g['target_price']:.2f} | Stop ${g['stop_price']:.2f}"
+            )
+    return entered
+
+
+def check_exits(positions: dict, executor) -> int:
+    """Check open positions for stop/target/timeout exits."""
+    if not positions:
+        return 0
+
+    closed = []
+    for sym, pos in list(positions.items()):
+        try:
+            ticker = yf.Ticker(sym)
+            df = ticker.history(period="5d", interval="1d", auto_adjust=True)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            current = float(df["Close"].iloc[-1])
+            today_high = float(df["High"].iloc[-1])
+            today_low = float(df["Low"].iloc[-1])
+        except Exception:
+            continue
+
+        entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        days_held = (datetime.now(timezone.utc) - entry_date).days
+
+        exit_reason = None
+        exit_price = current
+
+        if pos["direction"] == "long":
+            if today_low <= pos["stop_price"]:
+                exit_reason = "stop"
+                exit_price = pos["stop_price"]
+            elif today_high >= pos["target_price"]:
+                exit_reason = "target"
+                exit_price = pos["target_price"]
+
+        if days_held >= MAX_HOLD_DAYS:
+            exit_reason = "timeout"
+
+        if exit_reason:
+            pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
+            if executor:
+                executor.close_position(sym)
+            send_discord(
+                f"**HERMES EXIT: {sym} LONG -- {exit_reason.upper()}**\n"
+                f"PnL: {pnl_pct:+.2f}% | {days_held}d held"
+            )
+            closed.append(sym)
+
+    for sym in closed:
+        del positions[sym]
+    return len(closed)
 
 
 def scan_today(symbols: list[str] | None = None, min_score: int = 55) -> list[dict]:
@@ -227,10 +353,66 @@ def send_discord(content: str) -> bool:
         return False
 
 
+def run_cycle(args, executor):
+    """One scan + execution + exit cycle."""
+    print(f"\n=== HERMES cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
+
+    positions = load_positions()
+
+    # Check exits first
+    closed = check_exits(positions, executor)
+    if closed:
+        print(f"  Closed {closed} positions")
+
+    # Scan for new entries
+    gaps = scan_today(min_score=args.min_score)
+    if gaps:
+        print(f"\n{'Symbol':8s} {'Type':8s} {'Gap%':>6s} {'Dir':6s} {'Score':>5s} {'Entry':>8s} {'Target':>8s}")
+        print("-" * 65)
+        for g in gaps[:10]:
+            print(f"{g['symbol']:8s} {g['gap_type']:8s} {g['gap_pct']:+5.1f}% {g['direction']:6s} "
+                  f"{g['score']:5d} ${g['entry_price']:>7.2f} ${g['target_price']:>7.2f}")
+    else:
+        print("  No actionable gaps")
+
+    # Execute new entries (only if live + executor)
+    if executor and gaps:
+        entered = execute_entries(gaps, executor, positions)
+        if entered:
+            print(f"  Entered {entered} new positions")
+
+    save_positions(positions)
+
+    # Discord summary
+    if gaps:
+        report = format_discord(gaps)
+        send_discord(report)
+
+    # Heartbeat
+    try:
+        hb_path = LOGS_DIR / "heartbeat.json"
+        hb_path.write_text(json.dumps({
+            "system": "hermes",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "open_positions": len(positions),
+            "gaps_today": len(gaps),
+            "ibkr_connected": executor.is_connected() if executor else False,
+        }, indent=2))
+    except Exception:
+        pass
+
+    # Save scan log
+    log_path = LOGS_DIR / f"scan_{datetime.now().strftime('%Y%m%d')}.json"
+    log_path.write_text(json.dumps(gaps, indent=2, default=str))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hermes Gap Fill Scanner")
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--dry-run", action="store_true", default=True)
+    parser.add_argument("--live", action="store_true", help="Live IBKR execution")
+    parser.add_argument("--loop", action="store_true", help="Run continuously")
+    parser.add_argument("--interval-min", type=int, default=120, help="Loop interval in minutes")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--min-score", type=int, default=55)
     args = parser.parse_args()
@@ -245,28 +427,33 @@ def main():
     print(f"HERMES Gap Scanner -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'=' * 60}")
 
-    gaps = scan_today(min_score=args.min_score)
+    # Connect IBKR if live
+    executor = None
+    if args.live and _IBKR_AVAILABLE:
+        executor = IBKRExecutor(
+            client_id=CLIENT_IDS["hermes"],
+            system="hermes",
+            model_equity_usd=MODEL_EQUITY,
+        )
+        if not executor.connect():
+            print("  IBKR connection failed — running in scan-only mode")
+            executor = None
 
-    if gaps:
-        print(f"\n{'Symbol':8s} {'Type':8s} {'Gap%':>6s} {'Dir':6s} {'Score':>5s} {'Entry':>8s} {'Target':>8s} {'R:R':>5s}")
-        print("-" * 65)
-        for g in gaps:
-            print(f"{g['symbol']:8s} {g['gap_type']:8s} {g['gap_pct']:+5.1f}% {g['direction']:6s} "
-                  f"{g['score']:5d} ${g['entry_price']:>7.2f} ${g['target_price']:>7.2f} {g['risk_reward']:5.2f}")
+    if args.loop:
+        try:
+            while True:
+                run_cycle(args, executor)
+                print(f"\nSleeping {args.interval_min}min until next cycle...")
+                time.sleep(args.interval_min * 60)
+        except KeyboardInterrupt:
+            print("\nHermes stopped")
+        finally:
+            if executor:
+                executor.disconnect()
     else:
-        print("\n  No actionable gaps today.")
-
-    report = format_discord(gaps)
-    print(f"\n{report}")
-
-    if not args.dry_run or args.execute:
-        ok = send_discord(report)
-        print(f"\nDiscord: {'sent' if ok else 'FAILED'}")
-
-    # Save
-    log_path = LOGS_DIR / f"scan_{datetime.now().strftime('%Y%m%d')}.json"
-    log_path.write_text(json.dumps(gaps, indent=2, default=str))
-    print(f"Saved: {log_path}")
+        run_cycle(args, executor)
+        if executor:
+            executor.disconnect()
 
 
 if __name__ == "__main__":
