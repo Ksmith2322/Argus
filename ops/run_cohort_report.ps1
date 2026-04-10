@@ -25,6 +25,17 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running Apollo earnings scanner..."
+    $apolloOutput = & $python -m apollo.runner --dry-run --days 14 2>&1
+    foreach ($line in @($apolloOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] apollo: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] apollo WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Hermes gap scanner..."
     $hermesOutput = & $python -m hermes.runner --dry-run --min-score 75 2>&1
     foreach ($line in @($hermesOutput)) {
