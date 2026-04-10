@@ -3380,6 +3380,147 @@ async def api_fleet():
     })
 
 
+@app.get("/api/strategy_performance")
+async def api_strategy_performance():
+    """Per-strategy backtest stats vs live performance for the dashboard."""
+    strategies = []
+
+    # ── ARGUS strategies ──────────────────────────────────────
+    argus_live_trades = []
+    for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]:
+        trades_path = REPO / "argus_flow" / "logs" / sym / "trades.csv"
+        if trades_path.exists():
+            try:
+                with open(trades_path) as f:
+                    rows = [r for r in csv.DictReader(f) if r.get("experiment_valid", "").lower() == "true"]
+                    argus_live_trades.extend(rows)
+            except Exception:
+                pass
+
+    argus_pnls = [float(t.get("pnl_pips", 0)) for t in argus_live_trades]
+    argus_wins = sum(1 for p in argus_pnls if p > 0)
+    argus_pf = (sum(p for p in argus_pnls if p > 0) / abs(sum(p for p in argus_pnls if p <= 0))
+                if any(p <= 0 for p in argus_pnls) else 999)
+
+    strategies.append({
+        "system": "Argus",
+        "strategy": "MTF Trend (4H/1H/5m)",
+        "instruments": "AUDJPY, USDJPY, GBPUSD, CADJPY",
+        "backtest_pf": "1.1-1.3",
+        "backtest_trades": 114,
+        "backtest_wr": "55%",
+        "live_trades": len(argus_live_trades),
+        "live_wins": argus_wins,
+        "live_wr": round(argus_wins / len(argus_live_trades) * 100, 1) if argus_live_trades else 0,
+        "live_pf": round(argus_pf, 2) if argus_live_trades else 0,
+        "live_pnl": round(sum(argus_pnls), 1),
+        "live_unit": "pips",
+        "confidence": 45,
+        "status": "BAKING",
+    })
+
+    # ── TITAN strategies ──────────────────────────────────────
+    titan_trades_path = REPO / "titan" / "logs" / "trades.csv"
+    titan_trades = []
+    if titan_trades_path.exists():
+        try:
+            with open(titan_trades_path) as f:
+                titan_trades = list(csv.DictReader(f))
+        except Exception:
+            pass
+    titan_pnls = [float(t.get("pnl_pct", 0)) for t in titan_trades]
+    titan_wins = sum(1 for p in titan_pnls if p > 0)
+
+    strategies.append({
+        "system": "Titan",
+        "strategy": "Trend Following + Breakout",
+        "instruments": "GLD, GDX, PLTR, MRNA, QQQ, SPY, TSLA + 10 more",
+        "backtest_pf": "1.59 (long-only)",
+        "backtest_trades": 954,
+        "backtest_wr": "49%",
+        "live_trades": len(titan_trades),
+        "live_wins": titan_wins,
+        "live_wr": round(titan_wins / len(titan_trades) * 100, 1) if titan_trades else 0,
+        "live_pf": 0,
+        "live_pnl": round(sum(titan_pnls), 1),
+        "live_unit": "%",
+        "confidence": 65,
+        "status": "BAKING",
+    })
+
+    # ── ARES ───────────────────────────────────────────────────
+    strategies.append({
+        "system": "Ares",
+        "strategy": "Sector Rotation (top 2 of 6)",
+        "instruments": "SPY, QQQ, GDX, XLE, SMH, XBI",
+        "backtest_pf": "1.16-1.35",
+        "backtest_trades": 47,
+        "backtest_wr": "51%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 55,
+        "status": "MONTHLY",
+    })
+
+    # ── HERMES ─────────────────────────────────────────────────
+    strategies.append({
+        "system": "Hermes",
+        "strategy": "Gap Fill (gap-down + score 80+)",
+        "instruments": "30 high-volatility stocks",
+        "backtest_pf": "0.99 (1.27 filtered)",
+        "backtest_trades": 2607,
+        "backtest_wr": "49%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 35,
+        "status": "SCANNING",
+    })
+
+    # ── APOLLO ─────────────────────────────────────────────────
+    apollo_trades_path = REPO / "apollo" / "logs" / "trades.csv"
+    apollo_trades = []
+    if apollo_trades_path.exists():
+        try:
+            with open(apollo_trades_path) as f:
+                apollo_trades = list(csv.DictReader(f))
+        except Exception:
+            pass
+    apollo_pnls = [float(t.get("pnl_pct", 0)) for t in apollo_trades]
+    apollo_wins = sum(1 for p in apollo_pnls if p > 0)
+
+    strategies.append({
+        "system": "Apollo",
+        "strategy": "Earnings Drift (post-ER big gap)",
+        "instruments": "Tier 1: GOOGL, KLAC, PEP, WMT (100% consistent) + 11 Tier 2/3",
+        "backtest_pf": "1.27-2.61 (gap 6%+)",
+        "backtest_trades": 15,
+        "backtest_wr": "53-67%",
+        "live_trades": len(apollo_trades),
+        "live_wins": apollo_wins,
+        "live_wr": round(apollo_wins / len(apollo_trades) * 100, 1) if apollo_trades else 0,
+        "live_pf": 0,
+        "live_pnl": round(sum(apollo_pnls), 1),
+        "live_unit": "%",
+        "confidence": 80,
+        "status": "WAITING_ER",
+    })
+
+    return JSONResponse({
+        "strategies": strategies,
+        "fleet_confidence": 60,
+        "expected_annual": "18-25%",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 @app.get("/api/fx_analytics")
 async def api_fx_analytics():
     """Per-pair equity curves, drawdown waterfall, expectancy tracking."""
@@ -3742,6 +3883,61 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- FLEET OVERVIEW (all Greek family systems) -->
 <div id="fleet-overview" style="margin-bottom:14px;"></div>
+
+<!-- STRATEGY PERFORMANCE TABLE -->
+<div id="strategy-performance" style="margin-bottom:14px;"></div>
+<script>
+function loadStrategyPerformance() {
+  fetch('/api/strategy_performance').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('strategy-performance');
+    if (!el) return;
+    const strategies = data.strategies || [];
+
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">STRATEGY PERFORMANCE</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">Fleet confidence: ' + data.fleet_confidence + '% | Expected annual: ' + data.expected_annual + '</div>'
+      + '</div>';
+
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.72em;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;overflow:hidden;">';
+    html += '<thead><tr style="background:#0d1321;color:#7b8ab8;text-align:left;">'
+      + '<th style="padding:8px;">System</th>'
+      + '<th style="padding:8px;">Strategy</th>'
+      + '<th style="padding:8px;text-align:right;">Backtest PF</th>'
+      + '<th style="padding:8px;text-align:right;">BT Trades</th>'
+      + '<th style="padding:8px;text-align:right;">BT WR</th>'
+      + '<th style="padding:8px;text-align:right;">Live Trades</th>'
+      + '<th style="padding:8px;text-align:right;">Live WR</th>'
+      + '<th style="padding:8px;text-align:right;">Live PnL</th>'
+      + '<th style="padding:8px;text-align:right;">Confidence</th>'
+      + '<th style="padding:8px;text-align:right;">Status</th>'
+      + '</tr></thead><tbody>';
+
+    for (const s of strategies) {
+      const confColor = s.confidence >= 70 ? '#00ff88' : (s.confidence >= 50 ? '#ffc107' : '#ff4444');
+      const liveWrColor = s.live_wr >= 50 ? '#00ff88' : (s.live_wr >= 40 ? '#ffc107' : (s.live_wr > 0 ? '#ff4444' : '#7b8ab8'));
+      const livePnlColor = s.live_pnl > 0 ? '#00ff88' : (s.live_pnl < 0 ? '#ff4444' : '#7b8ab8');
+      const statusColor = s.status === 'BAKING' || s.status === 'SCANNING' || s.status === 'WAITING_ER' ? '#00d4ff' : '#7b8ab8';
+
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:8px;font-weight:bold;color:#00d4ff;">' + s.system + '</td>'
+        + '<td style="padding:8px;color:#e0e0e0;">' + s.strategy + '<br><span style="font-size:0.85em;color:#7b8ab8;">' + s.instruments + '</span></td>'
+        + '<td style="padding:8px;text-align:right;color:#fff;">' + s.backtest_pf + '</td>'
+        + '<td style="padding:8px;text-align:right;color:#7b8ab8;">' + s.backtest_trades + '</td>'
+        + '<td style="padding:8px;text-align:right;color:#7b8ab8;">' + s.backtest_wr + '</td>'
+        + '<td style="padding:8px;text-align:right;color:#fff;">' + s.live_trades + '</td>'
+        + '<td style="padding:8px;text-align:right;color:' + liveWrColor + ';">' + (s.live_wr || '-') + '%</td>'
+        + '<td style="padding:8px;text-align:right;color:' + livePnlColor + ';">' + (s.live_pnl >= 0 ? '+' : '') + s.live_pnl + ' ' + s.live_unit + '</td>'
+        + '<td style="padding:8px;text-align:right;color:' + confColor + ';font-weight:bold;">' + s.confidence + '%</td>'
+        + '<td style="padding:8px;text-align:right;color:' + statusColor + ';font-size:0.85em;">' + s.status + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }).catch((e)=>{ console.error('strategy perf error:', e); });
+}
+loadStrategyPerformance();
+setInterval(loadStrategyPerformance, 60000);
+</script>
 <script>
 function loadFleetOverview() {
   fetch('/api/fleet').then(r=>r.json()).then(data=>{
