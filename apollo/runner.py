@@ -42,6 +42,8 @@ sys.path.insert(0, str(REPO))
 from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
+from apollo.strategies.catalyst_signals import get_all_signals
+
 LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -462,6 +464,22 @@ def main():
             continue
         scored = score_pre_earnings_setup(data)
         if scored and scored["score"] >= args.min_score:
+            # Enrich with catalyst signals (options flow, insider, analyst)
+            if scored["days_until"] is not None and -5 <= scored["days_until"] <= 14:
+                try:
+                    catalyst = get_all_signals(sym)
+                    scored["catalyst_score"] = catalyst["total_signal"]
+                    scored["catalyst_consensus"] = catalyst["consensus"]
+                    scored["catalyst_details"] = catalyst["details"]
+                    scored["options_pc_ratio"] = catalyst["options"].get("pc_vol_ratio")
+                    scored["insider_buys_30d"] = catalyst["insider"].get("buys_30d", 0)
+                    scored["analyst_upgrades"] = catalyst["analyst"].get("upgrades_30d", 0)
+                    scored["analyst_buy_count"] = catalyst["analyst"].get("buy_count", 0)
+                    # Boost score with catalyst signals
+                    scored["score"] = min(100, scored["score"] + max(0, catalyst["total_signal"] // 2))
+                    scored["signals"].extend(catalyst["details"])
+                except Exception:
+                    scored["catalyst_score"] = 0
             results.append(scored)
         if (i + 1) % 10 == 0:
             print(f"  Scanned {i+1}/{len(UNIVERSE)}...")
