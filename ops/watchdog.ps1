@@ -23,28 +23,21 @@ $staleThresholdSeconds = 900  # 15 minutes
 $checkIntervalSeconds = 60
 $maxRestartsPerHour = 3
 
-# FX runner configs (full fleet)
-$fxConfigs = @(
-    "argus_flow/configs/gbpusd_range_paper_v1.json",
-    "argus_flow/configs/eurusd_t4_paper_v1.json",
-    "argus_flow/configs/eurjpy_t4_paper_v1.json",
-    "argus_flow/configs/gbpjpy_t4_paper_v1.json",
-    "argus_flow/configs/cadjpy_t4_paper_v1.json",
-    "argus_flow/configs/audjpy_t4_paper_v1.json",
-    "argus_flow/configs/usdjpy_ny_paper_v1.json",
-    "argus_flow/configs/audusd_ny_paper_v1.json"
-)
+# Active configs — dynamically discovered via deployment pipeline
+# Fallback to hardcoded if pipeline fails
+$fxConfigs = @(& $python -m argus_flow.ops.deployment_pipeline --emit-configs watcher,paper 2>$null)
+if ($fxConfigs.Count -eq 0) {
+    # Fallback: hardcoded active configs (updated 2026-04-09)
+    $fxConfigs = @(
+        "argus_flow/configs/audjpy_mtf_paper_v1.json",
+        "argus_flow/configs/usdjpy_mtf_paper_v1.json",
+        "argus_flow/configs/gbpusd_range_paper_v1.json",
+        "argus_flow/configs/cadjpy_mtf_paper_v1.json"
+    )
+}
 
-# Futures runner configs
-$futuresConfigs = @(
-    "argus_flow/configs/mes_range_paper_v1.json",
-    "argus_flow/configs/mnq_range_paper_v1.json",
-    "argus_flow/configs/mym_range_paper_v1.json",
-    "argus_flow/configs/m2k_range_paper_v1.json",
-    "argus_flow/configs/mgc_range_paper_v1.json",
-    "argus_flow/configs/mcl_range_paper_v1.json"
-    # NKD quarantined 2026-03-29: no edge with range_accel
-)
+# No futures configs (all killed in fleet consolidation 2026-04-07)
+$futuresConfigs = @()
 
 function Log($msg) {
     $line = "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')] $msg"

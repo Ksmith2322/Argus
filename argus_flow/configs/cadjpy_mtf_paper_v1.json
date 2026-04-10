@@ -32,7 +32,10 @@
     "min_signal_gap_minutes": 180,
     "risk_pct": 0.015,
     "lot_size": 1000,
-    "max_lot_size": 50000
+    "max_lot_size": 50000,
+    "atr_stop_mult": 1.5,
+    "atr_target_mult": 3.0,
+    "_note_atr": "ATR-scaled stops replace fixed pip stops. Adapts to volatility."
   },
   "hour_filter": {
     "enabled": false,
