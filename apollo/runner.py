@@ -274,9 +274,13 @@ def score_pre_earnings_setup(data: dict) -> dict | None:
     }
 
 
-def backtest_earnings_drift(symbols: list[str] | None = None):
+def backtest_earnings_drift(symbols: list[str] | None = None, broad: bool = False):
     """Backtest post-earnings drift: buy after positive surprise, sell after 20d."""
-    syms = symbols or UNIVERSE[:20]
+    if broad:
+        from apollo.ops.earnings_calendar import FULL_UNIVERSE
+        syms = FULL_UNIVERSE
+    else:
+        syms = symbols or UNIVERSE[:20]
     all_trades = []
 
     print(f"\n{'='*70}")
@@ -451,13 +455,32 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--days", type=int, default=10, help="Look ahead days (default: 10)")
     parser.add_argument("--backtest", action="store_true", help="Run earnings drift backtest")
+    parser.add_argument("--broad", action="store_true", help="Backtest across full 110-stock universe")
+    parser.add_argument("--manage", action="store_true", help="Check exits on open positions")
+    parser.add_argument("--review", action="store_true", help="Weekly performance review")
+    parser.add_argument("--status", action="store_true", help="Show open positions")
     parser.add_argument("--min-score", type=int, default=40)
     args = parser.parse_args()
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.backtest:
-        backtest_earnings_drift()
+        backtest_earnings_drift(broad=args.broad)
+        return
+
+    if args.manage:
+        from apollo.ops.trade_manager import check_exits
+        check_exits()
+        return
+
+    if args.review:
+        from apollo.ops.trade_manager import weekly_review
+        weekly_review()
+        return
+
+    if args.status:
+        from apollo.ops.trade_manager import status
+        status()
         return
 
     print(f"{'='*60}")
