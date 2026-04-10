@@ -80,6 +80,18 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] titan_runner WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    # Weekly review on Fridays
+    $today = (Get-Date).DayOfWeek
+    if ($today -eq "Friday") {
+        Write-Host "Running weekly fleet review (Friday)..."
+        $reviewOutput = & $python -m helio.weekly_review --days 7 2>&1
+        foreach ($line in @($reviewOutput)) {
+            if ($line) {
+                Add-Content -Path $logFile -Value "[$timestamp] weekly_review: $line"
+            }
+        }
+    }
+
     Write-Host "Running nightly analysis..."
     $analysisOutput = & $python -m argus_flow.ops.nightly_analysis --no-llm 2>&1
     foreach ($line in @($analysisOutput)) {

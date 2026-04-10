@@ -40,6 +40,12 @@ try:
 except ImportError:
     _IBKR_AVAILABLE = False
 
+try:
+    from helio.fleet_risk import check_exposure
+    _FLEET_RISK_AVAILABLE = True
+except ImportError:
+    _FLEET_RISK_AVAILABLE = False
+
 DATA_DIR = REPO / "hermes" / "data"
 LOGS_DIR = REPO / "hermes" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
@@ -120,6 +126,13 @@ def execute_entries(gaps: list[dict], executor, positions: dict) -> int:
         sym = g["symbol"]
         if sym in positions:
             continue
+
+        # Cross-system exposure check
+        if _FLEET_RISK_AVAILABLE:
+            exposure = check_exposure(sym)
+            if exposure["blocked"]:
+                print(f"  {sym}: FLEET BLOCK -- {exposure['reason']}")
+                continue
         risk_amount = MODEL_EQUITY * MAX_RISK_PCT
         risk_per_share = abs(g["entry_price"] - g["stop_price"])
         if risk_per_share <= 0:

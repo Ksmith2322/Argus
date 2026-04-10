@@ -46,7 +46,10 @@ from apollo.strategies.catalyst_signals import get_all_signals
 from apollo.strategies.market_data import get_full_profile
 from apollo.strategies.context_signals import get_full_context, analyze_macro_context
 from apollo.strategies.position_rules import should_enter_post_er, format_post_er_plan, PostERPlan
-from apollo.ops.fleet_risk import check_exposure, fleet_summary
+try:
+    from helio.fleet_risk import check_exposure, fleet_summary
+except ImportError:
+    from apollo.ops.fleet_risk import check_exposure, fleet_summary
 
 LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"

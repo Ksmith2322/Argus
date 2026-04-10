@@ -40,6 +40,12 @@ try:
 except ImportError:
     _IBKR_AVAILABLE = False
 
+try:
+    from helio.fleet_risk import check_exposure
+    _FLEET_RISK_AVAILABLE = True
+except ImportError:
+    _FLEET_RISK_AVAILABLE = False
+
 LOGS_DIR = REPO / "titan" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
 TRADES_FILE = LOGS_DIR / "trades.csv"
@@ -137,6 +143,13 @@ class TitanRunner:
             if sym in open_symbols:
                 log.info(f"  {sym}: already have position, skip")
                 continue
+
+            # Cross-system exposure check
+            if _FLEET_RISK_AVAILABLE:
+                exposure = check_exposure(sym)
+                if exposure["blocked"]:
+                    log.info(f"  {sym}: FLEET BLOCK -- {exposure['reason']}")
+                    continue
 
             if self.long_only and sig["direction"] == "SHORT":
                 continue

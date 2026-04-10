@@ -73,7 +73,20 @@ Start-System "Apollo" $apolloArgs
 # 5. Ares is monthly — runs via nightly cohort report, not as a daemon
 Log "Ares: runs via nightly cohort report (monthly cadence, no daemon needed)"
 
-# 6. Dashboard (if not running)
+# 6. Fleet Monitor (watchdog + heartbeat checker + snapshot)
+$monRunning = Get-Process python* -ErrorAction SilentlyContinue | Where-Object {
+    try {
+        $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+        $cmd -match "fleet_monitor"
+    } catch { $false }
+}
+if (-not $monRunning) {
+    Start-System "FleetMonitor" @("-m", "helio.fleet_monitor", "--interval-s", "60")
+} else {
+    Log "Fleet monitor already running"
+}
+
+# 7. Dashboard (if not running)
 if (-not $SkipDashboard) {
     $dashRunning = Get-Process python* -ErrorAction SilentlyContinue | Where-Object {
         try {
