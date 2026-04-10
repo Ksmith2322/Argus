@@ -1,0 +1,40 @@
+{
+  "updated": "2026-04-09",
+  "confidence": 80,
+  "tier_1": {
+    "description": "100% consistent drift on beats. Always trade post-ER.",
+    "stocks": ["GOOGL", "KLAC", "PEP", "WMT"],
+    "sizing": "full_position",
+    "avg_drift": 6.1
+  },
+  "tier_2": {
+    "description": "75% consistent drift. Trade standard size.",
+    "stocks": ["MU", "LRCX", "MRNA", "PLTR", "SOFI", "TSM", "GILD"],
+    "sizing": "standard",
+    "avg_drift": 9.2
+  },
+  "tier_3": {
+    "description": "67% consistent. Trade half size.",
+    "stocks": ["AMD", "INTC", "TMO", "ARM", "REGN"],
+    "sizing": "half_position",
+    "avg_drift": 9.0
+  },
+  "removed": {
+    "description": "50% or below consistency. No edge.",
+    "stocks": ["ORCL", "CDNS", "UPST", "SNOW"],
+    "reason": "coin flip — drift positive only half the time or less"
+  },
+  "entry_rules": {
+    "when": "Day 2 after earnings (confirmed beat + market confirmed via gap or Day 1 close above pre-ER)",
+    "gap_minimum_general": 6.0,
+    "gap_minimum_tier1": 0,
+    "note": "Tier 1 stocks drift reliably even without big gaps"
+  },
+  "exit_rules": {
+    "stop": "5% from entry",
+    "trail_trigger": "3% profit",
+    "trail_pct": "4% from peak",
+    "timeout_long": 20,
+    "timeout_short": 10
+  }
+}
