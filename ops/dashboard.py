@@ -4892,6 +4892,15 @@ async function loadIBKRFleet() {
     fetch('/api/fx_analytics').then(r=>r.json()).then(fa=>{
       const anaDiv = document.getElementById('ibkr-analytics');
       if (!anaDiv) return;
+      window.toggleKilledCards = function() {
+        const el = document.getElementById('killed-cards');
+        const btn = document.getElementById('killed-toggle-btn');
+        if (!el || !btn) return;
+        const showing = el.style.display !== 'none';
+        el.style.display = showing ? 'none' : 'grid';
+        const count = el.dataset.killedCount || '0';
+        btn.textContent = showing ? ('Show ' + count + ' killed') : ('Hide ' + count + ' killed');
+      };
       const order = { real: 0, quarantine: 1, paper: 2, watcher: 3 };
       const allAnalytics = (fa.analytics || []).slice().sort((a, b) => {
         const diff = (order[a.current_stage] ?? 9) - (order[b.current_stage] ?? 9);
@@ -4905,7 +4914,7 @@ async function loadIBKRFleet() {
         + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;">Per-Pair Analytics</div>'
         + '<div style="display:flex;align-items:center;gap:12px;">'
         + '<div style="color:#7b8ab8;font-size:0.68em;">' + active.length + ' active</div>'
-        + (killed.length ? '<button onclick="document.getElementById(\'killed-cards\').style.display=document.getElementById(\'killed-cards\').style.display===\'none\'?\'grid\':\'none\';this.textContent=this.textContent.includes(\'Show\')?\'Hide \'+' + killed.length + '+\' killed\':\'Show \'+' + killed.length + '+\' killed\'" style="background:#1e2a42;color:#7b8ab8;border:1px solid #2a3654;border-radius:4px;padding:2px 8px;font-size:0.65em;cursor:pointer;">Show ' + killed.length + ' killed</button>' : '')
+        + (killed.length ? '<button id="killed-toggle-btn" onclick="toggleKilledCards()" style="background:#1e2a42;color:#7b8ab8;border:1px solid #2a3654;border-radius:4px;padding:2px 8px;font-size:0.65em;cursor:pointer;">Show ' + killed.length + ' killed</button>' : '')
         + '</div></div>';
       html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">';
       for (const a of analytics) {
@@ -4932,7 +4941,7 @@ async function loadIBKRFleet() {
       html += '</div>';
       // Killed instruments — collapsed by default
       if (killed.length) {
-        html += '<div id="killed-cards" style="display:none;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px;opacity:0.5;">';
+        html += '<div id="killed-cards" data-killed-count="' + killed.length + '" style="display:none;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px;opacity:0.5;">';
         for (const a of killed) {
           html += '<div style="min-width:0;padding:10px;background:#0d1117;border:1px solid #1a1f2e;border-radius:6px;">';
           html += '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">'
