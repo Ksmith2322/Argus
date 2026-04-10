@@ -67,10 +67,21 @@ except ImportError:
     sys.exit(1)
 
 # ── Logging ──────────────────────────────────────────────────
+_LOG_DIR = Path("argus_flow/logs")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_log_handlers = [logging.StreamHandler()]
+try:
+    _file_handler = logging.FileHandler(_LOG_DIR / "runner_unified.log", encoding="utf-8")
+    _file_handler.setLevel(logging.INFO)
+    _log_handlers.append(_file_handler)
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
+    handlers=_log_handlers,
 )
 log = logging.getLogger("unified")
 
@@ -1409,10 +1420,11 @@ class InstrumentRunner:
             size = float(self.max_contracts)
 
         # Sanity cap: never exceed 10x the configured lot_size (catch config errors)
+        # FIX: cap to base_size * 10, not base_size (was zeroing out reasonable sizes)
         base_size = self.lot_size if self.uses_pips else self.num_contracts
         if base_size > 0 and size > base_size * 10:
-            self._log.error(f"SIZE_OVERFLOW: {size} > 10x base {base_size} — capping")
-            size = float(base_size)
+            self._log.warning(f"SIZE_CAP_10X: {size} > 10x base {base_size} — capping to {base_size * 10}")
+            size = float(base_size * 10)
 
         risk_usd = self._risk_usd_for_size(entry_price, stop_price, size)
         return size, risk_usd, policy
