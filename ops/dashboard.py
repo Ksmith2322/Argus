@@ -3219,6 +3219,177 @@ async def api_daily_performance():
     )
 
 
+@app.get("/api/fleet")
+async def api_fleet():
+    """Fleet overview — all 4 Greek family systems with performance metrics."""
+    import time as _time
+
+    systems = []
+
+    # ── ARGUS (FX intraday) ──────────────────────────────────
+    argus_pairs = []
+    argus_total_pnl = 0
+    argus_total_trades = 0
+    argus_wins = 0
+    for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]:
+        log_dir = REPO / "argus_flow" / "logs" / sym
+        hb_path = log_dir / "heartbeat.json"
+        trades_path = log_dir / "trades.csv"
+        hb = {}
+        if hb_path.exists():
+            try:
+                hb = json.loads(hb_path.read_text())
+            except Exception:
+                pass
+        trades = []
+        if trades_path.exists():
+            try:
+                with open(trades_path) as f:
+                    trades = [r for r in csv.DictReader(f) if r.get("experiment_valid", "").lower() == "true"]
+            except Exception:
+                pass
+        pnls = [float(t.get("pnl_pips", 0)) for t in trades]
+        pair_wins = sum(1 for p in pnls if p > 0)
+        pair_pnl = sum(pnls)
+        argus_total_pnl += pair_pnl
+        argus_total_trades += len(trades)
+        argus_wins += pair_wins
+        hb_age = int(_time.time() - hb_path.stat().st_mtime) if hb_path.exists() else None
+        argus_pairs.append({
+            "symbol": sym.upper(),
+            "trades": len(trades),
+            "win_rate": round(pair_wins / len(trades) * 100, 1) if trades else 0,
+            "pnl": round(pair_pnl, 1),
+            "position": hb.get("position", "FLAT") if hb else "?",
+            "alive": hb_age is not None and hb_age < 300,
+        })
+
+    argus_wr = round(argus_wins / argus_total_trades * 100, 1) if argus_total_trades > 0 else 0
+    systems.append({
+        "name": "Argus",
+        "strategy": "FX MTF Intraday",
+        "status": "LIVE" if any(p["alive"] for p in argus_pairs) else "DOWN",
+        "total_trades": argus_total_trades,
+        "win_rate": argus_wr,
+        "total_pnl": round(argus_total_pnl, 1),
+        "pnl_unit": "pips",
+        "instruments": argus_pairs,
+    })
+
+    # ── TITAN (Stock/commodity swing) ────────────────────────
+    titan_pos_path = REPO / "titan" / "logs" / "positions.json"
+    titan_trades_path = REPO / "titan" / "logs" / "trades.csv"
+    titan_positions = {}
+    titan_trades = []
+    if titan_pos_path.exists():
+        try:
+            titan_positions = json.loads(titan_pos_path.read_text())
+        except Exception:
+            pass
+    if titan_trades_path.exists():
+        try:
+            with open(titan_trades_path) as f:
+                titan_trades = list(csv.DictReader(f))
+        except Exception:
+            pass
+    titan_pnls = [float(t.get("pnl_pct", 0)) for t in titan_trades]
+    titan_wins = sum(1 for p in titan_pnls if p > 0)
+    titan_instruments = []
+    for sym, pos in titan_positions.items():
+        if sym in ("last_rebalance", "last_signal", "holdings"):
+            continue
+        titan_instruments.append({
+            "symbol": sym,
+            "direction": pos.get("direction", "?"),
+            "entry_price": pos.get("entry_price", 0),
+            "strategy": pos.get("strategy", "?"),
+        })
+
+    systems.append({
+        "name": "Titan",
+        "strategy": "Stock/Commodity Swing",
+        "status": "LIVE" if titan_instruments else "SCANNING",
+        "total_trades": len(titan_trades),
+        "win_rate": round(titan_wins / len(titan_trades) * 100, 1) if titan_trades else 0,
+        "total_pnl": round(sum(titan_pnls), 1),
+        "pnl_unit": "%",
+        "instruments": titan_instruments,
+        "open_positions": len(titan_instruments),
+    })
+
+    # ── ARES (Sector rotation) ───────────────────────────────
+    ares_pos_path = REPO / "ares" / "logs" / "positions.json"
+    ares_positions = {}
+    if ares_pos_path.exists():
+        try:
+            ares_positions = json.loads(ares_pos_path.read_text())
+        except Exception:
+            pass
+    ares_holdings = ares_positions.get("holdings", {})
+    # Load latest signal
+    ares_signal = {}
+    ares_logs = REPO / "ares" / "logs"
+    if ares_logs.exists():
+        sig_files = sorted(ares_logs.glob("signal_*.json"), reverse=True)
+        if sig_files:
+            try:
+                ares_signal = json.loads(sig_files[0].read_text())
+            except Exception:
+                pass
+
+    systems.append({
+        "name": "Ares",
+        "strategy": "Sector Rotation (Monthly)",
+        "status": "ACTIVE" if ares_holdings else "CASH",
+        "total_trades": 0,
+        "win_rate": 0,
+        "total_pnl": 0,
+        "pnl_unit": "%",
+        "holdings": list(ares_holdings.keys()),
+        "latest_signal": {
+            "buy": ares_signal.get("buy", []),
+            "sell": ares_signal.get("sell", []),
+            "risk_off": ares_signal.get("risk_off", False),
+            "rankings": ares_signal.get("rankings", [])[:6],
+        },
+    })
+
+    # ── HERMES (Gap fill) ────────────────────────────────────
+    hermes_logs = REPO / "hermes" / "logs"
+    hermes_latest = {}
+    if hermes_logs.exists():
+        scan_files = sorted(hermes_logs.glob("scan_*.json"), reverse=True)
+        if scan_files:
+            try:
+                hermes_latest = json.loads(scan_files[0].read_text())
+            except Exception:
+                pass
+    hermes_gaps = hermes_latest if isinstance(hermes_latest, list) else []
+
+    systems.append({
+        "name": "Hermes",
+        "strategy": "Gap Fill (Daily)",
+        "status": "SCANNING",
+        "total_trades": 0,
+        "win_rate": 0,
+        "total_pnl": 0,
+        "pnl_unit": "%",
+        "todays_gaps": len(hermes_gaps),
+        "top_gaps": hermes_gaps[:5],
+    })
+
+    return JSONResponse({
+        "systems": systems,
+        "fleet_summary": {
+            "total_systems": len(systems),
+            "systems_live": sum(1 for s in systems if s["status"] in ("LIVE", "ACTIVE")),
+            "total_trades": sum(s["total_trades"] for s in systems),
+            "total_open_positions": len(titan_instruments) + len(ares_holdings),
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 @app.get("/api/fx_analytics")
 async def api_fx_analytics():
     """Per-pair equity curves, drawdown waterfall, expectancy tracking."""
@@ -3575,9 +3746,120 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div style="display:flex; justify-content:space-between; align-items:center;">
-  <h1>ARGUS TRADING DASHBOARD</h1>
+  <h1>HELIO FLEET DASHBOARD</h1>
   <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR STAGED</span>
 </div>
+
+<!-- FLEET OVERVIEW (all Greek family systems) -->
+<div id="fleet-overview" style="margin-bottom:14px;"></div>
+<script>
+function loadFleetOverview() {
+  fetch('/api/fleet').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('fleet-overview');
+    if (!el) return;
+    const systems = data.systems || [];
+    const summary = data.fleet_summary || {};
+
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">FLEET STATUS</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">'
+      + summary.systems_live + '/' + summary.total_systems + ' systems live | '
+      + summary.total_trades + ' total trades | '
+      + summary.total_open_positions + ' open positions'
+      + '</div></div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">';
+
+    for (const sys of systems) {
+      const statusColor = sys.status === 'LIVE' || sys.status === 'ACTIVE' ? '#00e676'
+        : sys.status === 'DOWN' ? '#ff4444'
+        : sys.status === 'SCANNING' ? '#00d4ff' : '#ffc107';
+
+      const pnlColor = sys.total_pnl >= 0 ? '#00ff88' : '#ff4444';
+      const wrColor = sys.win_rate >= 50 ? '#00ff88' : (sys.win_rate >= 40 ? '#ffc107' : '#ff4444');
+
+      html += '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:8px;padding:12px;">';
+
+      // Header: system name + status
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+        + '<div style="font-weight:bold;color:#00d4ff;font-size:0.9em;">' + sys.name + '</div>'
+        + '<div style="font-size:0.6em;font-weight:bold;color:' + statusColor + ';letter-spacing:1px;">' + sys.status + '</div>'
+        + '</div>';
+
+      // Strategy name
+      html += '<div style="font-size:0.65em;color:#7b8ab8;margin-bottom:8px;">' + sys.strategy + '</div>';
+
+      // Metrics
+      if (sys.total_trades > 0) {
+        html += '<div style="display:flex;gap:12px;font-size:0.75em;margin-bottom:6px;">'
+          + '<div>Trades: <span style="font-weight:bold;color:#fff;">' + sys.total_trades + '</span></div>'
+          + '<div>WR: <span style="font-weight:bold;color:' + wrColor + ';">' + sys.win_rate + '%</span></div>'
+          + '<div>PnL: <span style="font-weight:bold;color:' + pnlColor + ';">' + (sys.total_pnl >= 0 ? '+' : '') + sys.total_pnl + ' ' + sys.pnl_unit + '</span></div>'
+          + '</div>';
+      }
+
+      // System-specific content
+      if (sys.name === 'Argus' && sys.instruments) {
+        html += '<div style="font-size:0.65em;margin-top:4px;">';
+        for (const p of sys.instruments) {
+          const dot = p.alive ? '<span style="color:#00e676;">&#9679;</span>' : '<span style="color:#ff4444;">&#9679;</span>';
+          const pairPnl = p.pnl >= 0 ? '+' + p.pnl : '' + p.pnl;
+          html += '<div style="display:flex;justify-content:space-between;padding:2px 0;">'
+            + '<span>' + dot + ' ' + p.symbol + '</span>'
+            + '<span style="color:' + (p.pnl >= 0 ? '#00ff88' : '#ff4444') + ';">' + pairPnl + 'p (' + p.trades + 't)</span>'
+            + '</div>';
+        }
+        html += '</div>';
+      }
+
+      if (sys.name === 'Titan') {
+        if (sys.instruments && sys.instruments.length > 0) {
+          html += '<div style="font-size:0.65em;margin-top:4px;">';
+          for (const p of sys.instruments) {
+            html += '<div>' + p.symbol + ' ' + p.direction + ' @ $' + p.entry_price.toFixed(2) + ' [' + p.strategy + ']</div>';
+          }
+          html += '</div>';
+        } else {
+          html += '<div style="font-size:0.65em;color:#7b8ab8;margin-top:4px;">No open positions</div>';
+        }
+      }
+
+      if (sys.name === 'Ares') {
+        const sig = sys.latest_signal || {};
+        if (sig.rankings && sig.rankings.length > 0) {
+          html += '<div style="font-size:0.65em;margin-top:4px;">';
+          for (const r of sig.rankings.slice(0, 4)) {
+            const tag = (sig.buy || []).includes(r.symbol) ? ' <span style="color:#00e676;font-weight:bold;">BUY</span>' : '';
+            html += '<div>#' + r.rank + ' ' + r.symbol + ' (' + (r.score >= 0 ? '+' : '') + r.score.toFixed(1) + ')' + tag + '</div>';
+          }
+          if (sig.risk_off) {
+            html += '<div style="color:#ff4444;font-weight:bold;">RISK OFF</div>';
+          }
+          html += '</div>';
+        }
+      }
+
+      if (sys.name === 'Hermes') {
+        if (sys.top_gaps && sys.top_gaps.length > 0) {
+          html += '<div style="font-size:0.65em;margin-top:4px;">';
+          for (const g of sys.top_gaps.slice(0, 3)) {
+            html += '<div>' + g.symbol + ' ' + g.gap_type + ' ' + g.gap_pct + '% (score=' + g.score + ')</div>';
+          }
+          html += '</div>';
+        } else {
+          html += '<div style="font-size:0.65em;color:#7b8ab8;margin-top:4px;">No gaps today (' + (sys.todays_gaps || 0) + ' scanned)</div>';
+        }
+      }
+
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadFleetOverview();
+setInterval(loadFleetOverview, 60000);
+</script>
 
 <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px 0;">
   <h2 style="font-size:0.95em;color:#00e676;margin:0;letter-spacing:2px;">SYSTEM HEALTH</h2>
