@@ -43,6 +43,8 @@ from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
 from apollo.strategies.catalyst_signals import get_all_signals
+from apollo.strategies.market_data import get_full_profile
+from apollo.strategies.position_rules import create_entry_plan, format_trade_plan
 
 LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"
@@ -393,13 +395,19 @@ def format_discord(results: list[dict]) -> str:
         lines.append(f"**EARNINGS THIS WEEK ({len(imminent)}):**")
         for r in imminent:
             dir_emoji = "LONG" if r["direction"] == "long" else ("SHORT" if r["direction"] == "short" else "NEUTRAL")
+            conviction = r.get("conviction", "?").upper()
+            pc = r.get("options_pc_ratio", "?")
+            short_pct = r.get("short_pct_float", 0)
+            upside = r.get("upside_pct", 0)
             lines.append(
-                f"  **{r['symbol']}** [{dir_emoji}] score={r['score']} | "
-                f"ER: {r['earnings_date']} ({r['days_until']}d)\n"
-                f"    ${r['price']} | BB={r['bb_pctile']:.0f}%ile | Vol={r['vol_ratio']:.1f}x | "
-                f"Beat rate: {r['beat_rate']:.0%}\n"
-                f"    {' | '.join(r['signals'][:3])}"
+                f"  **{r['symbol']}** [{dir_emoji}] score={r['score']} | {conviction} conviction\n"
+                f"    ER: {r['earnings_date']} ({r['days_until']}d) | Beat: {r['beat_rate']:.0%} | "
+                f"P/C: {pc} | Short: {short_pct:.1f}%\n"
+                f"    ${r['price']} | BB={r['bb_pctile']:.0f}%ile | Upside: {upside:+.0f}% to target\n"
+                f"    {' | '.join(r['signals'][:4])}"
             )
+            if r.get("trade_plan"):
+                lines.append(f"\n{r['trade_plan']}")
 
     if post_er:
         lines.append(f"\n**POST-EARNINGS DRIFT ({len(post_er)}):**")
@@ -480,6 +488,26 @@ def main():
                     scored["signals"].extend(catalyst["details"])
                 except Exception:
                     scored["catalyst_score"] = 0
+
+                # Market data (short interest, targets, valuation)
+                try:
+                    profile = get_full_profile(sym)
+                    scored["short_pct_float"] = profile["short_interest"].get("short_pct_float", 0)
+                    scored["short_ratio"] = profile["short_interest"].get("short_ratio", 0)
+                    scored["analyst_target"] = profile["analyst_targets"].get("target_mean", 0)
+                    scored["upside_pct"] = profile["analyst_targets"].get("upside_pct", 0)
+                    scored["revenue_growth"] = profile["valuation"].get("revenue_growth", 0)
+                    scored["score"] = min(100, scored["score"] + max(0, profile["total_signal"] // 3))
+                    scored["signals"].extend(profile["details"])
+                except Exception:
+                    pass
+
+                # Generate trade plan if score is high enough
+                plan = create_entry_plan(scored)
+                if plan:
+                    scored["trade_plan"] = format_trade_plan(plan)
+                    scored["conviction"] = plan.conviction
+                    scored["risk_pct"] = plan.risk_pct
             results.append(scored)
         if (i + 1) % 10 == 0:
             print(f"  Scanned {i+1}/{len(UNIVERSE)}...")
