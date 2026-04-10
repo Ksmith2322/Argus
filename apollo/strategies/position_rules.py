@@ -1,220 +1,181 @@
-"""apollo/strategies/position_rules.py -- Entry/exit rules for earnings plays.
+"""apollo/strategies/position_rules.py -- Post-ER entry/exit rules.
 
-Defines when to enter, how to size, and when to exit based on the scenario.
+BACKTEST PROVEN: Only post-ER drift on BIG confirmed moves works.
+Pre-earnings plays (blind entry, run-up) are negative EV across 110+ stocks.
 
-Entry Rules:
-  - Enter BEFORE market close on earnings day (or day before)
-  - Direction based on beat rate + catalyst consensus
-  - Size based on conviction score
+Strategy: "Day-After Big Gap" play
+  - Wait for earnings to report (after hours / pre-market)
+  - If gap >= 7% AND beat confirmed: enter LONG Day 2 morning
+  - Hold 5-20 days riding the post-ER drift
+  - Trail stop at 4% from peak after 3% profit
+  - PDT safe by design (enter Day 2, exit Day 4+ minimum)
 
-Exit Rules:
-  - POST-EARNINGS GAP: If gap > 5% in your direction → ride with trailing stop
-  - POST-EARNINGS GAP AGAINST: If gap > 3% against → cut immediately at open
-  - DRIFT PLAY: Hold 5-20 days after positive surprise, trail at 20 EMA
-  - TIMEOUT: Max hold 20 trading days regardless
+Backtest: gaps 7-15% = PF 1.27, 62% WR (the only profitable bucket)
 
-Sizing Rules:
-  - Score 80+: full position (2% risk)
-  - Score 60-79: half position (1% risk)
-  - Score < 60: no trade (watch only)
-
-PDT Constraint (under $25K):
-  - 3 day trades per 5 rolling business days
-  - Strategy: enter BEFORE earnings, hold MINIMUM 2 days (avoids day trade)
-  - Even if gap against you, hold through Day 2 then exit (not a day trade)
-  - Alternative: enter day BEFORE earnings, sell day AFTER = 2-day hold = safe
-  - Track day trade count to stay under 3/week
+What DOESN'T work (all backtested negative):
+  - Blind entry before earnings: PF 0.32
+  - 5-day run-up play: PF 0.37
+  - Post-ER drift on all beats: PF 0.69
+  - Post-ER drift on small gaps (<7%): PF 0.60
 """
 from dataclasses import dataclass
 
 
 @dataclass
-class EntryPlan:
-    """Pre-earnings entry plan."""
+class PostERPlan:
+    """Post-earnings drift trade plan."""
     symbol: str
-    direction: str        # "long" or "short"
-    entry_timing: str     # "before_close" or "after_open"
-    conviction: str       # "high" (80+), "medium" (60-79), "low" (<60)
-    risk_pct: float       # % of portfolio to risk
-    entry_price: float    # approximate entry (current price)
-    stop_pct: float       # stop as % from entry
-    target_pct: float     # target as % from entry
-    max_hold_days: int
-    reason: str
+    direction: str          # "long" (beat + gap up) or "short" (miss + gap down)
+    gap_pct: float          # Day 1 gap size
+    surprise_pct: float     # earnings surprise %
+    entry_timing: str       # "day2_open" — always
+    entry_price: float      # approximate (Day 1 close)
+    stop_pct: float         # 5% from entry
+    trail_trigger_pct: float  # activate trail after 3%
+    trail_pct: float        # 4% from peak
+    max_hold_days: int      # 20 for longs, 10 for shorts
     score: int
+    reason: str
 
 
-@dataclass
-class ExitRule:
-    """Post-news exit management rules."""
-    scenario: str         # what happened
-    action: str           # what to do
-    timing: str           # when
-    detail: str
+# ── Entry Criteria ────────────────────────────────────────────
 
+def should_enter_post_er(
+    gap_pct: float,
+    surprise_pct: float,
+    beat_rate: float = 0.5,
+    day1_volume_ratio: float = 1.0,
+    score: int = 0,
+) -> PostERPlan | None:
+    """Evaluate whether to enter a post-ER drift trade.
 
-def create_entry_plan(scored_market: dict) -> EntryPlan | None:
-    """Generate entry plan from a scored Apollo market."""
-    score = scored_market.get("score", 0)
-    direction = scored_market.get("direction", "neutral")
-    days_until = scored_market.get("days_until", 99)
+    Only enters on BIG confirmed moves (gap >= 7%).
+    Returns a trade plan or None.
+    """
+    # Must have meaningful gap
+    abs_gap = abs(gap_pct)
+    if abs_gap < 5:
+        return None  # too small — drift won't persist
 
-    if score < 60 or direction == "neutral":
+    direction = None
+    reasons = []
+
+    # LONG: beat + big gap up
+    if gap_pct >= 7 and surprise_pct > 0:
+        direction = "long"
+        reasons.append(f"BIG_GAP_UP: +{gap_pct:.1f}% | Beat +{surprise_pct:.1f}%")
+
+        # Extra confidence
+        if gap_pct >= 10:
+            reasons.append("MASSIVE_GAP: 10%+ = strong institutional buying")
+        if beat_rate >= 0.75:
+            reasons.append(f"SERIAL_BEATER: {beat_rate:.0%} historical beat rate")
+
+    # LONG: moderate gap (5-7%) but huge surprise
+    elif gap_pct >= 5 and surprise_pct > 10:
+        direction = "long"
+        reasons.append(f"BIG_SURPRISE: +{surprise_pct:.1f}% surprise, gap +{gap_pct:.1f}%")
+
+    # SHORT: miss + big gap down (less reliable — use caution)
+    elif gap_pct <= -7 and surprise_pct < -2:
+        direction = "short"
+        reasons.append(f"BIG_GAP_DOWN: {gap_pct:.1f}% | Miss {surprise_pct:.1f}%")
+
+    if direction is None:
         return None
 
-    # Conviction and sizing
-    if score >= 80:
-        conviction = "high"
-        risk_pct = 0.02  # 2% of portfolio
-        stop_pct = 8.0   # wider stop for high conviction
-        target_pct = 20.0
-    elif score >= 70:
-        conviction = "medium"
-        risk_pct = 0.01
-        stop_pct = 5.0
-        target_pct = 15.0
+    # Volume confirmation (high Day 1 volume = real move, not thin)
+    if day1_volume_ratio > 2.0:
+        reasons.append(f"VOLUME_CONFIRMED: {day1_volume_ratio:.1f}x avg")
+    elif day1_volume_ratio < 1.0:
+        reasons.append("LOW_VOL: may fade — reduce size")
+
+    # Sizing
+    if abs_gap >= 10:
+        stop = 5.0
+        max_hold = 20 if direction == "long" else 10
     else:
-        conviction = "low"
-        risk_pct = 0.005
-        stop_pct = 4.0
-        target_pct = 10.0
+        stop = 4.0
+        max_hold = 15 if direction == "long" else 8
 
-    # Entry timing
-    if days_until <= 1:
-        entry_timing = "before_close"
-    elif days_until <= 3:
-        entry_timing = "before_close"
-    else:
-        entry_timing = "watch"  # too early, revisit later
-
-    # Adjust for direction
-    if direction == "short":
-        stop_pct = stop_pct * 1.2  # wider stops for shorts (upside unbounded)
-        target_pct = target_pct * 0.8
-
-    # Max hold based on play type
-    if days_until < 0:
-        # Post-earnings drift play
-        max_hold = 20
-    else:
-        # Pre-earnings play (hold through earnings + drift)
-        max_hold = abs(days_until) + 20
-
-    signals = scored_market.get("signals", [])
-    reason = "; ".join(signals[:3]) if signals else "score-based"
-
-    return EntryPlan(
-        symbol=scored_market["symbol"],
+    return PostERPlan(
+        symbol="",  # filled by caller
         direction=direction,
-        entry_timing=entry_timing,
-        conviction=conviction,
-        risk_pct=risk_pct,
-        entry_price=scored_market.get("price", 0),
-        stop_pct=stop_pct,
-        target_pct=target_pct,
+        gap_pct=gap_pct,
+        surprise_pct=surprise_pct,
+        entry_timing="day2_open",
+        entry_price=0,  # filled by caller
+        stop_pct=stop,
+        trail_trigger_pct=3.0,
+        trail_pct=4.0,
         max_hold_days=max_hold,
-        reason=reason,
         score=score,
+        reason=" | ".join(reasons),
     )
 
 
-def get_exit_rules(direction: str) -> list[ExitRule]:
-    """Return the exit decision tree for managing a position after news."""
-    rules = []
+# ── Exit Rules ────────────────────────────────────────────────
 
-    # ALL EXITS: minimum 2-day hold to avoid PDT (enter Day -1, exit Day +1 minimum)
-    if direction == "long":
-        rules = [
-            ExitRule(
-                "GAP_UP_BIG",
-                "HOLD + trail stop at gap low (exit Day 2+)",
-                "Day 1 (morning after ER): gap > 5% up",
-                "DO NOT sell Day 1 (PDT). Set mental trailing stop at gap low. "
-                "Day 2: if still above gap low, hold with trail. Sell when trail hit. Max 20d.",
-            ),
-            ExitRule(
-                "GAP_UP_SMALL",
-                "HOLD through Day 2, trail at 8 EMA",
-                "Day 1: gap 1-5% up",
-                "Positive but modest. Hold Day 1 and Day 2 minimum (PDT safe). "
-                "Day 2 close: if above pre-ER close, set trail at 8 EMA. Else exit Day 2.",
-            ),
-            ExitRule(
-                "FLAT_OPEN",
-                "HOLD through Day 2, then decide",
-                "Day 1: gap < 1%",
-                "In-line surprise. Mandatory hold Day 1 (PDT). "
-                "Day 2: if positive, hold with trail. If negative, exit Day 2 close.",
-            ),
-            ExitRule(
-                "GAP_DOWN",
-                "HOLD Day 1, exit Day 2 open (PDT safe)",
-                "Day 1: gap > 2% down",
-                "Thesis wrong BUT cannot sell Day 1 (PDT). Hold through Day 1. "
-                "Day 2 open: exit immediately. Accept the 2-day loss.",
-            ),
-            ExitRule(
-                "DRIFT_PLAY",
-                "Hold 5-20 days with trailing stop",
-                "Day 2+ if still in profit",
-                "Post-ER drift = 3-8% over 20 days. Trail stop at 20-day EMA. "
-                "Exit on first close below EMA. No PDT concern (multi-day hold).",
-            ),
-            ExitRule(
-                "TIMEOUT",
-                "Close regardless",
-                "Day 20 after earnings",
-                "Drift exhausted. Close position and redeploy capital.",
-            ),
-        ]
-    else:  # short
-        rules = [
-            ExitRule(
-                "GAP_DOWN_BIG",
-                "HOLD short Day 1, trail from Day 2",
-                "Day 1: gap > 5% down",
-                "Miss confirmed. Hold Day 1 (PDT). Day 2+: trail stop at gap high. "
-                "Cover when momentum stalls. Max hold 10d.",
-            ),
-            ExitRule(
-                "GAP_DOWN_SMALL",
-                "HOLD short through Day 2, tight trail",
-                "Day 1: gap 1-5% down",
-                "Modest miss. Hold Day 1-2 (PDT safe). Day 2: trail at 8 EMA. "
-                "Cover if it reclaims pre-ER close.",
-            ),
-            ExitRule(
-                "GAP_UP_AGAINST",
-                "HOLD Day 1, cover Day 2 (PDT safe)",
-                "Day 1: gap > 2% up",
-                "Beat against your short. CANNOT cover Day 1 (PDT). "
-                "Day 2 open: cover immediately. Accept 2-day loss. Set max loss alert.",
-            ),
-            ExitRule(
-                "TIMEOUT",
-                "Cover regardless",
-                "Day 10 after earnings",
-                "Shorter timeout for shorts. Cover and move on.",
-            ),
-        ]
-
-    return rules
+EXIT_RULES = {
+    "long": [
+        {
+            "name": "TRAILING_STOP",
+            "trigger": "Unrealized profit >= 3%",
+            "action": "Set trail at 4% below peak. Tighten to 3% after 8%+ profit.",
+            "detail": "This captures the drift while locking in gains. Most winning trades exit here.",
+        },
+        {
+            "name": "HARD_STOP",
+            "trigger": "Price drops 5% from entry",
+            "action": "Exit immediately at next open.",
+            "detail": "The gap may have been a fakeout. Don't hold losers hoping for drift.",
+        },
+        {
+            "name": "MOMENTUM_STALL",
+            "trigger": "3 consecutive red days after Day 5",
+            "action": "Exit at Day 3 close.",
+            "detail": "Drift has stalled. Take whatever profit remains.",
+        },
+        {
+            "name": "TIMEOUT",
+            "trigger": "Day 20 (15 for moderate gaps)",
+            "action": "Exit at close regardless.",
+            "detail": "Post-ER drift exhausts after ~20 trading days. Capital is dead weight after.",
+        },
+    ],
+    "short": [
+        {
+            "name": "TRAILING_STOP",
+            "trigger": "Unrealized profit >= 3%",
+            "action": "Set trail at 4% above trough.",
+        },
+        {
+            "name": "HARD_STOP",
+            "trigger": "Price rises 5% from entry",
+            "action": "Cover immediately.",
+        },
+        {
+            "name": "TIMEOUT",
+            "trigger": "Day 10 (8 for moderate gaps)",
+            "action": "Cover at close. Short drift is shorter than long drift.",
+        },
+    ],
+}
 
 
-def format_trade_plan(plan: EntryPlan) -> str:
-    """Format a trade plan for Discord / display."""
+def format_post_er_plan(plan: PostERPlan) -> str:
+    """Format trade plan for Discord."""
     lines = [
-        f"**{plan.symbol} — {plan.direction.upper()} ({plan.conviction.upper()} conviction)**",
-        f"  Score: {plan.score} | Entry: {plan.entry_timing}",
-        f"  Price: ~${plan.entry_price:.2f} | Risk: {plan.risk_pct:.1%} of portfolio",
-        f"  Stop: {plan.stop_pct:.1f}% | Target: {plan.target_pct:.1f}% | Max hold: {plan.max_hold_days}d",
-        f"  Reason: {plan.reason[:80]}",
+        f"**{plan.symbol} — POST-ER {plan.direction.upper()}**",
+        f"  Gap: {plan.gap_pct:+.1f}% | Surprise: {plan.surprise_pct:+.1f}%",
+        f"  Entry: Day 2 open (~${plan.entry_price:.2f})",
+        f"  Stop: {plan.stop_pct}% | Trail: {plan.trail_pct}% after {plan.trail_trigger_pct}% profit",
+        f"  Max hold: {plan.max_hold_days}d | PDT safe (Day 2 entry)",
+        f"  {plan.reason}",
         "",
-        "  **Exit Rules:**",
+        "  Exit Rules:",
     ]
-
-    for rule in get_exit_rules(plan.direction)[:4]:
-        lines.append(f"    {rule.scenario}: {rule.action}")
-        lines.append(f"      {rule.timing}: {rule.detail[:80]}")
+    for rule in EXIT_RULES.get(plan.direction, []):
+        lines.append(f"    {rule['name']}: {rule['trigger']} -> {rule['action']}")
 
     return "\n".join(lines)

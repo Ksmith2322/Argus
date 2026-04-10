@@ -218,9 +218,9 @@ BEARISH_KEYWORDS = [
 ]
 
 
-def analyze_news_sentiment(symbol: str) -> dict:
-    """Scan yfinance news headlines for sentiment keywords."""
-    result = {"signal": 0, "details": [], "headlines": [], "bullish_count": 0, "bearish_count": 0}
+def analyze_news_sentiment(symbol: str, use_llm: bool = True) -> dict:
+    """Scan yfinance news headlines for sentiment — keyword + optional LLM deep analysis."""
+    result = {"signal": 0, "details": [], "headlines": [], "bullish_count": 0, "bearish_count": 0, "llm_analysis": ""}
 
     try:
         t = yf.Ticker(symbol)
@@ -230,10 +230,8 @@ def analyze_news_sentiment(symbol: str) -> dict:
 
         for article in news[:10]:
             title = str(article.get("title", "")).lower()
-            publisher = article.get("publisher", "")
             result["headlines"].append(title[:80])
 
-            # Score keywords
             bull_matches = [kw for kw in BULLISH_KEYWORDS if kw in title]
             bear_matches = [kw for kw in BEARISH_KEYWORDS if kw in title]
 
@@ -260,10 +258,76 @@ def analyze_news_sentiment(symbol: str) -> dict:
             result["signal"] -= 8
             result["details"].append(f"NEWS_NEGATIVE: {result['bullish_count']}B/{result['bearish_count']}N")
 
+        # LLM deep analysis (Ollama) — only for stocks with upcoming earnings
+        if use_llm and result["headlines"]:
+            llm_result = _llm_analyze_headlines(symbol, result["headlines"])
+            if llm_result:
+                result["llm_analysis"] = llm_result.get("analysis", "")
+                llm_signal = llm_result.get("signal", 0)
+                if abs(llm_signal) > 5:
+                    result["signal"] += llm_signal
+                    result["details"].append(f"LLM: {llm_result.get('summary', '')}")
+
     except Exception as e:
         _log.debug(f"{symbol} news error: {e}")
 
     return result
+
+
+def _llm_analyze_headlines(symbol: str, headlines: list[str]) -> dict | None:
+    """Use Ollama to analyze headlines more deeply than keyword matching."""
+    import json as _json
+    from urllib.request import Request, urlopen
+
+    OLLAMA_URL = "http://localhost:11434"
+
+    try:
+        # Check Ollama available
+        req = Request(f"{OLLAMA_URL}/api/version", method="GET")
+        urlopen(req, timeout=2)
+    except Exception:
+        return None
+
+    try:
+        headlines_text = "\n".join(f"  - {h}" for h in headlines[:8])
+        prompt = (
+            f"You are analyzing news headlines for {symbol} before an upcoming earnings report. "
+            f"Rate the sentiment for the stock price on a scale of -10 (very bearish) to +10 (very bullish).\n\n"
+            f"Headlines:\n{headlines_text}\n\n"
+            f"Reply in exactly this format:\n"
+            f"SCORE: [number from -10 to 10]\n"
+            f"SUMMARY: [one sentence explaining why]\n"
+            f"Nothing else."
+        )
+
+        payload = _json.dumps({
+            "model": "llama3.2:3b",
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 100},
+        }).encode()
+        req = Request(f"{OLLAMA_URL}/api/generate", data=payload,
+                      headers={"Content-Type": "application/json"}, method="POST")
+        resp = _json.loads(urlopen(req, timeout=15).read())
+        text = resp.get("response", "").strip()
+
+        # Parse response
+        score = 0
+        summary = ""
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("SCORE:"):
+                try:
+                    score = int(float(line.split(":", 1)[1].strip().split()[0]))
+                    score = max(-10, min(10, score))
+                except (ValueError, IndexError):
+                    pass
+            elif line.upper().startswith("SUMMARY:"):
+                summary = line.split(":", 1)[1].strip()
+
+        return {"signal": score, "summary": summary, "analysis": text}
+    except Exception:
+        return None
 
 
 # ── 4. Macro Context ─────────────────────────────────────────

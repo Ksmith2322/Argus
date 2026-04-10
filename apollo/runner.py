@@ -45,7 +45,8 @@ load_dotenv(REPO / ".env")
 from apollo.strategies.catalyst_signals import get_all_signals
 from apollo.strategies.market_data import get_full_profile
 from apollo.strategies.context_signals import get_full_context, analyze_macro_context
-from apollo.strategies.position_rules import create_entry_plan, format_trade_plan
+from apollo.strategies.position_rules import should_enter_post_er, format_post_er_plan, PostERPlan
+from apollo.ops.fleet_risk import check_exposure, fleet_summary
 
 LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"
@@ -392,9 +393,21 @@ def format_discord(results: list[dict]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"**APOLLO Earnings Scanner -- {now}**\n"]
 
-    imminent = [r for r in results if r["score"] >= 60 and 0 <= r.get("days_until", 99) <= 5]
-    watching = [r for r in results if r["score"] >= 45 and r not in imminent]
-    post_er = [r for r in results if r.get("days_until", 0) < 0 and r["score"] >= 50]
+    # POST-ER ACTIONABLE (just reported, big gap = drift play)
+    post_er_plays = [r for r in results if r.get("post_er_play")]
+
+    # PRE-ER WATCHLIST (upcoming, for awareness only — do NOT trade blind)
+    imminent = [r for r in results if r["score"] >= 60 and 0 <= r.get("days_until", 99) <= 5 and not r.get("post_er_play")]
+    watching = [r for r in results if r["score"] >= 45 and r not in imminent and not r.get("post_er_play")]
+    post_er = [r for r in results if r.get("days_until", 0) < 0 and r["score"] >= 50 and not r.get("post_er_play")]
+
+    if post_er_plays:
+        lines.append(f"**ACTIONABLE — POST-ER DRIFT PLAYS ({len(post_er_plays)}):**")
+        lines.append("_These stocks JUST reported with big gaps. Enter Day 2 for drift._\n")
+        for r in post_er_plays:
+            if r.get("trade_plan"):
+                lines.append(r["trade_plan"])
+                lines.append("")
 
     if imminent:
         lines.append(f"**EARNINGS THIS WEEK ({len(imminent)}):**")
@@ -548,12 +561,28 @@ def main():
                 except Exception:
                     pass
 
-                # Generate trade plan if score is high enough
-                plan = create_entry_plan(scored)
-                if plan:
-                    scored["trade_plan"] = format_trade_plan(plan)
-                    scored["conviction"] = plan.conviction
-                    scored["risk_pct"] = plan.risk_pct
+                # Fleet risk check — no double exposure
+                exposure = check_exposure(sym)
+                if exposure["blocked"]:
+                    scored["signals"].append(f"FLEET_BLOCKED: {exposure['reason']}")
+                    scored["fleet_blocked"] = True
+
+                # Post-ER trade plan (only for stocks that JUST reported with big gap)
+                if scored.get("days_until") is not None and -3 <= scored["days_until"] < 0:
+                    # This stock just reported — check for drift play
+                    gap = scored.get("ret_5d", 0)  # approximate gap from recent return
+                    plan = should_enter_post_er(
+                        gap_pct=gap,
+                        surprise_pct=scored.get("avg_surprise", 0),
+                        beat_rate=scored.get("beat_rate", 0.5),
+                        score=scored["score"],
+                    )
+                    if plan and not scored.get("fleet_blocked"):
+                        plan.symbol = sym
+                        plan.entry_price = scored.get("price", 0)
+                        scored["trade_plan"] = format_post_er_plan(plan)
+                        scored["post_er_play"] = True
+                        scored["conviction"] = "high" if abs(gap) >= 10 else "medium"
             results.append(scored)
         if (i + 1) % 10 == 0:
             print(f"  Scanned {i+1}/{len(UNIVERSE)}...")
