@@ -370,14 +370,8 @@ def read_coin_pool() -> dict:
 
 
 def _get_rotation_candidates() -> list:
-    """Return list of coin names that are rotation candidates (non-critical, returns [] on error)."""
-    try:
-        from ops.coin_rotation import check_rotation_candidates, read_coin_pool as _rcp
-        pool = read_coin_pool()
-        candidates = check_rotation_candidates(pool)
-        return [c["coin"] for c in candidates]
-    except Exception:
-        return []
+    """Legacy coin rotation — disabled. Returns empty list."""
+    return []
 
 
 def read_queue_status(skip_pc2: bool = False) -> dict:
@@ -1765,12 +1759,8 @@ async def api_pool():
 
 @app.get("/api/rotation_status")
 async def api_rotation_status():
-    """Live coin performance metrics and rotation candidates."""
-    try:
-        from ops.coin_rotation import get_rotation_status
-        return JSONResponse(get_rotation_status())
-    except Exception as e:
-        return JSONResponse({"error": str(e), "candidates": [], "pool": {}})
+    """Legacy coin rotation — disabled."""
+    return JSONResponse({"error": "disabled", "candidates": [], "pool": {}})
 
 
 @app.get("/api/evolution")
