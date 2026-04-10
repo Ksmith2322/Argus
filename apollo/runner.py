@@ -44,6 +44,7 @@ load_dotenv(REPO / ".env")
 
 from apollo.strategies.catalyst_signals import get_all_signals
 from apollo.strategies.market_data import get_full_profile
+from apollo.strategies.context_signals import get_full_context, analyze_macro_context
 from apollo.strategies.position_rules import create_entry_plan, format_trade_plan
 
 LOGS_DIR = REPO / "apollo" / "logs"
@@ -488,6 +489,15 @@ def main():
     print(f"Scanning {len(UNIVERSE)} stocks for earnings within {args.days} days")
     print(f"{'='*60}")
 
+    # Macro check first — if market is crashing, flag it
+    print("  Checking macro context...")
+    macro = analyze_macro_context()
+    print(f"  SPY: {macro['spy_trend']} ({macro['spy_5d_ret']:+.1f}% 5d) | VIX: {macro['vix_level']} | Risk: {macro['market_risk']}")
+    if macro["market_risk"] == "high":
+        print(f"  *** WARNING: HIGH RISK ENVIRONMENT — reduce position sizes ***")
+    for d in macro["details"]:
+        print(f"    {d}")
+
     results = []
     for i, sym in enumerate(UNIVERSE):
         data = get_earnings_data(sym)
@@ -522,6 +532,19 @@ def main():
                     scored["revenue_growth"] = profile["valuation"].get("revenue_growth", 0)
                     scored["score"] = min(100, scored["score"] + max(0, profile["total_signal"] // 3))
                     scored["signals"].extend(profile["details"])
+                except Exception:
+                    pass
+
+                # Context signals (peers, post-ER reaction, news, macro)
+                try:
+                    context = get_full_context(sym)
+                    scored["context_score"] = context["total_signal"]
+                    scored["peer_signal"] = context["peers"].get("signal", 0)
+                    scored["news_sentiment"] = f"{context['news'].get('bullish_count',0)}B/{context['news'].get('bearish_count',0)}N"
+                    scored["macro_risk"] = context["macro"].get("market_risk", "normal")
+                    scored["vix"] = context["macro"].get("vix_level", 0)
+                    scored["score"] = min(100, scored["score"] + max(-20, context["total_signal"] // 3))
+                    scored["signals"].extend(context["details"])
                 except Exception:
                     pass
 
