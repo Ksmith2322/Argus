@@ -7,7 +7,7 @@ Key design choices:
   - Connection pooling: each runner gets its own connection (clientId)
   - Stocks use SMART routing
   - Bracket orders (entry + stop + target) when possible
-  - Paper mode by default (TWS port 7496 with paper account)
+  - Paper mode by default (TWS port 7497 with DUP472829 paper account)
   - All orders logged to logs/<system>/orders.csv
 
 Usage:

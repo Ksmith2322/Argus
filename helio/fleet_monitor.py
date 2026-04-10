@@ -65,19 +65,19 @@ SYSTEMS = {
         "heartbeats": [REPO / "titan" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 4500,  # 75 min (loop is 60min + buffer)
         "process_match": "titan.runner",
-        "restart_args": ["-m", "titan.runner", "--loop", "--interval-min", "60"],
+        "restart_args": ["-m", "titan.runner", "--loop", "--interval-min", "60", "--live"],
     },
     "hermes": {
         "heartbeats": [REPO / "hermes" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 8400,  # 140 min (loop is 120min + buffer)
         "process_match": "hermes.runner",
-        "restart_args": ["-m", "hermes.runner", "--loop", "--interval-min", "120", "--min-score", "80"],
+        "restart_args": ["-m", "hermes.runner", "--loop", "--interval-min", "120", "--min-score", "80", "--live"],
     },
     "apollo": {
         "heartbeats": [REPO / "apollo" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 16200,  # 270 min (loop is 240min + buffer)
         "process_match": "apollo.runner",
-        "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14"],
+        "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14", "--live"],
     },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
