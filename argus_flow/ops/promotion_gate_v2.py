@@ -86,6 +86,28 @@ def _load_json(path: Path) -> dict | None:
         return None
 
 
+def _row_ts(row: dict) -> datetime | None:
+    ts = str(row.get("ts", "") or "").strip()
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _filter_rows_since(rows: list[dict], stage_start: datetime | None) -> list[dict]:
+    if stage_start is None:
+        return list(rows)
+    filtered: list[dict] = []
+    for row in rows:
+        ts = _row_ts(row)
+        if ts is None or ts < stage_start:
+            continue
+        filtered.append(row)
+    return filtered
+
+
 _DASHBOARD_FLEET_CACHE: dict[str, dict] | None = None
 
 
@@ -425,7 +447,11 @@ def check_win_rate_vs_replay(valid_trades: list[dict], replay_expectations: dict
     return _hard(delta_pp <= 15.0, detail)
 
 
-def check_signal_frequency(log_dir: Path, replay_expectations: dict) -> CheckResult:
+def check_signal_frequency(
+    log_dir: Path,
+    replay_expectations: dict,
+    stage_start: datetime | None = None,
+) -> CheckResult:
     replay_spd = replay_expectations.get("signals_per_day")
     if replay_spd is None:
         return _advisory(True, "no replay signals/day expectation available")
@@ -435,7 +461,7 @@ def check_signal_frequency(log_dir: Path, replay_expectations: dict) -> CheckRes
         return _hard(False, "signals.csv not found")
 
     with open(sig_file, "r", encoding="utf-8") as f:
-        all_signals = list(csv.DictReader(f))
+        all_signals = _filter_rows_since(list(csv.DictReader(f)), stage_start)
     if len(all_signals) < 2:
         return _hard(False, f"only {len(all_signals)} signals recorded")
 
@@ -614,7 +640,11 @@ def check_live_drawdown_vs_walkforward(valid_trades: list[dict], log_dir: Path) 
 
 def evaluate_runner(runner: dict) -> dict:
     log_dir = _runner_log_dir(runner)
-    all_trades = _load_trades(log_dir)
+    stage_start = _stage_entered_at(
+        str(runner.get("symbol", "") or ""),
+        str(runner.get("config_file", "") or ""),
+    )
+    all_trades = _filter_rows_since(_load_trades(log_dir), stage_start)
     valid_trades = [t for t in all_trades if str(t.get("experiment_valid", "")).lower() == "true"]
     replay_expectations = _load_replay_expectations(runner)
 
@@ -633,7 +663,7 @@ def evaluate_runner(runner: dict) -> dict:
         "consecutive_losses": check_consecutive_losses(valid_trades),
         "profit_factor": check_profit_factor(valid_trades),
         "win_rate_vs_replay": check_win_rate_vs_replay(valid_trades, replay_expectations),
-        "signal_frequency": check_signal_frequency(log_dir, replay_expectations),
+        "signal_frequency": check_signal_frequency(log_dir, replay_expectations, stage_start=stage_start),
         "walk_forward_positive": check_walk_forward_positive(log_dir),
         "live_drawdown_vs_walkforward": check_live_drawdown_vs_walkforward(valid_trades, log_dir),
         "survived_disconnect": check_survived_disconnect(all_trades),
@@ -682,6 +712,7 @@ def evaluate_runner(runner: dict) -> dict:
         "blockers": hard_blockers,
         "evidence_gaps": evidence_gaps,
         "advisories": advisory_items,
+        "cohort_start": stage_start.isoformat() if stage_start is not None else "",
         "total_trades": len(all_trades),
         "valid_trades": len(valid_trades),
         "summary": summary,

@@ -44,7 +44,7 @@ LOCK_NAME = "weekly_pair_onboarding"
 LATEST_REPORT_PATH = LOGS_DIR / "weekly_pair_onboarding_latest.json"
 
 DEFAULT_DISCOVERY_SPEC = {
-    "template_config": "argus_flow/configs/eurusd_t4_paper_v1.json",
+    "template_config": "argus_flow/configs/cadjpy_mtf_paper_v1.json",
     "entry_stage": STAGE_WATCHER,
     "history_days": 45,
     "max_new_pairs": 5,
@@ -314,7 +314,9 @@ def build_final_candidate_config(
     stage: str,
     results: dict,
 ) -> tuple[str, dict]:
+    normalized_stage = stage if stage in {STAGE_WATCHER, STAGE_DISCOVERY} else STAGE_WATCHER
     cfg = _build_eval_config(template_cfg, symbol)
+    cfg["stage"] = normalized_stage
     cfg["replay_expectations"] = _build_replay_expectations(results, _data_path_for_symbol(symbol))
 
     discovery = cfg.get("discovery", {}) if isinstance(cfg.get("discovery", {}), dict) else {}
@@ -328,7 +330,7 @@ def build_final_candidate_config(
     cfg["discovery"] = discovery
 
     config_name = candidate_config_name(symbol, template_path)
-    cfg, _ = _apply_managed_defaults(cfg, CONFIGS_DIR / config_name, stage)
+    cfg, _ = _apply_managed_defaults(cfg, CONFIGS_DIR / config_name, normalized_stage)
     return config_name, cfg
 
 

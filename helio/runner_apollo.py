@@ -254,11 +254,15 @@ def _eval_instrument(ib, inst: dict, bars, now: datetime, cfg: dict):
 def run_live(configs: list[Path]):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from ops.process_lock import ProcessLock, ProcessLockError
+    from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_name
     from ib_insync import IB, Forex
 
     # --- Process lock: prevent duplicate launches ---
-    lock_name = f"apollo_reversion_{os.getpid()}"
+    lock_name = build_runner_lock_name(
+        client_id=220,
+        config_paths=[str(c) for c in configs],
+        exclude=None,
+    )
     lock = ProcessLock(lock_name)
     try:
         lock.acquire(metadata={"family": "apollo", "strategy": "mean_reversion", "configs": [str(c) for c in configs]})

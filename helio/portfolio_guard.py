@@ -31,6 +31,12 @@ POSITION_SOURCES: Dict[str, str] = {
     "apollo":        str(REPO_ROOT / "helio" / "logs" / "apollo_*" / "state.json"),
     "hermes":        str(REPO_ROOT / "helio" / "logs" / "hermes_*" / "state.json"),
 }
+LEGACY_POSITION_FILES: Dict[str, Path] = {
+    "titan": REPO_ROOT / "titan" / "logs" / "positions.json",
+    "hermes_gap": REPO_ROOT / "hermes" / "logs" / "positions.json",
+    "apollo_earnings": REPO_ROOT / "apollo" / "logs" / "positions.json",
+    "ares_rotation": REPO_ROOT / "ares" / "logs" / "positions.json",
+}
 
 OUTPUT_PATH = REPO_ROOT / "helio" / "logs" / "portfolio_guard.json"
 
@@ -68,6 +74,15 @@ def _normalise_symbol(raw: str) -> str:
     for ch in ("_", "/", "-"):
         s = s.replace(ch, "")
     return s
+
+
+def _normalise_direction(raw: object, default: str = "LONG") -> str:
+    text = str(raw or default).strip().upper()
+    if text in {"BUY", "LONG"}:
+        return "LONG"
+    if text in {"SELL", "SHORT"}:
+        return "SHORT"
+    return default.upper()
 
 
 def _symbol_from_path(path: str, family: str) -> str:
@@ -145,6 +160,75 @@ def _load_position(path: str, family: str) -> Optional[OpenPosition]:
     )
 
 
+def _legacy_open_position(
+    *,
+    family: str,
+    symbol: str,
+    direction: object,
+    entry_price: object,
+    state_path: str,
+) -> OpenPosition:
+    try:
+        px = float(entry_price or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    return OpenPosition(
+        family=family,
+        symbol=symbol,
+        symbol_norm=_normalise_symbol(symbol),
+        direction=_normalise_direction(direction),
+        entry_price=px,
+        state_path=state_path,
+    )
+
+
+def _load_legacy_positions(path: Path, family: str) -> List[OpenPosition]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    positions: List[OpenPosition] = []
+    if family == "ares_rotation":
+        for symbol, payload in data.get("holdings", {}).items():
+            if not isinstance(payload, dict):
+                continue
+            positions.append(
+                _legacy_open_position(
+                    family=family,
+                    symbol=str(symbol),
+                    direction="LONG",
+                    entry_price=payload.get("entry_price", 0.0),
+                    state_path=str(path),
+                )
+            )
+        return positions
+
+    if family == "apollo_earnings":
+        items = data.get("positions", {}).items()
+    else:
+        items = data.items()
+
+    for symbol, payload in items:
+        if family in {"titan", "hermes_gap"} and symbol in {"last_rebalance", "last_signal", "holdings"}:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status", "OPEN") or "OPEN").strip().upper()
+        if status not in {"OPEN", "ACTIVE"}:
+            continue
+        positions.append(
+            _legacy_open_position(
+                family=family,
+                symbol=str(symbol),
+                direction=payload.get("direction", "LONG"),
+                entry_price=payload.get("entry_price", 0.0),
+                state_path=str(path),
+            )
+        )
+    return positions
+
+
 # Exclude internal/meta directories in argus_flow/logs that are not instruments
 _ARGUS_SKIP_DIRS = {
     "_broker", "_locks", "_risk", "_scratch_weekly_onboarding",
@@ -168,6 +252,10 @@ def scan_all_positions() -> List[OpenPosition]:
             op = _load_position(p, family)
             if op is not None:
                 positions.append(op)
+
+    for family, path in LEGACY_POSITION_FILES.items():
+        if path.exists():
+            positions.extend(_load_legacy_positions(path, family))
 
     return positions
 
@@ -297,7 +385,8 @@ def check_new_entry(
     Parameters
     ----------
     family : str
-        One of: argus_fx, helio_swing, apollo, hermes
+        Family identifier such as argus_fx, helio_swing, apollo, hermes,
+        titan, hermes_gap, apollo_earnings, or ares_rotation
     symbol : str
         Instrument symbol (e.g. EURUSD, mes, gold_f)
     direction : str

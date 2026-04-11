@@ -46,6 +46,13 @@ try:
 except ImportError:
     _FLEET_RISK_AVAILABLE = False
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
+from ops.process_lock import ProcessLock, ProcessLockError
+
 DATA_DIR = REPO / "hermes" / "data"
 LOGS_DIR = REPO / "hermes" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
@@ -133,6 +140,13 @@ def execute_entries(gaps: list[dict], executor, positions: dict) -> int:
             if exposure["blocked"]:
                 print(f"  {sym}: FLEET BLOCK -- {exposure['reason']}")
                 continue
+        if _pg_check_new_entry is not None:
+            pg_check = _pg_check_new_entry("hermes_gap", sym, "LONG")
+            if not pg_check.allowed:
+                print(f"  {sym}: PORTFOLIO BLOCK -- {pg_check.reason}")
+                continue
+            if pg_check.warnings:
+                print(f"  {sym}: portfolio warnings -- {pg_check.warnings}")
         risk_amount = MODEL_EQUITY * MAX_RISK_PCT
         risk_per_share = abs(g["entry_price"] - g["stop_price"])
         if risk_per_share <= 0:
@@ -406,7 +420,9 @@ def run_cycle(args, executor):
         hb_path = LOGS_DIR / "heartbeat.json"
         hb_path.write_text(json.dumps({
             "system": "hermes",
+            "family": "hermes_gap",
             "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": "LIVE" if executor else "PAPER",
             "open_positions": len(positions),
             "gaps_today": len(gaps),
             "ibkr_connected": executor.is_connected() if executor else False,
@@ -429,44 +445,57 @@ def main():
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--min-score", type=int, default=55)
     args = parser.parse_args()
+    lock = None
+    if not args.backtest:
+        lock = ProcessLock("hermes_gap_runner")
+        try:
+            lock.acquire(metadata={
+                "family": "hermes_gap",
+                "mode": "LIVE" if args.live else "PAPER",
+                "loop": args.loop,
+            })
+        except ProcessLockError as exc:
+            print(f"Cannot start Hermes runner: {exc}")
+            return
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if args.backtest:
-        run_backtest(min_score=args.min_score)
-        return
-
-    print(f"{'=' * 60}")
-    print(f"HERMES Gap Scanner -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'=' * 60}")
-
-    # Connect IBKR if live
     executor = None
-    if args.live and _IBKR_AVAILABLE:
-        executor = IBKRExecutor(
-            client_id=CLIENT_IDS["hermes"],
-            system="hermes",
-            model_equity_usd=MODEL_EQUITY,
-        )
-        if not executor.connect():
-            print("  IBKR connection failed — running in scan-only mode")
-            executor = None
+    try:
+        if args.backtest:
+            run_backtest(min_score=args.min_score)
+            return
 
-    if args.loop:
-        try:
-            while True:
-                run_cycle(args, executor)
-                print(f"\nSleeping {args.interval_min}min until next cycle...")
-                time.sleep(args.interval_min * 60)
-        except KeyboardInterrupt:
-            print("\nHermes stopped")
-        finally:
-            if executor:
-                executor.disconnect()
-    else:
-        run_cycle(args, executor)
+        print(f"{'=' * 60}")
+        print(f"HERMES Gap Scanner -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"{'=' * 60}")
+
+        # Connect IBKR if live
+        if args.live and _IBKR_AVAILABLE:
+            executor = IBKRExecutor(
+                client_id=CLIENT_IDS["hermes"],
+                system="hermes",
+                model_equity_usd=MODEL_EQUITY,
+            )
+            if not executor.connect():
+                print("  IBKR connection failed — running in scan-only mode")
+                executor = None
+
+        if args.loop:
+            try:
+                while True:
+                    run_cycle(args, executor)
+                    print(f"\nSleeping {args.interval_min}min until next cycle...")
+                    time.sleep(args.interval_min * 60)
+            except KeyboardInterrupt:
+                print("\nHermes stopped")
+        else:
+            run_cycle(args, executor)
+    finally:
         if executor:
             executor.disconnect()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":

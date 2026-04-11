@@ -51,6 +51,13 @@ try:
 except ImportError:
     from apollo.ops.fleet_risk import check_exposure, fleet_summary
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
+from ops.process_lock import ProcessLock, ProcessLockError
+
 LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -625,6 +632,13 @@ def main():
 
         for r in results:
             if r.get("post_er_play") and r["score"] >= 75 and r.get("direction") in ("long", "short"):
+                if _pg_check_new_entry is not None:
+                    pg_check = _pg_check_new_entry("apollo_earnings", r["symbol"], r["direction"].upper())
+                    if not pg_check.allowed:
+                        print(f"  {r['symbol']}: PORTFOLIO BLOCK -- {pg_check.reason}")
+                        continue
+                    if pg_check.warnings:
+                        print(f"  {r['symbol']}: portfolio warnings -- {pg_check.warnings}")
                 add_position(
                     symbol=r["symbol"],
                     direction=r["direction"],
@@ -641,13 +655,25 @@ def main():
 
     # Heartbeat
     try:
+        open_positions = 0
+        positions_path = LOGS_DIR / "positions.json"
+        if positions_path.exists():
+            payload = json.loads(positions_path.read_text())
+            open_positions = sum(
+                1
+                for pos in payload.get("positions", {}).values()
+                if str(pos.get("status", "OPEN") or "OPEN").upper() == "OPEN"
+            )
         hb_path = LOGS_DIR / "heartbeat.json"
         hb_path.write_text(json.dumps({
             "system": "apollo",
+            "family": "apollo_earnings",
             "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": "LIVE" if args.live else "PAPER",
             "scanned": len(UNIVERSE),
             "actionable": sum(1 for r in results if r.get("post_er_play")),
             "watchlist": len(results),
+            "open_positions": open_positions,
         }, indent=2))
     except Exception:
         pass
@@ -661,23 +687,45 @@ def run_apollo_cycle(args):
     pass
 
 
-if __name__ == "__main__":
-    if "--loop" in sys.argv:
-        # Loop mode: run main repeatedly
-        import argparse as _ap
-        _parser = _ap.ArgumentParser()
-        _parser.add_argument("--interval-min", type=int, default=240)
-        _known, _ = _parser.parse_known_args()
-        interval = _known.interval_min
+def _runtime_lock_required(argv: list[str]) -> bool:
+    readonly_flags = {"--backtest", "--manage", "--review", "--status"}
+    return not any(flag in argv for flag in readonly_flags)
 
-        while True:
-            try:
-                main()
-            except SystemExit:
-                pass
-            except Exception as e:
-                print(f"Apollo cycle error: {e}")
-            print(f"\nApollo sleeping {interval}min...")
-            time.sleep(interval * 60)
-    else:
-        main()
+
+if __name__ == "__main__":
+    lock = None
+    if _runtime_lock_required(sys.argv[1:]):
+        lock = ProcessLock("apollo_earnings_runner")
+        try:
+            lock.acquire(metadata={
+                "family": "apollo_earnings",
+                "mode": "LIVE" if "--live" in sys.argv else "PAPER",
+                "loop": "--loop" in sys.argv,
+            })
+        except ProcessLockError as exc:
+            print(f"Cannot start Apollo runner: {exc}")
+            sys.exit(1)
+
+    try:
+        if "--loop" in sys.argv:
+            # Loop mode: run main repeatedly
+            import argparse as _ap
+            _parser = _ap.ArgumentParser()
+            _parser.add_argument("--interval-min", type=int, default=240)
+            _known, _ = _parser.parse_known_args()
+            interval = _known.interval_min
+
+            while True:
+                try:
+                    main()
+                except SystemExit:
+                    pass
+                except Exception as e:
+                    print(f"Apollo cycle error: {e}")
+                print(f"\nApollo sleeping {interval}min...")
+                time.sleep(interval * 60)
+        else:
+            main()
+    finally:
+        if lock is not None:
+            lock.release()

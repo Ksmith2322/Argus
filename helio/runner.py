@@ -247,11 +247,15 @@ def run_live(configs: list[Path]):
     """Run Helio with live IBKR data. Evaluates once per day at market close."""
     import sys
     sys.path.insert(0, str(REPO))
-    from ops.process_lock import ProcessLock, ProcessLockError
-    from ib_insync import IB, Stock
+    from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_name
+    from ib_insync import IB
 
     # --- Process lock: prevent duplicate launches ---
-    lock_name = f"helio_swing_{os.getpid()}"
+    lock_name = build_runner_lock_name(
+        client_id=200,
+        config_paths=[str(c) for c in configs],
+        exclude=None,
+    )
     lock = ProcessLock(lock_name)
     try:
         lock.acquire(metadata={"family": "helio", "strategy": "swing_trend", "configs": [str(c) for c in configs]})
@@ -285,7 +289,7 @@ def run_live(configs: list[Path]):
         state = SwingState(log_dir / "state.json")
         state.load()
 
-        contract = Stock(cfg["ibkr_symbol"], cfg.get("ibkr_exchange", "SMART"), cfg.get("ibkr_currency", "USD"))
+        contract = _build_contract(cfg)
         ib.qualifyContracts(contract)
 
         instruments.append({
@@ -347,7 +351,7 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
         durationStr="120 D",
         barSizeSetting="1 day",
         whatToShow="TRADES",
-        useRTH=True,
+        useRTH=cfg.get("ibkr_sec_type") != "FUT",
     )
     if not bars or len(bars) < 60:
         log.warning(f"{symbol}: insufficient bars ({len(bars) if bars else 0})")
@@ -483,6 +487,21 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
 # ═══════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
+
+def _build_contract(cfg: dict):
+    from ib_insync import ContFuture, Stock
+
+    if cfg.get("ibkr_sec_type") == "FUT":
+        return ContFuture(
+            cfg["ibkr_symbol"],
+            exchange=cfg.get("ibkr_exchange", "CME"),
+        )
+    return Stock(
+        cfg["ibkr_symbol"],
+        cfg.get("ibkr_exchange", "SMART"),
+        cfg.get("ibkr_currency", "USD"),
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(description="Helio Swing Trading Runner")

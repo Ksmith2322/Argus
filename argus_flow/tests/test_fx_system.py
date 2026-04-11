@@ -284,20 +284,20 @@ def test_fleet_registry_stage_defaults():
     )
 
     gbp_path = CONFIGS_DIR / "gbpusd_range_paper_v1.json"
-    aud_path = CONFIGS_DIR / "audusd_ny_paper_v1.json"
+    cad_path = CONFIGS_DIR / "cadjpy_mtf_paper_v1.json"
 
     gbp_cfg = json.loads(gbp_path.read_text(encoding="utf-8"))
-    aud_cfg = json.loads(aud_path.read_text(encoding="utf-8"))
+    cad_cfg = json.loads(cad_path.read_text(encoding="utf-8"))
 
     if infer_stage(gbp_cfg, gbp_path) == "paper":
         _ok("fleet_registry infers GBPUSD legacy paper stage")
     else:
         _fail("fleet_registry paper-stage inference failed for GBPUSD")
 
-    if infer_stage(aud_cfg, aud_path) == "watcher":
-        _ok("fleet_registry infers AUDUSD legacy watcher stage")
+    if infer_stage(cad_cfg, cad_path) == "watcher":
+        _ok("fleet_registry infers CADJPY managed watcher stage")
     else:
-        _fail("fleet_registry watcher-stage inference failed for AUDUSD")
+        _fail("fleet_registry watcher-stage inference failed for CADJPY")
 
     if default_log_dir("EURUSD", "real").endswith("live_eurusd"):
         _ok("fleet_registry uses stage-aware live log dir")
@@ -315,7 +315,7 @@ def test_fleet_registry_stage_defaults():
     else:
         _fail("fleet_registry earned cap mismatch", f"got {risk.get('earned_cap_pct')}")
 
-    watcher_risk = resolve_risk_policy(aud_cfg, aud_path, stage="watcher")
+    watcher_risk = resolve_risk_policy(cad_cfg, cad_path, stage="watcher")
     if abs(float(watcher_risk.get("active_risk_pct", -1.0)) - 0.0) < 1e-9:
         _ok("fleet_registry watcher stage is observe-only (0 active risk)")
     else:
@@ -377,32 +377,43 @@ def test_config_unique_client_ids():
 def test_runner_client_id_resolution():
     from argus_flow.runner_unified import resolve_client_id
 
-    eurusd_cfg = str(CONFIGS_DIR / "eurusd_t4_paper_v1.json")
-    fx_group = [
-        str(CONFIGS_DIR / "cadjpy_t4_paper_v1.json"),
-        str(CONFIGS_DIR / "usdjpy_ny_paper_v1.json"),
-        str(CONFIGS_DIR / "eurusd_t4_paper_v1.json"),
+    gbpusd_cfg = CONFIGS_DIR / "gbpusd_range_paper_v1.json"
+    primary_group = [
+        str(CONFIGS_DIR / "cadjpy_mtf_paper_v1.json"),
+        str(CONFIGS_DIR / "audjpy_mtf_paper_v1.json"),
+        str(CONFIGS_DIR / "usdjpy_mtf_paper_v1.json"),
     ]
-    futures_group = [
-        str(CONFIGS_DIR / "m2k_range_paper_v1.json"),
-        str(CONFIGS_DIR / "mnq_range_paper_v1.json"),
-        str(CONFIGS_DIR / "mym_range_paper_v1.json"),
+    secondary_group = [
+        str(CONFIGS_DIR / "gbpusd_range_paper_v1.json"),
+        str(CONFIGS_DIR / "cadjpy_mtf_paper_v1.json"),
     ]
+    expected_single_id = int(json.loads(gbpusd_cfg.read_text(encoding="utf-8")).get("ibkr_client_id", 0))
 
-    single_id, single_source = resolve_client_id([eurusd_cfg], default_client_id=1)
-    if single_id == 10 and single_source.startswith("config:"):
+    single_id, single_source = resolve_client_id([str(gbpusd_cfg)], default_client_id=1)
+    if single_id == expected_single_id and single_source.startswith("config:"):
         _ok("runner_unified uses config ibkr_client_id for single-config launches")
     else:
         _fail("single-config client ID resolution mismatch", f"got id={single_id} source={single_source}")
 
-    fx_id, fx_source = resolve_client_id(fx_group, default_client_id=1)
-    futures_id, futures_source = resolve_client_id(futures_group, default_client_id=1)
-    if fx_source == "auto-group" and futures_source == "auto-group" and fx_id != futures_id:
-        _ok("runner_unified derives distinct stable client IDs for grouped FX/futures launches")
+    primary_id, primary_source = resolve_client_id(primary_group, default_client_id=1)
+    reversed_id, reversed_source = resolve_client_id(list(reversed(primary_group)), default_client_id=1)
+    secondary_id, secondary_source = resolve_client_id(secondary_group, default_client_id=1)
+    if (
+        primary_source == "auto-group"
+        and reversed_source == "auto-group"
+        and secondary_source == "auto-group"
+        and primary_id == reversed_id
+        and primary_id != secondary_id
+    ):
+        _ok("runner_unified derives stable distinct client IDs for grouped launches")
     else:
         _fail(
             "grouped client ID resolution mismatch",
-            f"fx=({fx_id},{fx_source}) futures=({futures_id},{futures_source})",
+            (
+                f"primary=({primary_id},{primary_source}) "
+                f"reversed=({reversed_id},{reversed_source}) "
+                f"secondary=({secondary_id},{secondary_source})"
+            ),
         )
 
 
@@ -955,12 +966,12 @@ def test_weekly_pair_onboarding_candidate_plan():
 def test_weekly_pair_onboarding_config_render():
     from argus_flow.ops.weekly_pair_onboarding import build_final_candidate_config
 
-    template_path = CONFIGS_DIR / "eurusd_t4_paper_v1.json"
+    template_path = CONFIGS_DIR / "cadjpy_mtf_paper_v1.json"
     template_cfg = json.loads(template_path.read_text(encoding="utf-8"))
     config_name, cfg = build_final_candidate_config(
         template_cfg=template_cfg,
         template_path=template_path,
-        symbol="USDJPY",
+        symbol="USDCHF",
         stage="watcher",
         results={
             "win_rate": 54.2,
@@ -975,8 +986,9 @@ def test_weekly_pair_onboarding_config_render():
     deployment = cfg.get("deployment", {}) if isinstance(cfg.get("deployment", {}), dict) else {}
     replay = cfg.get("replay_expectations", {}) if isinstance(cfg.get("replay_expectations", {}), dict) else {}
     if (
-        config_name == "usdjpy_t4_paper_v1.json"
-        and cfg.get("symbol") == "USDJPY"
+        config_name == "usdchf_mtf_paper_v1.json"
+        and cfg.get("symbol") == "USDCHF"
+        and cfg.get("stage") == "watcher"
         and deployment.get("managed") is True
         and deployment.get("stage") == "watcher"
         and abs(float(replay.get("win_rate", 0.0)) - 0.542) < 1e-9

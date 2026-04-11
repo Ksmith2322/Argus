@@ -38,7 +38,7 @@ def _ok(label):
 
 def _fail(label, detail=""):
     print(f"  \033[31m[FAIL]\033[0m {label}" + (f" — {detail}" if detail else ""))
-    return False
+    raise AssertionError(f"{label}: {detail}" if detail else label)
 
 
 # ── Mock classes ──────────────────────────────────────────────
@@ -48,6 +48,18 @@ class MockState:
     def __init__(self, state_file: Path, position: str = "FLAT"):
         self.file = state_file
         self.position = position
+        self.entry_price = 0.0
+        self.stop_price = 0.0
+        self.target_price = 0.0
+        self.timeout_time = None
+        self.entry_time = None
+        self.avg_entry_price = 0.0
+        self.pyramid_adds = 0
+        self.position_size = 0.0
+        self.entry_risk_usd = 0.0
+
+    def clear_trade_state(self):
+        self.position = "FLAT"
         self.entry_price = 0.0
         self.stop_price = 0.0
         self.target_price = 0.0
@@ -129,22 +141,20 @@ def test_scenario_a_orphan():
     if r.get("result") == ReconcileResult.LOCAL_FLAT_BROKER_OPEN:
         _ok("Detected orphan: LOCAL_FLAT_BROKER_OPEN")
     else:
-        return _fail("Expected LOCAL_FLAT_BROKER_OPEN", f"got {r.get('result')}")
+        _fail("Expected LOCAL_FLAT_BROKER_OPEN", f"got {r.get('result')}")
 
     # Verify runtime mode blocks entries
     mode = _determine_runtime_mode(results)
     if mode == RuntimeMode.RECOVERY_REQUIRED:
         _ok("Runtime mode: RECOVERY_REQUIRED (entries blocked)")
     else:
-        return _fail("Expected RECOVERY_REQUIRED", f"got {mode}")
+        _fail("Expected RECOVERY_REQUIRED", f"got {mode}")
 
     # Verify local state NOT auto-corrected (orphan requires manual review)
     if inst.state.position == "FLAT":
         _ok("Local state preserved as FLAT (requires manual review)")
     else:
-        return _fail("Local state should remain FLAT for manual review")
-
-    return True
+        _fail("Local state should remain FLAT for manual review")
 
 
 def test_scenario_b_phantom():
@@ -167,20 +177,18 @@ def test_scenario_b_phantom():
     if r.get("result") == ReconcileResult.LOCAL_OPEN_BROKER_FLAT:
         _ok("Detected phantom: LOCAL_OPEN_BROKER_FLAT")
     else:
-        return _fail("Expected LOCAL_OPEN_BROKER_FLAT", f"got {r.get('result')}")
+        _fail("Expected LOCAL_OPEN_BROKER_FLAT", f"got {r.get('result')}")
 
     # Verify auto-correction
     if inst.state.position == "FLAT":
         _ok("Auto-corrected to FLAT (trust broker truth)")
     else:
-        return _fail("Should auto-correct to FLAT", f"got {inst.state.position}")
+        _fail("Should auto-correct to FLAT", f"got {inst.state.position}")
 
     if inst.state.entry_price == 0.0 and inst.state.stop_price == 0.0:
         _ok("Lifecycle state cleared (entry_price, stop_price = 0)")
     else:
-        return _fail("Lifecycle state should be cleared")
-
-    return True
+        _fail("Lifecycle state should be cleared")
 
 
 def test_scenario_c_clean_flat():
@@ -198,8 +206,7 @@ def test_scenario_c_clean_flat():
     if r.get("result") == ReconcileResult.CLEAN_FLAT:
         _ok("CLEAN_FLAT — no action needed")
     else:
-        return _fail("Expected CLEAN_FLAT", f"got {r.get('result')}")
-    return True
+        _fail("Expected CLEAN_FLAT", f"got {r.get('result')}")
 
 
 def test_scenario_d_matched():
@@ -218,8 +225,7 @@ def test_scenario_d_matched():
     if r.get("result") == ReconcileResult.CLEAN_OPEN_MATCHED:
         _ok("CLEAN_OPEN_MATCHED — position confirmed")
     else:
-        return _fail("Expected CLEAN_OPEN_MATCHED", f"got {r.get('result')}")
-    return True
+        _fail("Expected CLEAN_OPEN_MATCHED", f"got {r.get('result')}")
 
 
 def test_scenario_e_untracked():
@@ -240,15 +246,13 @@ def test_scenario_e_untracked():
     if orphan_keys:
         _ok(f"Untracked broker position detected: {orphan_keys}")
     else:
-        return _fail("Should detect untracked GBP.USD position")
+        _fail("Should detect untracked GBP.USD position")
 
     orphan = results[orphan_keys[0]]
     if orphan["result"] == ReconcileResult.UNRESOLVED:
         _ok("Untracked position classified as UNRESOLVED")
     else:
-        return _fail("Expected UNRESOLVED", f"got {orphan['result']}")
-
-    return True
+        _fail("Expected UNRESOLVED", f"got {orphan['result']}")
 
 
 def test_scenario_f_broker_unavailable():
@@ -273,15 +277,13 @@ def test_scenario_f_broker_unavailable():
     if r.get("result") == ReconcileResult.BROKER_UNAVAILABLE:
         _ok("BROKER_UNAVAILABLE — no auto-correction")
     else:
-        return _fail("Expected BROKER_UNAVAILABLE", f"got {r.get('result')}")
+        _fail("Expected BROKER_UNAVAILABLE", f"got {r.get('result')}")
 
     # Position must NOT be auto-corrected when broker is unavailable
     if inst.state.position == "LONG":
         _ok("Position preserved (no blind correction without broker truth)")
     else:
-        return _fail("Position should be preserved when broker unavailable")
-
-    return True
+        _fail("Position should be preserved when broker unavailable")
 
 
 # ── Main ──────────────────────────────────────────────────────
@@ -304,13 +306,10 @@ def main():
     failed = 0
     for test in tests:
         try:
-            result = test()
-            if result:
-                passed += 1
-            else:
-                failed += 1
+            test()
+            passed += 1
         except Exception as e:
-            _fail(test.__name__, str(e))
+            print(f"  \033[31m[FAIL]\033[0m {test.__name__} â€” {e}")
             failed += 1
 
     print(f"\n  {'=' * 40}")

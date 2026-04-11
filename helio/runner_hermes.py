@@ -217,11 +217,15 @@ def _log_signal(log_dir, ts, direction, entry, stop, target, atr, consol_range):
 def run_live(configs: list[Path]):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from ops.process_lock import ProcessLock, ProcessLockError
-    from ib_insync import IB, Future, Contract
+    from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_name
+    from ib_insync import IB
 
     # --- Process lock: prevent duplicate launches ---
-    lock_name = f"hermes_momentum_{os.getpid()}"
+    lock_name = build_runner_lock_name(
+        client_id=210,
+        config_paths=[str(c) for c in configs],
+        exclude=None,
+    )
     lock = ProcessLock(lock_name)
     try:
         lock.acquire(metadata={"family": "hermes", "strategy": "momentum_breakout", "configs": [str(c) for c in configs]})
@@ -248,13 +252,8 @@ def run_live(configs: list[Path]):
         state = HermesState(log_dir / "state.json")
         state.load()
 
-        if cfg.get("ibkr_sec_type") == "FUT":
-            contract = Future(cfg["ibkr_symbol"], exchange=cfg.get("ibkr_exchange", "COMEX"))
-            ib.qualifyContracts(contract)
-        else:
-            from ib_insync import Stock
-            contract = Stock(cfg["ibkr_symbol"], cfg.get("ibkr_exchange", "SMART"), cfg.get("ibkr_currency", "USD"))
-            ib.qualifyContracts(contract)
+        contract = _build_contract(cfg)
+        ib.qualifyContracts(contract)
 
         instruments.append({"config": cfg, "state": state, "contract": contract, "log_dir": log_dir})
         log.info(f"  {sym}: {state.position} | trades={state.trade_count}")
@@ -276,8 +275,9 @@ def run_live(configs: list[Path]):
                 try:
                     cfg = inst["config"]
                     what = "TRADES" if cfg.get("ibkr_sec_type") == "FUT" else "MIDPOINT"
+                    use_rth = cfg.get("ibkr_sec_type") != "FUT"
                     bars = ib.reqHistoricalData(inst["contract"], endDateTime="", durationStr="120 D",
-                                                barSizeSetting="1 day", whatToShow=what, useRTH=True)
+                                                barSizeSetting="1 day", whatToShow=what, useRTH=use_rth)
                     if not bars or len(bars) < 30:
                         log.warning(f"{cfg['symbol']}: insufficient bars"); continue
                     df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
@@ -316,6 +316,21 @@ def run_live(configs: list[Path]):
         ib.disconnect()
         lock.release()
         log.info("Process lock released.")
+
+
+def _build_contract(cfg: dict):
+    from ib_insync import ContFuture, Stock
+
+    if cfg.get("ibkr_sec_type") == "FUT":
+        return ContFuture(
+            cfg["ibkr_symbol"],
+            exchange=cfg.get("ibkr_exchange", "COMEX"),
+        )
+    return Stock(
+        cfg["ibkr_symbol"],
+        cfg.get("ibkr_exchange", "SMART"),
+        cfg.get("ibkr_currency", "USD"),
+    )
 
 
 def main():

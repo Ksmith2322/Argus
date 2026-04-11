@@ -37,6 +37,17 @@ def get_fleet_positions() -> dict[str, list[str]]:
         except Exception:
             pass
 
+    # Hermes
+    hermes_pos = REPO / "hermes" / "logs" / "positions.json"
+    if hermes_pos.exists():
+        try:
+            data = json.loads(hermes_pos.read_text())
+            symbols = [s for s in data.keys() if s not in ("last_rebalance", "last_signal", "holdings")]
+            if symbols:
+                positions["Hermes"] = symbols
+        except Exception:
+            pass
+
     # Apollo (self)
     apollo_pos = REPO / "apollo" / "logs" / "positions.json"
     if apollo_pos.exists():

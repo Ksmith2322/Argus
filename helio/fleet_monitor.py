@@ -11,6 +11,7 @@ Usage:
     python -m helio.fleet_monitor              # run forever
     python -m helio.fleet_monitor --once       # single check + exit
     python -m helio.fleet_monitor --snapshot   # take snapshot only
+    python -m helio.fleet_monitor --legacy-execution-mode live
 """
 from __future__ import annotations
 
@@ -44,6 +45,24 @@ log = logging.getLogger("fleet_monitor")
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _managed_heartbeat_paths(config_glob: str, *, log_prefix: str = "") -> list[Path]:
+    cfg_dir = REPO / "helio" / "configs"
+    paths: list[Path] = []
+    for cfg_path in sorted(cfg_dir.glob(config_glob)):
+        payload = _load_json(cfg_path) or {}
+        symbol = str(payload.get("symbol", cfg_path.stem)).lower()
+        leaf = f"{log_prefix}{symbol}"
+        paths.append(REPO / "helio" / "logs" / leaf / "heartbeat.json")
+    return paths
+
 # Per-system config
 SYSTEMS = {
     "argus": {
@@ -65,19 +84,40 @@ SYSTEMS = {
         "heartbeats": [REPO / "titan" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 4500,  # 75 min (loop is 60min + buffer)
         "process_match": "titan.runner",
-        "restart_args": ["-m", "titan.runner", "--loop", "--interval-min", "60", "--live"],
+        "restart_args": ["-m", "titan.runner", "--loop", "--interval-min", "60"],
+        "supports_live_flag": True,
     },
     "hermes": {
         "heartbeats": [REPO / "hermes" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 8400,  # 140 min (loop is 120min + buffer)
         "process_match": "hermes.runner",
-        "restart_args": ["-m", "hermes.runner", "--loop", "--interval-min", "120", "--min-score", "80", "--live"],
+        "restart_args": ["-m", "hermes.runner", "--loop", "--interval-min", "120", "--min-score", "80"],
+        "supports_live_flag": True,
     },
     "apollo": {
         "heartbeats": [REPO / "apollo" / "logs" / "heartbeat.json"],
         "stale_threshold_s": 16200,  # 270 min (loop is 240min + buffer)
         "process_match": "apollo.runner",
-        "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14", "--live"],
+        "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14"],
+        "supports_live_flag": True,
+    },
+    "helio_swing": {
+        "heartbeats": _managed_heartbeat_paths("*_swing_v1.json"),
+        "stale_threshold_s": 129600,  # 36h (daily/4h evaluation with weekend buffer)
+        "process_match": " -m helio.runner ",
+        "restart_args": ["-m", "helio.runner"],
+    },
+    "helio_hermes": {
+        "heartbeats": _managed_heartbeat_paths("hermes_*_v1.json", log_prefix="hermes_"),
+        "stale_threshold_s": 129600,  # 36h (daily evaluation with weekend buffer)
+        "process_match": "helio.runner_hermes",
+        "restart_args": ["-m", "helio.runner_hermes"],
+    },
+    "helio_apollo": {
+        "heartbeats": _managed_heartbeat_paths("apollo_*_v1.json", log_prefix="apollo_"),
+        "stale_threshold_s": 43200,  # 12h (mixed hourly/daily evaluation)
+        "process_match": "helio.runner_apollo",
+        "restart_args": ["-m", "helio.runner_apollo"],
     },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
@@ -148,12 +188,20 @@ def is_process_running(pattern: str) -> bool:
 
 # ── Restart handler ─────────────────────────────────────────
 
-def restart_system(name: str, cfg: dict) -> bool:
+def build_restart_args(cfg: dict, legacy_execution_mode: str = "paper") -> list[str]:
+    args = list(cfg.get("restart_args", []))
+    if cfg.get("supports_live_flag") and legacy_execution_mode == "live":
+        args.append("--live")
+    return args
+
+
+def restart_system(name: str, cfg: dict, legacy_execution_mode: str = "paper") -> bool:
     """Auto-restart a crashed/stale system."""
-    log.warning(f"Restarting {name}...")
+    restart_args = build_restart_args(cfg, legacy_execution_mode=legacy_execution_mode)
+    log.warning(f"Restarting {name} in {legacy_execution_mode.upper()} mode...")
     try:
         subprocess.Popen(
-            [PYTHON] + cfg["restart_args"],
+            [PYTHON] + restart_args,
             cwd=str(REPO),
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
         )
@@ -289,7 +337,7 @@ def collect_trade_metrics() -> dict:
 
 # ── Main monitor loop ───────────────────────────────────────
 
-def run_check_cycle(auto_restart: bool = True) -> dict:
+def run_check_cycle(auto_restart: bool = True, legacy_execution_mode: str = "paper") -> dict:
     """One full health check cycle. Returns status dict."""
     overall = {"ts": datetime.now(timezone.utc).isoformat(), "systems": {}}
 
@@ -300,7 +348,7 @@ def run_check_cycle(auto_restart: bool = True) -> dict:
         if status["status"] in ("DOWN", "STALE"):
             log.warning(f"{name}: {status['status']} | {' | '.join(status['details'][:3])}")
             if auto_restart and status["status"] == "DOWN":
-                restart_system(name, cfg)
+                restart_system(name, cfg, legacy_execution_mode=legacy_execution_mode)
         else:
             log.info(f"{name}: OK")
 
@@ -321,6 +369,12 @@ def main():
     parser.add_argument("--no-restart", action="store_true", help="Don't auto-restart")
     parser.add_argument("--interval-s", type=int, default=60, help="Check interval seconds")
     parser.add_argument("--snapshot-interval-h", type=int, default=24, help="Snapshot interval hours")
+    parser.add_argument(
+        "--legacy-execution-mode",
+        choices=["paper", "live"],
+        default="paper",
+        help="Restart mode for legacy stock systems (paper-safe by default)",
+    )
     args = parser.parse_args()
 
     if args.snapshot:
@@ -329,13 +383,19 @@ def main():
         return
 
     if args.once:
-        status = run_check_cycle(auto_restart=not args.no_restart)
+        status = run_check_cycle(
+            auto_restart=not args.no_restart,
+            legacy_execution_mode=args.legacy_execution_mode,
+        )
         write_status(status)
         print(json.dumps(status, indent=2))
         return
 
     log.info("Fleet monitor starting...")
-    log.info(f"Interval: {args.interval_s}s | Snapshot: every {args.snapshot_interval_h}h | Auto-restart: {not args.no_restart}")
+    log.info(
+        f"Interval: {args.interval_s}s | Snapshot: every {args.snapshot_interval_h}h | "
+        f"Auto-restart: {not args.no_restart} | Legacy mode: {args.legacy_execution_mode}"
+    )
 
     last_snapshot_time = 0
     snapshot_interval_s = args.snapshot_interval_h * 3600
@@ -343,7 +403,10 @@ def main():
     try:
         while True:
             try:
-                status = run_check_cycle(auto_restart=not args.no_restart)
+                status = run_check_cycle(
+                    auto_restart=not args.no_restart,
+                    legacy_execution_mode=args.legacy_execution_mode,
+                )
                 write_status(status)
 
                 # Daily snapshot

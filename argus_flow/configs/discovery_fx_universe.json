@@ -1,5 +1,5 @@
 {
-  "template_config": "argus_flow/configs/eurusd_t4_paper_v1.json",
+  "template_config": "argus_flow/configs/cadjpy_mtf_paper_v1.json",
   "entry_stage": "watcher",
   "history_days": 45,
   "max_new_pairs": 5,

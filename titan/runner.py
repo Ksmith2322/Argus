@@ -46,6 +46,13 @@ try:
 except ImportError:
     _FLEET_RISK_AVAILABLE = False
 
+try:
+    from helio.portfolio_guard import check_new_entry as _pg_check_new_entry
+except ImportError:
+    _pg_check_new_entry = None
+
+from ops.process_lock import ProcessLock, ProcessLockError
+
 LOGS_DIR = REPO / "titan" / "logs"
 POSITIONS_FILE = LOGS_DIR / "positions.json"
 TRADES_FILE = LOGS_DIR / "trades.csv"
@@ -150,6 +157,14 @@ class TitanRunner:
                 if exposure["blocked"]:
                     log.info(f"  {sym}: FLEET BLOCK -- {exposure['reason']}")
                     continue
+
+            if _pg_check_new_entry is not None:
+                pg_check = _pg_check_new_entry("titan", sym, sig["direction"])
+                if not pg_check.allowed:
+                    log.info(f"  {sym}: PORTFOLIO BLOCK -- {pg_check.reason}")
+                    continue
+                if pg_check.warnings:
+                    log.info(f"  {sym}: portfolio warnings -- {pg_check.warnings}")
 
             if self.long_only and sig["direction"] == "SHORT":
                 continue
@@ -381,6 +396,18 @@ def main():
     parser.add_argument("--max-positions", type=int, default=5)
     parser.add_argument("--equity", type=float, default=10000)
     args = parser.parse_args()
+    lock = None
+    if not args.check:
+        lock = ProcessLock("titan_runner")
+        try:
+            lock.acquire(metadata={
+                "family": "titan",
+                "mode": "LIVE" if args.live else "PAPER",
+                "loop": args.loop,
+            })
+        except ProcessLockError as exc:
+            log.error(f"Cannot start Titan runner: {exc}")
+            return
 
     dry_run = not args.live
 
@@ -392,77 +419,79 @@ def main():
 
     runner = TitanRunner(config=config, dry_run=dry_run)
 
-    mode = "DRY RUN" if dry_run else "LIVE"
-    print(f"{'=' * 60}")
-    print(f"TITAN Runner [{mode}] — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'=' * 60}")
+    try:
+        mode = "DRY RUN" if dry_run else "LIVE"
+        print(f"{'=' * 60}")
+        print(f"TITAN Runner [{mode}] — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"{'=' * 60}")
 
-    if args.check:
-        runner.status()
-        return
+        if args.check:
+            runner.status()
+            return
 
-    if args.close:
-        if args.close in runner.positions:
-            # Force close
-            pos = runner.positions[args.close]
-            daily = get_data(args.close, "daily")
-            if daily is not None:
-                exit_px = daily["Close"].iloc[-1]
-                entry_date = datetime.fromisoformat(pos["entry_date"])
-                days = (datetime.now(timezone.utc) - entry_date).days
-                if pos["direction"] == "LONG":
-                    pnl_pct = (exit_px - pos["entry_price"]) / pos["entry_price"] * 100
-                else:
-                    pnl_pct = (pos["entry_price"] - exit_px) / pos["entry_price"] * 100
-                pnl_usd = pnl_pct / 100 * pos["entry_price"] * pos["shares"]
-                runner._log_trade(args.close, pos, exit_px, "manual_close", pnl_pct, pnl_usd, days)
-                runner.overlay.learn(pnl_pct)
-                del runner.positions[args.close]
-                runner._save_positions()
-                print(f"Closed {args.close}: PnL {pnl_pct:+.2f}%")
+        if args.close:
+            if args.close in runner.positions:
+                # Force close
+                pos = runner.positions[args.close]
+                daily = get_data(args.close, "daily")
+                if daily is not None:
+                    exit_px = daily["Close"].iloc[-1]
+                    entry_date = datetime.fromisoformat(pos["entry_date"])
+                    days = (datetime.now(timezone.utc) - entry_date).days
+                    if pos["direction"] == "LONG":
+                        pnl_pct = (exit_px - pos["entry_price"]) / pos["entry_price"] * 100
+                    else:
+                        pnl_pct = (pos["entry_price"] - exit_px) / pos["entry_price"] * 100
+                    pnl_usd = pnl_pct / 100 * pos["entry_price"] * pos["shares"]
+                    runner._log_trade(args.close, pos, exit_px, "manual_close", pnl_pct, pnl_usd, days)
+                    runner.overlay.learn(pnl_pct)
+                    del runner.positions[args.close]
+                    runner._save_positions()
+                    print(f"Closed {args.close}: PnL {pnl_pct:+.2f}%")
+            else:
+                print(f"{args.close} not in positions")
+            return
+
+        def run_cycle():
+            print(f"\n=== TITAN cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
+            print("\n[1] Checking exits on open positions...")
+            runner.check_exits()
+            print("\n[2] Evaluating new entries from scanner...")
+            runner.evaluate_entries()
+            print("\n[3] Current portfolio:")
+            runner.status()
+            print(f"\nAI Overlay: {runner.overlay.get_weight_summary()}")
+            # Update heartbeat
+            try:
+                hb_path = LOGS_DIR / "heartbeat.json"
+                hb_path.parent.mkdir(parents=True, exist_ok=True)
+                hb_path.write_text(json.dumps({
+                    "system": "titan",
+                    "family": "titan",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "mode": mode,
+                    "open_positions": len(runner.positions),
+                    "ibkr_connected": runner._executor.is_connected() if runner._executor else False,
+                }, indent=2))
+            except Exception:
+                pass
+
+        if args.loop:
+            log.info(f"Starting Titan loop (interval={args.interval_min}min, mode={mode})")
+            try:
+                while True:
+                    run_cycle()
+                    log.info(f"Sleeping {args.interval_min}min until next cycle...")
+                    time.sleep(args.interval_min * 60)
+            except KeyboardInterrupt:
+                log.info("Titan loop stopped by user")
         else:
-            print(f"{args.close} not in positions")
-        return
-
-    def run_cycle():
-        print(f"\n=== TITAN cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
-        print("\n[1] Checking exits on open positions...")
-        runner.check_exits()
-        print("\n[2] Evaluating new entries from scanner...")
-        runner.evaluate_entries()
-        print("\n[3] Current portfolio:")
-        runner.status()
-        print(f"\nAI Overlay: {runner.overlay.get_weight_summary()}")
-        # Update heartbeat
-        try:
-            hb_path = LOGS_DIR / "heartbeat.json"
-            hb_path.parent.mkdir(parents=True, exist_ok=True)
-            hb_path.write_text(json.dumps({
-                "system": "titan",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "mode": mode,
-                "open_positions": len(runner.positions),
-                "ibkr_connected": runner._executor.is_connected() if runner._executor else False,
-            }, indent=2))
-        except Exception:
-            pass
-
-    if args.loop:
-        log.info(f"Starting Titan loop (interval={args.interval_min}min, mode={mode})")
-        try:
-            while True:
-                run_cycle()
-                log.info(f"Sleeping {args.interval_min}min until next cycle...")
-                time.sleep(args.interval_min * 60)
-        except KeyboardInterrupt:
-            log.info("Titan loop stopped by user")
-        finally:
-            if runner._executor:
-                runner._executor.disconnect()
-    else:
-        run_cycle()
+            run_cycle()
+    finally:
         if runner._executor:
             runner._executor.disconnect()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":

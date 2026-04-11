@@ -22,6 +22,7 @@ import os
 import uuid
 import sys
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -59,6 +60,28 @@ from argus_flow.sizing import (
 from ops.process_lock import ProcessLock, ProcessLockError, build_runner_lock_name
 
 load_dotenv()
+
+
+def _ensure_import_event_loop() -> None:
+    """Ensure ib_insync/eventkit sees a default loop during module import."""
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            asyncio.get_event_loop_policy().get_event_loop()
+            return
+        except RuntimeError:
+            pass
+
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+_ensure_import_event_loop()
 
 try:
     from ib_insync import IB, Forex, Future, MarketOrder, StopOrder, LimitOrder, util
@@ -193,6 +216,8 @@ class State:
 
     def save(self) -> None:
         """Atomic state write: write to temp file, flush, then rename."""
+        if self.position == "FLAT" and not self.entry_pending and not self.exit_pending:
+            self.clear_trade_state()
         data = json.dumps({
             "position": self.position,
             "entry_price": self.entry_price,
@@ -236,6 +261,37 @@ class State:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def clear_trade_state(self) -> None:
+        """Reset trade-specific fields while preserving cumulative PnL and counters."""
+        self.position = "FLAT"
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.stop_price = 0.0
+        self.target_price = 0.0
+        self.timeout_time = None
+        self.direction_str = ""
+        self.hard_stop_price = 0.0
+        self.profit_floor_price = 0.0
+        self.profit_floor_state = "DISARMED"
+        self.max_favorable_pips = 0.0
+        self.pyramid_adds = 0
+        self.avg_entry_price = 0.0
+        self.position_size = 0.0
+        self.entry_risk_usd = 0.0
+        self.sizing_policy = ""
+        self.account_equity_at_entry = 0.0
+        self.entry_regime = ""
+        self.entry_pending = False
+        self.exit_pending = False
+        self.entry_order_id = ""
+        self.stop_order_id = ""
+        self.target_order_id = ""
+        self.exit_order_id = ""
+        self.entry_fill_px = 0.0
+        self.exit_fill_px = 0.0
+        self.entry_submitted_ts = ""
+        self.exit_submitted_ts = ""
 
     def load(self, sym_label: str) -> None:
         if not self.file.exists():
@@ -290,7 +346,7 @@ class State:
                 f"If broker has a real position, reconciliation will flag PHANTOM mismatch."
             )
             self.had_zero_stops = True
-            self.position = "FLAT"
+            self.clear_trade_state()
         # Safety: if restored in-position but timeout missing, mark invalid
         if self.position != "FLAT" and self.timeout_time is None:
             log.warning(f"[{sym_label}] Restored {self.position} but timeout_time missing — trade validity compromised")
@@ -300,11 +356,13 @@ class State:
             if self.entry_price <= 0:
                 log.error(f"[{sym_label}] CORRUPT STATE: {self.position} but entry_price={self.entry_price} — forcing FLAT")
                 self.had_zero_stops = True
-                self.position = "FLAT"
+                self.clear_trade_state()
             elif self.position_size <= 0:
                 log.error(f"[{sym_label}] CORRUPT STATE: {self.position} but position_size={self.position_size} — forcing FLAT")
                 self.had_zero_stops = True
-                self.position = "FLAT"
+                self.clear_trade_state()
+        if self.position == "FLAT":
+            self.clear_trade_state()
         if self.position != "FLAT":
             self.restored_this_session = True
             log.info(
@@ -566,15 +624,16 @@ def _write_broker_truth_artifacts(
                 "ib_key": ib_key,
                 "local_position": inst.state.position,
                 "position_size": inst.state.position_size,
-                "entry_price": inst.state.entry_price,
-                "stop_price": inst.state.stop_price,
-                "target_price": inst.state.target_price,
+                "entry_price": inst.state.entry_price if inst.state.position != "FLAT" else None,
+                "stop_price": inst.state.stop_price if inst.state.position != "FLAT" else None,
+                "target_price": inst.state.target_price if inst.state.position != "FLAT" else None,
                 "entry_risk_usd": inst.state.entry_risk_usd,
                 "open_risk_usd": local_open_risk,
                 "unrealized_pnl_usd": local_unrealized_pnl,
                 "trade_count": inst.state.trade_count,
                 "quarantined": getattr(inst, "_quarantined", False),
                 "entries_blocked": getattr(inst, "_entries_blocked", False),
+                "entry_block_reason": getattr(inst, "_entries_block_reason", ""),
             },
             "broker": {
                 "position": broker_info.get("direction", "FLAT"),
@@ -637,6 +696,7 @@ def _write_heartbeat_files(
                 "broker_position": getattr(inst, '_broker_position', 'FLAT'),
                 "broker_qty": getattr(inst, '_broker_qty', 0.0),
                 "entries_blocked": getattr(inst, '_entries_blocked', False),
+                "entry_block_reason": getattr(inst, '_entries_block_reason', ""),
                 "quarantined": getattr(inst, '_quarantined', False),
                 "consecutive_errors": getattr(inst, '_consecutive_errors', 0),
                 "reconciliation": getattr(inst, '_reconciliation', ''),
@@ -652,6 +712,19 @@ def _write_heartbeat_files(
             })
         except Exception:
             pass
+
+
+def _sync_entry_block_state(inst) -> None:
+    """Combine control-plane and reconciliation blocks into one runtime flag."""
+    control_blocked = bool(getattr(inst, "_control_blocked", False))
+    recon_blocked = bool(getattr(inst, "_recon_blocked", False))
+    inst._entries_blocked = control_blocked or recon_blocked
+    if control_blocked:
+        inst._entries_block_reason = str(getattr(inst, "_control_block_reason", "") or "CONTROL_BLOCK")
+    elif recon_blocked:
+        inst._entries_block_reason = str(getattr(inst, "_recon_block_reason", "") or "RECON_BLOCK")
+    else:
+        inst._entries_block_reason = ""
 
 
 def _load_governor():
@@ -808,7 +881,8 @@ def compute_features_fx(buf: BarBuffer) -> Optional[dict]:
     pre = df.iloc[-lookback:]
     context = df.iloc[-ctx_win:]
 
-    range_pct = (pre["high"].max() - pre["low"].min()) / pre["close"].iloc[-1]
+    last_close = float(pre["close"].iloc[-1])
+    range_pct = (pre["high"].max() - pre["low"].min()) / last_close if last_close != 0 else 0.0
     pre_vol = (pre["high"] - pre["low"]).mean()
     ctx_vol = (context["high"] - context["low"]).mean()
     vol_z = (pre_vol - ctx_vol) / ctx_vol if ctx_vol > 0 else 0
@@ -858,7 +932,8 @@ def compute_features_futures(buf: BarBuffer) -> Optional[dict]:
     pre = df.iloc[-lookback:]
     context = df.iloc[-ctx_win:]
 
-    range_pct = (pre["high"].max() - pre["low"].min()) / pre["close"].iloc[-1]
+    last_close = float(pre["close"].iloc[-1])
+    range_pct = (pre["high"].max() - pre["low"].min()) / last_close if last_close != 0 else 0.0
     pre_vol = (pre["high"] - pre["low"]).mean()
     ctx_vol = (context["high"] - context["low"]).mean()
     vol_z = (pre_vol - ctx_vol) / ctx_vol if ctx_vol > 0 else 0
@@ -1104,6 +1179,12 @@ class InstrumentRunner:
         self.stage_account = stage_account(self.deployment_stage)
         self.execution_mode = stage_execution_mode(self.deployment_stage)
         self.trade_enabled = self.execution_mode in ("paper", "real")
+        self._entries_blocked = False
+        self._entries_block_reason = ""
+        self._control_blocked = False
+        self._control_block_reason = ""
+        self._recon_blocked = False
+        self._recon_block_reason = ""
 
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -2092,8 +2173,7 @@ class InstrumentRunner:
         qty = abs(s.position_size)
         if qty <= 0:
             self._log.error("Cannot exit: position_size is 0")
-            s.position = "FLAT"
-            s.exit_pending = False
+            s.clear_trade_state()
             s.save()
             return False
         ib = getattr(self, '_ib', None)
@@ -2300,26 +2380,7 @@ class InstrumentRunner:
             self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
 
         # Flatten state
-        s.position = "FLAT"
-        s.entry_time = None
-        s.timeout_time = None
-        s.pyramid_adds = 0
-        s.avg_entry_price = 0.0
-        s.position_size = 0.0
-        s.entry_risk_usd = 0.0
-        s.sizing_policy = ""
-        s.account_equity_at_entry = 0.0
-        s.entry_regime = ""
-        s.entry_pending = False
-        s.exit_pending = False
-        s.entry_order_id = ""
-        s.stop_order_id = ""
-        s.target_order_id = ""
-        s.exit_order_id = ""
-        s.entry_fill_px = 0.0
-        s.exit_fill_px = 0.0
-        s.entry_submitted_ts = ""
-        s.exit_submitted_ts = ""
+        s.clear_trade_state()
         s.save()
 
     _BRACKET_CHECK_INTERVAL_S = 60  # check bracket health every 60s
@@ -2382,10 +2443,7 @@ class InstrumentRunner:
                         f"ENTRY TIMEOUT: order {s.entry_order_id} pending >60s — cancelling"
                     )
                     self._cancel_order_by_id(s.entry_order_id, "entry_timeout")
-                    s.entry_pending = False
-                    s.entry_order_id = ""
-                    s.entry_submitted_ts = ""
-                    s.position = "FLAT"
+                    s.clear_trade_state()
                     s.save()
             except (ValueError, TypeError):
                 pass
@@ -2444,10 +2502,7 @@ class InstrumentRunner:
                     _write_incident(self, "EXIT_FAILED",
                                     f"All exit retries exhausted, forced local FLAT",
                                     s.position, {"direction": s.position, "qty": s.position_size})
-                    s.exit_pending = False
-                    s.exit_order_id = ""
-                    s.exit_submitted_ts = ""
-                    s.position = "FLAT"
+                    s.clear_trade_state()
                     s.save()
                     self._exit_retry_count = 0
             except (ValueError, TypeError):
@@ -2573,16 +2628,7 @@ class InstrumentRunner:
                 if self.uses_pips:
                     self._ai_overlay_learn(pnl)
                     self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
-                s.position = "FLAT"
-                s.entry_time = None
-                s.timeout_time = None
-                s.pyramid_adds = 0
-                s.avg_entry_price = 0.0
-                s.position_size = 0.0
-                s.entry_risk_usd = 0.0
-                s.sizing_policy = ""
-                s.account_equity_at_entry = 0.0
-                s.entry_regime = ""
+                s.clear_trade_state()
                 s.save()
             else:
                 # ── Pyramiding: scale-in on confirmed move ────
@@ -2942,7 +2988,10 @@ class InstrumentRunner:
 
         # Block new entries if reconciliation requires recovery
         if direction and self.trade_enabled and getattr(self, '_entries_blocked', False):
-            self._log.warning(f"Entry BLOCKED ({direction}) -- reconciliation recovery required")
+            block_reason = str(getattr(self, "_entries_block_reason", "") or "ENTRY_BLOCKED")
+            self._log.warning(f"Entry BLOCKED ({direction}) -- {block_reason}")
+            self._log_signal(features, direction, f"RUNTIME_BLOCKED_{block_reason}")
+            _gate_log["risk_gate"] = "FAIL"
             direction = None
 
         # Write gate decision log for brain visualization
@@ -2984,10 +3033,10 @@ class InstrumentRunner:
                     f"policy={sizing_policy} usd_jpy_ref={self._reference_usd_jpy()}"
                 )
 
-            # Drawdown-scaled sizing: linear ramp-down with floor at 0.2x
-            if hasattr(self, '_risk_mgr') and self._risk_mgr._drawdown_pause:
-                size = 0  # hard pause already active
-            elif hasattr(self, '_risk_mgr') and self._risk_mgr._peak_pnl > 0:
+            # Drawdown-scaled sizing: linear ramp-down with floor at 0.2x.
+            # Hard pauses are enforced in the portfolio risk gate so a manual
+            # RESET_DRAWDOWN/session reset can clear them before sizing is zeroed.
+            if hasattr(self, '_risk_mgr') and self._risk_mgr._peak_pnl > 0 and not self._risk_mgr._drawdown_pause:
                 dd = (self._risk_mgr._peak_pnl - self._risk_mgr._current_pnl) / abs(self._risk_mgr._peak_pnl)
                 if dd > 0 and self._risk_mgr.max_drawdown_pct > 0:
                     dd_mult = max(0.2, 1.0 - (dd / self._risk_mgr.max_drawdown_pct))
@@ -3049,7 +3098,7 @@ class InstrumentRunner:
                 )
                 if not ok:
                     self._log.warning(f"REAL_ENTRY SUBMIT FAILED — staying FLAT")
-                    s.position = "FLAT"
+                    s.clear_trade_state()
                     self._log_signal(features, direction, "REAL_ENTRY_FAILED")
                     return
                 # Don't set position yet — _on_fill will handle it
@@ -3307,14 +3356,7 @@ def reconcile_instruments(ib, instruments: list) -> dict:
                 # Direction matches but qty is 0 — trust broker
                 result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
                 detail = f"Direction matches but broker qty=0 — forcing FLAT"
-                inst.state.position = "FLAT"
-                inst.state.entry_price = 0.0
-                inst.state.stop_price = 0.0
-                inst.state.target_price = 0.0
-                inst.state.timeout_time = None
-                inst.state.entry_time = None
-                inst.state.avg_entry_price = 0.0
-                inst.state.pyramid_adds = 0
+                inst.state.clear_trade_state()
                 inst.state.save()
         elif local_pos == "FLAT" and broker_dir in ("LONG", "SHORT"):
             result = ReconcileResult.LOCAL_FLAT_BROKER_OPEN
@@ -3323,14 +3365,7 @@ def reconcile_instruments(ib, instruments: list) -> dict:
             result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
             detail = f"Phantom: runner says {local_pos} but broker is FLAT -- forcing local FLAT"
             # Auto-correct: trust broker truth — clear ALL lifecycle state
-            inst.state.position = "FLAT"
-            inst.state.entry_price = 0.0
-            inst.state.stop_price = 0.0
-            inst.state.target_price = 0.0
-            inst.state.timeout_time = None
-            inst.state.entry_time = None
-            inst.state.avg_entry_price = 0.0
-            inst.state.pyramid_adds = 0
+            inst.state.clear_trade_state()
             inst.state.save()
         else:
             result = ReconcileResult.UNRESOLVED
@@ -3697,10 +3732,7 @@ def _execute_emergency_shutdown(ib, instruments, kill_file):
                     log.error(f"Emergency close {inst.symbol} failed: {e}")
 
         # Reset local state
-        inst.state.position = "FLAT"
-        inst.state.entry_price = 0.0
-        inst.state.stop_price = 0.0
-        inst.state.target_price = 0.0
+        inst.state.clear_trade_state()
         inst.state.save()
 
     # 4. Discord notification
@@ -3849,15 +3881,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                 f"[{runner.label}] {runner.deployment_stage.upper()} stage is non-trading; "
                 f"forcing local state FLAT from restored {runner.state.position}"
             )
-            runner.state.position = "FLAT"
-            runner.state.entry_price = 0.0
-            runner.state.stop_price = 0.0
-            runner.state.target_price = 0.0
-            runner.state.timeout_time = None
-            runner.state.entry_time = None
-            runner.state.position_size = 0.0
-            runner.state.entry_risk_usd = 0.0
-            runner.state.sizing_policy = ""
+            runner.state.clear_trade_state()
         runner._hydrate_trade_history_from_journal()
         runner._hydrate_legacy_state_size()
         runner.state.save()
@@ -3913,13 +3937,19 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             r = recon_results.get(inst.symbol, {})
             r_result = r.get("result", "") if isinstance(r, dict) else getattr(r, "result", "")
             if str(r_result) in ("LOCAL_FLAT_BROKER_OPEN", "UNRESOLVED", "RECOVERY_REQUIRED"):
-                inst._entries_blocked = True
+                inst._recon_blocked = True
+                inst._recon_block_reason = str(r_result)
+                _sync_entry_block_state(inst)
                 log.error(f"  BLOCKED: {inst.symbol} ({r_result})")
             else:
-                inst._entries_blocked = False
+                inst._recon_blocked = False
+                inst._recon_block_reason = ""
+                _sync_entry_block_state(inst)
     else:
         for inst in instruments:
-            inst._entries_blocked = False
+            inst._recon_blocked = False
+            inst._recon_block_reason = ""
+            _sync_entry_block_state(inst)
 
     _write_broker_truth_artifacts(
         ib,
@@ -3999,10 +4029,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     f"ORDER {status_str.upper()}: entry order {order_id} — "
                     f"clearing entry_pending, forcing FLAT"
                 )
-                s.entry_pending = False
-                s.entry_order_id = ""
-                s.entry_submitted_ts = ""
-                s.position = "FLAT"
+                s.clear_trade_state()
                 s.save()
             elif order_id in (s.stop_order_id, s.target_order_id):
                 inst._log.critical(
@@ -4108,9 +4135,13 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
 
             # Check graceful exit — block entries, wait for all positions to close, then stop
             graceful_file = REPO / "GRACEFUL_EXIT"
+            for inst in instruments:
+                inst._control_blocked = False
+                inst._control_block_reason = ""
             if graceful_file.exists():
                 for inst in instruments:
-                    inst._entries_blocked = True
+                    inst._control_blocked = True
+                    inst._control_block_reason = "GRACEFUL_EXIT"
                 all_flat = all(inst.state.position == "FLAT" for inst in instruments)
                 if all_flat:
                     log.critical("GRACEFUL EXIT: all positions closed. Shutting down.")
@@ -4137,11 +4168,8 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             pause_file = REPO / "PAUSE_ENTRIES"
             if pause_file.exists():
                 for inst in instruments:
-                    inst._entries_blocked = True
-            else:
-                # Only unblock if not quarantined or otherwise blocked
-                if not graceful_file.exists():
-                    pass  # Entry blocking is managed per-instrument elsewhere
+                    inst._control_blocked = True
+                    inst._control_block_reason = "PAUSE_ENTRIES"
 
             now = datetime.now(timezone.utc)
 
@@ -4152,7 +4180,8 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     for inst in instruments:
                         if inst.instrument_type != "forex":
                             continue
-                        inst._entries_blocked = True
+                        inst._control_blocked = True
+                        inst._control_block_reason = "FRIDAY_CLOSE"
                         s = inst.state
                         if s.position != "FLAT" and not s.exit_pending:
                             reason = "friday_close"
@@ -4174,11 +4203,14 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                                 else:
                                     s.pnl_points += pnl
                                 s.pnl_usd += pnl_usd
-                                s.position = "FLAT"
+                                s.clear_trade_state()
                                 s.save()
                 else:
                     for inst in instruments:
                         inst._friday_close_logged = False
+
+            for inst in instruments:
+                _sync_entry_block_state(inst)
 
             # Use model equity for paper fleet, broker equity for real
             equity_tracker.refresh()
@@ -4224,15 +4256,18 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                                 f"RECON_DRIFT: {inst.symbol} local={local_pos} "
                                 f"broker_qty={bp} key={ib_key} — BLOCKING ENTRIES"
                             )
-                            inst._entries_blocked = True
+                            inst._recon_blocked = True
+                            inst._recon_block_reason = "RECON_DRIFT"
+                            _sync_entry_block_state(inst)
                             _write_incident(inst, "RECON_DRIFT",
                                             f"local={local_pos} broker_qty={bp}",
                                             local_pos, {"direction": "unknown", "qty": bp})
                         else:
-                            # Clear recon-based entry block if positions agree
                             if getattr(inst, '_recon_blocked', False):
-                                inst._entries_blocked = False
-                                inst._recon_blocked = False
+                                log.info(f"RECON_DRIFT CLEARED: {inst.symbol} local and broker positions agree again")
+                            inst._recon_blocked = False
+                            inst._recon_block_reason = ""
+                            _sync_entry_block_state(inst)
                 except Exception as e:
                     log.warning(f"Periodic reconciliation failed: {e}")
 
