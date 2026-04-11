@@ -94,7 +94,14 @@ _LOG_DIR = Path("argus_flow/logs")
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _log_handlers = [logging.StreamHandler()]
 try:
-    _file_handler = logging.FileHandler(_LOG_DIR / "runner_unified.log", encoding="utf-8")
+    from logging.handlers import RotatingFileHandler
+    # Rotate at 5MB, keep 3 backups (max 20MB total)
+    _file_handler = RotatingFileHandler(
+        _LOG_DIR / "runner_unified.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
     _file_handler.setLevel(logging.INFO)
     _log_handlers.append(_file_handler)
 except Exception:

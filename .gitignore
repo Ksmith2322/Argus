@@ -23,6 +23,13 @@ ops/logs/
 .pycache_verify/
 !ops/coin_pool.json
 
+# --- Runtime flag files (operational state, not source) ---
+PAUSE_ENTRIES
+KILL_SWITCH
+.tmp_*/
+*.lock
+*.pidlock
+
 # --- Candle data (keep in repo for PC2 sync) ---
 !data/eth_usd_1m.csv
 !data/btc_usd_1m.csv
