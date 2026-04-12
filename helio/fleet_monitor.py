@@ -224,7 +224,8 @@ def build_restart_args(cfg: dict, legacy_execution_mode: str = "paper") -> list[
 def restart_system(name: str, cfg: dict, legacy_execution_mode: str = "paper") -> bool:
     """Auto-restart a crashed/stale system."""
     restart_args = build_restart_args(cfg, legacy_execution_mode=legacy_execution_mode)
-    log.warning(f"Restarting {name} in {legacy_execution_mode.upper()} mode...")
+    mode_label = "LIVE" if cfg.get("supports_live_flag") and legacy_execution_mode == "live" else "DEFAULT"
+    log.warning(f"Restarting {name} ({mode_label} mode, args={restart_args})...")
     try:
         subprocess.Popen(
             [PYTHON] + restart_args,
