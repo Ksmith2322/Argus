@@ -323,6 +323,21 @@ def run_live(configs: list[Path]):
                         log.error(f"Apollo hourly {inst['config']['symbol']}: {e}")
                     ib.sleep(1)
 
+            # --- Liveness refresh for daily instruments ---
+            # Daily pairs only re-evaluate once per day (after 17:00 UTC), but the
+            # fleet monitor flags any heartbeat older than ~hours as STALE. Touch
+            # each daily instrument's heartbeat once per hour with the current ts.
+            if daily_instruments and now.minute < 2:
+                for inst in daily_instruments:
+                    hb_path = inst["log_dir"] / "heartbeat.json"
+                    try:
+                        if hb_path.exists():
+                            payload = json.loads(hb_path.read_text())
+                            payload["ts"] = now.isoformat()
+                            hb_path.write_text(json.dumps(payload, indent=2, default=str))
+                    except Exception as e:
+                        log.warning(f"heartbeat refresh failed for {inst['config']['symbol']}: {e}")
+
             # --- Daily evaluation (daily instruments) ---
             if daily_instruments and today != last_daily_eval and now.hour >= 17:
                 last_daily_eval = today

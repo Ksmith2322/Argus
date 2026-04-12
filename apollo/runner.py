@@ -626,34 +626,42 @@ def main():
     print(f"Saved: {log_path}")
 
     # Auto-execute high-conviction post-ER plays if --live
+    # Wrapped so any failure here cannot prevent the heartbeat write below.
     if args.live:
-        from apollo.ops.trade_manager import add_position, check_exits
-        check_exits()  # close any due exits first
+        try:
+            from apollo.ops.trade_manager import add_position, check_exits
+            check_exits()  # close any due exits first
 
-        for r in results:
-            if r.get("post_er_play") and r["score"] >= 75 and r.get("direction") in ("long", "short"):
-                if _pg_check_new_entry is not None:
-                    pg_check = _pg_check_new_entry("apollo_earnings", r["symbol"], r["direction"].upper())
-                    if not pg_check.allowed:
-                        print(f"  {r['symbol']}: PORTFOLIO BLOCK -- {pg_check.reason}")
-                        continue
-                    if pg_check.warnings:
-                        print(f"  {r['symbol']}: portfolio warnings -- {pg_check.warnings}")
-                add_position(
-                    symbol=r["symbol"],
-                    direction=r["direction"],
-                    entry_price=r["price"],
-                    score=r["score"],
-                    conviction=r.get("conviction", "medium"),
-                    earnings_date=r["earnings_date"],
-                    beat_rate=r.get("beat_rate", 0),
-                    stop_pct=5.0,
-                    target_pct=20.0,
-                    risk_pct=0.02 if r.get("conviction") == "high" else 0.01,
-                    live=True,
-                )
+            for r in results:
+                if r.get("post_er_play") and r["score"] >= 75 and r.get("direction") in ("long", "short"):
+                    if _pg_check_new_entry is not None:
+                        pg_check = _pg_check_new_entry("apollo_earnings", r["symbol"], r["direction"].upper())
+                        if not pg_check.allowed:
+                            print(f"  {r['symbol']}: PORTFOLIO BLOCK -- {pg_check.reason}")
+                            continue
+                        if pg_check.warnings:
+                            print(f"  {r['symbol']}: portfolio warnings -- {pg_check.warnings}")
+                    try:
+                        add_position(
+                            symbol=r["symbol"],
+                            direction=r["direction"],
+                            entry_price=r["price"],
+                            score=r["score"],
+                            conviction=r.get("conviction", "medium"),
+                            earnings_date=r["earnings_date"],
+                            beat_rate=r.get("beat_rate", 0),
+                            stop_pct=5.0,
+                            target_pct=20.0,
+                            risk_pct=0.02 if r.get("conviction") == "high" else 0.01,
+                            live=True,
+                        )
+                    except Exception as e:
+                        print(f"  {r['symbol']}: add_position failed: {e}")
+        except Exception as e:
+            print(f"  auto-execute block failed: {e}")
 
     # Heartbeat
+    print(f"[apollo] writing heartbeat at {datetime.now(timezone.utc).isoformat()}")
     try:
         open_positions = 0
         positions_path = LOGS_DIR / "positions.json"

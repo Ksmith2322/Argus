@@ -119,6 +119,12 @@ SYSTEMS = {
         "process_match": "helio.runner_apollo",
         "restart_args": ["-m", "helio.runner_apollo"],
     },
+    "forge_gdx_gld": {
+        "heartbeats": [REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"],
+        "stale_threshold_s": 5400,  # 90 min (loop is 60min + buffer)
+        "process_match": "forge.gdx_gld_runner",
+        "restart_args": ["-m", "forge.gdx_gld_runner", "--signal-only", "--loop", "--interval-min", "60"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,

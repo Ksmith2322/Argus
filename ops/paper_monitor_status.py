@@ -35,6 +35,7 @@ HELIO_THRESHOLDS = {
     "helio_hermes": 129600,
     "helio_apollo": 43200,
 }
+FORGE_THRESHOLD_S = 5400  # 90 min (signal-only loop is 60min + buffer)
 EXPECTED_BLOCK_REASONS = {
     "FRIDAY_CLOSE",
     "MARKET_CLOSED",
@@ -194,6 +195,26 @@ def _collect_managed_helio() -> list[SystemStatus]:
     return out
 
 
+def _collect_forge() -> list[SystemStatus]:
+    specs = {
+        "gdx_gld": REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json",
+    }
+    out: list[SystemStatus] = []
+    for name, path in specs.items():
+        age_s = _age_seconds(path)
+        payload = _load_json(path) or {}
+        status = _status_from_age(age_s, FORGE_THRESHOLD_S)
+        z = payload.get("z_score")
+        z_str = f"{z:.4f}" if isinstance(z, (int, float)) else "?"
+        detail = (
+            f"mode={payload.get('mode', '?')} "
+            f"pos={payload.get('position', '?')} "
+            f"z={z_str}"
+        )
+        out.append(SystemStatus(name=f"forge:{name}", status=status, age_s=age_s, detail=detail, extra={}))
+    return out
+
+
 def _collect_registry() -> dict[str, Any]:
     path = REPO / "argus_flow" / "logs" / "deployment_registry.json"
     payload = _load_json(path) or {}
@@ -233,7 +254,7 @@ def _collect_portfolio_guard() -> dict[str, Any]:
 
 
 def _collect_snapshot() -> dict[str, Any]:
-    systems = _collect_argus() + _collect_legacy() + _collect_managed_helio()
+    systems = _collect_argus() + _collect_legacy() + _collect_managed_helio() + _collect_forge()
     failing = [s.name for s in systems if s.status != "OK"]
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -253,6 +274,7 @@ def _print_text(snapshot: dict[str, Any]) -> None:
         ("Managed FX", "argus:"),
         ("Legacy Greek", "legacy:"),
         ("Managed Helio", "helio_"),
+        ("Forge (Paper)", "forge:"),
     )
     systems = snapshot["systems"]
     for title, prefix in sections:
