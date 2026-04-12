@@ -384,6 +384,15 @@ def run_cycle(args, executor):
     """One scan + execution + exit cycle."""
     print(f"\n=== HERMES cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
 
+    # Atlas regime context (LOG_ONLY during burn-in)
+    try:
+        from forge.atlas.fleet_gate import check_atlas
+        _atlas = check_atlas()
+        if _atlas.available:
+            _atlas.log_recommendation("hermes")
+    except Exception:
+        pass  # Atlas is optional — never break the runner
+
     positions = load_positions()
 
     # Check exits first

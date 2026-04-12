@@ -125,6 +125,18 @@ SYSTEMS = {
         "process_match": "forge.gdx_gld_runner",
         "restart_args": ["-m", "forge.gdx_gld_runner", "--signal-only", "--loop", "--interval-min", "60"],
     },
+    "forge_atlas": {
+        "heartbeats": [REPO / "forge" / "logs" / "atlas" / "heartbeat.json"],
+        "stale_threshold_s": 600,  # 10 min (polls every 2min, 5x buffer)
+        "process_match": "forge.atlas.runner",
+        "restart_args": ["-m", "forge.atlas.runner", "--loop", "--interval-sec", "120"],
+    },
+    "forge_themis": {
+        "heartbeats": [REPO / "forge" / "logs" / "themis" / "heartbeat.json"],
+        "stale_threshold_s": 28800,  # 8h (polls every 6h)
+        "process_match": "forge.themis.runner",
+        "restart_args": ["-m", "forge.themis.runner", "--loop", "--interval-min", "360"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,

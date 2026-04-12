@@ -603,6 +603,15 @@ def main():
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
+    # Atlas regime context (LOG_ONLY during burn-in)
+    try:
+        from forge.atlas.fleet_gate import check_atlas
+        _atlas = check_atlas()
+        if _atlas.available:
+            _atlas.log_recommendation("apollo")
+    except Exception:
+        pass  # Atlas is optional — never break the runner
+
     # Print table
     print(f"\n{'Symbol':8s} {'Score':>5s} {'Dir':8s} {'ER Date':12s} {'Days':>5s} {'Price':>8s} {'BB%':>5s} {'Vol':>5s} {'Beat':>5s} {'Signals'}")
     print("-" * 100)

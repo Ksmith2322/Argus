@@ -4278,6 +4278,16 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                 except Exception as e:
                     log.warning(f"Periodic reconciliation failed: {e}")
 
+            # Atlas regime context (LOG_ONLY during burn-in)
+            if time.time() - last_heartbeat_file_write > heartbeat_file_interval:
+                try:
+                    from forge.atlas.fleet_gate import check_atlas
+                    _atlas = check_atlas()
+                    if _atlas.available:
+                        _atlas.log_recommendation("argus")
+                except Exception:
+                    pass  # Atlas is optional — never break the runner
+
             # Lightweight per-instrument heartbeat for dashboard/chart freshness
             if time.time() - last_heartbeat_file_write > heartbeat_file_interval:
                 last_heartbeat_file_write = time.time()

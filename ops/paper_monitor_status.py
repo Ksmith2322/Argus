@@ -196,22 +196,43 @@ def _collect_managed_helio() -> list[SystemStatus]:
 
 
 def _collect_forge() -> list[SystemStatus]:
-    specs = {
-        "gdx_gld": REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json",
-    }
     out: list[SystemStatus] = []
-    for name, path in specs.items():
-        age_s = _age_seconds(path)
-        payload = _load_json(path) or {}
-        status = _status_from_age(age_s, FORGE_THRESHOLD_S)
-        z = payload.get("z_score")
-        z_str = f"{z:.4f}" if isinstance(z, (int, float)) else "?"
-        detail = (
-            f"mode={payload.get('mode', '?')} "
-            f"pos={payload.get('position', '?')} "
-            f"z={z_str}"
-        )
-        out.append(SystemStatus(name=f"forge:{name}", status=status, age_s=age_s, detail=detail, extra={}))
+
+    # GDX/GLD pairs
+    gdx_path = REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"
+    age_s = _age_seconds(gdx_path)
+    payload = _load_json(gdx_path) or {}
+    status = _status_from_age(age_s, FORGE_THRESHOLD_S)
+    z = payload.get("z_score")
+    z_str = f"{z:.4f}" if isinstance(z, (int, float)) else "?"
+    detail = f"mode={payload.get('mode', '?')} pos={payload.get('position', '?')} z={z_str}"
+    out.append(SystemStatus(name="forge:gdx_gld", status=status, age_s=age_s, detail=detail, extra={}))
+
+    # Themis
+    themis_path = REPO / "forge" / "logs" / "themis" / "heartbeat.json"
+    age_s = _age_seconds(themis_path)
+    payload = _load_json(themis_path) or {}
+    status = _status_from_age(age_s, 28800)  # 8h threshold
+    detail = (
+        f"trades={payload.get('total_trades', '?')} "
+        f"signals={payload.get('active_signals', '?')} "
+        f"new={payload.get('new_signals_this_cycle', '?')}"
+    )
+    out.append(SystemStatus(name="forge:themis", status=status, age_s=age_s, detail=detail, extra={}))
+
+    # Atlas
+    atlas_path = REPO / "forge" / "logs" / "atlas" / "heartbeat.json"
+    age_s = _age_seconds(atlas_path)
+    payload = _load_json(atlas_path) or {}
+    status = _status_from_age(age_s, 600)  # 10 min threshold
+    detail = (
+        f"regime={payload.get('regime', '?')} "
+        f"alert={payload.get('alert_level', '?')} "
+        f"events_today={payload.get('events_today', '?')} "
+        f"size_mod={payload.get('position_size_modifier', '?')}"
+    )
+    out.append(SystemStatus(name="forge:atlas", status=status, age_s=age_s, detail=detail, extra={}))
+
     return out
 
 

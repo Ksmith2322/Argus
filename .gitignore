@@ -60,3 +60,7 @@ argus_flow/logs/
 !argus_flow/configs/*.json
 # IB Gateway installer
 ibgateway-*.exe
+
+# Forge runtime data (databases, generated artifacts)
+forge/data/
+forge/logs/

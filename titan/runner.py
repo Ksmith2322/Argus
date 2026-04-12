@@ -454,6 +454,16 @@ def main():
 
         def run_cycle():
             print(f"\n=== TITAN cycle @ {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
+
+            # Atlas regime context (LOG_ONLY during burn-in)
+            try:
+                from forge.atlas.fleet_gate import check_atlas
+                _atlas = check_atlas()
+                if _atlas.available:
+                    _atlas.log_recommendation("titan")
+            except Exception:
+                pass  # Atlas is optional — never break the runner
+
             print("\n[1] Checking exits on open positions...")
             runner.check_exits()
             print("\n[2] Evaluating new entries from scanner...")
