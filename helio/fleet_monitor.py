@@ -101,24 +101,32 @@ SYSTEMS = {
         "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14"],
         "supports_live_flag": True,
     },
-    "helio_swing": {
-        "heartbeats": _managed_heartbeat_paths("*_swing_v1.json"),
-        "stale_threshold_s": 129600,  # 36h (daily/4h evaluation with weekend buffer)
-        "process_match": " -m helio.runner ",
-        "restart_args": ["-m", "helio.runner"],
-    },
-    "helio_hermes": {
-        "heartbeats": _managed_heartbeat_paths("hermes_*_v1.json", log_prefix="hermes_"),
-        "stale_threshold_s": 129600,  # 36h (daily evaluation with weekend buffer)
-        "process_match": "helio.runner_hermes",
-        "restart_args": ["-m", "helio.runner_hermes"],
-    },
-    "helio_apollo": {
-        "heartbeats": _managed_heartbeat_paths("apollo_*_v1.json", log_prefix="apollo_"),
-        "stale_threshold_s": 43200,  # 12h (mixed hourly/daily evaluation)
-        "process_match": "helio.runner_apollo",
-        "restart_args": ["-m", "helio.runner_apollo"],
-    },
+    # --- Managed Helio: DISABLED ---
+    # These runners are disabled from auto-restart until the managed Helio
+    # layer is fixed. Legacy Greek (titan/hermes/apollo) is the active
+    # execution path. Managed Helio ran in watcher/paper mode but created
+    # noisy synthetic positions and stale heartbeats. Re-enable after:
+    #   1. Watcher lane is truly observe-only (no synthetic trades)
+    #   2. State cleanup on FLAT is implemented
+    #   3. Single control plane decision is made (legacy vs managed)
+    # "helio_swing": {
+    #     "heartbeats": _managed_heartbeat_paths("*_swing_v1.json"),
+    #     "stale_threshold_s": 129600,
+    #     "process_match": " -m helio.runner ",
+    #     "restart_args": ["-m", "helio.runner"],
+    # },
+    # "helio_hermes": {
+    #     "heartbeats": _managed_heartbeat_paths("hermes_*_v1.json", log_prefix="hermes_"),
+    #     "stale_threshold_s": 129600,
+    #     "process_match": "helio.runner_hermes",
+    #     "restart_args": ["-m", "helio.runner_hermes"],
+    # },
+    # "helio_apollo": {
+    #     "heartbeats": _managed_heartbeat_paths("apollo_*_v1.json", log_prefix="apollo_"),
+    #     "stale_threshold_s": 43200,
+    #     "process_match": "helio.runner_apollo",
+    #     "restart_args": ["-m", "helio.runner_apollo"],
+    # },
     "forge_gdx_gld": {
         "heartbeats": [REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"],
         "stale_threshold_s": 5400,  # 90 min (loop is 60min + buffer)

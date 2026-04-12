@@ -165,34 +165,11 @@ def _managed_heartbeat_paths(config_glob: str, log_prefix: str = "") -> list[tup
 
 
 def _collect_managed_helio() -> list[SystemStatus]:
-    groups = {
-        "helio_swing": _managed_heartbeat_paths("*_swing_v1.json"),
-        "helio_hermes": _managed_heartbeat_paths("hermes_*_v1.json", log_prefix="hermes_"),
-        "helio_apollo": _managed_heartbeat_paths("apollo_*_v1.json", log_prefix="apollo_"),
-    }
-    out: list[SystemStatus] = []
-    for family, items in groups.items():
-        threshold = HELIO_THRESHOLDS[family]
-        for symbol, path in items:
-            age_s = _age_seconds(path)
-            payload = _load_json(path) or {}
-            status = _status_from_age(age_s, threshold)
-            detail_parts = [
-                f"stage={payload.get('stage', '?')}",
-                f"pos={payload.get('position', '?')}",
-            ]
-            if "regime" in payload:
-                detail_parts.append(f"regime={payload.get('regime', '?')}")
-            if "trade_count" in payload:
-                detail_parts.append(f"trades={payload.get('trade_count', '?')}")
-            out.append(SystemStatus(
-                name=f"{family}:{symbol}",
-                status=status,
-                age_s=age_s,
-                detail=" ".join(detail_parts),
-                extra={},
-            ))
-    return out
+    # Managed Helio is SUSPENDED per ARCHITECTURE_DECISION.md
+    # Legacy Greek (titan/hermes/apollo) is the active execution path.
+    # Return empty list — these systems are not running and should not
+    # pollute the monitor with stale heartbeats.
+    return []
 
 
 def _collect_forge() -> list[SystemStatus]:
@@ -294,7 +271,6 @@ def _print_text(snapshot: dict[str, Any]) -> None:
     sections = (
         ("Managed FX", "argus:"),
         ("Legacy Greek", "legacy:"),
-        ("Managed Helio", "helio_"),
         ("Forge (Paper)", "forge:"),
     )
     systems = snapshot["systems"]

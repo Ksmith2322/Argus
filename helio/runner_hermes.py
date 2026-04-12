@@ -301,10 +301,12 @@ def run_live(configs: list[Path]):
                         "regime_confidence": regime_info["confidence"],
                     }, indent=2, default=str))
 
-                    # Regime depriority gate — only block new entries in watcher stage
+                    # --- Watcher stage: observe-only ---
                     _stage = cfg.get("deployment", {}).get("stage", "watcher")
-                    if _stage == "watcher" and "hermes" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
-                        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY hermes not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
+                    if _stage == "watcher":
+                        log.info(f"{cfg['symbol']}: WATCHER mode — observe-only, skipping entry/exit eval")
+                    elif "hermes" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
+                        log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY hermes not in top-2 — skipping entry eval")
                     else:
                         evaluate(inst["state"], df, cfg, today, inst["log_dir"])
                 except Exception as e:

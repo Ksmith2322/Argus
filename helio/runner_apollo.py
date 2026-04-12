@@ -242,9 +242,14 @@ def _eval_instrument(ib, inst: dict, bars, now: datetime, cfg: dict):
         "regime": regime_info["regime"], "regime_confidence": regime_info["confidence"],
     }, indent=2, default=str))
 
-    # Regime depriority gate
+    # --- Watcher stage: observe-only, no synthetic positions ---
     _stage = cfg.get("deployment", {}).get("stage", "watcher")
-    if _stage == "watcher" and "apollo" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
+    if _stage == "watcher":
+        log.info(f"{cfg['symbol']}: WATCHER mode — observe-only, skipping entry/exit eval")
+        return
+
+    # Regime depriority gate (paper/real stages only)
+    if "apollo" not in regime_info["family_priority"][:2] and inst["state"].position == "FLAT":
         log.info(f"{cfg['symbol']}: REGIME_DEPRIORITY — skipping entry eval")
         return
 

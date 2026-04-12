@@ -201,6 +201,32 @@ def manage_position(state: SwingState, row, cfg: dict) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Watcher Signal Logging (observe-only — no trades, no positions)
+# ═══════════════════════════════════════════════════════════════
+
+def _log_watcher_signal(log_dir: Path, symbol: str, direction: str, latest, date_str: str):
+    """Log a watcher-mode signal to signals.csv without entering a position."""
+    import csv
+    sig_file = log_dir / "signals.csv"
+    header = ["date", "symbol", "direction", "close", "atr", "ema", "stage"]
+    row = {
+        "date": date_str,
+        "symbol": symbol,
+        "direction": direction,
+        "close": f"{float(latest['Close']):.2f}",
+        "atr": f"{float(latest['atr']):.4f}",
+        "ema": f"{float(latest['ema']):.2f}",
+        "stage": "watcher",
+    }
+    write_header = not sig_file.exists()
+    with open(sig_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Trade Logging
 # ═══════════════════════════════════════════════════════════════
 
@@ -407,9 +433,14 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
             log.info(f"{symbol}: EXIT {state.position} @ {exit_price:.2f} | {exit_reason} | PnL={pnl:+.2f}% | bars={state.bars_held}")
 
             state.position = "FLAT"
-            state.entry_price = 0
-            state.stop_price = 0
-            state.trail_stop = 0
+            state.entry_price = 0.0
+            state.entry_date = ""
+            state.stop_price = 0.0
+            state.initial_stop = 0.0
+            state.trail_stop = 0.0
+            state.target_price = 0.0
+            state.highest = 0.0
+            state.lowest = 0.0
             state.bars_held = 0
             state.save()
         else:
@@ -417,13 +448,23 @@ def _evaluate_instrument(ib, inst: dict, now: datetime):
             state.save()
         return
 
-    # Regime depriority gate — only block new entries in watcher stage
+    # --- Watcher stage: observe-only, no synthetic positions ---
     _stage = cfg.get("deployment", {}).get("stage", "watcher")
-    if _stage == "watcher" and "helio" not in regime_info["family_priority"][:2]:
+    if _stage == "watcher":
+        # Watchers log signals but NEVER enter positions or increment trades.
+        direction = check_entry(latest, cfg)
+        if direction:
+            log.info(f"{symbol}: WATCHER signal {direction} (observe-only, not entering)")
+            # Log the signal to signals.csv for later analysis
+            _log_watcher_signal(log_dir, symbol, direction, latest, today_str)
+        return
+
+    # Regime depriority gate — only for paper/real stages
+    if "helio" not in regime_info["family_priority"][:2]:
         log.info(f"{symbol}: REGIME_DEPRIORITY helio not in top-2 {regime_info['family_priority'][:2]} — skipping entry eval")
         return
 
-    # Entry check
+    # Entry check (paper/real stages only)
     direction = check_entry(latest, cfg)
     if direction:
         risk_cfg = cfg.get("risk", {})
