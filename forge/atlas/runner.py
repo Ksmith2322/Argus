@@ -197,6 +197,18 @@ def run_cycle() -> dict:
         regime["position_size_modifier"] = get_position_size_modifier(regime)
 
         update_regime_file(regime)
+
+        # VIX term structure overlay
+        try:
+            from forge.atlas.vix_structure import update_atlas_regime_with_vix_structure
+            vix_result = update_atlas_regime_with_vix_structure()
+            log.info("VIX structure: %s | signal=%s | ratio=%.3f",
+                     vix_result.get("structure", "?"),
+                     vix_result.get("signal", "?"),
+                     vix_result.get("ratio", 0))
+        except Exception as e:
+            log.warning("VIX structure update failed: %s", e)
+
         log.info("Regime: %s | vol=%s rates=%s growth=%s liquidity=%s | size_mod=%.2f",
                  regime.get("overall", "?"),
                  regime.get("vol", "?"),
