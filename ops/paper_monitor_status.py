@@ -210,6 +210,30 @@ def _collect_forge() -> list[SystemStatus]:
     )
     out.append(SystemStatus(name="forge:atlas", status=status, age_s=age_s, detail=detail, extra={}))
 
+    # Mamba (NAS100/US30 scalping)
+    mamba_path = REPO / "forge" / "logs" / "mamba" / "heartbeat.json"
+    age_s = _age_seconds(mamba_path)
+    payload = _load_json(mamba_path) or {}
+    status = _status_from_age(age_s, 600)  # 10 min during NY session
+    detail = (
+        f"status={payload.get('status', '?')} "
+        f"v={payload.get('version', '?')} "
+        f"instruments={','.join(payload.get('tickers', []))}"
+    )
+    out.append(SystemStatus(name="forge:mamba", status=status, age_s=age_s, detail=detail, extra={}))
+
+    # Tori (4H commodity swing)
+    tori_path = REPO / "forge" / "logs" / "tori" / "heartbeat.json"
+    age_s = _age_seconds(tori_path)
+    payload = _load_json(tori_path) or {}
+    status = _status_from_age(age_s, 18000)  # 5h threshold (scans every 4h)
+    instruments = payload.get("instruments", [])
+    detail = (
+        f"status={payload.get('status', '?')} "
+        f"instruments={','.join(instruments) if instruments else '?'}"
+    )
+    out.append(SystemStatus(name="forge:tori", status=status, age_s=age_s, detail=detail, extra={}))
+
     return out
 
 

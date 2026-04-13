@@ -145,6 +145,18 @@ SYSTEMS = {
         "process_match": "forge.themis.runner",
         "restart_args": ["-m", "forge.themis.runner", "--loop", "--interval-min", "360"],
     },
+    "forge_mamba": {
+        "heartbeats": [REPO / "forge" / "logs" / "mamba" / "heartbeat.json"],
+        "stale_threshold_s": 600,  # 10 min (scans every 5 min during NY, writes heartbeat each cycle)
+        "process_match": "forge.mamba.runner",
+        "restart_args": ["-m", "forge.mamba.runner", "--loop"],
+    },
+    "forge_tori": {
+        "heartbeats": [REPO / "forge" / "logs" / "tori" / "heartbeat.json"],
+        "stale_threshold_s": 18000,  # 5h (scans every 4h, with buffer)
+        "process_match": "forge.tori.runner",
+        "restart_args": ["-m", "forge.tori.runner", "--loop"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,
