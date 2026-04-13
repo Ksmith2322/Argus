@@ -222,6 +222,18 @@ def _collect_forge() -> list[SystemStatus]:
     )
     out.append(SystemStatus(name="forge:mamba", status=status, age_s=age_s, detail=detail, extra={}))
 
+    # Cue Banks (US30 confluence)
+    cb_path = REPO / "forge" / "logs" / "cuebanks" / "heartbeat.json"
+    age_s = _age_seconds(cb_path)
+    payload = _load_json(cb_path) or {}
+    status = _status_from_age(age_s, 600)
+    detail = (
+        f"status={payload.get('status', '?')} "
+        f"bias={payload.get('daily_bias', payload.get('bias', '?'))} "
+        f"instrument={payload.get('instrument', 'YM=F')}"
+    )
+    out.append(SystemStatus(name="forge:cuebanks", status=status, age_s=age_s, detail=detail, extra={}))
+
     # Tori (4H commodity swing)
     tori_path = REPO / "forge" / "logs" / "tori" / "heartbeat.json"
     age_s = _age_seconds(tori_path)

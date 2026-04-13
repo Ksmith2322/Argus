@@ -157,6 +157,12 @@ SYSTEMS = {
         "process_match": "forge.tori.runner",
         "restart_args": ["-m", "forge.tori.runner", "--loop"],
     },
+    "forge_cuebanks": {
+        "heartbeats": [REPO / "forge" / "logs" / "cuebanks" / "heartbeat.json"],
+        "stale_threshold_s": 600,  # 10 min (scans every 5 min during NY)
+        "process_match": "forge.cuebanks.runner",
+        "restart_args": ["-m", "forge.cuebanks.runner", "--loop"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,
