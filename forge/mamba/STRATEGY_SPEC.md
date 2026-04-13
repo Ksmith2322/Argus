@@ -1,88 +1,105 @@
-# Mamba — NAS100 5-Min Trendline Breakout Strategy
+# Mamba — Index Futures Breakout Scalping System
 
-**Named after:** MambaFX (@mambafx)
-**Instrument:** NAS100 (MNQ micro Nasdaq futures via IBKR)
-**Timeframe:** 5-minute primary, 1-min for entry refinement
-**Style:** Intraday breakout scalper with tight stops and wide targets
+**Named after:** MambaFX (Anthony Alvarenga, @mambafx)
+**Instruments:** US30 (MYM micro Dow) + NAS100 (MNQ micro Nasdaq)
+**Timeframes:** 5-min for bias/levels, 1-min for entry
+**Style:** Pure price-action breakout scalping at NY open
+**Session:** NY only — 9:25-10:30 AM EST (hard cutoff)
+**Max trades:** 1-2 per day, or zero
 
-## The Edge
+## The Method (from MambaFX's rulebook)
 
-Price respects trendlines on 5-min NAS100 because:
-1. Retail traders draw the same lines → stop clusters form at obvious levels
-2. Algos detect and front-run these clusters
-3. When the trendline breaks, the stop cascade creates a 1:4+ momentum move
-4. More touches on the trendline = more stops clustered = bigger breakout
+### 1. Prep (5-min chart, 9:20-9:25 AM EST)
+- Mark horizontal support/resistance (more touches = stronger)
+- Draw trendlines where price respects them
+- Determine bias:
+  - Bullish: price respecting support + higher highs/lows
+  - Bearish: price respecting resistance + lower highs/lows
+- If price is choppy/consolidating with no clear bias → NO TRADE today
 
-## Entry Rules
+### 2. Wait for Volume (9:30 AM EST)
+- Volume must pick up at open
+- Don't enter pre-open
+- If no momentum by 9:35 → keep waiting
 
-1. **Identify trendline:** Connect 3+ swing highs (descending) or swing lows (ascending) on 5-min chart
-2. **Count touches:** Each time price tests and respects the trendline = 1 touch
-   - 3-4 touches: MINIMUM for a valid setup
-   - 5-6 touches: GOOD setup
-   - 7+ touches: HIGH CONVICTION (like the 9-touch example)
-3. **Wait for breakout:** Candle CLOSES beyond the trendline (not just a wick)
-4. **Volume confirmation:** Breakout candle volume > 1.5x average of last 20 bars
-5. **Entry:** Market order on the close of the breakout candle, or limit order at trendline retest
+### 3. Entry (switch to 1-min chart)
+- **Bullish:** Break above resistance/trendline + bullish 1-min structure (higher high → higher low → breakout candle close)
+- **Bearish:** Break below support/trendline + bearish 1-min structure (lower low → lower high → breakdown candle close)
+- Multiple confluences = higher probability (trendline break + S/R break + structure shift)
+- Enter on breakout candle close (confirmed) or aggressively on the break
 
-## Stop Loss
+### 4. Risk Management
+- **Stop:** Tight — just beyond the broken level or recent swing (10-20 points on indices)
+- **Target:** 1:3 to 1:5 R:R (he typically aims 1:4 to 1:5)
+- **Hold time:** 10-30 minutes max. "20 minutes, we're out."
+- **Scale out** at key zones or trail stops on strong moves
+- **Cut losses fast** if no follow-through after breakout
 
-- Place stop just beyond the last swing point before breakout
-- Typically 0.10-0.20% from entry on NAS100 (15-40 points)
-- TIGHT — this is what creates the asymmetric R:R
+### 5. Hard Rules (Non-Negotiable)
+- Max 1-2 trades per day
+- NY session only (9:25-10:30 AM EST)
+- If no setup by ~10:30 AM → done for the day
+- Never trade pre-open, low-volume, or choppy conditions
+- Never hold through reversals
+- Never overtrade or extend session
+- No indicators — pure price action
 
-## Take Profit
+## What Changed From Our V1 Build
 
-- Minimum 1:4 risk/reward ratio (if stop is 20 pts, target is 80 pts minimum)
-- Scale out: 50% at 1:3, remainder at 1:5 with trailing stop
-- Or: trail stop to breakeven at 1:2, let the rest run
+| V1 (wrong) | V2 (correct per rulebook) |
+|------------|--------------------------|
+| 5-min for everything | 5-min bias + 1-min entry |
+| London + NY + overlap sessions | **NY open only: 9:25-10:30 AM EST** |
+| Many trades per day | **Max 1-2, often zero** |
+| 1:4 fixed target | **1:3 to 1:5, scale out** |
+| Trendline breaks only | **S/R + trendlines + structure on 1-min** |
+| Any time of day | **First 45-60 min after open only** |
+| Volume > 1.5x filter | **Volume conviction at open (qualitative)** |
+| Hold until target or stop | **10-30 min max hold, manual exit on fade** |
 
-## Filters
+## Instruments
 
-- **Session filter:** Only trade during high-volume sessions:
-  - London open: 03:00-05:00 ET
-  - NY open: 09:30-11:30 ET
-  - London/NY overlap: 08:00-11:00 ET (BEST)
-- **Avoid:** First 5 min of session (spread widening), last 30 min before close
-- **No trading:** During FOMC/CPI/NFP releases (Atlas calendar gate)
-- **Trend direction:** On 1H chart, prefer breakouts in the direction of the higher timeframe trend
+**Primary:** Both US30 (YM/MYM) and NAS100 (NQ/MNQ) — they correlate but offer independent setups.
+
+Via IBKR:
+- MNQ: Micro E-mini Nasdaq-100, $2/point, CME/GLOBEX, client ID 102
+- MYM: Micro E-mini Dow, $0.50/point, CME/GLOBEX, client ID 103
+
+## Algorithm Translation
+
+### Bias Detection (5-min, computed at 9:25 AM EST)
+1. Identify swing highs/lows from overnight session (last 12 hours)
+2. Fit support/resistance levels (horizontal clusters where price reversed 2+ times)
+3. Fit trendlines through swing points
+4. Classify bias:
+   - BULLISH: 2+ higher lows AND price above key support
+   - BEARISH: 2+ lower highs AND price below key resistance
+   - NEUTRAL/CHOPPY: no clear structure → skip day
+
+### Entry Detection (1-min, 9:30-10:30 AM EST)
+1. After open, monitor 1-min bars for structure shift confirming bias
+2. For BULLISH bias: wait for 1-min higher high → higher low → breakout candle closing above resistance/trendline
+3. For BEARISH bias: wait for 1-min lower low → lower high → breakdown candle closing below support/trendline
+4. Breakout candle should show conviction (large body, small wicks, above-average volume)
+5. Multiple confluences boost conviction score
+
+### Position Management
+1. Stop: below the 1-min swing low (bullish) or above swing high (bearish)
+2. Target: stop distance × 3 minimum, × 4-5 preferred
+3. Trail stop to breakeven at 1:2
+4. Close 50% at 1:3, let rest run to 1:5 with trailing stop
+5. Hard time stop: close everything at 10:30 AM EST regardless
+6. Max 2 entries per day across both instruments
 
 ## Sizing
+- Base: 1% equity risk per trade
+- Touch count multiplier: 3-4 touches = 1.0x, 5+ = 1.25x
+- Conviction scorer integration: 0.25x to 2.0x from fleet conductor
+- Max risk: 3% equity per day (if both trades taken)
 
-- Base: 1 MNQ contract per $5,000 equity
-- Conviction scoring:
-  - 3-4 touches: 1x size
-  - 5-6 touches: 1.25x size
-  - 7+ touches: 1.5x size
-  - Breakout WITH Atlas regime alignment: +0.25x
-  - Breakout AGAINST Atlas regime: -0.25x
-
-## Expected Performance (from MambaFX examples)
-
-- Win rate: 35-45% (most breakouts fail, but winners are 4-5x losers)
-- Average winner: 0.8-1.5% on NAS100
-- Average loser: 0.15-0.25% on NAS100
-- Profit factor: 2.0-3.5
-- Trades per day: 2-5 setups, 1-3 taken (filtered)
-- Monthly trades: 20-40
-
-## Technical Implementation
-
-### Trendline Detection Algorithm
-1. Identify swing highs/lows using pivot point detection (N bars left, N bars right)
-2. For descending trendlines: connect the two most recent swing highs
-3. Extend the line forward
-4. Count how many subsequent swing highs touch the line (within ATR*0.2 tolerance)
-5. For ascending trendlines: same with swing lows
-
-### Breakout Detection
-1. Current 5-min candle closes beyond the trendline by > ATR*0.1
-2. Volume of breakout candle > 1.5x 20-bar average volume
-3. The trendline has been active for at least 30 minutes (6+ bars)
-4. No breakout signal if price already moved >50% of expected target distance
-
-### IBKR Integration
-- Contract: MNQ (Micro E-mini Nasdaq-100 Futures)
-- Exchange: CME/GLOBEX
-- Client ID: 102 (forge reserved range 100-199)
-- Data: 5-min real-time bars via reqHistoricalData or reqRealTimeBars
-- Orders: bracket order (entry + stop + target)
+## Expected Performance (realistic)
+- Win rate: 35-45% (tight stops mean many small losses)
+- Average winner: 1:3 to 1:5 R:R
+- Profit factor: 2.0-3.0
+- Trades per week: 3-8 (many skip days)
+- Monthly return target: 5-10% on deployed capital
