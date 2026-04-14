@@ -9989,11 +9989,11 @@ function layoutNodes(data) {
   paper.forEach((n,i)=>{const a=(i/Math.max(1,paper.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*iR; n.y=cY+Math.sin(a)*iR; n.ring='inner'; n.radius=24;});
   watcher.forEach((n,i)=>{const a=(i/Math.max(1,watcher.length))*Math.PI*2-Math.PI/2; n.x=cX+Math.cos(a)*oR; n.y=cY+Math.sin(a)*oR; n.ring='outer'; n.radius=14;});
 
-  const famColors={helio:'#ffaa00',hermes:'#ff6b6b',apollo:'#a78bfa'};
+  const famColors={helio:'#ffaa00',hermes:'#ff6b6b',apollo:'#a78bfa',forge_pairs:'#00ff88',forge_intel:'#ff00ff',forge_scalp:'#ff8800',forge_confluence:'#00ccff',forge_swing:'#88ff00'};
   // Group family nodes by family for arc segmentation
   const famGroups={};
   familyNodes.forEach(n=>{const f=n.family||'helio'; if(!famGroups[f])famGroups[f]=[]; famGroups[f].push(n);});
-  const famOrder=['helio','hermes','apollo'];
+  const famOrder=['helio','hermes','apollo','forge_pairs','forge_intel','forge_scalp','forge_confluence','forge_swing'];
   let idx=0;
   const total=familyNodes.length;
   famOrder.forEach(fam=>{
