@@ -9781,7 +9781,8 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
   <div class="stat-item"><div class="stat-val" id="s-drift" style="color:#00ff88;">--</div><div class="stat-label">Drift</div></div>
 </div>
 <div id="nav">
-  <a href="/">Fleet</a>
+  <a href="/">Dashboard</a>
+  <a href="/fleet">Fleet Ops</a>
   <button class="toggle-btn active" onclick="togglePanel('decision-flow',this)" title="Decision Pipeline">Pipeline</button>
   <button class="toggle-btn active" onclick="togglePanel('system-health',this)" title="System Health">Health</button>
   <button class="toggle-btn active" onclick="togglePanel('signal-panel',this)" title="Signal Feed">Signals</button>
@@ -10479,6 +10480,551 @@ render();
 @app.get("/brain", response_class=HTMLResponse)
 async def brain_page():
     return BRAIN_HTML
+
+
+# ---------------------------------------------------------------------------
+# Fleet Operations Page
+# ---------------------------------------------------------------------------
+
+
+def _collect_fleet_status() -> dict:
+    """Gather all fleet data for the /api/fleet_status endpoint."""
+    import sqlite3
+
+    result = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "regime": {"mode": "UNKNOWN", "vix": 0, "vix_term": "N/A", "position_size_mod": 1.0},
+        "active_trades": [],
+        "systems": [],
+        "recent_trades": [],
+        "conviction": [],
+        "events": [],
+        "fleet_pnl_today": 0,
+    }
+
+    # --- Atlas regime ---
+    atlas_hb = REPO / "forge" / "logs" / "atlas" / "heartbeat.json"
+    if atlas_hb.exists():
+        try:
+            ah = json.loads(atlas_hb.read_text(encoding="utf-8"))
+            result["regime"] = {
+                "mode": ah.get("regime", "UNKNOWN").upper(),
+                "alert_level": ah.get("alert_level", "normal"),
+                "vix": 0,
+                "vix_term": "N/A",
+                "position_size_mod": ah.get("position_size_modifier", 1.0),
+                "events_today": ah.get("events_today", 0),
+            }
+        except Exception:
+            pass
+
+    # VIX structure
+    vix_hist = REPO / "forge" / "logs" / "atlas" / "vix_structure_history.json"
+    if vix_hist.exists():
+        try:
+            vdata = json.loads(vix_hist.read_text(encoding="utf-8"))
+            if vdata:
+                latest = vdata[-1]
+                result["regime"]["vix"] = latest.get("vix", 0)
+                result["regime"]["vix_term"] = latest.get("structure", "N/A")
+        except Exception:
+            pass
+
+    # --- Portfolio guard active positions ---
+    pg_path = REPO / "helio" / "logs" / "portfolio_guard.json"
+    if pg_path.exists():
+        try:
+            pg = json.loads(pg_path.read_text(encoding="utf-8"))
+            for pos in pg.get("metrics", {}).get("positions_detail", []):
+                result["active_trades"].append({
+                    "system": pos.get("family", "?"),
+                    "ticker": pos.get("symbol", "?"),
+                    "direction": pos.get("direction", "?"),
+                    "entry_price": 0,
+                    "current_pnl": 0,
+                    "days_held": 0,
+                    "conviction": 0,
+                })
+        except Exception:
+            pass
+
+    # Enrich active trades from heartbeats
+    helio_logs = REPO / "helio" / "logs"
+    for at in result["active_trades"]:
+        sym_lower = at["ticker"].lower()
+        fam = at["system"].lower()
+        hb_dir = helio_logs / f"{fam}_{sym_lower}"
+        if not hb_dir.exists():
+            hb_dir = helio_logs / sym_lower
+        hb_path = hb_dir / "heartbeat.json"
+        if hb_path.exists():
+            try:
+                hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                at["entry_price"] = hb.get("entry_price", hb.get("close", 0))
+                at["conviction"] = round(hb.get("rsi", 0) / 100, 2) if hb.get("rsi") else 0
+            except Exception:
+                pass
+
+    # --- System status cards ---
+    all_systems = []
+
+    # Argus FX systems
+    try:
+        argus_runners = _managed_ibkr_runners()
+        for r in argus_runners:
+            rd = _read_ibkr_runner(r)
+            all_systems.append({
+                "name": rd.get("name", r.get("symbol", "?")),
+                "family": "argus",
+                "family_color": "#00d4ff",
+                "status": "OK" if rd.get("last_signal_age_s", 9999) < 300 else "STALE",
+                "heartbeat_age": rd.get("last_signal_age_s", 9999),
+                "metric_label": "Position",
+                "metric_value": rd.get("position", "FLAT"),
+                "extra": f"Regime: {rd.get('regime', 'N/A')}",
+            })
+    except Exception:
+        pass
+
+    # Helio family (Titan, Apollo, Hermes, Helio-core)
+    if helio_logs.exists():
+        for sub in sorted(helio_logs.iterdir()):
+            if not sub.is_dir() or sub.name.startswith("_"):
+                continue
+            hb_path = sub / "heartbeat.json"
+            if not hb_path.exists():
+                continue
+            try:
+                hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                age = time.time() - hb_path.stat().st_mtime
+                fam = hb.get("family", "helio")
+                fam_colors = {"helio": "#00d4ff", "titan": "#ffaa00", "apollo": "#a78bfa", "hermes": "#ff6b6b"}
+                pos = hb.get("position", "FLAT")
+                all_systems.append({
+                    "name": f"{fam.capitalize()} {hb.get('symbol', sub.name)}",
+                    "family": fam,
+                    "family_color": fam_colors.get(fam, "#4a5568"),
+                    "status": "OK" if age < 86400 else "STALE",
+                    "heartbeat_age": int(age),
+                    "metric_label": "Position",
+                    "metric_value": pos,
+                    "extra": f"Trades: {hb.get('trade_count', 0)}",
+                })
+            except Exception:
+                pass
+
+    # Forge systems
+    forge_defs = [
+        ("GDX/GLD Pairs", "gdx_gld", "forge_pairs", "#00ff88"),
+        ("Atlas Intel", "atlas", "forge_intel", "#ff6b6b"),
+        ("Themis Congress", "themis", "forge_intel", "#ffaa00"),
+        ("Mamba NQ/YM", "mamba", "forge_scalp", "#a78bfa"),
+        ("Cue Banks US30", "cuebanks", "forge_confluence", "#00d4ff"),
+        ("Tori Swing", "tori", "forge_swing", "#ff6b6b"),
+    ]
+    for name, dirname, family, color in forge_defs:
+        hb_path = REPO / "forge" / "logs" / dirname / "heartbeat.json"
+        if not hb_path.exists():
+            continue
+        try:
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            age = time.time() - hb_path.stat().st_mtime
+            status = "OK" if age < 600 else ("STALE" if age < 3600 else "DOWN")
+            metric_label, metric_value, extra = "Status", hb.get("status", hb.get("mode", "?")), ""
+            if dirname == "gdx_gld":
+                metric_label = "Z-Score"
+                metric_value = str(round(hb.get("z_score", 0), 3))
+                extra = f"Pos: {hb.get('position', 'FLAT')}"
+            elif dirname == "atlas":
+                metric_label = "Events Today"
+                metric_value = str(hb.get("events_today", 0))
+                extra = f"Alert: {hb.get('alert_level', 'N/A')}"
+            elif dirname == "themis":
+                metric_label = "Active Signals"
+                metric_value = str(hb.get("active_signals", 0))
+                extra = f"Trades tracked: {hb.get('total_trades', 0)}"
+            elif dirname == "mamba":
+                metric_label = "Status"
+                metric_value = hb.get("status", "?")
+                extra = ", ".join(hb.get("tickers", []))
+            elif dirname == "cuebanks":
+                metric_label = "Mode"
+                metric_value = hb.get("status", "?")
+            elif dirname == "tori":
+                metric_label = "Instruments"
+                metric_value = str(len(hb.get("instruments", [])))
+                extra = ", ".join(hb.get("instruments", [])[:3])
+            all_systems.append({
+                "name": name,
+                "family": family,
+                "family_color": color,
+                "status": status,
+                "heartbeat_age": int(age),
+                "metric_label": metric_label,
+                "metric_value": metric_value,
+                "extra": extra,
+            })
+        except Exception:
+            pass
+
+    result["systems"] = all_systems
+
+    # --- Recent trades (last 20 across all systems) ---
+    all_trades = []
+
+    # Helio family trades
+    if helio_logs.exists():
+        for sub in sorted(helio_logs.iterdir()):
+            trades_csv = sub / "trades.csv"
+            if not trades_csv.exists():
+                continue
+            try:
+                rows = list(csv.DictReader(open(trades_csv, encoding="utf-8")))
+                fam = sub.name.split("_")[0] if "_" in sub.name else "helio"
+                sym = sub.name.split("_", 1)[1].upper() if "_" in sub.name else sub.name.upper()
+                for r in rows[-10:]:
+                    all_trades.append({
+                        "date": r.get("exit_date", r.get("entry_date", "?")),
+                        "system": fam,
+                        "ticker": sym,
+                        "direction": r.get("direction", "?"),
+                        "entry": r.get("entry_px", "?"),
+                        "exit": r.get("exit_px", "?"),
+                        "pnl_pct": float(r.get("pnl_pct", 0)),
+                        "duration": r.get("bars_held", "?"),
+                        "exit_reason": r.get("exit_reason", "?"),
+                    })
+            except Exception:
+                pass
+
+    # Argus FX trades
+    argus_logs = REPO / "argus_flow" / "logs"
+    if argus_logs.exists():
+        for sub in sorted(argus_logs.iterdir()):
+            trades_csv = sub / "trades.csv"
+            if not trades_csv.exists():
+                continue
+            try:
+                rows = list(csv.DictReader(open(trades_csv, encoding="utf-8")))
+                for r in rows[-10:]:
+                    all_trades.append({
+                        "date": (r.get("ts", "?"))[:10],
+                        "system": "argus",
+                        "ticker": sub.name.upper(),
+                        "direction": r.get("direction", "?"),
+                        "entry": r.get("entry_px", "?"),
+                        "exit": r.get("exit_px", "?"),
+                        "pnl_pct": float(r.get("pnl_pips", 0)),
+                        "duration": r.get("duration_min", "?"),
+                        "exit_reason": r.get("exit_reason", "?"),
+                    })
+            except Exception:
+                pass
+
+    # Sort by date descending, take last 20
+    all_trades.sort(key=lambda x: x.get("date", ""), reverse=True)
+    result["recent_trades"] = all_trades[:20]
+
+    # --- Upcoming events from Atlas DB ---
+    atlas_db = REPO / "forge" / "atlas" / "atlas.db"
+    if atlas_db.exists():
+        try:
+            conn = sqlite3.connect(str(atlas_db))
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            end = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
+            cur = conn.execute(
+                "SELECT date, title, importance, category FROM scheduled_events "
+                "WHERE date >= ? AND date <= ? ORDER BY date LIMIT 20",
+                (now, end),
+            )
+            for row in cur.fetchall():
+                result["events"].append({
+                    "date": row[0],
+                    "title": row[1],
+                    "importance": row[2] if row[2] else "normal",
+                    "category": row[3] if row[3] else "",
+                })
+            conn.close()
+        except Exception:
+            pass
+
+    return result
+
+
+@app.get("/api/fleet_status")
+async def api_fleet_status():
+    """Fleet operations data endpoint."""
+    try:
+        data = _collect_fleet_status()
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+FLEET_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Helio Fleet Operations</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0e1a; color:#e0e0e0; font-family:'Courier New',monospace; font-size:14px; }
+a { color:#00d4ff; text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+.header { background:#111827; border-bottom:1px solid #1e2a42; padding:12px 20px; display:flex;
+  align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; position:sticky; top:0; z-index:100; }
+.header-left { display:flex; align-items:center; gap:16px; }
+.fleet-name { font-size:1.3em; font-weight:bold; letter-spacing:4px;
+  background:linear-gradient(135deg,#00d4ff,#00ff88); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.regime-badge { padding:4px 12px; border-radius:4px; font-weight:bold; font-size:0.85em; }
+.regime-RISK_ON,.regime-UNKNOWN { background:#00ff8833; color:#00ff88; }
+.regime-RISK_OFF { background:#ffaa0033; color:#ffaa00; }
+.regime-CRISIS { background:#ff444433; color:#ff4444; }
+.header-stats { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+.header-stat { text-align:center; }
+.header-stat .val { font-size:1.1em; font-weight:bold; }
+.header-stat .lbl { font-size:0.65em; color:#4a5568; text-transform:uppercase; letter-spacing:1px; }
+.psm-warn { color:#ffaa00; font-weight:bold; font-size:1.2em; }
+.nav-links { display:flex; gap:8px; }
+.nav-links a { padding:4px 12px; border:1px solid #1e2a42; border-radius:12px; font-size:0.75em;
+  color:#4a5568; transition:all 0.2s; }
+.nav-links a:hover { background:#1e2a42; color:#00d4ff; border-color:#00d4ff44; text-decoration:none; }
+
+.container { max-width:1400px; margin:0 auto; padding:16px; }
+.section { margin-bottom:20px; }
+.section-title { font-size:0.8em; color:#00d4ff; letter-spacing:3px; text-transform:uppercase;
+  margin-bottom:8px; padding-bottom:4px; border-bottom:1px solid #1e2a42; }
+
+/* Active trades table */
+table { width:100%; border-collapse:collapse; font-size:0.85em; }
+th { color:#4a5568; text-align:left; padding:6px 8px; font-weight:normal; text-transform:uppercase;
+  font-size:0.75em; letter-spacing:1px; border-bottom:1px solid #1e2a42; }
+td { padding:6px 8px; border-bottom:1px solid #0d1420; }
+.pos { color:#00ff88; } .neg { color:#ff4444; }
+.dir-long { color:#00ff88; } .dir-short { color:#ff4444; }
+
+/* System grid */
+.sys-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
+.sys-card { background:#111827; border:1px solid #1e2a42; border-radius:6px; padding:10px;
+  transition:border-color 0.2s; }
+.sys-card:hover { border-color:#00d4ff44; }
+.sys-card-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+.sys-name { font-weight:bold; font-size:0.85em; }
+.sys-family { font-size:0.6em; padding:2px 6px; border-radius:3px; text-transform:uppercase; letter-spacing:1px; }
+.status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; }
+.dot-OK { background:#00ff88; } .dot-STALE { background:#ffaa00; } .dot-DOWN { background:#ff4444; }
+.sys-metric { margin-top:4px; }
+.sys-metric .k { color:#4a5568; font-size:0.75em; }
+.sys-metric .v { font-size:0.9em; }
+.sys-age { color:#4a5568; font-size:0.7em; margin-top:4px; }
+
+/* Trades log */
+.trade-row { display:grid; grid-template-columns:90px 60px 70px 55px 80px 80px 65px 55px 70px;
+  gap:4px; padding:4px 0; border-bottom:1px solid #0d1420; font-size:0.8em; align-items:center; }
+.trade-header { color:#4a5568; font-size:0.7em; text-transform:uppercase; letter-spacing:1px; }
+
+/* Events */
+.event-row { display:flex; gap:12px; padding:4px 0; border-bottom:1px solid #0d1420; font-size:0.8em; }
+.event-date { color:#4a5568; min-width:80px; }
+.imp-high { color:#ff4444; } .imp-medium { color:#ffaa00; } .imp-low,.imp-normal { color:#4a5568; }
+
+/* Refresh indicator */
+.refresh-bar { position:fixed; bottom:0; left:0; right:0; background:#111827; border-top:1px solid #1e2a42;
+  padding:4px 20px; display:flex; justify-content:space-between; font-size:0.7em; color:#4a5568; z-index:100; }
+
+.empty-msg { color:#333; font-size:0.85em; padding:8px 0; }
+
+@media(max-width:768px) {
+  .header { flex-direction:column; align-items:flex-start; }
+  .sys-grid { grid-template-columns:1fr; }
+  .trade-row { grid-template-columns:1fr 1fr 1fr; font-size:0.75em; }
+  .container { padding:8px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="fleet-name">HELIO FLEET</span>
+    <span id="regime-badge" class="regime-badge regime-UNKNOWN">---</span>
+  </div>
+  <div class="header-stats">
+    <div class="header-stat"><div class="val" id="h-vix">--</div><div class="lbl">VIX</div></div>
+    <div class="header-stat"><div class="val" id="h-term">--</div><div class="lbl">Term</div></div>
+    <div class="header-stat"><div class="val psm-warn" id="h-psm" style="display:none">0.75x</div><div class="lbl" id="h-psm-lbl" style="display:none">Size Mod</div></div>
+    <div class="header-stat"><div class="val" id="h-pnl">--</div><div class="lbl">Fleet P&amp;L</div></div>
+  </div>
+  <div class="nav-links">
+    <a href="/">Dashboard</a>
+    <a href="/brain">Neural Core</a>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="section">
+    <div class="section-title">Active Positions</div>
+    <table>
+      <thead><tr><th>System</th><th>Ticker</th><th>Direction</th><th>Entry</th><th>P&amp;L</th><th>Days</th><th>Conviction</th></tr></thead>
+      <tbody id="active-trades"><tr><td colspan="7" class="empty-msg">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-title">System Status</div>
+    <div class="sys-grid" id="sys-grid"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Recent Trades</div>
+    <div id="recent-trades"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Upcoming Events (7 days)</div>
+    <div id="events-list"><div class="empty-msg">Loading...</div></div>
+  </div>
+
+</div>
+
+<div class="refresh-bar">
+  <span id="last-update">Connecting...</span>
+  <span id="sys-count">-- systems</span>
+</div>
+
+<script>
+let fleetData = null;
+
+async function fetchFleet() {
+  try {
+    const r = await fetch('/api/fleet_status');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    fleetData = await r.json();
+    render();
+    document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    document.getElementById('last-update').textContent = 'Error: ' + e.message;
+  }
+}
+
+function fmtAge(s) {
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.round(s/60) + 'm';
+  if (s < 86400) return Math.round(s/3600) + 'h';
+  return Math.round(s/86400) + 'd';
+}
+
+function render() {
+  const d = fleetData;
+  if (!d) return;
+
+  // Header
+  const reg = d.regime || {};
+  const mode = reg.mode || 'UNKNOWN';
+  const badge = document.getElementById('regime-badge');
+  badge.textContent = mode;
+  badge.className = 'regime-badge regime-' + mode;
+  document.getElementById('h-vix').textContent = reg.vix ? reg.vix.toFixed(1) : '--';
+  document.getElementById('h-term').textContent = reg.vix_term || '--';
+  const psm = reg.position_size_mod;
+  if (psm && psm !== 1.0) {
+    document.getElementById('h-psm').textContent = psm + 'x';
+    document.getElementById('h-psm').style.display = '';
+    document.getElementById('h-psm-lbl').style.display = '';
+  } else {
+    document.getElementById('h-psm').style.display = 'none';
+    document.getElementById('h-psm-lbl').style.display = 'none';
+  }
+  document.getElementById('h-pnl').textContent = d.fleet_pnl_today ? d.fleet_pnl_today.toFixed(2) : '--';
+
+  // Active trades
+  const at = d.active_trades || [];
+  const tbody = document.getElementById('active-trades');
+  if (at.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-msg">No active positions</td></tr>';
+  } else {
+    tbody.innerHTML = at.map(t => {
+      const dc = t.direction === 'LONG' ? 'dir-long' : 'dir-short';
+      const pc = t.current_pnl >= 0 ? 'pos' : 'neg';
+      return '<tr><td>' + t.system + '</td><td style="color:#00d4ff;">' + t.ticker
+        + '</td><td class="' + dc + '">' + t.direction
+        + '</td><td>' + (t.entry_price || '--')
+        + '</td><td class="' + pc + '">' + (t.current_pnl || '--')
+        + '</td><td>' + (t.days_held || '--')
+        + '</td><td>' + (t.conviction || '--') + '</td></tr>';
+    }).join('');
+  }
+
+  // System grid
+  const sys = d.systems || [];
+  document.getElementById('sys-count').textContent = sys.length + ' systems';
+  const grid = document.getElementById('sys-grid');
+  grid.innerHTML = sys.map(s => {
+    const dot = 'dot-' + s.status;
+    return '<div class="sys-card">'
+      + '<div class="sys-card-head">'
+      + '<span class="sys-name">' + s.name + '</span>'
+      + '<span class="sys-family" style="background:' + s.family_color + '22;color:' + s.family_color + ';">' + s.family + '</span>'
+      + '</div>'
+      + '<div><span class="status-dot ' + dot + '"></span>' + s.status + '</div>'
+      + '<div class="sys-metric"><span class="k">' + s.metric_label + ': </span><span class="v">' + s.metric_value + '</span></div>'
+      + (s.extra ? '<div class="sys-age">' + s.extra + '</div>' : '')
+      + '<div class="sys-age">Heartbeat: ' + fmtAge(s.heartbeat_age) + ' ago</div>'
+      + '</div>';
+  }).join('');
+
+  // Recent trades
+  const rt = d.recent_trades || [];
+  const rtDiv = document.getElementById('recent-trades');
+  if (rt.length === 0) {
+    rtDiv.innerHTML = '<div class="empty-msg">No trades recorded</div>';
+  } else {
+    let html = '<div class="trade-row trade-header"><span>Date</span><span>System</span><span>Ticker</span>'
+      + '<span>Dir</span><span>Entry</span><span>Exit</span><span>P&L</span><span>Dur</span><span>Reason</span></div>';
+    html += rt.map(t => {
+      const pc = t.pnl_pct >= 0 ? 'pos' : 'neg';
+      const dc = (t.direction||'').toUpperCase().startsWith('L') ? 'dir-long' : 'dir-short';
+      return '<div class="trade-row"><span>' + (t.date||'--')
+        + '</span><span>' + (t.system||'--')
+        + '</span><span style="color:#00d4ff;">' + (t.ticker||'--')
+        + '</span><span class="' + dc + '">' + (t.direction||'--')
+        + '</span><span>' + (t.entry||'--')
+        + '</span><span>' + (t.exit||'--')
+        + '</span><span class="' + pc + '">' + (typeof t.pnl_pct === 'number' ? t.pnl_pct.toFixed(3) + '%' : '--')
+        + '</span><span>' + (t.duration||'--')
+        + '</span><span style="color:#4a5568;">' + (t.exit_reason||'--') + '</span></div>';
+    }).join('');
+    rtDiv.innerHTML = html;
+  }
+
+  // Events
+  const ev = d.events || [];
+  const evDiv = document.getElementById('events-list');
+  if (ev.length === 0) {
+    evDiv.innerHTML = '<div class="empty-msg">No upcoming events</div>';
+  } else {
+    evDiv.innerHTML = ev.map(e => {
+      const ic = 'imp-' + (e.importance || 'normal');
+      return '<div class="event-row"><span class="event-date">' + e.date
+        + '</span><span class="' + ic + '">[' + (e.importance||'').toUpperCase() + ']</span>'
+        + '<span>' + e.title + '</span></div>';
+    }).join('');
+  }
+}
+
+fetchFleet();
+setInterval(fetchFleet, 30000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/fleet", response_class=HTMLResponse)
+async def fleet_page():
+    return FLEET_HTML
 
 
 # ---------------------------------------------------------------------------
