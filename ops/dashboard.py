@@ -9396,6 +9396,105 @@ def _scan_greek_family_heartbeats() -> list[dict]:
     return family_nodes
 
 
+def _scan_forge_heartbeats() -> list[dict]:
+    """Scan all forge system heartbeats and return neural core nodes."""
+    forge_systems = [
+        {
+            "name": "GDX/GLD Pairs",
+            "symbol": "GDX_GLD",
+            "family": "forge_pairs",
+            "heartbeat": REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json",
+        },
+        {
+            "name": "Atlas Intel",
+            "symbol": "ATLAS",
+            "family": "forge_intel",
+            "heartbeat": REPO / "forge" / "logs" / "atlas" / "heartbeat.json",
+        },
+        {
+            "name": "Themis Congress",
+            "symbol": "THEMIS",
+            "family": "forge_intel",
+            "heartbeat": REPO / "forge" / "logs" / "themis" / "heartbeat.json",
+        },
+        {
+            "name": "Mamba NQ/YM",
+            "symbol": "MAMBA",
+            "family": "forge_scalp",
+            "heartbeat": REPO / "forge" / "logs" / "mamba" / "heartbeat.json",
+        },
+        {
+            "name": "Cue Banks US30",
+            "symbol": "CUEBANKS",
+            "family": "forge_confluence",
+            "heartbeat": REPO / "forge" / "logs" / "cuebanks" / "heartbeat.json",
+        },
+        {
+            "name": "Tori Swing",
+            "symbol": "TORI",
+            "family": "forge_swing",
+            "heartbeat": REPO / "forge" / "logs" / "tori" / "heartbeat.json",
+        },
+    ]
+
+    nodes = []
+    for sys_info in forge_systems:
+        path = sys_info["heartbeat"]
+        if not path.exists():
+            continue
+        try:
+            hb = json.loads(path.read_text(encoding="utf-8"))
+            age = time.time() - path.stat().st_mtime
+
+            # Read system-specific details
+            position = hb.get("position", "FLAT")
+            status = hb.get("status", hb.get("mode", "unknown"))
+
+            # Determine "heat" based on system type
+            heat = 0
+            if sys_info["symbol"] == "GDX_GLD":
+                z = abs(hb.get("z_score", 0))
+                heat = min(1.0, z / 2.0)  # closer to 2.0 = hotter (near entry)
+            elif sys_info["symbol"] == "ATLAS":
+                sev = hb.get("high_severity_this_cycle", 0)
+                heat = min(1.0, sev / 10.0)
+            elif sys_info["symbol"] == "THEMIS":
+                new_sigs = hb.get("new_signals_this_cycle", hb.get("active_signals", 0))
+                heat = min(1.0, new_sigs / 5.0)
+            elif sys_info["symbol"] in ("MAMBA", "CUEBANKS"):
+                heat = 0.8 if status == "scanning" else 0.2
+            elif sys_info["symbol"] == "TORI":
+                heat = 0.5  # always moderate (4H timeframe)
+
+            nodes.append({
+                "symbol": sys_info["symbol"],
+                "name": sys_info["name"],
+                "system": sys_info["symbol"].lower(),
+                "family": sys_info["family"],
+                "stage": status,
+                "position": position if position != "FLAT" else "FLAT",
+                "entry_price": 0,
+                "pnl": 0,
+                "unit": "",
+                "heat": round(heat, 3),
+                "active": age < 600,
+                "signal_age_s": int(age),
+                "session": "ON" if age < 600 else "OFF",
+                "features": hb,
+                "gates": {},
+                "conviction": 0,
+                "win_rate": 0,
+                "closed_trades": hb.get("total_trades", hb.get("trades", hb.get("trade_count", 0))),
+                "blocked_24h": 0,
+                "entries_today": 0,
+                "broker_connected": hb.get("ibkr_connected", False),
+            })
+        except Exception:
+            pass
+
+    return nodes
+
+
 # ---------------------------------------------------------------------------
 # 10x Module APIs: Portfolio Guard, Drift Detector, Regime Router
 # ---------------------------------------------------------------------------
@@ -9445,8 +9544,7 @@ async def api_brain_state():
     raw_map = {r.get("symbol", "").upper(): r for r in raw_runners}
     nodes = []
     for r in runners:
-        if r.get("current_stage") in ("killed",):
-            continue
+        is_killed = r.get("current_stage") in ("killed",)
         features = r.get("features", {})
         raw = raw_map.get(r["symbol"].upper(), {})
         log_dir = REPO / raw.get("log_dir", f"argus_flow/logs/{r['symbol'].lower()}")
@@ -9458,6 +9556,11 @@ async def api_brain_state():
         # Recent signal activity
         sig_age = r.get("last_signal_age_s", 9999)
         active = sig_age < 120
+
+        # Killed systems show up but are visually distinct
+        if is_killed:
+            heat = 0
+            active = False
 
         nodes.append({
             "symbol": r["symbol"],
@@ -9492,6 +9595,10 @@ async def api_brain_state():
     # Add Greek family nodes (Helio, Hermes, Apollo)
     family_nodes = _scan_greek_family_heartbeats()
     nodes.extend(family_nodes)
+
+    # Add Forge system nodes
+    forge_nodes = _scan_forge_heartbeats()
+    nodes.extend(forge_nodes)
 
     # Recent signals across all pairs (last 20)
     recent_signals = []
@@ -9537,12 +9644,25 @@ async def api_brain_state():
         except Exception:
             pass
 
+    # Atlas regime overlay
+    regime_path = REPO / "forge" / "macro_regime.json"
+    regime = {}
+    if regime_path.exists():
+        try:
+            regime = json.loads(regime_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     return JSONResponse({
         "nodes": nodes,
         "families": families,
         "recent_signals": recent_signals[:20],
         "portfolio_guard": pg_data,
         "drift": drift_data,
+        "regime": regime.get("regime", {}),
+        "regime_alert": regime.get("alert_level", "unknown"),
+        "position_size_modifier": regime.get("position_size_modifier", 1.0),
+        "vix_structure": regime.get("vix_structure", {}),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
