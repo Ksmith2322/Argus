@@ -246,6 +246,30 @@ def _collect_forge() -> list[SystemStatus]:
     )
     out.append(SystemStatus(name="forge:tori", status=status, age_s=age_s, detail=detail, extra={}))
 
+    # VIX Mean-Reversion
+    vix_path = REPO / "forge" / "logs" / "vix_revert" / "heartbeat.json"
+    age_s = _age_seconds(vix_path)
+    payload = _load_json(vix_path) or {}
+    status = _status_from_age(age_s, 7200)  # 2h threshold (checks hourly)
+    detail = (
+        f"vix={payload.get('vix', '?')} "
+        f"action={payload.get('action', '?')} "
+        f"in_position={payload.get('in_position', '?')}"
+    )
+    out.append(SystemStatus(name="forge:vix_revert", status=status, age_s=age_s, detail=detail, extra={}))
+
+    # Index Rebalance
+    reb_path = REPO / "forge" / "logs" / "rebalance" / "heartbeat.json"
+    age_s = _age_seconds(reb_path)
+    payload = _load_json(reb_path) or {}
+    status = _status_from_age(age_s, 90000)  # 25h threshold (checks daily)
+    detail = (
+        f"windows={payload.get('active_windows', '?')} "
+        f"new_signals={payload.get('new_signals', '?')} "
+        f"last_scan={payload.get('last_scan', '?')}"
+    )
+    out.append(SystemStatus(name="forge:rebalance", status=status, age_s=age_s, detail=detail, extra={}))
+
     return out
 
 
