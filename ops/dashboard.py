@@ -4495,8 +4495,8 @@ setInterval(loadFleetOverview, 60000);
   </div>
 </div>
 
-<!-- QA section -->
-<div style="margin:16px 0 10px 0;">
+<!-- QA section — HIDDEN (moved to /fleet page) -->
+<div style="margin:16px 0 10px 0;display:none !important;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <h2 style="font-size:0.95em;color:#00d4ff;margin:0;letter-spacing:2px;">QA PAIRS</h2>
     <span style="font-size:0.72em;color:#7b8ab8;">Promotion lane. Same method as prod, isolated from broker capital.</span>
