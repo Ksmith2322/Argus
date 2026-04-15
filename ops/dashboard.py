@@ -3525,10 +3525,165 @@ async def api_strategy_performance():
         "status": "WAITING_ER",
     })
 
+    # ── FORGE: GDX/GLD Pairs ─────────────────────────────────
+    strategies.append({
+        "system": "GDX/GLD",
+        "strategy": "Log-Ratio Mean Reversion",
+        "instruments": "GDX vs GLD",
+        "backtest_pf": "1.56",
+        "backtest_trades": 87,
+        "backtest_wr": "61%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 75,
+        "status": "SIGNAL_ONLY",
+    })
+
+    # ── FORGE: Mamba ───────────────────────────────────────────
+    strategies.append({
+        "system": "Mamba",
+        "strategy": "NAS100/US30 Breakout Scalping",
+        "instruments": "NQ=F, YM=F (MNQ, MYM)",
+        "backtest_pf": "0.68 (tuning)",
+        "backtest_trades": 128,
+        "backtest_wr": "16%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 30,
+        "status": "SIGNAL_ONLY",
+    })
+
+    # ── FORGE: Cue Banks ───────────────────────────────────────
+    strategies.append({
+        "system": "Cue Banks",
+        "strategy": "US30 Confluence + Fib",
+        "instruments": "YM=F (MYM)",
+        "backtest_pf": "0.89 (tuning)",
+        "backtest_trades": 82,
+        "backtest_wr": "32%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 35,
+        "status": "SIGNAL_ONLY",
+    })
+
+    # ── FORGE: Tori ────────────────────────────────────────────
+    strategies.append({
+        "system": "Tori",
+        "strategy": "4H Trendline Swing (Action/Safety)",
+        "instruments": "PL, CL, GC, YM futures",
+        "backtest_pf": "0.61 (bounce PF 3.56)",
+        "backtest_trades": 65,
+        "backtest_wr": "29%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 30,
+        "status": "SIGNAL_ONLY",
+    })
+
+    # ── FORGE: VIX Mean Reversion ──────────────────────────────
+    strategies.append({
+        "system": "VIX Revert",
+        "strategy": "Buy SPY when VIX > 30",
+        "instruments": "SPY",
+        "backtest_pf": "2.40",
+        "backtest_trades": 16,
+        "backtest_wr": "75%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 80,
+        "status": "WAITING_VIX",
+    })
+
+    # ── FORGE: Index Rebalance ─────────────────────────────────
+    strategies.append({
+        "system": "Index Rebal",
+        "strategy": "S&P 500 Add/Delete Flow",
+        "instruments": "S&P 500 additions",
+        "backtest_pf": "6.65",
+        "backtest_trades": 19,
+        "backtest_wr": "53%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 85,
+        "status": "WAITING_EVENT",
+    })
+
+    # ── FORGE: Sector Rotation ─────────────────────────────────
+    strategies.append({
+        "system": "Sector Rot",
+        "strategy": "Atlas Regime → ETF Rotation",
+        "instruments": "XLE, XLF, XLK, XLU, XLY, GLD, TLT",
+        "backtest_pf": "1.55",
+        "backtest_trades": 74,
+        "backtest_wr": "60%",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 55,
+        "status": "BUILT",
+    })
+
+    # ── FORGE: Themis Cluster ──────────────────────────────────
+    themis_db = REPO / "forge" / "data" / "themis.db"
+    themis_signals = 0
+    if themis_db.exists():
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(themis_db))
+            themis_signals = conn.execute("SELECT COUNT(*) FROM signals WHERE status='active'").fetchone()[0]
+            conn.close()
+        except Exception:
+            pass
+
+    strategies.append({
+        "system": "Themis",
+        "strategy": "Congressional Cluster Follows",
+        "instruments": "Congress stock picks",
+        "backtest_pf": "tracking",
+        "backtest_trades": 0,
+        "backtest_wr": "tracking",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "status": f"{themis_signals} SIGNALS",
+    })
+
     return JSONResponse({
         "strategies": strategies,
-        "fleet_confidence": 60,
-        "expected_annual": "18-25%",
+        "fleet_confidence": 65,
+        "expected_annual": "40-75%",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -4235,8 +4390,8 @@ setInterval(loadFleetOverview, 60000);
 
 <!-- QA paper-model account and cohort status moved below the production section -->
 
-<!-- Live Strategy Chart -->
-<div id="live-strategy-chart-card" class="live-chart-card">
+<!-- Live Strategy Chart — HIDDEN (replaced by /fleet page) -->
+<div id="live-strategy-chart-card" class="live-chart-card" style="display:none !important;">
   <div class="live-chart-toolbar">
     <div>
       <h3 style="font-size:0.9em;color:#00d4ff;margin:0;letter-spacing:1px;">LIVE STRATEGY CHART</h3>
