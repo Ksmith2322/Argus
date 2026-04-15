@@ -7,7 +7,7 @@ Lifecycle:
   1. Apollo scanner flags a setup (score 60+)
   2. You enter before market close on entry day
   3. trade_manager tracks the position from next morning
-  4. Applies PDT-safe exit rules (min 2-day hold)
+  4. Applies exit rules (stop/target/trailing/timeout)
   5. Logs the trade when closed
   6. Weekly summary every Friday
 """
@@ -192,10 +192,7 @@ def check_exits():
         exit_reason = None
         exit_price = current
 
-        # PDT check: minimum 2 days held before any exit
-        if days_held < 2:
-            print(f"  {sym}: DAY {days_held} (PDT hold) | {unrealized_pct:+.1f}% unrealized")
-            continue
+        # PDT rule eliminated by SEC (2026-04-14). No minimum hold required.
 
         # Check exit conditions
         if direction == "long":

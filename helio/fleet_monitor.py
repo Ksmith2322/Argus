@@ -131,7 +131,7 @@ SYSTEMS = {
         "heartbeats": [REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"],
         "stale_threshold_s": 5400,  # 90 min (loop is 60min + buffer)
         "process_match": "forge.gdx_gld_runner",
-        "restart_args": ["-m", "forge.gdx_gld_runner", "--signal-only", "--loop", "--interval-min", "60"],
+        "restart_args": ["-m", "forge.gdx_gld_runner", "--live", "--loop", "--interval-min", "60"],
     },
     "forge_atlas": {
         "heartbeats": [REPO / "forge" / "logs" / "atlas" / "heartbeat.json"],
@@ -162,6 +162,18 @@ SYSTEMS = {
         "stale_threshold_s": 600,  # 10 min (scans every 5 min during NY)
         "process_match": "forge.cuebanks.runner",
         "restart_args": ["-m", "forge.cuebanks.runner", "--loop"],
+    },
+    "forge_vix_revert": {
+        "heartbeats": [REPO / "forge" / "logs" / "vix_revert" / "heartbeat.json"],
+        "stale_threshold_s": 7200,  # 2h (checks hourly)
+        "process_match": "forge.vix_revert_runner",
+        "restart_args": ["-m", "forge.vix_revert_runner", "--loop"],
+    },
+    "forge_rebalance": {
+        "heartbeats": [REPO / "forge" / "logs" / "rebalance" / "heartbeat.json"],
+        "stale_threshold_s": 90000,  # 25h (checks daily)
+        "process_match": "forge.rebalance_runner",
+        "restart_args": ["-m", "forge.rebalance_runner", "--loop"],
     },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only

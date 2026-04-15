@@ -207,6 +207,8 @@ def check_exits(positions: dict, executor) -> int:
         exit_reason = None
         exit_price = current
 
+        # PDT rule eliminated by SEC (2026-04-14). No minimum hold required.
+
         if pos["direction"] == "long":
             if today_low <= pos["stop_price"]:
                 exit_reason = "stop"

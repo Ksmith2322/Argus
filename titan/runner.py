@@ -179,6 +179,18 @@ class TitanRunner:
                 log.info(f"  {sym}: AI SKIP (consensus={sig.get('ai_consensus', 0):+.2f})")
                 continue
 
+            # Pre-trade safety check (earnings + news + conviction)
+            size_mod = 1.0
+            try:
+                from forge.titan_filters import titan_pre_trade_check
+                check = titan_pre_trade_check(sym, sig["direction"])
+                if not check.get("allowed", True):
+                    log.info(f"  {sym}: BLOCKED by pre-trade filter — {check.get('warnings', ['unknown'])}")
+                    continue
+                size_mod = check.get("size_modifier", 1.0)
+            except Exception:
+                pass  # Filters are optional — never break Titan
+
             # Position sizing
             risk_amount = self.model_equity * self.max_risk_pct
             entry = sig["entry"]
@@ -186,7 +198,7 @@ class TitanRunner:
             risk_per_share = abs(entry - stop)
             if risk_per_share <= 0:
                 continue
-            shares = int(risk_amount / risk_per_share)
+            shares = int(risk_amount / risk_per_share * size_mod)
             if shares <= 0:
                 continue
             risk_usd = shares * risk_per_share
@@ -250,6 +262,8 @@ class TitanRunner:
 
             exit_reason = None
             exit_price = current_price
+
+            # PDT rule eliminated by SEC (2026-04-14). No minimum hold required.
 
             if pos["direction"] == "LONG":
                 if current_low <= pos["stop_price"]:
