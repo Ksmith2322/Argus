@@ -62,25 +62,22 @@ LOGS_DIR = REPO / "apollo" / "logs"
 DATA_DIR = REPO / "apollo" / "data"
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-# Scan universe — stocks with liquid options and frequent big earnings moves
-UNIVERSE = [
-    # Mega tech (always big movers on earnings)
-    "NVDA", "TSLA", "META", "AMZN", "GOOGL", "AAPL", "MSFT", "NFLX",
-    # Semis
-    "AMD", "AVGO", "MU", "MRVL", "ARM", "SMCI", "TSM",
-    # Fintech / Growth
-    "SOFI", "PLTR", "COIN", "HOOD", "UPST", "AFRM", "NU",
-    # Biotech
-    "MRNA", "BNTX", "CRSP",
-    # EV / Energy
-    "RIVN", "LCID", "PLUG", "FSLR", "ENPH",
-    # Retail / Consumer
-    "SHOP", "SNAP", "PINS", "RBLX",
-    # China
-    "BABA", "PDD", "JD", "NIO",
-    # Other movers
-    "MARA", "GME", "AMC",
-]
+# Scan universe — expanded to FULL_UNIVERSE from earnings_calendar.py
+# Covers S&P 500 top ~100 by market cap + high-beta growth names
+# ~110 stocks: captures 80%+ of all liquid earnings plays
+try:
+    from apollo.ops.earnings_calendar import FULL_UNIVERSE
+    UNIVERSE = FULL_UNIVERSE
+except ImportError:
+    # Fallback to original list if import fails
+    UNIVERSE = [
+        "NVDA", "TSLA", "META", "AMZN", "GOOGL", "AAPL", "MSFT", "NFLX",
+        "AMD", "AVGO", "MU", "MRVL", "ARM", "SMCI", "TSM",
+        "SOFI", "PLTR", "COIN", "HOOD", "UPST", "AFRM", "NU",
+        "MRNA", "BNTX", "CRSP", "RIVN", "LCID", "PLUG", "FSLR", "ENPH",
+        "SHOP", "SNAP", "PINS", "RBLX", "BABA", "PDD", "JD", "NIO",
+        "MARA", "GME", "AMC",
+    ]
 
 
 def get_earnings_data(symbol: str) -> dict | None:

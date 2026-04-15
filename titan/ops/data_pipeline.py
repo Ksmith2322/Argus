@@ -55,6 +55,15 @@ UNIVERSE = {
     "SPY": {"name": "S&P 500", "sector": "index", "tier": 2},
     "QQQ": {"name": "NASDAQ 100", "sector": "index", "tier": 2},
 
+    # Tier 2: High-frequency breakout vehicles (from breakout_profile research)
+    "HOOD": {"name": "Robinhood", "sector": "fintech", "tier": 2},
+    "UPST": {"name": "Upstart", "sector": "fintech", "tier": 2},
+    "ARM": {"name": "ARM Holdings", "sector": "semi", "tier": 2},
+
+    # Tier 2: Industrial / Defense (sector diversification, currently favored)
+    "CAT": {"name": "Caterpillar", "sector": "industrial", "tier": 2},
+    "RTX": {"name": "RTX Corp", "sector": "defense", "tier": 2},
+
     # Tier 3: Sector ETFs (rotation signals)
     "SMH": {"name": "Semiconductor ETF", "sector": "semi_etf", "tier": 3},
     "XBI": {"name": "Biotech ETF", "sector": "bio_etf", "tier": 3},
