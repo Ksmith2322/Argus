@@ -220,18 +220,18 @@ def run_cycle() -> dict:
         log.error("Regime update failed: %s", e)
         summary["errors"].append(f"regime: {e}")
 
-    # --- 5. Discord alerts for high-severity events ---
-    for event in new_high_severity:
-        forecast = format_cascade_forecast(event["type"], event["severity"])
-        msg = (
-            f"**ATLAS EVENT: {event['type']}** (severity {event['severity']:.2f})\n"
-            f"> {event['title'][:200]}\n"
-        )
-        if forecast:
-            msg += f"\n**Cascade Forecast:**\n{forecast[:800]}"
-
-        log.info("HIGH SEVERITY: [%s] sev=%.2f | %s", event["type"], event["severity"], event["title"][:100])
-        _send_discord(msg)
+    # --- 5. Discord alerts: batch into one message per cycle ---
+    # Why: posting each event individually flooded Discord and got the IP
+    # Cloudflare-banned (error 1010, 2026-04-16). Cap at top-N by severity.
+    if new_high_severity:
+        ranked = sorted(new_high_severity, key=lambda e: e.get("severity", 0), reverse=True)[:10]
+        lines = [f"**ATLAS: {len(new_high_severity)} high-severity events this cycle**"]
+        for event in ranked:
+            log.info("HIGH SEVERITY: [%s] sev=%.2f | %s", event["type"], event["severity"], event["title"][:100])
+            lines.append(f"- `{event['type']}` sev={event['severity']:.2f} — {event['title'][:140]}")
+        if len(new_high_severity) > 10:
+            lines.append(f"_... and {len(new_high_severity) - 10} more_")
+        _send_discord("\n".join(lines))
 
     # --- 6. Heartbeat ---
     conn = get_connection(DB_PATH)

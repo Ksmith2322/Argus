@@ -396,17 +396,55 @@ def backtest_earnings_drift(symbols: list[str] | None = None, broad: bool = Fals
     print(f"\n  Saved: {RESULTS_DIR / f'drift_{ts}.csv'}")
 
 
+_ALERT_HISTORY_PATH = LOGS_DIR / "alert_history.json"
+
+
+def _load_alert_history() -> dict:
+    try:
+        return json.loads(_ALERT_HISTORY_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _dedup_results(results: list[dict], score_change_min: int = 15) -> list[dict]:
+    """Drop signals already alerted on for this (symbol, earnings_date) unless
+    score moved meaningfully. Persists across runs.
+
+    Why: previous behavior re-posted the same ticker daily as BB/momentum noise
+    oscillated, training the operator to ignore Discord. We only want to alert
+    on (a) first appearance, or (b) material score change >= 15pts.
+    """
+    history = _load_alert_history()
+    kept = []
+    new_history = dict(history)
+    for r in results:
+        key = f"{r['symbol']}|{r.get('earnings_date', '')}"
+        prev_score = history.get(key, {}).get("score")
+        if prev_score is None or abs(r["score"] - prev_score) >= score_change_min:
+            kept.append(r)
+            new_history[key] = {"score": r["score"], "ts": datetime.now(timezone.utc).isoformat()}
+    try:
+        _ALERT_HISTORY_PATH.write_text(json.dumps(new_history, indent=2))
+    except OSError:
+        pass
+    return kept
+
+
 def format_discord(results: list[dict]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"**APOLLO Earnings Scanner -- {now}**\n"]
 
+    # Dedup: only surface tickers we haven't recently alerted on, OR with material score moves.
+    # Then apply higher thresholds to drop low-conviction noise (audit 2026-04-16: 77 alerts/day, 0 trades).
+    results = _dedup_results(results)
+
     # POST-ER ACTIONABLE (just reported, big gap = drift play)
     post_er_plays = [r for r in results if r.get("post_er_play")]
 
-    # PRE-ER WATCHLIST (upcoming, for awareness only — do NOT trade blind)
-    imminent = [r for r in results if r["score"] >= 60 and 0 <= r.get("days_until", 99) <= 5 and not r.get("post_er_play")]
-    watching = [r for r in results if r["score"] >= 45 and r not in imminent and not r.get("post_er_play")]
-    post_er = [r for r in results if r.get("days_until", 0) < 0 and r["score"] >= 50 and not r.get("post_er_play")]
+    # Thresholds raised: imminent 60->75, watching 45->75, post_er 50->75
+    imminent = [r for r in results if r["score"] >= 75 and 0 <= r.get("days_until", 99) <= 5 and not r.get("post_er_play")]
+    watching = [r for r in results if r["score"] >= 75 and r not in imminent and not r.get("post_er_play")]
+    post_er = [r for r in results if r.get("days_until", 0) < 0 and r["score"] >= 75 and not r.get("post_er_play")]
 
     if post_er_plays:
         lines.append(f"**ACTIONABLE — POST-ER DRIFT PLAYS ({len(post_er_plays)}):**")
@@ -618,13 +656,18 @@ def main():
               f"{r['days_until']:5d} ${r['price']:>7.2f} {r['bb_pctile']:5.0f} "
               f"{r['vol_ratio']:5.2f} {r['beat_rate']:5.0%} {sigs}")
 
-    # Discord
+    # Discord — only post if there's actionable content (skip "no setups" noise)
     report = format_discord(results)
     print(f"\n{report}")
 
-    if not args.dry_run:
+    has_content = any(marker in report for marker in (
+        "ACTIONABLE", "EARNINGS THIS WEEK", "POST-EARNINGS DRIFT", "WATCHLIST",
+    ))
+    if not args.dry_run and has_content:
         ok = send_discord(report)
         print(f"\nDiscord: {'sent' if ok else 'FAILED'}")
+    elif not args.dry_run:
+        print("\nDiscord: skipped (no actionable signals after dedup/threshold)")
 
     # Save
     log_path = LOGS_DIR / f"scan_{datetime.now().strftime('%Y%m%d')}.json"

@@ -41,11 +41,8 @@ REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "tori"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("tori")
+from forge.logging_setup import setup_logging
+log = setup_logging("tori")
 
 # Instruments
 TICKERS = ["PL=F", "CL=F", "GC=F", "YM=F"]

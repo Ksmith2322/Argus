@@ -175,11 +175,62 @@ SYSTEMS = {
         "process_match": "forge.rebalance_runner",
         "restart_args": ["-m", "forge.rebalance_runner", "--loop"],
     },
+    "forge_wick_gbpusd": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.wick_gbpusd.runner",  # short-lived; rarely alive
+        "artifact_glob": str(REPO / "forge" / "logs" / "wick_gbpusd" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h — daily run via run_cohort_report.ps1
+        "no_restart": True,  # scheduled externally
+    },
+    "forge_gld_pm_long": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.gld_pm_long.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "gld_pm_long" / "heartbeat.json"),
+        "artifact_max_age_s": 7200,  # 2h — runs at top of hours 18/19/20 UTC weekdays
+        "no_restart": True,  # scheduled externally
+    },
+    "forge_nq_overnight": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.nq_overnight.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "nq_overnight" / "heartbeat.json"),
+        "artifact_max_age_s": 7200,  # 2h — runs hourly during overnight session
+        "no_restart": True,
+    },
+    "forge_jpy_pm_short": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.jpy_pm_short.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "jpy_pm_short" / "heartbeat.json"),
+        "artifact_max_age_s": 7200,  # 2h
+        "no_restart": True,
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,
         "process_match": "dashboard.py",
         "restart_args": ["ops/dashboard.py", "--port", "8080"],
+    },
+    # Scheduled-task systems: monitored by daily artifact freshness, not process aliveness.
+    # Why: ares (sector rotation, monthly eval) and oracle (Polymarket scan) run as
+    # scheduled jobs that produce a dated file each run; the process is short-lived.
+    "ares": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "ares.runner",
+        "artifact_glob": str(REPO / "ares" / "logs" / "signal_*.json"),
+        "artifact_max_age_s": 93600,  # 26h — daily run + buffer
+        "no_restart": True,  # scheduled externally, don't auto-restart
+    },
+    "oracle": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "oracle.runner",
+        "artifact_glob": str(REPO / "oracle" / "logs" / "scan_*.json"),
+        "artifact_max_age_s": 93600,
+        "no_restart": True,
     },
 }
 
@@ -198,15 +249,57 @@ def get_heartbeat_age(path: Path) -> float | None:
     return time.time() - path.stat().st_mtime
 
 
+def _argus_killed_symbols() -> set[str]:
+    """Symbols whose Argus deployment stage is 'killed' — skip their heartbeats.
+
+    Why: killed configs aren't running in runner_unified, so their per-pair
+    heartbeat file goes stale forever and pollutes fleet_status.json.
+    """
+    registry = _load_json(REPO / "argus_flow" / "logs" / "deployment_registry.json")
+    if not registry:
+        return set()
+    killed: set[str] = set()
+    for r in registry.get("runners", []):
+        if str(r.get("current_stage", "")).lower() == "killed":
+            sym = str(r.get("symbol", "")).lower()
+            if sym:
+                killed.add(sym)
+    return killed
+
+
 def check_system_health(name: str, cfg: dict) -> dict:
     """Check if a system is healthy. Returns status dict."""
     result = {"name": name, "status": "UNKNOWN", "stale_count": 0, "details": []}
     process_alive = is_process_running(cfg["process_match"])
     result["process_alive"] = process_alive
 
+    skip_symbols = _argus_killed_symbols() if name == "argus" else set()
+
+    # Scheduled-task path: check artifact freshness instead of process aliveness.
+    artifact_glob = cfg.get("artifact_glob")
+    if artifact_glob:
+        import glob as _glob
+        matches = _glob.glob(artifact_glob)
+        if not matches:
+            result["status"] = "DOWN"
+            result["details"].append(f"no artifact matches {Path(artifact_glob).name}")
+            result["max_age_s"] = -1
+            return result
+        newest = max((Path(m).stat().st_mtime for m in matches), default=0)
+        age = time.time() - newest
+        result["max_age_s"] = int(age)
+        if age > cfg["artifact_max_age_s"]:
+            result["status"] = "STALE"
+            result["details"].append(f"newest artifact {int(age)}s old (>{cfg['artifact_max_age_s']}s)")
+        else:
+            result["status"] = "OK"
+        return result
+
     if cfg["heartbeats"]:
         ages = []
         for hb in cfg["heartbeats"]:
+            if hb.parent.name.lower() in skip_symbols:
+                continue
             age = get_heartbeat_age(hb)
             if age is None:
                 result["stale_count"] += 1
@@ -404,7 +497,7 @@ def run_check_cycle(auto_restart: bool = True, legacy_execution_mode: str = "pap
 
         if status["status"] in ("DOWN", "STALE"):
             log.warning(f"{name}: {status['status']} | {' | '.join(status['details'][:3])}")
-            if auto_restart and status["status"] == "DOWN":
+            if auto_restart and status["status"] == "DOWN" and not cfg.get("no_restart"):
                 restart_system(name, cfg, legacy_execution_mode=legacy_execution_mode)
         else:
             log.info(f"{name}: OK")

@@ -53,11 +53,8 @@ REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "cuebanks"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("cuebanks")
+from forge.logging_setup import setup_logging
+log = setup_logging("cuebanks")
 
 # Instrument
 TICKER = "YM=F"

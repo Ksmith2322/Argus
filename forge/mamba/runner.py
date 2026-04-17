@@ -41,11 +41,8 @@ REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "mamba"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("mamba")
+from forge.logging_setup import setup_logging
+log = setup_logging("mamba")
 
 # Instruments
 TICKERS = ["NQ=F", "YM=F"]
@@ -514,13 +511,21 @@ def run_backtest(
                     candle_quality=has_candle,
                 )
 
-                if confluences < 2:
+                # Per-confluence-bucket backtest (2026-04-16) showed:
+                #   3-conf: 13% WR, -$576 (noise)
+                #   4-conf: 26% WR, +$13 (breakeven)
+                #   5-conf: 36% WR, +$176 (matches rulebook 35-45% target)
+                # Edge lives ONLY in 5-confluence sniper setups. Structure is mandatory.
+                if confluences < 5 or not has_structure:
                     continue
 
                 # --- ENTRY ---
                 entry_price = close_price
 
-                # Stop: ATR-based, 10-20 points typical
+                # Stop: ATR-based, 10-20 points typical. (Tried swing-based per
+                # rulebook 2026-04-16 but synth_1min swing detection produced
+                # tighter stops that got whipsawed — WR dropped 36%->21%. Keeping
+                # ATR until a better swing detector is in place.)
                 stop_dist = max(current_atr * 0.8, 10)
                 stop_dist = min(stop_dist, 25)  # cap at 25 points
 

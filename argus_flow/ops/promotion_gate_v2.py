@@ -56,6 +56,15 @@ def _unevidenced(detail: str) -> CheckResult:
     return CheckResult(False, detail, "unevidenced")
 
 
+def _awaiting(detail: str) -> CheckResult:
+    """Check skipped because a prerequisite (e.g. valid trades) isn't met yet.
+
+    Treated as not-passing but reported separately so the report doesn't bury
+    the real blocker under a cascade of misleading downstream failures.
+    """
+    return CheckResult(False, detail, "awaiting")
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -648,29 +657,52 @@ def evaluate_runner(runner: dict) -> dict:
     valid_trades = [t for t in all_trades if str(t.get("experiment_valid", "")).lower() == "true"]
     replay_expectations = _load_replay_expectations(runner)
 
-    checks: dict[str, CheckResult] = {
-        "min_valid_trades": check_min_valid_trades(valid_trades),
-        "min_calendar_days": check_min_calendar_days(runner),
-        "frozen_config_hash": check_frozen_config_hash(valid_trades),
-        "git_sha_consistent": check_git_sha_consistent(valid_trades),
-        "invalid_rate": check_invalid_rate(all_trades),
-        "no_runtime_anomalies": check_no_runtime_anomalies(valid_trades),
-        "positive_expectancy": check_positive_expectancy(valid_trades),
-        "session_concentration": check_session_concentration(valid_trades),
-        "outlier_trade": check_outlier_trade(valid_trades),
-        "regime_diversity": check_regime_diversity(valid_trades),
-        "give_back": check_give_back(valid_trades),
-        "consecutive_losses": check_consecutive_losses(valid_trades),
-        "profit_factor": check_profit_factor(valid_trades),
-        "win_rate_vs_replay": check_win_rate_vs_replay(valid_trades, replay_expectations),
-        "signal_frequency": check_signal_frequency(log_dir, replay_expectations, stage_start=stage_start),
-        "walk_forward_positive": check_walk_forward_positive(log_dir),
-        "live_drawdown_vs_walkforward": check_live_drawdown_vs_walkforward(valid_trades, log_dir),
-        "survived_disconnect": check_survived_disconnect(all_trades),
-        "dashboard_truth": check_dashboard_truth(runner, all_trades, valid_trades),
-        "no_manual_intervention": check_no_manual_intervention(valid_trades),
-        "execution_quality": check_execution_quality(valid_trades),
-    }
+    # If there are no valid trades, surface that as the single blocker rather
+    # than cascading 8+ misleading "no PnL data / no config_hash" failures
+    # that all derive from the same root cause.
+    if not valid_trades:
+        awaiting = _awaiting("awaiting valid trades")
+        valid_trade_dependent = {
+            "frozen_config_hash", "git_sha_consistent", "no_runtime_anomalies",
+            "positive_expectancy", "session_concentration", "outlier_trade",
+            "regime_diversity", "give_back", "consecutive_losses", "profit_factor",
+            "win_rate_vs_replay", "live_drawdown_vs_walkforward",
+            "no_manual_intervention", "execution_quality",
+        }
+        checks: dict[str, CheckResult] = {
+            "min_valid_trades": check_min_valid_trades(valid_trades),
+            "min_calendar_days": check_min_calendar_days(runner),
+            "invalid_rate": check_invalid_rate(all_trades),
+            "signal_frequency": check_signal_frequency(log_dir, replay_expectations, stage_start=stage_start),
+            "walk_forward_positive": check_walk_forward_positive(log_dir),
+            "survived_disconnect": check_survived_disconnect(all_trades),
+            "dashboard_truth": check_dashboard_truth(runner, all_trades, valid_trades),
+            **{name: awaiting for name in valid_trade_dependent},
+        }
+    else:
+        checks = {
+            "min_valid_trades": check_min_valid_trades(valid_trades),
+            "min_calendar_days": check_min_calendar_days(runner),
+            "frozen_config_hash": check_frozen_config_hash(valid_trades),
+            "git_sha_consistent": check_git_sha_consistent(valid_trades),
+            "invalid_rate": check_invalid_rate(all_trades),
+            "no_runtime_anomalies": check_no_runtime_anomalies(valid_trades),
+            "positive_expectancy": check_positive_expectancy(valid_trades),
+            "session_concentration": check_session_concentration(valid_trades),
+            "outlier_trade": check_outlier_trade(valid_trades),
+            "regime_diversity": check_regime_diversity(valid_trades),
+            "give_back": check_give_back(valid_trades),
+            "consecutive_losses": check_consecutive_losses(valid_trades),
+            "profit_factor": check_profit_factor(valid_trades),
+            "win_rate_vs_replay": check_win_rate_vs_replay(valid_trades, replay_expectations),
+            "signal_frequency": check_signal_frequency(log_dir, replay_expectations, stage_start=stage_start),
+            "walk_forward_positive": check_walk_forward_positive(log_dir),
+            "live_drawdown_vs_walkforward": check_live_drawdown_vs_walkforward(valid_trades, log_dir),
+            "survived_disconnect": check_survived_disconnect(all_trades),
+            "dashboard_truth": check_dashboard_truth(runner, all_trades, valid_trades),
+            "no_manual_intervention": check_no_manual_intervention(valid_trades),
+            "execution_quality": check_execution_quality(valid_trades),
+        }
 
     hard_checks = {name: result for name, result in checks.items() if result.classification == "hard"}
     hard_blockers = [name for name, result in hard_checks.items() if not result.passed]

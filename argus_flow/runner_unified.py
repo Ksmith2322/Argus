@@ -2591,6 +2591,17 @@ class InstrumentRunner:
             if s.timeout_time and now >= s.timeout_time:
                 exit_reason = "timeout"
 
+            # Pre-IBKR-maintenance flatten: IBKR drops the socket at 23:45 UTC
+            # nightly. Any position open through that disconnect taints the next
+            # trade as `restored_from_file`. For paper QA we'd rather close
+            # 15min early than burn a cohort slot on a tainted entry. Real
+            # configs should NOT flatten — they have proper reconnect handling.
+            if (not exit_reason
+                and self.deployment_stage in ("paper", "watcher")
+                and self.instrument_type == "forex"
+                and now.hour == 23 and now.minute >= 30):
+                exit_reason = "pre_disconnect_flatten"
+
             # ── Trailing stop: move stop to breakeven after 1R ──
             if s.position != "FLAT" and not exit_reason:
                 self._check_trailing_stop(mid)

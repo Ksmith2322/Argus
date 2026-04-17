@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from forge.logging_setup import setup_logging
 from forge.themis.db import DB_PATH, get_connection, get_signal_scorecard, init_db
 from forge.themis.fetcher import fetch_and_store
 from forge.themis.signals import (
@@ -15,6 +16,8 @@ from forge.themis.signals import (
     get_top_signals,
     score_signals,
 )
+
+log = setup_logging("themis")
 
 HEARTBEAT_DIR = Path(r"C:\Argus\repo\forge\logs\themis")
 HEARTBEAT_PATH = HEARTBEAT_DIR / "heartbeat.json"
@@ -52,7 +55,7 @@ def _send_discord_alert(message: str) -> None:
         import requests
         requests.post(webhook, json={"content": message}, timeout=10)
     except Exception as e:
-        print(f"[themis] Discord alert failed: {e}")
+        log.warning("Discord alert failed: %s", e)
 
 
 def _count(conn, table: str) -> int:
@@ -64,16 +67,16 @@ def _count_active(conn) -> int:
 
 
 def run_fetch(conn) -> dict:
-    print("[themis] Fetching trades...")
+    log.info("Fetching trades...")
     result = fetch_and_store(conn)
-    print(f"[themis] Fetch: {result['fetched']} fetched, {result['new']} new, {result['duplicates']} duplicates")
+    log.info("Fetch: %d fetched, %d new, %d duplicates", result['fetched'], result['new'], result['duplicates'])
     return result
 
 
 def run_scan(conn) -> list[dict]:
-    print("[themis] Scanning for signals...")
+    log.info("Scanning for signals...")
     new_signals = detect_signals(conn)
-    print(f"[themis] Found {len(new_signals)} new signals")
+    log.info("Found %d new signals", len(new_signals))
     for sig in new_signals:
         alert = format_signal_alert(sig)
         print(f"  {alert.encode('ascii', 'replace').decode('ascii')}")
@@ -82,9 +85,9 @@ def run_scan(conn) -> list[dict]:
 
 
 def run_score(conn) -> dict:
-    print("[themis] Scoring mature signals...")
+    log.info("Scoring mature signals...")
     result = score_signals(conn)
-    print(f"[themis] Scored: {result['scored']}, errors: {result['errors']}")
+    log.info("Scored: %d, errors: %d", result['scored'], result['errors'])
     return result
 
 
@@ -150,7 +153,7 @@ def run_scorecard(conn) -> None:
 
 
 def run_loop(conn, interval_min: int = 360) -> None:
-    print(f"[themis] Loop mode — interval {interval_min} min")
+    log.info("Loop mode — interval %d min", interval_min)
     while True:
         try:
             fetch_result = run_fetch(conn)
@@ -165,13 +168,13 @@ def run_loop(conn, interval_min: int = 360) -> None:
                 new_signals=len(new_signals),
             )
 
-            print(f"[themis] Cycle complete — sleeping {interval_min} min")
+            log.info("Cycle complete — sleeping %d min", interval_min)
             time.sleep(interval_min * 60)
         except KeyboardInterrupt:
-            print("[themis] Interrupted — exiting")
+            log.info("Interrupted — exiting")
             break
         except Exception as e:
-            print(f"[themis] Error in loop: {e}")
+            log.error("Error in loop: %s", e)
             time.sleep(60)
 
 

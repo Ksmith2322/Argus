@@ -58,6 +58,61 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] ares WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running JPY PM Short evaluation..."
+    $jpyOutput = & $python -m forge.jpy_pm_short.runner --evaluate 2>&1
+    foreach ($line in @($jpyOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] jpy_pm_short: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] jpy_pm_short WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running NQ Overnight evaluation..."
+    $nqOvOutput = & $python -m forge.nq_overnight.runner --evaluate 2>&1
+    foreach ($line in @($nqOvOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] nq_overnight: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] nq_overnight WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running GLD PM Long evaluation..."
+    $gldPmOutput = & $python -m forge.gld_pm_long.runner --evaluate 2>&1
+    foreach ($line in @($gldPmOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] gld_pm_long: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] gld_pm_long WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running Wick GBPUSD daily evaluation..."
+    $wickOutput = & $python -m forge.wick_gbpusd.runner --evaluate 2>&1
+    foreach ($line in @($wickOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] wick_gbpusd: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] wick_gbpusd WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running Oracle Polymarket scanner..."
+    $oracleOutput = & $python -m oracle.runner --dry-run 2>&1
+    foreach ($line in @($oracleOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] oracle: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] oracle WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Titan scanner (refresh + long-only)..."
     $titanOutput = & $python -m titan.ops.scanner --refresh --long-only 2>&1
     foreach ($line in @($titanOutput)) {
