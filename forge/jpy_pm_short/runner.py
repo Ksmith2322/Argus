@@ -22,6 +22,8 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
+from argus_flow.sizing import fx_notional_per_unit_usd
+from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
 
 REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "jpy_pm_short"
@@ -40,8 +42,8 @@ PARAMS = {
     "stop_atr": 0.5,
     "hold_bars": 4,
     "atr_period": 14,
-    "risk_pct_per_pair": 0.01,
-    "model_equity_usd": 10000.0,
+    # risk_pct_per_pair + model_equity_usd removed 2026-04-17 — sourced
+    # from helio.fleet_sizing tier system (strategy_label="forge_jpy_pm_short").
 }
 
 TRADES_PATH = LOG_DIR / "trades.csv"
@@ -73,8 +75,8 @@ def _git_sha() -> str:
 
 TRADE_FIELDS = [
     "ts", "symbol", "direction", "entry_px", "exit_px", "pnl_pips", "exit_reason",
-    "duration_min", "trade_num", "pnl_usd", "position_size", "risk_usd",
-    "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
+    "duration_min", "trade_num", "pnl_usd", "pnl_pct_of_fleet", "position_size", "risk_usd",
+    "risk_pct_of_fleet", "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
     "config_hash", "session_id", "runtime_epoch", "git_sha",
     "atr_entry", "stop_px", "target_px",
 ]
@@ -202,10 +204,17 @@ def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float) -> None:
     entry = float(df["Close"].iloc[idx])
     target = entry - PARAMS["target_atr"] * a  # SHORT: target below
     stop = entry + PARAMS["stop_atr"] * a       # SHORT: stop above
-    risk_usd = PARAMS["model_equity_usd"] * PARAMS["risk_pct_per_pair"]
+    risk_budget_usd = compute_risk_usd(strategy_label="forge_jpy_pm_short")
     stop_pips = (stop - entry) * (100 if "JPY" in sym else 10000)
     pip_value = 10.0 if "JPY" in sym else 10.0  # both 100K lot ~$10/pip
-    pos_size = max(1, int(risk_usd / max(stop_pips * pip_value / 100000, 0.001)))
+    pos_size = max(1, int(risk_budget_usd / max(stop_pips * pip_value / 100000, 0.001)))
+    usd_jpy_ref = entry if sym == "USDJPY" else None
+    notional_per_unit = fx_notional_per_unit_usd(sym, quote_price=entry, usd_jpy_price=usd_jpy_ref)
+    cap_units = int(max_notional_usd("fx") / max(notional_per_unit, 1e-9))
+    if cap_units > 0 and pos_size > cap_units:
+        log.warning("NOTIONAL_CAP: %s units %d > cap %d", sym, pos_size, cap_units)
+        pos_size = cap_units
+    risk_usd = stop_pips * pip_value * (pos_size / 100_000)
     state["open_trades"][sym] = {
         "entry_ts": str(df.index[idx]),
         "entry_px": entry,
@@ -242,9 +251,11 @@ def _close(state: dict, sym: str, exit_ts, exit_px: float, reason: str) -> None:
         "duration_min": round(duration_min, 1),
         "trade_num": state["trade_count"],
         "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct_of_fleet": round(pnl_pct_of_fleet(pnl_usd), 4),
         "position_size": ot["position_size"],
         "risk_usd": ot["risk_usd"],
-        "sizing_policy": "fixed_risk_pct",
+        "risk_pct_of_fleet": round(__import__("helio.fleet_sizing", fromlist=["get_effective_risk_pct"]).get_effective_risk_pct("forge_jpy_pm_short")["risk_pct"] * 100, 3),
+        "sizing_policy": "fleet_anchored_risk_pct",
         "entry_regime": "ny_pm",
         "experiment_valid": "true",
         "invalid_reason": "",

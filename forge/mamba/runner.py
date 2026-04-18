@@ -859,6 +859,10 @@ def run_scan():
 # Signal loop
 # ---------------------------------------------------------------------------
 
+RESEARCH_ONLY = True  # 2026-04-17: 4-iteration audit showed no edge in current
+# impl. Excluded from fleet_perf_summary USD roll-up until promotion candidate.
+
+
 def write_heartbeat(status: str = "running", extra: dict | None = None):
     """Write heartbeat file."""
     hb = {
@@ -867,6 +871,7 @@ def write_heartbeat(status: str = "running", extra: dict | None = None):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "tickers": TICKERS,
+        "mode": "research_only",
     }
     if extra:
         hb.update(extra)

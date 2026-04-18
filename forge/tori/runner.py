@@ -44,6 +44,10 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 from forge.logging_setup import setup_logging
 log = setup_logging("tori")
 
+RESEARCH_ONLY = True  # 2026-04-17: not yet promotion candidate. Sizing module
+# uses a local backtest equity; not aligned to fleet_sizing.json. Do not
+# include in fleet USD roll-up until cohort-tagged + walk-forward-validated.
+
 # Instruments
 TICKERS = ["PL=F", "CL=F", "GC=F", "YM=F"]
 TICKER_NAMES = {
@@ -685,6 +689,7 @@ def run_loop(datasets: dict[str, pd.DataFrame]):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "instruments": list(fresh.keys()),
                 "status": "ok",
+                "mode": "research_only",  # 2026-04-17: not promotion candidate
             }, indent=2))
 
             log.info("Sleeping 4 hours until next scan...")

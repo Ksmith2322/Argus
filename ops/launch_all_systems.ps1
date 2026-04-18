@@ -51,7 +51,7 @@ if (-not $argusRunning) {
     Start-System "Argus" @(
         "-m", "argus_flow.runner_unified",
         "--configs",
-        "argus_flow/configs/audjpy_mtf_paper_v1.json",
+        # AUDJPY killed 2026-04-14, config archived 2026-04-17.
         "argus_flow/configs/usdjpy_mtf_paper_v1.json",
         "argus_flow/configs/gbpusd_range_paper_v1.json",
         "argus_flow/configs/cadjpy_mtf_paper_v1.json"

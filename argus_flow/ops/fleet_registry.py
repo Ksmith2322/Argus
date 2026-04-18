@@ -40,12 +40,28 @@ STAGE_ORDER = {
     STAGE_QUARANTINE: 3,
     STAGE_KILLED: 4,
 }
+try:
+    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
+    _MODEL_EQUITY = _fleet_anchor()
+except Exception:
+    _MODEL_EQUITY = 10000.0
 RISK_POLICY_DEFAULTS = {
-    "model_start_equity_usd": 10000.0,
+    "model_start_equity_usd": _MODEL_EQUITY,
     "base_risk_pct": 0.005,
     "earned_cap_pct": 0.03,
     "manual_step_up_required": False,
 }
+
+
+def _resolve_model_start_equity(raw_value) -> float:
+    """Resolve model equity, including the fleet-anchor sentinel.
+
+    Active paper configs use the string "fleet_anchor" so changing
+    fleet_sizing.json moves Argus sizing without editing every config.
+    """
+    if isinstance(raw_value, str) and raw_value.strip().lower() == "fleet_anchor":
+        return float(RISK_POLICY_DEFAULTS["model_start_equity_usd"])
+    return float(raw_value or RISK_POLICY_DEFAULTS["model_start_equity_usd"])
 
 # Legacy active fleet. Future additions can opt in by adding:
 #   "deployment": {"managed": true, "stage": "watcher"}
@@ -289,7 +305,9 @@ def resolve_risk_policy(config: dict, config_path: Path, stage: str | None = Non
         "configured_risk_pct": float(risk.get("risk_pct", 0.0) or 0.0),
         "earned_cap_pct": earned_cap,
         "manual_step_up_required": bool(risk_policy.get("manual_step_up_required", RISK_POLICY_DEFAULTS["manual_step_up_required"])),
-        "model_start_equity_usd": float(risk_policy.get("model_start_equity_usd", RISK_POLICY_DEFAULTS["model_start_equity_usd"]) or RISK_POLICY_DEFAULTS["model_start_equity_usd"]),
+        "model_start_equity_usd": _resolve_model_start_equity(
+            risk_policy.get("model_start_equity_usd", RISK_POLICY_DEFAULTS["model_start_equity_usd"])
+        ),
         "scale_state": str(risk_policy.get("scale_state", "BASE") or "BASE"),
     }
 
@@ -313,14 +331,23 @@ def validate_risk_policy_for_execution(config: dict, config_path: Path, stage: s
             f"model_start_equity_usd is required for {resolved_stage} stage but is "
             f"{'missing' if raw_value is None else f'zero/empty ({raw_value!r})'}. "
             f"Add deployment.risk_policy.model_start_equity_usd to {config_path.name}. "
-            f"Without it, sizing will use real broker equity and block all trades."
+            f"Use the string \"fleet_anchor\" to inherit from fleet_sizing.json, or "
+            f"a positive number to override."
         )
+    # Sentinel: "fleet_anchor" means inherit from helio/fleet_sizing config.
+    # We still require the key to be present so an operator can't silently
+    # forget to declare sizing intent.
+    if isinstance(raw_value, str) and raw_value.strip().lower() == "fleet_anchor":
+        return None
     try:
         val = float(raw_value)
         if val <= 0:
             return f"model_start_equity_usd must be positive, got {val} in {config_path.name}"
     except (TypeError, ValueError):
-        return f"model_start_equity_usd is not a valid number: {raw_value!r} in {config_path.name}"
+        return (
+            f"model_start_equity_usd is not a valid number or the 'fleet_anchor' "
+            f"sentinel: {raw_value!r} in {config_path.name}"
+        )
 
     return None
 

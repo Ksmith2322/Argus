@@ -28,6 +28,8 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
+from argus_flow.sizing import fx_notional_per_unit_usd
+from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
 
 REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "wick_gbpusd"
@@ -49,8 +51,8 @@ PARAMS = {
     "stop_atr": 1.0,
     "hold_bars": 20,
     "atr_period": 14,
-    "risk_pct": 0.01,
-    "model_equity_usd": 10000.0,
+    # risk_pct + model_equity_usd removed 2026-04-17 — sourced from
+    # helio.fleet_sizing tier system (strategy_label="forge_wick_gbpusd").
 }
 
 TRADES_PATH = LOG_DIR / "trades.csv"
@@ -123,8 +125,8 @@ def _git_sha() -> str:
 
 TRADE_FIELDS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pips", "exit_reason",
-    "duration_min", "trade_num", "pnl_usd", "position_size", "risk_usd",
-    "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
+    "duration_min", "trade_num", "pnl_usd", "pnl_pct_of_fleet", "position_size", "risk_usd",
+    "risk_pct_of_fleet", "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
     "config_hash", "session_id", "runtime_epoch", "git_sha",
     "atr_entry", "stop_px", "target_px",
 ]
@@ -230,10 +232,16 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
     entry_anchor = float(df["Close"].iloc[signal_idx])  # placeholder
     target = entry_anchor + PARAMS["target_atr"] * a
     stop = entry_anchor - PARAMS["stop_atr"] * a
-    risk_usd = PARAMS["model_equity_usd"] * PARAMS["risk_pct"]
+    risk_budget_usd = compute_risk_usd(strategy_label="forge_wick_gbpusd")
     pip_value = 10.0  # GBPUSD per pip per 100K — approximate
     stop_distance_pips = (entry_anchor - stop) / 0.0001
-    pos_size = int(risk_usd / (stop_distance_pips * pip_value / 100_000)) if stop_distance_pips > 0 else 0
+    pos_size = int(risk_budget_usd / (stop_distance_pips * pip_value / 100_000)) if stop_distance_pips > 0 else 0
+    notional_per_unit = fx_notional_per_unit_usd("GBPUSD", quote_price=entry_anchor)
+    cap_units = int(max_notional_usd("fx") / max(notional_per_unit, 1e-9)) if entry_anchor > 0 else pos_size
+    if cap_units > 0 and pos_size > cap_units:
+        log.warning("NOTIONAL_CAP: GBPUSD units %d > cap %d", pos_size, cap_units)
+        pos_size = cap_units
+    risk_usd = stop_distance_pips * pip_value * (pos_size / 100_000)
     state["open_trade"] = {
         "signal_ts": str(df.index[signal_idx]),
         "signal_close": entry_anchor,
@@ -287,9 +295,11 @@ def _close_paper_trade(state: dict, df: pd.DataFrame, exit_idx: int, exit_px: fl
         "duration_min": round(duration_min, 1),
         "trade_num": state["trade_count"],
         "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct_of_fleet": round(pnl_pct_of_fleet(pnl_usd), 4),
         "position_size": ot["position_size"],
         "risk_usd": ot["risk_usd"],
-        "sizing_policy": "fixed_risk_pct",
+        "risk_pct_of_fleet": round(__import__("helio.fleet_sizing", fromlist=["get_effective_risk_pct"]).get_effective_risk_pct("forge_wick_gbpusd")["risk_pct"] * 100, 3),
+        "sizing_policy": "fleet_anchored_risk_pct",
         "entry_regime": "range",
         "experiment_valid": "true",
         "invalid_reason": "",

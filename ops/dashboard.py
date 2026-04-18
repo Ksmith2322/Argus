@@ -1786,8 +1786,7 @@ IBKR_RUNNERS = [
     {"name": "EUR/JPY", "symbol": "EURJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/eurjpy", "unit": "pips", "mult": 100},
     {"name": "GBP/JPY", "symbol": "GBPJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/gbpjpy", "unit": "pips", "mult": 100},
     {"name": "CAD/JPY", "symbol": "CADJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/cadjpy", "unit": "pips", "mult": 100},
-    # FX — Asia session
-    {"name": "AUD/JPY", "symbol": "AUDJPY", "strategy": "T4 Full Stack", "log_dir": "argus_flow/logs/audjpy", "unit": "pips", "mult": 100},
+    # FX — Asia session (AUDJPY killed 2026-04-14, archived 2026-04-17)
     {"name": "USD/JPY", "symbol": "USDJPY", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/usdjpy", "unit": "pips", "mult": 100},
     {"name": "AUD/USD", "symbol": "AUDUSD", "strategy": "Range + Accel", "log_dir": "argus_flow/logs/audusd", "unit": "pips", "mult": 10000},
     # Futures — Equity Index Micros (US session)
@@ -1806,7 +1805,11 @@ ALERT_STATE_FILE = REPO / "argus_flow" / "logs" / "alert_state.json"
 ALERT_EVENTS_FILE = REPO / "argus_flow" / "logs" / "alert_events.jsonl"
 FLEET_BROKER_FILE = REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json"
 DEPLOYMENT_REGISTRY_FILE = REPO / "argus_flow" / "logs" / "deployment_registry.json"
-PAPER_MODEL_START_USD = 10000.0
+try:
+    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
+    PAPER_MODEL_START_USD = _fleet_anchor()
+except Exception:
+    PAPER_MODEL_START_USD = 10000.0
 PAPER_MODEL_BASE_RISK_PCT = 0.005
 PAPER_MODEL_CAP_RISK_PCT = 0.03
 MANAGED_GOVERNANCE_FRESH_S = 30 * 60
@@ -3221,7 +3224,7 @@ async def api_fleet():
     argus_total_pnl = 0
     argus_total_trades = 0
     argus_wins = 0
-    for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]:
+    for sym in ["usdjpy", "gbpusd", "cadjpy"]:
         log_dir = REPO / "argus_flow" / "logs" / sym
         hb_path = log_dir / "heartbeat.json"
         trades_path = log_dir / "trades.csv"
@@ -3380,16 +3383,590 @@ async def api_fleet():
     })
 
 
+def _read_canonical_with_freshness(path_rel: str, fresh_threshold_s: int = 900) -> dict:
+    """Read a canonical report file. Adds _meta.{source_file, mtime_s_ago,
+    fresh} so UI can show "loaded 42s ago" instead of silently trusting it.
+    """
+    path = REPO / path_rel
+    if not path.exists():
+        return {"error": f"missing {path_rel}", "_meta": {"source_file": path_rel, "fresh": False}}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        return {"error": str(e), "_meta": {"source_file": path_rel, "fresh": False}}
+    age = int(time.time() - path.stat().st_mtime)
+    data["_meta"] = {
+        "source_file": path_rel,
+        "mtime_s_ago": age,
+        "fresh": age < fresh_threshold_s,
+        "fresh_threshold_s": fresh_threshold_s,
+    }
+    return data
+
+
+def _parse_report_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                ts = datetime.strptime(str(raw).split(".")[0], fmt)
+                break
+            except ValueError:
+                ts = None
+        else:
+            return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _strategy_live_cutoffs() -> dict[str, datetime]:
+    """Live-only cutoffs used by dashboard trade/equity views.
+
+    This keeps historical back-fills, especially GDX/GLD, out of the
+    operator's recent-trades/account-balance views unless explicitly requested.
+    """
+    try:
+        cfg = json.loads((REPO / "argus_flow" / "configs" / "fleet_sizing.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, datetime] = {}
+    for label, raw in (cfg.get("strategy_live_cutoffs") or {}).items():
+        ts = _parse_report_ts(raw)
+        if ts is not None:
+            out[str(label)] = ts
+    return out
+
+
 @app.get("/api/fleet_health")
 async def api_fleet_health():
-    """Fleet monitor status — read from fleet_status.json written by helio.fleet_monitor."""
-    status_file = REPO / "argus_flow" / "logs" / "fleet_status.json"
-    if not status_file.exists():
-        return JSONResponse({"error": "fleet_monitor not running", "systems": {}})
+    """Canonical fleet health — from argus_flow/logs/fleet_status.json
+    (written by helio.fleet_monitor every 60s)."""
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180))
+
+
+@app.get("/api/fleet_perf")
+async def api_fleet_perf():
+    """Canonical fleet performance — from argus_flow/logs/fleet_perf_summary.json
+    (written nightly by helio.fleet_perf_summary). Serves BOTH live_window and
+    all_time views — consumer should prefer live_window for current PnL claims.
+    """
+    # Nightly regen at cohort-report time, so ~26h is the expected freshness bound.
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_perf_summary.json", 26 * 3600))
+
+
+@app.get("/api/promotion_gate")
+async def api_promotion_gate():
+    """Canonical promotion-gate verdicts — from argus_flow/logs/promotion_gate_report.json."""
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/promotion_gate_report.json", 2 * 3600))
+
+
+@app.get("/api/risk_state")
+async def api_risk_state():
+    """Canonical risk state. Returns the three risk-related truth files
+    together with a drift flag so the UI can surface disagreements instead
+    of silently picking one."""
+    state = _read_canonical_with_freshness("argus_flow/logs/_risk/portfolio_risk_state.json", 600)
+    oversight = _read_canonical_with_freshness("argus_flow/logs/risk_oversight_report.json", 2 * 3600)
+    guard = _read_canonical_with_freshness("helio/logs/portfolio_guard.json", 2 * 3600)
+    drifts = []
+    if state.get("drawdown_pause") is True and str(oversight.get("level", "")).upper() == "GREEN":
+        drifts.append("drawdown_pause=true while oversight=GREEN")
+    if guard.get("allowed") is False and str(oversight.get("level", "")).upper() == "GREEN":
+        drifts.append(f"portfolio_guard.allowed=false ({guard.get('reason', '?')}) while oversight=GREEN")
+    return JSONResponse({
+        "portfolio_risk_state": state,
+        "risk_oversight": oversight,
+        "portfolio_guard": guard,
+        "drift": " | ".join(drifts) if drifts else None,
+    })
+
+
+@app.get("/api/apollo_forward_returns")
+async def api_apollo_forward_returns():
+    """Apollo T+1/T+3/T+5 forward returns. One JSON record per scan-row/symbol.
+    Written nightly by apollo.ops.backfill_forward_returns.
+    """
+    path = REPO / "apollo" / "logs" / "forward_returns.jsonl"
+    if not path.exists():
+        return JSONResponse({"records": [], "_meta": {"source_file": "apollo/logs/forward_returns.jsonl", "fresh": False, "error": "missing"}})
+    records = []
     try:
-        return JSONResponse(json.loads(status_file.read_text()))
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
     except Exception as e:
-        return JSONResponse({"error": str(e), "systems": {}})
+        return JSONResponse({"error": str(e)})
+    # Aggregate summary
+    summary = {"records": len(records)}
+    for h in ("T+1", "T+3", "T+5"):
+        vals = [r["forward_returns_pct"][h]["return_pct"] for r in records if h in r.get("forward_returns_pct", {})]
+        if vals:
+            summary[h] = {
+                "n": len(vals),
+                "mean_pct": round(sum(vals) / len(vals), 3),
+                "hit_rate_pct": round(sum(1 for v in vals if v > 0) / len(vals) * 100, 1),
+            }
+    age = int(time.time() - path.stat().st_mtime)
+    return JSONResponse({
+        "summary": summary,
+        "records": records,
+        "_meta": {"source_file": "apollo/logs/forward_returns.jsonl", "mtime_s_ago": age, "fresh": age < 30 * 3600},
+    })
+
+
+@app.get("/api/kill_discipline")
+async def api_kill_discipline():
+    """Kill-discipline report — which configs have been retired and why."""
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/kill_discipline_report.json", 26 * 3600))
+
+
+@app.get("/api/artifact_divergence")
+async def api_artifact_divergence():
+    """Divergence report between replay expectations and live signal generation."""
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/artifact_divergence_report.json", 26 * 3600))
+
+
+@app.get("/api/discord_failures")
+async def api_discord_failures():
+    """Recent Discord webhook failures. Empty = healthy."""
+    path = REPO / "argus_flow" / "logs" / "discord_failures.jsonl"
+    if not path.exists():
+        return JSONResponse({"failures": [], "_meta": {"present": False, "healthy": True}})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    records = []
+    for line in lines[-50:]:
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                pass
+    return JSONResponse({
+        "failures": records,
+        "total_failures": len(lines),
+        "_meta": {"present": True, "last_50_shown": True},
+    })
+
+
+@app.get("/api/crash_loop_alerts")
+async def api_crash_loop_alerts():
+    """Crash-loop alerts fired by fleet_monitor (3+ restarts in 10 min).
+    Empty = healthy.
+    """
+    path = REPO / "argus_flow" / "logs" / "crash_loop_alerts.json"
+    if not path.exists():
+        return JSONResponse({"alerts": [], "_meta": {"present": False, "healthy": True}})
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+    return JSONResponse({**data, "_meta": {"present": True}})
+
+
+@app.get("/api/recent_trades")
+async def api_recent_trades(limit: int = 50, window_days: int = 90, include_backfill: bool = False):
+    """Flat chronological trade list across every strategy. Keeps fields
+    uniform so the UI can render one table: what/when/direction/size/risk/pnl.
+
+    Also surfaces the broker-side context (which paper account the trades
+    hit, sizing anchor used, etc.) so the operator doesn't have to cross-
+    reference fleet_sizing.json manually.
+    """
+    specs = [
+        ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",  "USDJPY",  "IBKR", "ts",        True),
+        ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",  "GBPUSD",  "IBKR", "ts",        True),
+        ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",  "CADJPY",  "IBKR", "ts",        True),
+        ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",  "GLD",     "IBKR", "ts",        False),
+        ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",  "GBPUSD",  "IBKR", "ts",        False),
+        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv", "MNQ",     "IBKR", "ts",        False),
+        ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv", "USD/CAD-JPY", "IBKR", "ts",    False),
+        ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",      "GDX/GLD", "IBKR", "exit_date", False),
+    ]
+    cutoff = None
+    if window_days and window_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    live_cutoffs = _strategy_live_cutoffs()
+
+    trades = []
+    for label, path_rel, symbol_default, account_type, ts_col, valid_only in specs:
+        p = REPO / path_rel
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if valid_only and str(r.get("experiment_valid", "")).lower() != "true":
+                        continue
+                    ts_raw = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
+                    if not ts_raw:
+                        continue
+                    ts = _parse_report_ts(ts_raw)
+                    if ts is None:
+                        continue
+                    if cutoff and ts < cutoff:
+                        continue
+                    live_cut = live_cutoffs.get(label)
+                    if not include_backfill and live_cut is not None and ts < live_cut:
+                        continue
+                    pnl_raw = r.get("pnl_usd")
+                    if pnl_raw in (None, ""):
+                        continue
+                    try:
+                        pnl_usd = float(pnl_raw)
+                    except ValueError:
+                        continue
+                    size = r.get("position_size") or r.get("gdx_shares") or r.get("shares") or ""
+                    risk = r.get("risk_usd") or ""
+                    try:
+                        risk_f = float(risk) if risk not in (None, "") else None
+                    except ValueError:
+                        risk_f = None
+
+                    # Best-effort USD notional ("total buy-in") per strategy/instrument.
+                    # Stocks/ETFs: shares × entry_px. FX: size is in base-currency units;
+                    # notional_usd depends on which side is USD. gdx_gld: sum of both legs.
+                    def _safe_f(v):
+                        try: return float(v or 0)
+                        except (TypeError, ValueError): return 0.0
+                    notional_usd = None
+                    sym_upper = str(r.get("symbol") or symbol_default).upper().replace("/", "")
+                    if label == "forge_gdx_gld":
+                        notional_usd = (_safe_f(r.get("gdx_shares")) * _safe_f(r.get("gdx_entry"))
+                                        + _safe_f(r.get("gld_shares")) * _safe_f(r.get("gld_entry")))
+                    elif label.startswith("argus_") or label in ("forge_wick_gbpusd", "forge_jpy_pm_short"):
+                        sz = _safe_f(size)
+                        ep = _safe_f(r.get("entry_px"))
+                        if sym_upper.startswith("USD"):        # USDJPY, USDCAD etc — base = USD
+                            notional_usd = sz
+                        elif sym_upper.endswith("USD"):        # GBPUSD, EURUSD — entry IS USD/base
+                            notional_usd = sz * ep
+                        elif sym_upper.endswith("JPY"):        # cross-JPY — rough 1:1 USD approx
+                            notional_usd = sz   # approximation; actual depends on base-to-USD rate
+                        else:
+                            notional_usd = sz * ep if ep > 0 else sz
+                    elif label in ("forge_gld_pm_long", "forge_nq_overnight"):
+                        notional_usd = _safe_f(size) * _safe_f(r.get("entry_px"))
+                    notional_usd = round(notional_usd, 2) if notional_usd else None
+
+                    trades.append({
+                        "ts": ts.isoformat(),
+                        "strategy": label,
+                        "symbol": r.get("symbol") or symbol_default,
+                        "direction": r.get("direction", ""),
+                        "entry_px": r.get("entry_px") or r.get("gdx_entry") or "",
+                        "exit_px": r.get("exit_px") or r.get("gdx_exit") or "",
+                        "size": size,
+                        "notional_usd": notional_usd,
+                        "risk_usd": risk_f,
+                        "pnl_usd": round(pnl_usd, 2),
+                        "pnl_pct_of_fleet": r.get("pnl_pct_of_fleet") or "",
+                        "exit_reason": r.get("exit_reason", ""),
+                        "account_type": account_type,
+                    })
+        except Exception:
+            continue
+
+    trades.sort(key=lambda t: t["ts"], reverse=True)
+    limited = trades[:limit] if limit and limit > 0 else trades
+
+    # Account context — also probe .env directly since the dashboard does
+    # not load dotenv at startup and env vars may not be in process.
+    def _env_from_file(key: str, default: str = "") -> str:
+        v = os.getenv(key)
+        if v:
+            return v
+        env_path = REPO / ".env"
+        if env_path.exists():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith(f"{key}="):
+                        return line.split("=", 1)[1].strip()
+            except Exception:
+                pass
+        return default
+
+    ibkr_port = _env_from_file("IBKR_PORT", "7497")
+    ibkr_account = _env_from_file("IBKR_ACCOUNT_ID", "")
+    try:
+        from helio.fleet_sizing import get_sizing_anchor_usd as _gs
+        anchor = _gs()
+    except Exception:
+        anchor = 10000.0
+    # Actual broker equity (from risk_oversight)
+    try:
+        ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+        broker_equity = ro.get("broker_truth", {}).get("account_equity_usd")
+    except Exception:
+        broker_equity = None
+
+    account_mode = "PAPER" if str(ibkr_port) == "7497" or str(ibkr_account).upper().startswith("DU") else "LIVE"
+
+    return JSONResponse({
+        "account": {
+            "ibkr_account_id": ibkr_account,
+            "ibkr_port": int(ibkr_port) if str(ibkr_port).isdigit() else ibkr_port,
+            "mode": account_mode,
+            "broker_equity_usd": broker_equity,
+            "fleet_sizing_anchor_usd": anchor,
+            "note": "Orders route to broker_equity. Position sizing is derived from fleet_sizing_anchor (for prod-parity). Per-trade risk ~= anchor * strategy_risk_pct.",
+        },
+        "window_days": window_days,
+        "include_backfill": include_backfill,
+        "live_cutoffs_applied": not include_backfill,
+        "limit": limit,
+        "total_trades_in_window": len(trades),
+        "trades": limited,
+    })
+
+
+@app.get("/api/fleet_equity_curve")
+async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool = False):
+    """Build a fleet-wide equity curve from every strategy's trades.csv.
+
+    Aggregates USD PnL across all tracked strategies, sorts by exit timestamp,
+    and emits a cumulative series. Strategies logging non-USD PnL (e.g. Argus
+    pre-sizing-fix rows) are skipped — honest math only.
+
+    `window_days` (default 90) restricts to recent trades so the 20-year
+    historical gdx_gld back-fill doesn't dominate the visual.
+    """
+    specs = [
+        ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",        "ts",         "pnl_usd", True),
+        ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",        "ts",         "pnl_usd", True),
+        ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",        "ts",         "pnl_usd", True),
+        ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",        "ts",         "pnl_usd", False),
+        ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",        "ts",         "pnl_usd", False),
+        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",       "ts",         "pnl_usd", False),
+        ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",       "ts",         "pnl_usd", False),
+        ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",            "exit_date",  "pnl_usd", False),
+    ]
+    cutoff = None
+    if window_days and window_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    live_cutoffs = _strategy_live_cutoffs()
+
+    events: list[tuple[datetime, str, float]] = []
+    for label, path_rel, ts_col, pnl_col, valid_filter in specs:
+        p = REPO / path_rel
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if valid_filter and str(r.get("experiment_valid", "")).lower() != "true":
+                        continue
+                    ts_str = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
+                    if not ts_str:
+                        continue
+                    ts = _parse_report_ts(ts_str)
+                    if ts is None:
+                        continue
+                    if cutoff and ts < cutoff:
+                        continue
+                    live_cut = live_cutoffs.get(label)
+                    if not include_backfill and live_cut is not None and ts < live_cut:
+                        continue
+                    raw = r.get(pnl_col)
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        pnl = float(raw)
+                    except ValueError:
+                        continue
+                    events.append((ts, label, pnl))
+        except Exception:
+            continue
+
+    events.sort(key=lambda e: e[0])
+
+    try:
+        from helio.fleet_sizing import get_sizing_anchor_usd as _gs
+        anchor = _gs()
+    except Exception:
+        anchor = 10000.0
+    cumulative = 0.0
+    points = []
+    by_strategy: dict[str, float] = {}
+    for ts, label, pnl in events:
+        cumulative += pnl
+        by_strategy[label] = by_strategy.get(label, 0.0) + pnl
+        points.append({
+            "ts": ts.isoformat(),
+            "trade_pnl_usd": round(pnl, 2),
+            "cumulative_pnl_usd": round(cumulative, 2),
+            "cumulative_pnl_pct": round((cumulative / anchor) * 100.0 if anchor else 0.0, 4),
+            "strategy": label,
+        })
+
+    return JSONResponse({
+        "window_days": window_days,
+        "include_backfill": include_backfill,
+        "live_cutoffs_applied": not include_backfill,
+        "anchor_capital_usd": anchor,
+        "total_trades": len(points),
+        "current_cumulative_pnl_usd": round(cumulative, 2),
+        "current_cumulative_pnl_pct": round((cumulative / anchor) * 100.0 if anchor else 0.0, 4),
+        "contribution_by_strategy": {k: round(v, 2) for k, v in sorted(by_strategy.items(), key=lambda x: -x[1])},
+        "points": points,
+    })
+
+
+@app.get("/api/strategy_tiers")
+async def api_strategy_tiers():
+    """Current confidence tier + risk_pct for every tracked strategy. Tiers
+    are auto-set from measured live performance (trades + PF) over the last
+    N days. Returns for each strategy: {tier, risk_pct, risk_usd_now, stats}.
+    """
+    try:
+        from helio.fleet_sizing import (
+            get_effective_risk_pct, get_sizing_anchor_usd, _load_config
+        )
+    except ImportError:
+        return JSONResponse({"error": "fleet_sizing unavailable"}, status_code=500)
+    labels = [
+        "argus_usdjpy", "argus_gbpusd", "argus_cadjpy",
+        "forge_gld_pm_long", "forge_wick_gbpusd", "forge_nq_overnight",
+        "forge_jpy_pm_short", "forge_gdx_gld",
+    ]
+    anchor = get_sizing_anchor_usd()
+    cfg = _load_config()
+    out = {
+        "anchor_usd": round(anchor, 2),
+        "sizing_mode": cfg.get("sizing_mode", "?"),
+        "tier_window_days": cfg.get("tier_window_days"),
+        "ceiling_pct": cfg.get("max_risk_pct_per_trade_ceiling"),
+        "tiers_config": cfg.get("tiers", []),
+        "strategies": [],
+    }
+    for label in labels:
+        info = get_effective_risk_pct(label)
+        out["strategies"].append({
+            "strategy": label,
+            "tier": info["tier_name"],
+            "risk_pct": info["risk_pct"],
+            "risk_usd_now": round(info["risk_pct"] * anchor, 2),
+            "drawdown_brake_applied": info["drawdown_brake_applied"],
+            "stats": info["stats"],
+        })
+    return JSONResponse(out)
+
+
+@app.get("/api/signal_frequency")
+async def api_signal_frequency():
+    """Live-vs-replay signal frequency per strategy. Ratios far below 1.0
+    are the early-warning signal for strategy-logic drift (USDJPY 12x gap
+    class). Regenerated nightly via argus_flow.ops.signal_frequency_tracker.
+    """
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/signal_frequency_report.json", 26 * 3600))
+
+
+@app.get("/api/ops_summary")
+async def api_ops_summary():
+    """Single consolidated ops snapshot. Intended for a future compact
+    operator dashboard panel — one call returns everything worth seeing at
+    a glance: fleet health, live-window PnL, promotion status, risk drift,
+    Apollo outcome sample, and any alert-worthy counts.
+
+    Each section is pulled from its canonical file (no local recompute) so
+    this endpoint can never disagree with the single-source reports.
+    """
+    out: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
+
+    # Fleet health
+    fs = _read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180)
+    systems = fs.get("systems", {}) or {}
+    non_ok = {n: s.get("status") for n, s in systems.items() if s.get("status") not in ("OK", None)}
+    out["fleet_health"] = {
+        "total_systems": len(systems),
+        "non_ok": non_ok,
+        "control_files": fs.get("control_files", {}),
+        "risk_disagreement": fs.get("risk_state", {}).get("disagreement"),
+        "fresh": fs.get("_meta", {}).get("fresh"),
+        "mtime_s_ago": fs.get("_meta", {}).get("mtime_s_ago"),
+    }
+
+    # Live-window PnL
+    fp = _read_canonical_with_freshness("argus_flow/logs/fleet_perf_summary.json", 26 * 3600)
+    live = fp.get("live_window", {})
+    all_time = fp.get("all_time", {})
+    out["performance"] = {
+        "anchor_capital_usd": fp.get("anchor_capital_usd"),
+        "live_window": {
+            "label": live.get("window_label"),
+            "pnl_usd": live.get("fleet_total", {}).get("pnl_usd"),
+            "pnl_pct_of_fleet": live.get("fleet_total", {}).get("pnl_pct_of_fleet"),
+            "active_strategies": live.get("fleet_total", {}).get("active_strategies"),
+        },
+        "all_time": {
+            "pnl_usd": all_time.get("fleet_total", {}).get("pnl_usd"),
+            "pnl_pct_of_fleet": all_time.get("fleet_total", {}).get("pnl_pct_of_fleet"),
+            "note": "includes historical back-fill; use live_window for current perf",
+        },
+        "fresh": fp.get("_meta", {}).get("fresh"),
+    }
+
+    # Promotion gate
+    pg = _read_canonical_with_freshness("argus_flow/logs/promotion_gate_report.json", 2 * 3600)
+    out["promotion"] = {
+        "promote": pg.get("promote"),
+        "not_ready": pg.get("not_ready"),
+        "runners": [{"name": r.get("name"), "verdict": r.get("verdict"), "valid_trades": r.get("valid_trades")} for r in pg.get("runners", [])] if isinstance(pg.get("runners"), list) else None,
+        "fresh": pg.get("_meta", {}).get("fresh"),
+    }
+
+    # Apollo forward returns summary
+    apollo_path = REPO / "apollo" / "logs" / "forward_returns.jsonl"
+    if apollo_path.exists():
+        records = [json.loads(l) for l in apollo_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        apollo_summary = {"records": len(records)}
+        for h in ("T+1", "T+3", "T+5"):
+            vals = [r["forward_returns_pct"][h]["return_pct"] for r in records if h in r.get("forward_returns_pct", {})]
+            if vals:
+                apollo_summary[h] = {
+                    "n": len(vals),
+                    "mean_pct": round(sum(vals) / len(vals), 3),
+                    "hit_rate_pct": round(sum(1 for v in vals if v > 0) / len(vals) * 100, 1),
+                }
+        out["apollo"] = apollo_summary
+    else:
+        out["apollo"] = {"records": 0}
+
+    # Alert-worthy counts
+    discord_path = REPO / "argus_flow" / "logs" / "discord_failures.jsonl"
+    crash_path = REPO / "argus_flow" / "logs" / "crash_loop_alerts.json"
+    out["alerts"] = {
+        "discord_failures": sum(1 for _ in discord_path.read_text(encoding="utf-8").splitlines() if _.strip()) if discord_path.exists() else 0,
+        "crash_loops": len((_load_json(crash_path) or {}).get("alerts", [])) if crash_path.exists() else 0,
+    }
+
+    # Signal-frequency drift summary
+    sf = _read_canonical_with_freshness("argus_flow/logs/signal_frequency_report.json", 26 * 3600)
+    sf_summary = sf.get("summary") or {}
+    out["signal_frequency"] = {
+        "severe_drift": sf_summary.get("severe_drift", []),
+        "warning_drift": sf_summary.get("warning_drift", []),
+        "per_strategy_diagnoses": {
+            s["label"]: s.get("diagnosis")
+            for s in (sf.get("strategies") or [])
+            if s.get("diagnosis")
+        },
+        "fresh": sf.get("_meta", {}).get("fresh"),
+    }
+
+    return JSONResponse(out)
+
+
+def _load_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 @app.get("/api/strategy_performance")
@@ -3399,7 +3976,7 @@ async def api_strategy_performance():
 
     # ── ARGUS strategies ──────────────────────────────────────
     argus_live_trades = []
-    for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]:
+    for sym in ["usdjpy", "gbpusd", "cadjpy"]:
         trades_path = REPO / "argus_flow" / "logs" / sym / "trades.csv"
         if trades_path.exists():
             try:
@@ -3417,7 +3994,7 @@ async def api_strategy_performance():
     strategies.append({
         "system": "Argus",
         "strategy": "MTF Trend (4H/1H/5m)",
-        "instruments": "AUDJPY, USDJPY, GBPUSD, CADJPY",
+        "instruments": "USDJPY, GBPUSD, CADJPY",
         "backtest_pf": "1.1-1.3",
         "backtest_trades": 114,
         "backtest_wr": "55%",
@@ -4053,6 +4630,279 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- FLEET HEALTH BAR (5 systems × status light) -->
 <div id="fleet-health" style="margin-bottom:14px;"></div>
+
+<!-- Overall equity curve: cumulative USD PnL across every strategy -->
+<div id="fleet-equity-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
+
+<!-- Recent trades table: flat chronological list of every trade -->
+<div id="recent-trades-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
+
+<!-- Dynamic risk tier table: shows why each strategy gets its current risk % -->
+<div id="strategy-tiers-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
+<script>
+function loadRecentTrades() {
+  fetch('/api/recent_trades?limit=50&window_days=90&include_backfill=false').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('recent-trades-panel');
+    if (!el) return;
+    const acct = data.account || {};
+    const trades = data.trades || [];
+    const modeColor = acct.mode === 'PAPER' ? '#00d4ff' : '#ff9800';
+    const brokerEq = acct.broker_equity_usd ? '$' + Number(acct.broker_equity_usd).toLocaleString(undefined, {maximumFractionDigits:0}) : '—';
+    const anchor = '$' + Number(acct.fleet_sizing_anchor_usd || 0).toLocaleString();
+
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">RECENT TRADES</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">live-only last ' + (data.window_days || 90) + 'd | showing ' + trades.length + ' of ' + (data.total_trades_in_window || 0) + '</div>'
+      + '</div>';
+
+    // Account context strip
+    html += '<div style="background:#0d1117;border:1px solid #1a1f2e;border-radius:4px;padding:8px 12px;margin-bottom:10px;display:flex;flex-wrap:wrap;gap:18px;font-size:0.72em;">'
+      + '<div><span style="color:#7b8ab8;">Account:</span> <span style="color:#e0e0e0;font-weight:bold;">' + (acct.ibkr_account_id || '—') + '</span> <span style="color:' + modeColor + ';font-weight:bold;">[' + (acct.mode || '?') + ']</span></div>'
+      + '<div><span style="color:#7b8ab8;">Port:</span> <span style="color:#e0e0e0;">' + (acct.ibkr_port || '?') + '</span></div>'
+      + '<div><span style="color:#7b8ab8;">Broker equity:</span> <span style="color:#e0e0e0;">' + brokerEq + '</span></div>'
+      + '<div><span style="color:#7b8ab8;">Sizing anchor:</span> <span style="color:#e0e0e0;">' + anchor + '</span></div>'
+      + '</div>';
+
+    if (trades.length === 0) {
+      html += '<div style="padding:20px;text-align:center;color:#7b8ab8;font-size:0.75em;">No trades in window.</div>';
+      el.innerHTML = html;
+      return;
+    }
+
+    // Running cumulative (oldest-first, so walk reversed)
+    const oldestFirst = trades.slice().reverse();
+    let running = 0;
+    const runMap = new Map();
+    for (const t of oldestFirst) {
+      running += (t.pnl_usd || 0);
+      runMap.set(t.ts + '|' + t.strategy, running);
+    }
+
+    html += '<div style="overflow-x:auto;">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.72em;">';
+    html += '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:6px 4px;">When</th>'
+      + '<th style="text-align:left;padding:6px 4px;">Strategy</th>'
+      + '<th style="text-align:left;padding:6px 4px;">Symbol</th>'
+      + '<th style="text-align:left;padding:6px 4px;">Dir</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Entry</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Exit</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Size</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Buy-in $</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Risk $</th>'
+      + '<th style="text-align:right;padding:6px 4px;">PnL $</th>'
+      + '<th style="text-align:right;padding:6px 4px;">PnL %</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Cumulative</th>'
+      + '<th style="text-align:left;padding:6px 4px;">Exit reason</th>'
+      + '</tr></thead><tbody>';
+
+    for (const t of trades) {
+      const tsShort = (t.ts || '').replace('T', ' ').substring(0, 19);
+      const pnlColor = (t.pnl_usd || 0) >= 0 ? '#00ff88' : '#ff4444';
+      const sign = (t.pnl_usd || 0) >= 0 ? '+' : '';
+      const risk = t.risk_usd != null ? '$' + Number(t.risk_usd).toFixed(2) : '—';
+      const pct = t.pnl_pct_of_fleet !== '' && t.pnl_pct_of_fleet != null ? (Number(t.pnl_pct_of_fleet) >= 0 ? '+' : '') + Number(t.pnl_pct_of_fleet).toFixed(3) + '%' : '—';
+      const entry = t.entry_px ? Number(t.entry_px).toFixed(4).replace(/\.?0+$/, '') : '—';
+      const exit = t.exit_px ? Number(t.exit_px).toFixed(4).replace(/\.?0+$/, '') : '—';
+      const cum = runMap.get(t.ts + '|' + t.strategy);
+      const cumColor = (cum || 0) >= 0 ? '#00ff88' : '#ff4444';
+      const cumStr = cum != null ? ((cum >= 0 ? '+' : '') + '$' + cum.toFixed(2)) : '—';
+      const buyIn = t.notional_usd != null ? '$' + Number(t.notional_usd).toLocaleString(undefined, {maximumFractionDigits:0}) : '—';
+      html += '<tr style="border-bottom:1px solid #151c2c;">'
+        + '<td style="padding:5px 4px;color:#9da8c7;white-space:nowrap;">' + tsShort + '</td>'
+        + '<td style="padding:5px 4px;color:#00d4ff;">' + (t.strategy || '—') + '</td>'
+        + '<td style="padding:5px 4px;color:#e0e0e0;">' + (t.symbol || '—') + '</td>'
+        + '<td style="padding:5px 4px;color:#9da8c7;">' + (t.direction || '—') + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + entry + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + exit + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + (t.size || '—') + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#e0e0e0;">' + buyIn + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + risk + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + sign + '$' + (t.pnl_usd || 0).toFixed(2) + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:' + pnlColor + ';">' + pct + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:' + cumColor + ';">' + cumStr + '</td>'
+        + '<td style="padding:5px 4px;color:#7b8ab8;">' + (t.exit_reason || '—') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+
+    el.innerHTML = html;
+  }).catch((e)=>{
+    const el = document.getElementById('recent-trades-panel');
+    if (el) el.innerHTML = '<div style="color:#ff4444;font-size:0.75em;">recent trades error: ' + e + '</div>';
+  });
+}
+loadRecentTrades();
+setInterval(loadRecentTrades, 60000);
+</script>
+<script>
+function loadStrategyTiers() {
+  fetch('/api/strategy_tiers').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('strategy-tiers-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="color:#ff4444;font-size:0.75em;">strategy tier error: ' + data.error + '</div>';
+      return;
+    }
+    const strategies = data.strategies || [];
+    const anchor = Number(data.anchor_usd || 0);
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">DYNAMIC RISK TIERS</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">anchor $' + anchor.toLocaleString(undefined,{maximumFractionDigits:0})
+      + ' | ceiling ' + (Number(data.ceiling_pct || 0) * 100).toFixed(2) + '% | window ' + (data.tier_window_days || '?') + 'd</div>'
+      + '</div>';
+
+    html += '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.72em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:6px 4px;">Strategy</th>'
+      + '<th style="text-align:left;padding:6px 4px;">Tier</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Risk %</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Risk $ now</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Trades</th>'
+      + '<th style="text-align:right;padding:6px 4px;">PF</th>'
+      + '<th style="text-align:right;padding:6px 4px;">Win %</th>'
+      + '<th style="text-align:right;padding:6px 4px;">PnL $</th>'
+      + '</tr></thead><tbody>';
+    for (const s of strategies) {
+      const stats = s.stats || {};
+      const tier = s.tier || 'unknown';
+      const tierColor = tier === 'unproven' ? '#7b8ab8' : tier === 'emerging' ? '#00d4ff' : tier === 'validated' ? '#00ff88' : tier === 'promoted' ? '#ffaa00' : '#ff9800';
+      const pnl = Number(stats.pnl_usd || 0);
+      const pnlColor = pnl >= 0 ? '#00ff88' : '#ff4444';
+      html += '<tr style="border-bottom:1px solid #151c2c;">'
+        + '<td style="padding:5px 4px;color:#e0e0e0;">' + (s.strategy || '—') + '</td>'
+        + '<td style="padding:5px 4px;color:' + tierColor + ';font-weight:bold;">' + tier + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#00d4ff;">' + (Number(s.risk_pct || 0) * 100).toFixed(2) + '%</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#e0e0e0;">$' + Number(s.risk_usd_now || 0).toLocaleString(undefined,{maximumFractionDigits:0}) + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + Number(stats.trades || 0) + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + Number(stats.profit_factor || 0).toFixed(2) + '</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:#9da8c7;">' + (Number(stats.win_rate || 0) * 100).toFixed(1) + '%</td>'
+        + '<td style="padding:5px 4px;text-align:right;color:' + pnlColor + ';">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch((e)=>{
+    const el = document.getElementById('strategy-tiers-panel');
+    if (el) el.innerHTML = '<div style="color:#ff4444;font-size:0.75em;">strategy tier error: ' + e + '</div>';
+  });
+}
+loadStrategyTiers();
+setInterval(loadStrategyTiers, 60000);
+</script>
+<script>
+function renderEquityCurve(points, width, height, anchor) {
+  if (!points || points.length < 2) {
+    return '<div style="color:#7b8ab8;font-size:0.7em;padding:20px;text-align:center;">Not enough trades in window to plot.</div>';
+  }
+  const pad = {top: 10, right: 10, bottom: 20, left: 44};
+  const W = width, H = height;
+  const innerW = W - pad.left - pad.right;
+  const innerH = H - pad.top - pad.bottom;
+  const vals = points.map(p => p.cumulative_pnl_usd);
+  let vMin = Math.min(0, ...vals);
+  let vMax = Math.max(0, ...vals);
+  if (vMax === vMin) vMax = vMin + 1;
+  const pad_v = (vMax - vMin) * 0.08;
+  vMin -= pad_v; vMax += pad_v;
+  const t0 = new Date(points[0].ts).getTime();
+  const t1 = new Date(points[points.length-1].ts).getTime();
+  const tSpan = Math.max(t1 - t0, 1);
+  const x = (ts) => pad.left + ((new Date(ts).getTime() - t0) / tSpan) * innerW;
+  const y = (v) => pad.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
+
+  // Path + area
+  let linePath = '';
+  let areaPath = '';
+  points.forEach((p, i) => {
+    const px = x(p.ts), py = y(p.cumulative_pnl_usd);
+    linePath += (i === 0 ? 'M' : 'L') + px.toFixed(1) + ',' + py.toFixed(1) + ' ';
+  });
+  if (points.length) {
+    const x0 = x(points[0].ts), x1 = x(points[points.length-1].ts), yZero = y(0);
+    areaPath = 'M' + x0.toFixed(1) + ',' + yZero.toFixed(1) + ' '
+      + points.map(p => 'L' + x(p.ts).toFixed(1) + ',' + y(p.cumulative_pnl_usd).toFixed(1)).join(' ')
+      + ' L' + x1.toFixed(1) + ',' + yZero.toFixed(1) + ' Z';
+  }
+
+  const finalVal = vals[vals.length-1];
+  const stroke = finalVal >= 0 ? '#00ff88' : '#ff4444';
+  const fill = finalVal >= 0 ? 'rgba(0,255,136,0.10)' : 'rgba(255,68,68,0.10)';
+
+  // Y ticks (3 values)
+  const yTicks = [vMin, (vMin+vMax)/2, vMax];
+  let yTickHtml = '';
+  for (const v of yTicks) {
+    const py = y(v);
+    yTickHtml += '<line x1="' + pad.left + '" y1="' + py.toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + py.toFixed(1) + '" stroke="#1e2a42" stroke-width="1" stroke-dasharray="2,3"/>';
+    yTickHtml += '<text x="' + (pad.left - 6) + '" y="' + (py + 3).toFixed(1) + '" fill="#7b8ab8" font-size="10" text-anchor="end">$' + v.toFixed(0) + '</text>';
+  }
+
+  // Zero line (if in range)
+  let zeroLine = '';
+  if (vMin < 0 && vMax > 0) {
+    const yZero = y(0);
+    zeroLine = '<line x1="' + pad.left + '" y1="' + yZero.toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + yZero.toFixed(1) + '" stroke="#334" stroke-width="1"/>';
+  }
+
+  // X date labels (start, middle, end)
+  const fmt = (ts) => { const d = new Date(ts); return (d.getMonth()+1) + '/' + d.getDate(); };
+  const xLabels = '<text x="' + pad.left + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10">' + fmt(points[0].ts) + '</text>'
+    + '<text x="' + (W/2) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="middle">' + fmt(points[Math.floor(points.length/2)].ts) + '</text>'
+    + '<text x="' + (W-pad.right) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="end">' + fmt(points[points.length-1].ts) + '</text>';
+
+  return '<svg width="' + W + '" height="' + H + '" style="display:block;">'
+    + yTickHtml + zeroLine
+    + '<path d="' + areaPath + '" fill="' + fill + '" stroke="none"/>'
+    + '<path d="' + linePath + '" fill="none" stroke="' + stroke + '" stroke-width="1.5"/>'
+    + xLabels
+    + '</svg>';
+}
+
+function loadFleetEquityCurve() {
+  fetch('/api/fleet_equity_curve?window_days=90&include_backfill=false').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('fleet-equity-panel');
+    if (!el) return;
+    const pnl = data.current_cumulative_pnl_usd || 0;
+    const pct = data.current_cumulative_pnl_pct || 0;
+    const anchor = data.anchor_capital_usd || 10000;
+    const trades = data.total_trades || 0;
+    const pnlColor = pnl >= 0 ? '#00ff88' : '#ff4444';
+    const sign = pnl >= 0 ? '+' : '';
+
+    let contribHtml = '';
+    const contrib = data.contribution_by_strategy || {};
+    const entries = Object.entries(contrib);
+    if (entries.length) {
+      contribHtml = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;font-size:0.68em;">';
+      for (const [label, val] of entries) {
+        if (Math.abs(val) < 0.005) continue;
+        const c = val >= 0 ? '#00ff88' : '#ff4444';
+        contribHtml += '<span style="color:#7b8ab8;">' + label + ' <span style="color:' + c + ';">' + (val >= 0 ? '+' : '') + '$' + val.toFixed(2) + '</span></span>';
+      }
+      contribHtml += '</div>';
+    }
+
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">FLEET EQUITY CURVE</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">live-only last ' + (data.window_days || 90) + 'd | anchor $' + anchor.toLocaleString() + ' | ' + trades + ' trades</div>'
+      + '</div>';
+    html += '<div style="display:flex;gap:20px;align-items:baseline;margin-bottom:6px;">'
+      + '<div style="font-size:1.6em;font-weight:bold;color:' + pnlColor + ';">' + sign + '$' + pnl.toFixed(2) + '</div>'
+      + '<div style="font-size:1.0em;color:' + pnlColor + ';">' + sign + pct.toFixed(3) + '%</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">of fleet anchor</div>'
+      + '</div>';
+    html += '<div>' + renderEquityCurve(data.points || [], Math.max(el.clientWidth - 28, 600), 180, anchor) + '</div>';
+    html += contribHtml;
+    el.innerHTML = html;
+  }).catch((e)=>{
+    const el = document.getElementById('fleet-equity-panel');
+    if (el) el.innerHTML = '<div style="color:#ff4444;font-size:0.75em;">equity curve error: ' + e + '</div>';
+  });
+}
+loadFleetEquityCurve();
+setInterval(loadFleetEquityCurve, 60000);
+</script>
 <script>
 function loadFleetHealth() {
   fetch('/api/fleet_health').then(r=>r.json()).then(data=>{
@@ -4586,7 +5436,8 @@ setInterval(loadFleetOverview, 60000);
   </div>
 </div>
 
-<div id="ibkr-analytics" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin:12px 0;"></div>
+<!-- Per-Pair Analytics section removed 2026-04-17: duplicative with fleet_perf_summary. -->
+<!-- WATCHERS section removed 2026-04-17: research-lane card was redundant once fleet monitor surfaced pair-level state. -->
 
 <!-- Greek Family (Helio/Apollo/Hermes) -->
 <div style="margin:16px 0 14px 0;">
@@ -4595,15 +5446,6 @@ setInterval(loadFleetOverview, 60000);
     <span style="font-size:0.72em;color:#7b8ab8;">Swing (Helio) + Momentum (Hermes) + Mean Reversion (Apollo)</span>
   </div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:6px;margin-bottom:12px;" id="greek-family-cards"></div>
-</div>
-
-<!-- Watcher section -->
-<div style="margin:16px 0 14px 0;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h2 style="font-size:0.95em;color:#7b8ab8;margin:0;letter-spacing:2px;">WATCHERS</h2>
-    <span style="font-size:0.72em;color:#7b8ab8;">Research lane. New managed pairs start here and must earn paper QA.</span>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-bottom:12px;" id="ibkr-watcher-cards"></div>
 </div>
 
 <!-- Graveyard (killed pairs) -->
@@ -5288,74 +6130,8 @@ async function loadIBKRFleet() {
       sigsDiv.innerHTML = html;
     }
 
-    // Per-pair equity + drawdown section
-    fetch('/api/fx_analytics').then(r=>r.json()).then(fa=>{
-      const anaDiv = document.getElementById('ibkr-analytics');
-      if (!anaDiv) return;
-      window.toggleKilledCards = function() {
-        const el = document.getElementById('killed-cards');
-        const btn = document.getElementById('killed-toggle-btn');
-        if (!el || !btn) return;
-        const showing = el.style.display !== 'none';
-        el.style.display = showing ? 'none' : 'grid';
-        const count = el.dataset.killedCount || '0';
-        btn.textContent = showing ? ('Show ' + count + ' killed') : ('Hide ' + count + ' killed');
-      };
-      const order = { real: 0, quarantine: 1, paper: 2, watcher: 3 };
-      const allAnalytics = (fa.analytics || []).slice().sort((a, b) => {
-        const diff = (order[a.current_stage] ?? 9) - (order[b.current_stage] ?? 9);
-        if (diff) return diff;
-        return String(a.name || '').localeCompare(String(b.name || ''));
-      });
-      const active = allAnalytics.filter(a => String(a.current_stage||'').toLowerCase() !== 'killed');
-      const killed = allAnalytics.filter(a => String(a.current_stage||'').toLowerCase() === 'killed');
-      const analytics = active;
-      let html = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">'
-        + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;">Per-Pair Analytics</div>'
-        + '<div style="display:flex;align-items:center;gap:12px;">'
-        + '<div style="color:#7b8ab8;font-size:0.68em;">' + active.length + ' active</div>'
-        + (killed.length ? '<button id="killed-toggle-btn" onclick="toggleKilledCards()" style="background:#1e2a42;color:#7b8ab8;border:1px solid #2a3654;border-radius:4px;padding:2px 8px;font-size:0.65em;cursor:pointer;">Show ' + killed.length + ' killed</button>' : '')
-        + '</div></div>';
-      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">';
-      for (const a of analytics) {
-        const ddColor = a.current_drawdown > 0 ? '#ff4444' : '#00ff88';
-        const stage = String(a.current_stage || '').toUpperCase();
-        const stageColor = stage === 'REAL' || stage === 'QUARANTINE' ? '#00e676' : (stage === 'PAPER' ? '#00d4ff' : '#7b8ab8');
-        html += '<div style="min-width:0;padding:10px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;">';
-        html += '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">'
-          + '<div style="font-weight:bold;color:#00d4ff;font-size:0.8em;min-width:0;">' + a.name + '</div>'
-          + '<div style="font-size:0.62em;font-weight:bold;color:' + stageColor + ';letter-spacing:0.8px;white-space:nowrap;">' + stage + '</div>'
-          + '</div>';
-        html += '<div style="font-size:0.7em;margin-top:4px;">';
-        html += 'PnL: <span style="color:' + (a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '">' + (a.cumulative_pnl>=0?'+':'') + a.cumulative_pnl.toFixed(1) + '</span>';
-        html += ' | Max DD: <span style="color:#ff4444">' + a.max_drawdown.toFixed(1) + '</span>';
-        html += ' | Now: <span style="color:' + ddColor + '">' + a.current_drawdown.toFixed(1) + '</span>';
-        html += '</div>';
-        if (a.equity_curve && a.equity_curve.length > 1) {
-          html += '<div style="margin-top:8px;">' + ibkrMiniChart(a.equity_curve, 220, 44, a.cumulative_pnl>=0?'#00ff88':'#ff4444') + '</div>';
-        } else {
-          html += '<div style="margin-top:8px;color:#7b8ab8;font-size:0.68em;">No equity history yet.</div>';
-        }
-        html += '</div>';
-      }
-      html += '</div>';
-      // Killed instruments — collapsed by default
-      if (killed.length) {
-        html += '<div id="killed-cards" data-killed-count="' + killed.length + '" style="display:none;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px;opacity:0.5;">';
-        for (const a of killed) {
-          html += '<div style="min-width:0;padding:10px;background:#0d1117;border:1px solid #1a1f2e;border-radius:6px;">';
-          html += '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">'
-            + '<div style="font-weight:bold;color:#555;font-size:0.8em;min-width:0;">' + a.name + '</div>'
-            + '<div style="font-size:0.62em;font-weight:bold;color:#ff4444;letter-spacing:0.8px;white-space:nowrap;">KILLED</div>'
-            + '</div>';
-          html += '<div style="font-size:0.7em;margin-top:4px;color:#555;">';
-          html += 'PnL: <span>' + (a.cumulative_pnl>=0?'+':'') + a.cumulative_pnl.toFixed(1) + '</span>';
-          html += '</div></div>';
-        }
-        html += '</div>';
-      }
-      anaDiv.innerHTML = html;
-    }).catch(()=>{});
+    // Per-Pair Analytics fetch removed 2026-04-17 along with its container div.
+    // fleet_perf_summary + /api/fleet_perf now cover per-strategy performance.
 
   } catch (e) {
     console.error('IBKR fleet load error:', e);

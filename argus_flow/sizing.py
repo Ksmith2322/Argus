@@ -30,6 +30,37 @@ def fx_pip_value_per_unit_usd(
     return 0.0001
 
 
+def fx_notional_per_unit_usd(
+    symbol: str,
+    *,
+    quote_price: float | None = None,
+    usd_jpy_price: float | None = None,
+) -> float:
+    """Approximate USD notional represented by one base-currency unit.
+
+    This is intentionally separate from pip value. A USDJPY unit is roughly
+    $1 of notional, not ``1 / USDJPY``. For JPY crosses, base/USD is inferred
+    from cross / USDJPY when both prices are available.
+    """
+
+    symbol = (symbol or "").upper()
+    if len(symbol) < 6:
+        return 1.0
+
+    base = symbol[:3]
+    quote = symbol[3:6]
+    px = float(quote_price or 0.0)
+    usd_jpy = float(usd_jpy_price or 0.0)
+
+    if base == "USD":
+        return 1.0
+    if quote == "USD" and px > 0:
+        return px
+    if quote == "JPY" and px > 0 and usd_jpy > 0:
+        return px / usd_jpy
+    return 1.0
+
+
 def fx_units_for_risk(
     *,
     equity_usd: float,

@@ -53,6 +53,7 @@ from argus_flow.ops.trade_artifact_schema import ensure_trade_csv_schema
 from argus_flow.schemas import signal_header, build_signal_row
 from argus_flow.sizing import (
     DEFAULT_JPY_PIP_VALUE_PER_UNIT_USD,
+    fx_notional_per_unit_usd,
     fx_pip_value_per_unit_usd,
     fx_units_for_risk,
     futures_contracts_for_risk,
@@ -124,7 +125,11 @@ REPO = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
-DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
+try:
+    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
+    DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "") or _fleet_anchor())
+except Exception:
+    DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
 GOVERNOR_MODEL_PATH = Path("argus_flow/data/fx_governor.pkl")
 AUTO_GROUP_CLIENT_ID_BASE = 1000
 AUTO_GROUP_CLIENT_ID_SPAN = 8000
@@ -1427,15 +1432,32 @@ class InstrumentRunner:
 
     # ── CSV helpers ──────────────────────────────────────────
     def _get_account_equity(self) -> float:
-        # Paper/watcher stages use modeled equity from risk policy, not live account
-        if getattr(self, "deployment_stage", "") in ("paper", "watcher"):
-            modeled = float(self.risk_policy.get("model_start_equity_usd", 0) or 0)
-            if modeled > 0:
-                return modeled
+        # 2026-04-17: anchor is now dynamic (broker equity), not hardcoded $10K.
+        # Paper/watcher/real all pull from the central helper so going live is
+        # literally a broker-account swap — no sizing math changes.
+        raw = self.risk_policy.get("model_start_equity_usd", 0)
+        if isinstance(raw, str) and raw.strip().lower() == "fleet_anchor":
+            try:
+                from helio.fleet_sizing import get_sizing_anchor_usd
+                return float(get_sizing_anchor_usd())
+            except Exception:
+                return DEFAULT_ACCOUNT_EQUITY_USD
+        # Explicit numeric override in config (escape hatch for testing)
+        try:
+            modeled = float(raw or 0)
+        except (TypeError, ValueError):
+            modeled = 0.0
+        if modeled > 0:
+            return modeled
+        # Live broker equity for real stage, or if paper lacks an override
         tracker = getattr(self, "_equity_tracker", None)
-        if tracker is None:
+        if tracker is not None and tracker.equity_usd:
+            return tracker.equity_usd
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            return float(get_sizing_anchor_usd())
+        except Exception:
             return DEFAULT_ACCOUNT_EQUITY_USD
-        return tracker.equity_usd or DEFAULT_ACCOUNT_EQUITY_USD
 
     def _reference_usd_jpy(self) -> float | None:
         if self.symbol.upper() == "USDJPY":
@@ -1465,17 +1487,36 @@ class InstrumentRunner:
         stop_distance_pts = abs(entry_price - stop_price)
         return stop_distance_pts * self.multiplier * size
 
+    def _effective_risk_pct(self) -> float:
+        """Dynamic tier-based risk_pct for this symbol's Argus strategy.
+        Falls back to the config's static self.risk_pct if fleet_sizing is
+        unavailable — keeps Argus safe even if the central config breaks.
+        """
+        try:
+            from helio.fleet_sizing import get_effective_risk_pct
+            label = f"argus_{self.symbol.lower()}"
+            return float(get_effective_risk_pct(label)["risk_pct"])
+        except Exception:
+            return self.risk_pct
+
     def _resolve_position_size(self, entry_price: float, stop_price: float) -> tuple[float, float, str]:
         equity_usd = self._get_account_equity()
+        # Resolve tier-based risk_pct each call so Argus auto-promotes as
+        # measured live performance earns it (matches Forge tier behavior).
+        effective_risk = self._effective_risk_pct() or self.risk_pct
         if equity_usd < 100:
-            self._log.warning(f"LOW_EQUITY_DEBUG: equity={equity_usd} stage={self.deployment_stage} model={self.risk_policy.get('model_start_equity_usd')} risk_pct={self.risk_pct}")
+            self._log.warning(f"LOW_EQUITY_DEBUG: equity={equity_usd} stage={self.deployment_stage} model={self.risk_policy.get('model_start_equity_usd')} risk_pct={effective_risk}")
 
         if self.dynamic_position_sizing and equity_usd > 0:
             if self.uses_pips:
+                actual_stop_pips = (
+                    abs(entry_price - stop_price) / self.pip_size
+                    if self.pip_size > 0 else self.stop_pips
+                )
                 size = fx_units_for_risk(
                     equity_usd=equity_usd,
-                    risk_pct=self.risk_pct,
-                    stop_pips=self.stop_pips,
+                    risk_pct=effective_risk,
+                    stop_pips=actual_stop_pips if actual_stop_pips > 0 else self.stop_pips,
                     symbol=self.symbol,
                     min_units=self.min_lot_size,
                     max_units=self.max_lot_size,
@@ -1483,11 +1524,15 @@ class InstrumentRunner:
                     usd_jpy_price=self._reference_usd_jpy(),
                 )
             else:
+                actual_stop_bps = (
+                    abs(entry_price - stop_price) / entry_price * 10000.0
+                    if entry_price > 0 else self.stop_bps
+                )
                 size = futures_contracts_for_risk(
                     equity_usd=equity_usd,
-                    risk_pct=self.risk_pct,
+                    risk_pct=effective_risk,
                     entry_price=entry_price,
-                    stop_bps=self.stop_bps,
+                    stop_bps=actual_stop_bps if actual_stop_bps > 0 else self.stop_bps,
                     multiplier=self.multiplier,
                     min_contracts=self.min_contracts,
                     max_contracts=self.max_contracts,
@@ -1507,12 +1552,35 @@ class InstrumentRunner:
             self._log.warning(f"SIZE_CAP: {size} > max_contracts {self.max_contracts}")
             size = float(self.max_contracts)
 
-        # Sanity cap: never exceed 10x the configured lot_size (catch config errors)
-        # FIX: cap to base_size * 10, not base_size (was zeroing out reasonable sizes)
-        base_size = self.lot_size if self.uses_pips else self.num_contracts
-        if base_size > 0 and size > base_size * 10:
-            self._log.warning(f"SIZE_CAP_10X: {size} > 10x base {base_size} — capping to {base_size * 10}")
-            size = float(base_size * 10)
+        # Notional cap (replaced the old SIZE_CAP_10X 2026-04-17): enforce
+        # a percent-of-anchor ceiling on total notional so sizing auto-scales
+        # with broker equity instead of the fixed lot_size config. This keeps
+        # risk math anchored to what a real funded account could actually
+        # hold (e.g., stocks capped at 2x equity per Reg T margin).
+        try:
+            from helio.fleet_sizing import max_notional_usd, get_sizing_anchor_usd
+            asset_class = "fx" if self.uses_pips else "micro_future"
+            cap_usd = max_notional_usd(asset_class)
+            if cap_usd > 0 and entry_price > 0:
+                if self.uses_pips:
+                    notional_per_unit = fx_notional_per_unit_usd(
+                        self.symbol,
+                        quote_price=entry_price,
+                        usd_jpy_price=self._reference_usd_jpy(),
+                    )
+                    cap_units = cap_usd / max(notional_per_unit, 1e-9)
+                else:
+                    cap_units = cap_usd / (float(entry_price) * float(self.multiplier or 1))
+                if size > cap_units:
+                    self._log.warning(f"NOTIONAL_CAP: size {size} > {asset_class} cap {cap_units:.0f} (anchor=${get_sizing_anchor_usd():,.0f})")
+                    size = float(cap_units)
+        except Exception as _e:
+            # Safety fallback: retain the original 10x lot_size guard if
+            # fleet_sizing is unavailable at this callsite.
+            base_size = self.lot_size if self.uses_pips else self.num_contracts
+            if base_size > 0 and size > base_size * 10:
+                self._log.warning(f"SIZE_CAP_10X (fallback): {size} > 10x base {base_size} — capping")
+                size = float(base_size * 10)
 
         risk_usd = self._risk_usd_for_size(entry_price, stop_price, size)
         return size, risk_usd, policy
@@ -3546,6 +3614,9 @@ class PortfolioRiskManager:
             data = json.loads(self._STATE_FILE.read_text())
             self._drawdown_pause = bool(data.get("drawdown_pause", False))
             self._peak_pnl = float(data.get("peak_pnl", 0.0))
+            # Persisted current_pnl used only for startup-reconciliation dd check
+            # (in-memory _current_pnl otherwise re-derives from live update()).
+            _persisted_current_pnl = float(data.get("current_pnl", 0.0))
             day = data.get("current_day", "")
             if day == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
                 self._daily_pnl = {k: float(v) for k, v in data.get("daily_pnl", {}).items()}
@@ -3554,6 +3625,29 @@ class PortfolioRiskManager:
                 self._current_day = day
             if self._drawdown_pause:
                 log.warning(f"RISK_MGR: restored DRAWDOWN_PAUSE from disk (peak={self._peak_pnl:.2f}R)")
+                # Startup reconciliation: if persisted drawdown is below threshold
+                # OR a manual RESET_DRAWDOWN flag is pending, clear the pause now
+                # instead of waiting for the first can_enter call. Rationale:
+                # when upstream PAUSE_ENTRIES blocks can_enter, the auto-consume
+                # path never fires and drawdown_pause sticks across restarts
+                # (observed 2026-04-17: 9.4-day-old RESET_DRAWDOWN never consumed).
+                reset_file = REPO / "RESET_DRAWDOWN"
+                if self._peak_pnl > 0:
+                    persisted_dd = (self._peak_pnl - _persisted_current_pnl) / abs(self._peak_pnl)
+                    if persisted_dd < self.max_drawdown_pct:
+                        self._drawdown_pause = False
+                        log.info(
+                            f"RISK_MGR: startup reconciliation cleared pause — "
+                            f"dd={persisted_dd*100:.2f}% < threshold={self.max_drawdown_pct*100:.2f}%"
+                        )
+                    elif reset_file.exists():
+                        self._drawdown_pause = False
+                        try:
+                            reset_file.unlink()
+                        except OSError:
+                            pass
+                        log.info("RISK_MGR: startup reconciliation consumed RESET_DRAWDOWN; pause cleared")
+                self.save_persistent_state()
         except Exception as exc:
             log.warning(f"RISK_MGR: failed to load persistent state: {exc}")
 

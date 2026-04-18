@@ -1,0 +1,36 @@
+{
+  "_comment": "Central fleet sizing. Risk = risk_pct * broker_equity. Anchor is DYNAMIC — pulled from risk_oversight_report.json each trade. Going live means IBKR account switches; broker equity updates automatically, sizing follows.",
+
+  "sizing_mode": "broker_equity_dynamic",
+  "fallback_anchor_usd": 10000.0,
+  "_fallback_note": "Used only when risk_oversight_report.json is missing/stale. Guards against divide-by-zero on cold start.",
+
+  "max_risk_pct_per_trade_ceiling": 0.03,
+  "fleet_max_open_risk_pct": 0.06,
+
+  "_tiers_note": "Confidence-based risk_pct. Each strategy's risk scales with measured live performance (last 90 days). Tiers evaluated per trade. Drawdown brake halves the tier if current dd > 50% of peak_pnl.",
+  "tiers": [
+    {"name": "unproven",    "min_valid_trades": 0,   "min_profit_factor": 0.0,  "risk_pct": 0.005},
+    {"name": "emerging",    "min_valid_trades": 10,  "min_profit_factor": 1.00, "risk_pct": 0.010},
+    {"name": "validated",   "min_valid_trades": 30,  "min_profit_factor": 1.20, "risk_pct": 0.015},
+    {"name": "promoted",    "min_valid_trades": 60,  "min_profit_factor": 1.30, "risk_pct": 0.020},
+    {"name": "exceptional", "min_valid_trades": 100, "min_profit_factor": 1.50, "risk_pct": 0.030}
+  ],
+  "tier_window_days": 90,
+  "drawdown_brake_threshold": 0.5,
+
+  "_strategy_live_cutoffs_note": "ISO-8601 timestamp per strategy. Trades with ts before this are excluded from tier stats (e.g. gdx_gld back-filled historicals). If unset, all trades count.",
+  "strategy_live_cutoffs": {
+    "forge_gdx_gld": "2026-04-17T00:00:00+00:00"
+  },
+
+  "notional_caps_by_asset_class": {
+    "stock": 2.0,
+    "etf":   2.0,
+    "fx":    20.0,
+    "micro_future": 5.0
+  },
+  "_notional_caps_note": "Position notional_usd must be <= anchor * multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK (e.g., $48K GLD on $10K cash account).",
+
+  "version": "2026-04-17.v3"
+}

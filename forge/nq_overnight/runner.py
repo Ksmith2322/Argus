@@ -26,6 +26,7 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
+from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
 
 REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "nq_overnight"
@@ -42,8 +43,8 @@ PARAMS = {
     "stop_atr": 0.5,
     "hold_bars": 4,
     "atr_period": 14,
-    "risk_pct": 0.01,
-    "model_equity_usd": 10000.0,
+    # risk_pct + model_equity_usd removed 2026-04-17 — sourced from
+    # helio.fleet_sizing tier system (strategy_label="forge_nq_overnight").
     "point_value_usd": 2.0,  # MNQ
 }
 
@@ -76,8 +77,8 @@ def _git_sha() -> str:
 
 TRADE_FIELDS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pts", "exit_reason",
-    "duration_min", "trade_num", "pnl_usd", "position_size", "risk_usd",
-    "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
+    "duration_min", "trade_num", "pnl_usd", "pnl_pct_of_fleet", "position_size", "risk_usd",
+    "risk_pct_of_fleet", "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
     "config_hash", "session_id", "runtime_epoch", "git_sha",
     "atr_entry", "stop_px", "target_px", "signal_hour_utc",
 ]
@@ -195,9 +196,14 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float) -> None:
     entry = float(df["Close"].iloc[idx])
     target = entry + PARAMS["target_atr"] * a
     stop = entry - PARAMS["stop_atr"] * a
-    risk_usd = PARAMS["model_equity_usd"] * PARAMS["risk_pct"]
+    risk_budget_usd = compute_risk_usd(strategy_label="forge_nq_overnight")
     stop_dist_pts = entry - stop
-    contracts = max(1, int(risk_usd / (stop_dist_pts * PARAMS["point_value_usd"])))
+    contracts = max(1, int(risk_budget_usd / (stop_dist_pts * PARAMS["point_value_usd"])))
+    cap_contracts = int(max_notional_usd("micro_future") / (entry * PARAMS["point_value_usd"])) if entry > 0 else contracts
+    if cap_contracts > 0 and contracts > cap_contracts:
+        log.warning("NOTIONAL_CAP: MNQ contracts %d > cap %d", contracts, cap_contracts)
+        contracts = cap_contracts
+    risk_usd = stop_dist_pts * PARAMS["point_value_usd"] * contracts
     state["open_trade"] = {
         "entry_ts": str(df.index[idx]),
         "entry_px": entry,
@@ -231,9 +237,11 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
         "duration_min": round(duration_min, 1),
         "trade_num": state["trade_count"],
         "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct_of_fleet": round(pnl_pct_of_fleet(pnl_usd), 4),
         "position_size": ot["position_size"],
         "risk_usd": ot["risk_usd"],
-        "sizing_policy": "fixed_risk_pct",
+        "risk_pct_of_fleet": round(__import__("helio.fleet_sizing", fromlist=["get_effective_risk_pct"]).get_effective_risk_pct("forge_nq_overnight")["risk_pct"] * 100, 3),
+        "sizing_policy": "fleet_anchored_risk_pct",
         "entry_regime": "overnight",
         "experiment_valid": "true",
         "invalid_reason": "",

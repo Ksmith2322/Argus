@@ -59,19 +59,30 @@ def config_hash(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _KEY_SOURCE_FILES = [
-    "engine.py",
-    "strategy_phase2.py",
-    "confluence.py",
-    "adaptive_confluence.py",
-    "regime.py",
-    "structure.py",
-    "liquidity.py",
+    # Files whose change invalidates a run's reproducibility. Pre-Phase-6
+    # legacy files (engine.py, strategy_phase2.py, confluence.py, etc.) were
+    # removed in the Greek-family refactor. Current scope reflects active
+    # production code: Argus runner, risk mgmt, the central sizing anchor,
+    # the fleet monitor, and every live Forge runner. code_hash() is
+    # tolerant of missing files (just skips them), so adding new ones here
+    # is safe.
     "risk.py",
     "ledger.py",
-    "indicators.py",
-    "decisions.py",
-    "runner_live.py",
     "runtime_mode.py",
+    "argus_flow/runner_unified.py",
+    "argus_flow/ops/promotion_gate_v2.py",
+    "argus_flow/ops/fleet_registry.py",
+    "argus_flow/configs/fleet_sizing.json",
+    "helio/fleet_sizing.py",
+    "helio/fleet_monitor.py",
+    "helio/fleet_perf_summary.py",
+    "forge/gld_pm_long/runner.py",
+    "forge/wick_gbpusd/runner.py",
+    "forge/nq_overnight/runner.py",
+    "forge/jpy_pm_short/runner.py",
+    "forge/gdx_gld_runner.py",
+    "apollo/runner.py",
+    "apollo/ops/backfill_forward_returns.py",
 ]
 
 

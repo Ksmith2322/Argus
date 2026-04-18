@@ -35,7 +35,11 @@ MIN_TRADES_PER_WEEK = 10
 DRAWDOWN_QUARANTINE_MULT = 2.0  # 2x model DD -> QUARANTINE
 DRAWDOWN_KILL_MULT = 3.0  # 3x model DD -> KILL
 SINGLE_DAY_LOSS_PCT = 0.05  # 5% of model equity
-MODEL_EQUITY_DEFAULT = 10_000.0
+try:
+    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
+    MODEL_EQUITY_DEFAULT = _fleet_anchor()
+except Exception:
+    MODEL_EQUITY_DEFAULT = 10_000.0
 
 # No-progress kill: if a pair is break-even after this many trades, prune it
 NO_PROGRESS_TRADE_THRESHOLD = 80  # trades in paper/real before checking

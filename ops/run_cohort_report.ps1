@@ -36,6 +36,39 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] apollo WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Running Apollo forward-return backfill..."
+    $apolloBackfillOutput = & $python -m apollo.ops.backfill_forward_returns 2>&1
+    foreach ($line in @($apolloBackfillOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] apollo_backfill: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] apollo_backfill WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Generating fleet performance summary..."
+    $perfOutput = & $python -m helio.fleet_perf_summary 2>&1
+    foreach ($line in @($perfOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] fleet_perf: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] fleet_perf WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Generating signal frequency report..."
+    $sigFreqOutput = & $python -m argus_flow.ops.signal_frequency_tracker 2>&1
+    foreach ($line in @($sigFreqOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] signal_freq: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] signal_freq WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Hermes gap scanner..."
     $hermesOutput = & $python -m hermes.runner --dry-run --min-score 75 2>&1
     foreach ($line in @($hermesOutput)) {

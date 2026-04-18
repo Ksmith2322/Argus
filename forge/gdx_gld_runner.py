@@ -42,6 +42,12 @@ except ImportError:
     print("Required: pip install pandas numpy")
     sys.exit(1)
 
+# Ensure repo root on path for helio.fleet_sizing
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from helio.fleet_sizing import get_initial_capital_usd, pnl_pct_of_fleet
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -261,6 +267,7 @@ SIGNAL_COLS = ["timestamp", "gdx_close", "gld_close", "spread", "z_score", "sign
 TRADE_COLS = [
     "entry_date", "exit_date", "direction", "entry_z", "exit_z",
     "gdx_entry", "gld_entry", "gdx_exit", "gld_exit", "pnl_pct", "exit_reason",
+    "gdx_shares", "gld_shares", "equity_at_entry_usd", "pnl_usd", "pnl_pct_of_fleet",
 ]
 
 
@@ -280,14 +287,43 @@ def append_signal_row(
                                  f"{spread:.6f}", f"{z:.4f}", signal])
 
 
+def compute_trade_pnl_usd(
+    direction: str,
+    gdx_entry: float, gld_entry: float,
+    gdx_exit: float, gld_exit: float,
+    equity_usd: float,
+) -> Tuple[int, int, float]:
+    """Compute dollar PnL for a gdx_gld pairs trade using the same sizing
+    the strategy would use at `equity_usd` (half-equity per leg, dollar-neutral).
+
+    Returns (gdx_shares, gld_shares, pnl_usd).
+    """
+    half_equity = equity_usd / 2.0
+    gdx_shares = max(1, int(half_equity / gdx_entry))
+    gld_shares = max(1, int(half_equity / gld_entry))
+    # LONG_SPREAD = long GDX, short GLD (spread expected to mean-revert up)
+    # SHORT_SPREAD = short GDX, long GLD
+    if direction == "LONG_SPREAD":
+        pnl_usd = gdx_shares * (gdx_exit - gdx_entry) - gld_shares * (gld_exit - gld_entry)
+    else:  # SHORT_SPREAD
+        pnl_usd = -gdx_shares * (gdx_exit - gdx_entry) + gld_shares * (gld_exit - gld_entry)
+    return gdx_shares, gld_shares, pnl_usd
+
+
 def append_trade_row(
     entry_date: str, exit_date: str, direction: str,
     entry_z: float, exit_z: float,
     gdx_entry: float, gld_entry: float,
     gdx_exit: float, gld_exit: float,
     pnl_pct: float, exit_reason: str,
+    equity_usd: Optional[float] = None,
 ) -> None:
     _init_csv(TRADES_CSV, TRADE_COLS)
+    if equity_usd is None:
+        equity_usd = get_initial_capital_usd()
+    gdx_shares, gld_shares, pnl_usd = compute_trade_pnl_usd(
+        direction, gdx_entry, gld_entry, gdx_exit, gld_exit, equity_usd
+    )
     with open(TRADES_CSV, "a", newline="") as f:
         csv.writer(f).writerow([
             entry_date, exit_date, direction,
@@ -295,6 +331,8 @@ def append_trade_row(
             f"{gdx_entry:.4f}", f"{gld_entry:.4f}",
             f"{gdx_exit:.4f}", f"{gld_exit:.4f}",
             f"{pnl_pct:.4f}", exit_reason,
+            gdx_shares, gld_shares, f"{equity_usd:.2f}",
+            f"{pnl_usd:.2f}", f"{pnl_pct_of_fleet(pnl_usd):.4f}",
         ])
 
 
@@ -781,7 +819,7 @@ Examples:
                    help="Run signal-only continuously (evaluate every --interval-min)")
     p.add_argument("--interval-min", type=int, default=60,
                    help="Loop interval in minutes (default: 60)")
-    p.add_argument("--equity", type=float, default=10_000.0,
+    p.add_argument("--equity", type=float, default=get_initial_capital_usd(),
                    help="Model equity in USD (default: 10000)")
     p.add_argument("--start", type=str, default="2006-05-22",
                    help="Backtest start date (default: 2006-05-22, GDX inception)")

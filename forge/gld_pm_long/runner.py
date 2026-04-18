@@ -29,6 +29,7 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
+from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
 
 REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "gld_pm_long"
@@ -45,8 +46,10 @@ PARAMS = {
     "stop_atr": 0.5,
     "hold_bars": 4,
     "atr_period": 14,
-    "risk_pct": 0.01,
-    "model_equity_usd": 10000.0,
+    # risk_pct + model_equity_usd both removed 2026-04-17:
+    # sizing now comes from helio.fleet_sizing via tier system (risk_pct
+    # auto-sets from measured live performance). See strategy_label
+    # "forge_gld_pm_long" in fleet_sizing.json tiers config.
 }
 
 TRADES_PATH = LOG_DIR / "trades.csv"
@@ -78,8 +81,8 @@ def _git_sha() -> str:
 
 TRADE_FIELDS = [
     "ts", "direction", "entry_px", "exit_px", "pnl_pts", "exit_reason",
-    "duration_min", "trade_num", "pnl_usd", "position_size", "risk_usd",
-    "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
+    "duration_min", "trade_num", "pnl_usd", "pnl_pct_of_fleet", "position_size", "risk_usd",
+    "risk_pct_of_fleet", "sizing_policy", "entry_regime", "experiment_valid", "invalid_reason",
     "config_hash", "session_id", "runtime_epoch", "git_sha",
     "atr_entry", "stop_px", "target_px", "signal_hour_utc",
 ]
@@ -110,13 +113,29 @@ def _save_state(state: dict) -> None:
 
 
 def _write_heartbeat(state: dict, last_eval_ts: str) -> None:
+    ot = state.get("open_trade")
+    open_bars_held = None
+    open_wall_minutes = None
+    if ot:
+        try:
+            entry_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+            last_ts_dt = pd.to_datetime(last_eval_ts, utc=True)
+            open_wall_minutes = round((last_ts_dt - entry_ts).total_seconds() / 60.0, 1)
+            open_bars_held = int(ot.get("bars_held", 0))
+        except Exception:
+            pass
     HEARTBEAT_PATH.write_text(json.dumps({
         "system": "gld_pm_long",
         "family": "forge",
         "ts": datetime.now(timezone.utc).isoformat(),
         "mode": "paper",
         "trade_count": state.get("trade_count", 0),
-        "open_trade": state.get("open_trade"),
+        "open_trade": ot,
+        # Use bars_held for open-trade SLO, not wall-clock minutes: equity hourly
+        # bars gap overnight so a held position can show 18+ wall-clock hours
+        # while only occupying 2-3 market bars (designed-normal for this strategy).
+        "open_bars_held": open_bars_held,
+        "open_wall_minutes": open_wall_minutes,
         "last_eval_ts": last_eval_ts,
         "config_hash": _config_hash(),
         "git_sha": _git_sha(),
@@ -200,8 +219,13 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float) -> None:
     entry = float(df["Close"].iloc[idx])  # fill at hour close (paper)
     target = entry + PARAMS["target_atr"] * a
     stop = entry - PARAMS["stop_atr"] * a
-    risk_usd = PARAMS["model_equity_usd"] * PARAMS["risk_pct"]
-    pos_size = int(risk_usd / max(entry - stop, 0.01))
+    risk_budget_usd = compute_risk_usd(strategy_label="forge_gld_pm_long")
+    pos_size = int(risk_budget_usd / max(entry - stop, 0.01))
+    cap_shares = int(max_notional_usd("etf") / entry) if entry > 0 else pos_size
+    if cap_shares > 0 and pos_size > cap_shares:
+        log.warning("NOTIONAL_CAP: GLD shares %d > cap %d", pos_size, cap_shares)
+        pos_size = cap_shares
+    risk_usd = pos_size * max(entry - stop, 0.0)
     state["open_trade"] = {
         "entry_ts": str(df.index[idx]),
         "entry_px": entry,
@@ -235,9 +259,11 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
         "duration_min": round(duration_min, 1),
         "trade_num": state["trade_count"],
         "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct_of_fleet": round(pnl_pct_of_fleet(pnl_usd), 4),
         "position_size": ot["position_size"],
         "risk_usd": ot["risk_usd"],
-        "sizing_policy": "fixed_risk_pct",
+        "risk_pct_of_fleet": round(__import__("helio.fleet_sizing", fromlist=["get_effective_risk_pct"]).get_effective_risk_pct("forge_gld_pm_long")["risk_pct"] * 100, 3),
+        "sizing_policy": "fleet_anchored_risk_pct",
         "entry_regime": "pm_session",
         "experiment_valid": "true",
         "invalid_reason": "",

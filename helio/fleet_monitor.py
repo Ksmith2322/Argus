@@ -32,13 +32,21 @@ sys.path.insert(0, str(REPO))
 from dotenv import load_dotenv
 load_dotenv(REPO / ".env")
 
+from logging.handlers import RotatingFileHandler
+
+_fleet_log_path = REPO / "argus_flow" / "logs" / "fleet_monitor.log"
+_fleet_log_path.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] fleet | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(REPO / "argus_flow" / "logs" / "fleet_monitor.log", encoding="utf-8"),
+        # Rotation: 5 MB × 3 backups. Caps worst-case disk use at ~20 MB and
+        # prevents the kind of 50k-line log explosion we saw during the
+        # 2026-04-17 hash-pin crash loop.
+        RotatingFileHandler(_fleet_log_path, maxBytes=5 * 1024 * 1024,
+                            backupCount=3, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("fleet_monitor")
@@ -53,28 +61,17 @@ def _load_json(path: Path) -> dict | None:
         return None
 
 
-def _managed_heartbeat_paths(config_glob: str, *, log_prefix: str = "") -> list[Path]:
-    cfg_dir = REPO / "helio" / "configs"
-    paths: list[Path] = []
-    for cfg_path in sorted(cfg_dir.glob(config_glob)):
-        payload = _load_json(cfg_path) or {}
-        symbol = str(payload.get("symbol", cfg_path.stem)).lower()
-        leaf = f"{log_prefix}{symbol}"
-        paths.append(REPO / "helio" / "logs" / leaf / "heartbeat.json")
-    return paths
-
 # Per-system config
 SYSTEMS = {
     "argus": {
         "heartbeats": [
             REPO / "argus_flow" / "logs" / sym / "heartbeat.json"
-            for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]
+            for sym in ["usdjpy", "gbpusd", "cadjpy"]
         ],
         "stale_threshold_s": 300,  # 5 min
         "process_match": "runner_unified",
         "restart_args": [
             "-m", "argus_flow.runner_unified", "--configs",
-            "argus_flow/configs/audjpy_mtf_paper_v1.json",
             "argus_flow/configs/usdjpy_mtf_paper_v1.json",
             "argus_flow/configs/gbpusd_range_paper_v1.json",
             "argus_flow/configs/cadjpy_mtf_paper_v1.json",
@@ -101,32 +98,6 @@ SYSTEMS = {
         "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14"],
         "supports_live_flag": True,
     },
-    # --- Managed Helio: DISABLED ---
-    # These runners are disabled from auto-restart until the managed Helio
-    # layer is fixed. Legacy Greek (titan/hermes/apollo) is the active
-    # execution path. Managed Helio ran in watcher/paper mode but created
-    # noisy synthetic positions and stale heartbeats. Re-enable after:
-    #   1. Watcher lane is truly observe-only (no synthetic trades)
-    #   2. State cleanup on FLAT is implemented
-    #   3. Single control plane decision is made (legacy vs managed)
-    # "helio_swing": {
-    #     "heartbeats": _managed_heartbeat_paths("*_swing_v1.json"),
-    #     "stale_threshold_s": 129600,
-    #     "process_match": " -m helio.runner ",
-    #     "restart_args": ["-m", "helio.runner"],
-    # },
-    # "helio_hermes": {
-    #     "heartbeats": _managed_heartbeat_paths("hermes_*_v1.json", log_prefix="hermes_"),
-    #     "stale_threshold_s": 129600,
-    #     "process_match": "helio.runner_hermes",
-    #     "restart_args": ["-m", "helio.runner_hermes"],
-    # },
-    # "helio_apollo": {
-    #     "heartbeats": _managed_heartbeat_paths("apollo_*_v1.json", log_prefix="apollo_"),
-    #     "stale_threshold_s": 43200,
-    #     "process_match": "helio.runner_apollo",
-    #     "restart_args": ["-m", "helio.runner_apollo"],
-    # },
     "forge_gdx_gld": {
         "heartbeats": [REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"],
         "stale_threshold_s": 5400,  # 90 min (loop is 60min + buffer)
@@ -237,7 +208,17 @@ SYSTEMS = {
 PYTHON = r"C:\Argus\.venv\Scripts\python.exe"
 SNAPSHOT_DIR = REPO / "argus_flow" / "logs" / "fleet_snapshots"
 ALERT_COOLDOWN_S = 1800  # don't alert same issue more than once per 30 min
-_last_alert = {}  # system -> timestamp
+_last_alert: dict[str, float] = {}  # alert_key -> timestamp
+_restart_history: dict[str, list[float]] = {}  # system -> recent restart epochs
+_last_webhook_ping: float = 0.0  # last successful heartbeat ping to webhook
+CRASH_LOOP_WINDOW_S = 600   # 10 min window
+CRASH_LOOP_MAX = 3          # >3 restarts in window = loop
+WEBHOOK_PING_INTERVAL_S = 4 * 3600  # send alive ping every 4h
+PAUSE_ENTRIES_FILE = REPO / "PAUSE_ENTRIES"
+PAUSE_ENTRIES_ALERT_AGE_S = 600  # alert if file older than 10 min
+HASHES_FILE = REPO / "argus_flow" / "configs" / "hashes.json"
+DISCORD_FAILURES_LOG = REPO / "argus_flow" / "logs" / "discord_failures.jsonl"
+CRASH_LOOP_ALERTS_LOG = REPO / "argus_flow" / "logs" / "crash_loop_alerts.json"
 
 
 # ── Heartbeat checks ─────────────────────────────────────────
@@ -267,8 +248,34 @@ def _argus_killed_symbols() -> set[str]:
     return killed
 
 
+def _read_heartbeat_runtime(hb_path: Path) -> dict:
+    """Extract runtime truth fields from a heartbeat file (if JSON)."""
+    data = _load_json(hb_path) or {}
+    keys = ("entries_blocked", "entry_block_reason", "broker_connected",
+            "consecutive_errors", "position", "reconciled_at", "strategy")
+    return {k: data.get(k) for k in keys if k in data}
+
+
+def _scan_fatals(log_path: Path, tail_lines: int = 200) -> tuple[int, str | None]:
+    """Count FATAL lines in the last N lines of a log. Returns (count, most_recent_line)."""
+    if not log_path.exists():
+        return 0, None
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(64 * 1024, size)
+            f.seek(size - chunk)
+            data = f.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()[-tail_lines:]
+        fatal_lines = [ln for ln in lines if "FATAL" in ln or "[ERROR]" in ln.upper() and "fatal" in ln.lower()]
+        return len(fatal_lines), (fatal_lines[-1] if fatal_lines else None)
+    except Exception:
+        return 0, None
+
+
 def check_system_health(name: str, cfg: dict) -> dict:
-    """Check if a system is healthy. Returns status dict."""
+    """Check if a system is healthy. Returns status dict with runtime-truth fields."""
     result = {"name": name, "status": "UNKNOWN", "stale_count": 0, "details": []}
     process_alive = is_process_running(cfg["process_match"])
     result["process_alive"] = process_alive
@@ -279,6 +286,8 @@ def check_system_health(name: str, cfg: dict) -> dict:
     artifact_glob = cfg.get("artifact_glob")
     if artifact_glob:
         import glob as _glob
+        result["health_basis"] = "artifact_freshness"
+        result["scheduled_one_shot"] = True
         matches = _glob.glob(artifact_glob)
         if not matches:
             result["status"] = "DOWN"
@@ -295,6 +304,12 @@ def check_system_health(name: str, cfg: dict) -> dict:
             result["status"] = "OK"
         return result
 
+    result["health_basis"] = "process_and_heartbeat"
+
+    runtime_by_symbol: dict[str, dict] = {}
+    any_entries_blocked = False
+    any_broker_disconnected = False
+
     if cfg["heartbeats"]:
         ages = []
         for hb in cfg["heartbeats"]:
@@ -310,13 +325,40 @@ def check_system_health(name: str, cfg: dict) -> dict:
                 result["details"].append(f"{hb.parent.name}: stale {int(age)}s")
             else:
                 ages.append(age)
+                rt = _read_heartbeat_runtime(hb)
+                if rt:
+                    runtime_by_symbol[hb.parent.name] = rt
+                    if rt.get("entries_blocked"):
+                        any_entries_blocked = True
+                    if rt.get("broker_connected") is False:
+                        any_broker_disconnected = True
         if ages:
             result["max_age_s"] = int(max(ages))
+
+    if runtime_by_symbol:
+        result["runtime"] = runtime_by_symbol
+        if any_entries_blocked:
+            reasons = sorted({r.get("entry_block_reason") or "?" for r in runtime_by_symbol.values() if r.get("entries_blocked")})
+            result["details"].append(f"entries_blocked: {','.join(reasons)}")
+        if any_broker_disconnected:
+            result["details"].append("broker_disconnected")
+
+    # Argus-specific: scan runner_unified.log for recent FATALs
+    if name == "argus":
+        runner_log = REPO / "argus_flow" / "logs" / "runner_unified.log"
+        fatal_count, last_fatal = _scan_fatals(runner_log)
+        if fatal_count > 0:
+            result["recent_fatal_count"] = fatal_count
+            if last_fatal:
+                result["last_fatal"] = last_fatal[-300:]
+            result["details"].append(f"recent FATALs in runner_unified.log: {fatal_count}")
 
     if not process_alive:
         result["status"] = "DOWN"
     elif result["stale_count"] > 0:
         result["status"] = "STALE"
+    elif any_entries_blocked or any_broker_disconnected:
+        result["status"] = "BLOCKED"
     else:
         result["status"] = "OK"
 
@@ -344,9 +386,93 @@ def build_restart_args(cfg: dict, legacy_execution_mode: str = "paper") -> list[
     return args
 
 
+def _hash_preflight(restart_args: list[str]) -> list[tuple[str, str, str]]:
+    """Return mismatches [(filename, expected, actual)] between the configs in
+    restart_args and the pinned registry. Empty list = all good or no configs.
+
+    Why: prevents fleet_monitor from spinning a crash loop when an operator edits
+    a config without re-pinning hashes.json — see 2026-04-17 incident.
+    """
+    if not HASHES_FILE.exists():
+        return []
+    try:
+        pinned = json.loads(HASHES_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    import hashlib
+    mismatches: list[tuple[str, str, str]] = []
+    for arg in restart_args:
+        if not arg.endswith(".json"):
+            continue
+        cfg_path = REPO / arg if not Path(arg).is_absolute() else Path(arg)
+        if not cfg_path.exists():
+            continue
+        expected = pinned.get(cfg_path.name)
+        if expected is None:
+            continue
+        raw = cfg_path.read_text(encoding="utf-8")
+        actual = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        if expected != actual:
+            mismatches.append((cfg_path.name, expected, actual))
+    return mismatches
+
+
+def _register_restart(name: str) -> bool:
+    """Record a restart attempt. Return True if within crash-loop budget,
+    False if crash loop detected (caller should NOT restart).
+    """
+    now = time.time()
+    hist = _restart_history.setdefault(name, [])
+    # Drop entries outside the window
+    cutoff = now - CRASH_LOOP_WINDOW_S
+    hist[:] = [t for t in hist if t >= cutoff]
+    if len(hist) >= CRASH_LOOP_MAX:
+        return False
+    hist.append(now)
+    return True
+
+
+def _emit_crash_loop_alert(name: str, count: int, reason: str) -> None:
+    """Persist a crash-loop alert and fire a distinct-keyed Discord message."""
+    CRASH_LOOP_ALERTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "system": name,
+        "restart_count_in_window": count,
+        "window_s": CRASH_LOOP_WINDOW_S,
+        "reason": reason,
+    }
+    try:
+        existing = _load_json(CRASH_LOOP_ALERTS_LOG) or {"alerts": []}
+        existing.setdefault("alerts", []).append(record)
+        CRASH_LOOP_ALERTS_LOG.write_text(json.dumps(existing, indent=2))
+    except Exception as exc:
+        log.error(f"Could not write crash-loop alert log: {exc}")
+    send_discord(
+        f"**CRASH LOOP: {name.upper()}** {count} restarts in {CRASH_LOOP_WINDOW_S // 60} min. "
+        f"Restarts suspended. Reason: {reason}",
+        system=f"{name}_crashloop",
+    )
+
+
 def restart_system(name: str, cfg: dict, legacy_execution_mode: str = "paper") -> bool:
-    """Auto-restart a crashed/stale system."""
+    """Auto-restart a crashed/stale system, with hash-pin preflight + crash-loop guard."""
     restart_args = build_restart_args(cfg, legacy_execution_mode=legacy_execution_mode)
+
+    mismatches = _hash_preflight(restart_args)
+    if mismatches:
+        diff_summary = "; ".join(f"{fn}: pinned={exp} actual={act}" for fn, exp, act in mismatches)
+        log.error(f"HASH_PREFLIGHT: {name} restart SKIPPED — config hash mismatch. {diff_summary}")
+        send_discord(
+            f"**HASH MISMATCH: {name.upper()}** restart SKIPPED. Update `hashes.json` then allow restart.\n{diff_summary}",
+            system=f"{name}_hash_mismatch",
+        )
+        return False
+
+    if not _register_restart(name):
+        _emit_crash_loop_alert(name, len(_restart_history.get(name, [])), "restart budget exceeded")
+        return False
+
     mode_label = "LIVE" if cfg.get("supports_live_flag") and legacy_execution_mode == "live" else "DEFAULT"
     log.warning(f"Restarting {name} ({mode_label} mode, args={restart_args})...")
     try:
@@ -355,28 +481,74 @@ def restart_system(name: str, cfg: dict, legacy_execution_mode: str = "paper") -
             cwd=str(REPO),
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
         )
-        send_discord(f"**FLEET MONITOR: Restarted {name.upper()}** (was DOWN/STALE)")
+        send_discord(f"**FLEET MONITOR: Restarted {name.upper()}** (was DOWN/STALE)", system=f"{name}_restart")
         return True
     except Exception as e:
         log.error(f"Restart failed for {name}: {e}")
         return False
 
 
-def send_discord(msg: str, system: str = "general") -> None:
-    """Send Discord alert with cooldown to prevent spam."""
-    now = time.time()
-    last = _last_alert.get(system, 0)
-    if now - last < ALERT_COOLDOWN_S:
-        return
-    _last_alert[system] = now
-
-    if not WEBHOOK_URL:
-        return
+def _log_discord_failure(reason: str, status: int | None, msg: str) -> None:
+    DISCORD_FAILURES_LOG.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "status": status,
+        "msg_prefix": msg[:120],
+    }
     try:
-        import requests
-        requests.post(WEBHOOK_URL, json={"content": msg[:2000]}, timeout=10)
+        with open(DISCORD_FAILURES_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
     except Exception:
         pass
+
+
+def send_discord(msg: str, system: str = "general", bypass_cooldown: bool = False) -> bool:
+    """Send Discord alert with per-key cooldown. Returns True on HTTP 2xx.
+
+    Why per-key cooldown: prior implementation used a single shared "general"
+    bucket, so first restart muted all other fleet alerts for 30 min.
+    Distinct keys per system/event let alerts coexist.
+
+    Cooldown marking happens ONLY on confirmed 2xx so a transient POST failure
+    cannot mute the next alert attempt for 30 minutes.
+    """
+    now = time.time()
+    if not bypass_cooldown:
+        last = _last_alert.get(system, 0)
+        if now - last < ALERT_COOLDOWN_S:
+            return False
+
+    if not WEBHOOK_URL:
+        _log_discord_failure("no_webhook_url", None, msg)
+        return False
+    try:
+        import requests
+        r = requests.post(WEBHOOK_URL, json={"content": msg[:2000]}, timeout=10)
+        if 200 <= r.status_code < 300:
+            if not bypass_cooldown:
+                _last_alert[system] = now
+            return True
+        _log_discord_failure(f"http_{r.status_code}", r.status_code, msg)
+        return False
+    except Exception as e:
+        _log_discord_failure(f"exc_{type(e).__name__}", None, msg)
+        return False
+
+
+def maybe_webhook_ping() -> None:
+    """Emit a 4-hourly heartbeat so silence on the webhook is visible."""
+    global _last_webhook_ping
+    now = time.time()
+    if now - _last_webhook_ping < WEBHOOK_PING_INTERVAL_S:
+        return
+    ok = send_discord(
+        f"fleet_monitor alive @ {datetime.now(timezone.utc).isoformat()}",
+        system="webhook_heartbeat",
+        bypass_cooldown=True,
+    )
+    if ok:
+        _last_webhook_ping = now
 
 
 # ── Snapshots ──────────────────────────────────────────────
@@ -390,9 +562,10 @@ def take_snapshot() -> dict:
         "systems": {},
     }
 
-    # Argus
+    # Argus (AUDJPY killed 2026-04-14 + archived 2026-04-17; excluded here so
+    # aggregate snapshots don't keep resurrecting dead-strategy data).
     argus_data = {"trades": 0, "win_rate": 0, "total_pnl": 0, "pairs": {}}
-    for sym in ["audjpy", "usdjpy", "gbpusd", "cadjpy"]:
+    for sym in ["usdjpy", "gbpusd", "cadjpy"]:
         trades_path = REPO / "argus_flow" / "logs" / sym / "trades.csv"
         if trades_path.exists():
             try:
@@ -487,6 +660,70 @@ def collect_trade_metrics() -> dict:
 
 # ── Main monitor loop ───────────────────────────────────────
 
+def _check_control_files() -> dict:
+    """Surface PAUSE_ENTRIES / RESET_DRAWDOWN / KILL_SWITCH state in fleet_status."""
+    out: dict = {}
+    for name, path in [
+        ("PAUSE_ENTRIES", PAUSE_ENTRIES_FILE),
+        ("RESET_DRAWDOWN", REPO / "RESET_DRAWDOWN"),
+        ("KILL_SWITCH", REPO / "KILL_SWITCH"),
+    ]:
+        if path.exists():
+            age = time.time() - path.stat().st_mtime
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+            except Exception:
+                content = ""
+            out[name] = {"present": True, "age_s": int(age), "content": content[:200]}
+        else:
+            out[name] = {"present": False}
+    return out
+
+
+def _check_risk_state() -> dict:
+    """Read portfolio_risk_state + risk_oversight + portfolio_guard; flag
+    disagreements across the three sources. All three write their own truth
+    of "can we trade?" — when they disagree, a consumer picking the wrong
+    one can decide wrongly in silence.
+    """
+    rs_path = REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
+    ro_path = REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
+    pg_path = REPO / "helio" / "logs" / "portfolio_guard.json"
+    rs = _load_json(rs_path) or {}
+    ro = _load_json(ro_path) or {}
+    pg = _load_json(pg_path) or {}
+    out = {
+        "portfolio_risk_state": {
+            "drawdown_pause": rs.get("drawdown_pause"),
+            "peak_pnl": rs.get("peak_pnl"),
+            "current_pnl": rs.get("current_pnl"),
+            "ts": rs.get("ts"),
+        },
+        "risk_oversight": {
+            "level": ro.get("level"),
+            "status": ro.get("status"),
+            "ts": ro.get("timestamp"),
+        },
+        "portfolio_guard": {
+            "allowed": pg.get("allowed"),
+            "reason": pg.get("reason"),
+            "warnings": pg.get("warnings", []),
+        },
+    }
+    disagreements = []
+    if rs.get("drawdown_pause") is True and str(ro.get("level", "")).upper() == "GREEN":
+        disagreements.append("drawdown_pause=true while oversight=GREEN")
+    # portfolio_guard.allowed=False with oversight GREEN — the guard is
+    # blocking entries while oversight thinks everything is fine. Could be
+    # directional-bias cap, correlation, or concentration; either way the
+    # UI should flag it, not pick one silently.
+    if pg.get("allowed") is False and str(ro.get("level", "")).upper() == "GREEN":
+        disagreements.append(f"portfolio_guard.allowed=false ({pg.get('reason', '?')}) while oversight=GREEN")
+    if disagreements:
+        out["disagreement"] = " | ".join(disagreements)
+    return out
+
+
 def run_check_cycle(auto_restart: bool = True, legacy_execution_mode: str = "paper") -> dict:
     """One full health check cycle. Returns status dict."""
     overall = {"ts": datetime.now(timezone.utc).isoformat(), "systems": {}}
@@ -495,13 +732,44 @@ def run_check_cycle(auto_restart: bool = True, legacy_execution_mode: str = "pap
         status = check_system_health(name, cfg)
         overall["systems"][name] = status
 
-        if status["status"] in ("DOWN", "STALE"):
+        if status["status"] in ("DOWN", "STALE", "BLOCKED"):
             log.warning(f"{name}: {status['status']} | {' | '.join(status['details'][:3])}")
             if auto_restart and status["status"] == "DOWN" and not cfg.get("no_restart"):
                 restart_system(name, cfg, legacy_execution_mode=legacy_execution_mode)
         else:
             log.info(f"{name}: OK")
 
+    # Refresh portfolio_guard so its JSON reflects current state, not the
+    # frozen snapshot from the last check_new_entry call. Without this the
+    # dashboard can show blocked="true" based on positions that closed hours
+    # ago, leading operators to think entries are stuck when they aren't.
+    try:
+        from helio.portfolio_guard import check_current as _pg_refresh
+        _pg_refresh()
+    except Exception as exc:
+        log.warning(f"portfolio_guard refresh failed: {exc}")
+
+    # Surface control files + risk state disagreement in fleet_status
+    control = _check_control_files()
+    overall["control_files"] = control
+    overall["risk_state"] = _check_risk_state()
+
+    # PAUSE_ENTRIES age alert (distinct key — won't be swallowed by restart cooldown)
+    pe = control.get("PAUSE_ENTRIES", {})
+    if pe.get("present") and pe.get("age_s", 0) > PAUSE_ENTRIES_ALERT_AGE_S:
+        send_discord(
+            f"**PAUSE_ENTRIES active {pe['age_s'] // 60} min** — reason: `{pe.get('content', '?')}`. Entries are blocked fleet-wide.",
+            system="pause_entries_age",
+        )
+
+    rs = overall["risk_state"]
+    if rs.get("disagreement"):
+        send_discord(
+            f"**RISK STATE DRIFT**: {rs['disagreement']}",
+            system="risk_state_drift",
+        )
+
+    maybe_webhook_ping()
     return overall
 
 

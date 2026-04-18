@@ -56,6 +56,10 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 from forge.logging_setup import setup_logging
 log = setup_logging("cuebanks")
 
+RESEARCH_ONLY = True  # 2026-04-17: rulebook exists, production readiness not
+# validated. Local sizing module not aligned to fleet_sizing.json. Keep out
+# of fleet USD roll-up until promotion candidate.
+
 # Instrument
 TICKER = "YM=F"
 TICKER_PROXY = "^DJI"  # Fallback if futures data unavailable
@@ -734,7 +738,8 @@ def run_loop():
             "system": "cuebanks",
             "timestamp": now.isoformat(),
             "status": "scanning" if ny_start <= t <= ny_end else "waiting",
-            "mode": "loop",
+            "mode": "research_only",  # 2026-04-17: gated; see RESEARCH_ONLY flag at top
+            "run_phase": "loop",
         }
         heartbeat_path.write_text(json.dumps(heartbeat, indent=2))
 

@@ -27,9 +27,8 @@ $maxRestartsPerHour = 3
 # Fallback to hardcoded if pipeline fails
 $fxConfigs = @(& $python -m argus_flow.ops.deployment_pipeline --emit-configs watcher,paper 2>$null)
 if ($fxConfigs.Count -eq 0) {
-    # Fallback: hardcoded active configs (updated 2026-04-09)
+    # Fallback: hardcoded active configs (updated 2026-04-17 — AUDJPY killed/archived)
     $fxConfigs = @(
-        "argus_flow/configs/audjpy_mtf_paper_v1.json",
         "argus_flow/configs/usdjpy_mtf_paper_v1.json",
         "argus_flow/configs/gbpusd_range_paper_v1.json",
         "argus_flow/configs/cadjpy_mtf_paper_v1.json"
