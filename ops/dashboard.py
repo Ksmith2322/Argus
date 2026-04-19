@@ -3590,6 +3590,13 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
     cutoff = None
     if window_days and window_days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+    # Per-strategy live cutoff — trades before this are back-fill. Default UI
+    # view hides back-fill to avoid showing 20 years of gdx_gld historicals as
+    # if they were real account trades. Pass ?include_backfill=true to see them.
+    BACKFILL_CUTOFFS = {
+        "forge_gdx_gld": datetime(2026, 4, 17, tzinfo=timezone.utc),
+    }
     live_cutoffs = _strategy_live_cutoffs()
 
     trades = []
@@ -3667,6 +3674,7 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
                         "pnl_pct_of_fleet": r.get("pnl_pct_of_fleet") or "",
                         "exit_reason": r.get("exit_reason", ""),
                         "account_type": account_type,
+                        "is_backfill": is_backfill,
                     })
         except Exception:
             continue
@@ -3815,6 +3823,203 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
         "contribution_by_strategy": {k: round(v, 2) for k, v in sorted(by_strategy.items(), key=lambda x: -x[1])},
         "points": points,
     })
+
+
+@app.get("/api/gateway_status")
+async def api_gateway_status():
+    """IBKR gateway + broker health summary for the top-of-page banner.
+    Reads the latest Argus heartbeats + oversight report.
+    """
+    out = {"all_healthy": False, "per_pair": {}, "pause_entries_present": False, "broker_equity_usd": None}
+    for sym in ("usdjpy", "gbpusd", "cadjpy"):
+        p = REPO / "argus_flow" / "logs" / sym / "heartbeat.json"
+        if not p.exists():
+            out["per_pair"][sym] = {"present": False}
+            continue
+        age = int(time.time() - p.stat().st_mtime)
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            out["per_pair"][sym] = {"present": True, "age_s": age, "error": "parse_failed"}
+            continue
+        out["per_pair"][sym] = {
+            "present": True,
+            "age_s": age,
+            "fresh": age < 300,
+            "broker_connected": d.get("broker_connected"),
+            "entries_blocked": d.get("entries_blocked"),
+            "entry_block_reason": d.get("entry_block_reason"),
+            "consecutive_errors": d.get("consecutive_errors"),
+            "position": d.get("position"),
+        }
+    out["all_healthy"] = all(
+        p.get("fresh") and p.get("broker_connected") is True and int(p.get("consecutive_errors") or 0) == 0
+        for p in out["per_pair"].values() if p.get("present")
+    ) and any(p.get("present") for p in out["per_pair"].values())
+    out["pause_entries_present"] = (REPO / "PAUSE_ENTRIES").exists()
+    try:
+        ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+        out["broker_equity_usd"] = ro.get("broker_truth", {}).get("account_equity_usd")
+    except Exception:
+        pass
+    return JSONResponse(out)
+
+
+@app.get("/api/broker_equity_curve")
+async def api_broker_equity_curve(limit: int = 288):
+    """Time series of broker equity from fleet_monitor's periodic snapshots
+    (broker_equity_history.jsonl). Independent of trade-CSV derivation —
+    reflects actual account balance as IBKR reports it.
+
+    Default limit=288 ≈ 24h at one sample per 5 minutes.
+    """
+    path = REPO / "argus_flow" / "logs" / "broker_equity_history.jsonl"
+    if not path.exists():
+        return JSONResponse({"points": [], "error": "no history yet"})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    recent = lines[-limit:] if limit else lines
+    points = []
+    for line in recent:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            points.append(json.loads(line))
+        except Exception:
+            continue
+    return JSONResponse({
+        "points": points,
+        "total_samples": len(lines),
+        "window_count": len(points),
+    })
+
+
+@app.get("/api/shortlist_drift")
+async def api_shortlist_drift():
+    """Live-vs-replay drift for the strategy shortlist only (blueprint §18.8
+    week 3 deliverable). Filters signal_frequency_report down to the 4
+    near-term candidates so the dashboard can show a focused view.
+    """
+    sf = _read_canonical_with_freshness("argus_flow/logs/signal_frequency_report.json", 26 * 3600)
+    if "error" in sf:
+        return JSONResponse(sf)
+    shortlist = {"forge_gdx_gld", "forge_gld_pm_long", "forge_wick_gbpusd", "forge_jpy_pm_short", "forge_nq_overnight"}
+    filtered = [s for s in sf.get("strategies", []) if s.get("label") in shortlist]
+    return JSONResponse({
+        "generated_at": sf.get("generated_at"),
+        "window_label": sf.get("window_label"),
+        "strategies": filtered,
+        "_meta": sf.get("_meta"),
+    })
+
+
+@app.get("/api/reconciliation")
+async def api_reconciliation():
+    """Canonical fills vs per-strategy trades.csv reconciliation. DRIFT means
+    the canonical log has drifted from the per-strategy sources — typically
+    from a backfill run on different filter semantics. If DRIFT persists,
+    wipe canonical_fills.jsonl and re-backfill.
+    """
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/reconciliation_report.json", 26 * 3600))
+
+
+@app.get("/api/morning_brief")
+async def api_morning_brief():
+    """Latest morning brief digest as text."""
+    path = REPO / "argus_flow" / "logs" / "morning_brief.txt"
+    if not path.exists():
+        return JSONResponse({"text": "", "error": "no brief yet"})
+    age = int(time.time() - path.stat().st_mtime)
+    return JSONResponse({
+        "text": path.read_text(encoding="utf-8"),
+        "mtime_s_ago": age,
+        "fresh": age < 26 * 3600,
+    })
+
+
+@app.get("/api/drift_forensics")
+async def api_drift_forensics():
+    """Per-pair blocker histogram + feature distribution comparison for the
+    Argus FX pairs. Surfaces where live-vs-replay trigger drift is eaten
+    (e.g., HOUR_FILTERED, MTF_BLOCKED_*). Regenerated nightly.
+    """
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/drift_forensics_report.json", 26 * 3600))
+
+
+@app.get("/api/canonical_fills")
+async def api_canonical_fills(limit: int = 100, strategy: str | None = None):
+    """Canonical fills log — one source of truth for all closed trades across
+    every strategy. Generated nightly via `helio.canonical_fills --backfill`
+    (idempotent). Preferred over /api/recent_trades for reconciliation use.
+    """
+    try:
+        from helio.canonical_fills import read_fills
+        rows = read_fills(limit=limit, strategy=strategy)
+    except Exception as e:
+        return JSONResponse({"error": str(e), "rows": []})
+    total_pnl = sum((r.get("pnl_usd") or 0) for r in rows if isinstance(r.get("pnl_usd"), (int, float)))
+    return JSONResponse({
+        "rows": rows,
+        "count_returned": len(rows),
+        "sum_pnl_usd_in_window": round(total_pnl, 2),
+        "strategy_filter": strategy,
+    })
+
+
+@app.get("/api/apollo_planned_trades")
+async def api_apollo_planned_trades(limit: int = 50):
+    """Apollo execution-path skeleton — active planned tickets + recently
+    matured counterfactual trades. Strategy remains research_only (no real
+    orders). Flip MODE in apollo/execution/planned_trades.py to activate.
+    """
+    planned_path = REPO / "apollo" / "logs" / "planned_trades.jsonl"
+    matured_path = REPO / "apollo" / "logs" / "matured_trades.jsonl"
+    planned = []
+    matured = []
+    if planned_path.exists():
+        for line in planned_path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            line = line.strip()
+            if line:
+                try: planned.append(json.loads(line))
+                except Exception: pass
+    if matured_path.exists():
+        for line in matured_path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            line = line.strip()
+            if line:
+                try: matured.append(json.loads(line))
+                except Exception: pass
+    active = [p for p in planned if p.get("status") == "planned"]
+    total_pnl = sum(m.get("counterfactual_pnl_usd") or 0 for m in matured)
+    wins = sum(1 for m in matured if (m.get("counterfactual_pnl_usd") or 0) > 0)
+    return JSONResponse({
+        "mode": "research_only",
+        "active_planned": active,
+        "recent_matured": matured[-20:],
+        "summary": {
+            "active_count": len(active),
+            "matured_count_shown": len(matured),
+            "counterfactual_pnl_usd_total": round(total_pnl, 2),
+            "matured_win_rate_pct": round(wins / len(matured) * 100, 1) if matured else None,
+        },
+    })
+
+
+@app.get("/api/kill_watchdog")
+async def api_kill_watchdog():
+    """Canonical kill-rule watchdog report — any strategy flagged as
+    kill_candidate or drift_warning, per each strategy card's kill rules.
+    Regenerated nightly by helio.kill_watchdog.
+    """
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/kill_watchdog_report.json", 26 * 3600))
+
+
+@app.get("/api/promotion_readiness")
+async def api_promotion_readiness():
+    """Canonical promotion-readiness report — strategy cards present, review
+    gate + canonical gate status, next-action per strategy. Generated nightly
+    by helio.promotion_readiness and wired into run_cohort_report.ps1.
+    """
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/promotion_readiness_report.json", 26 * 3600))
 
 
 @app.get("/api/strategy_tiers")
@@ -4627,6 +4832,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- FLEET OVERVIEW (all Greek family systems) -->
 <div id="fleet-overview" style="margin-bottom:14px;"></div>
+
+<!-- Gateway/broker status banner — one-line top-of-page pulse -->
+<div id="gateway-status-banner" style="margin-bottom:10px;"></div>
+<script>
+function loadGatewayStatus() {
+  fetch('/api/gateway_status').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('gateway-status-banner');
+    if (!el) return;
+    const healthy = d.all_healthy;
+    const pauseFlag = d.pause_entries_present;
+    const eq = d.broker_equity_usd;
+    const bg = healthy && !pauseFlag ? '#0d2818' : (pauseFlag ? '#3a2a0a' : '#3a0d0d');
+    const border = healthy && !pauseFlag ? '#00e676' : (pauseFlag ? '#ff9800' : '#ff4444');
+    const label = healthy && !pauseFlag ? 'GATEWAY OK' : (pauseFlag ? 'ENTRIES PAUSED' : 'GATEWAY UNHEALTHY');
+    const labelColor = healthy && !pauseFlag ? '#00e676' : (pauseFlag ? '#ff9800' : '#ff4444');
+    const pairSummary = Object.entries(d.per_pair || {}).map(([sym, v]) => {
+      const ok = v.fresh && v.broker_connected && (v.consecutive_errors || 0) === 0;
+      const color = ok ? '#00e676' : '#ff4444';
+      return `<span style="color:${color};margin:0 8px;">${sym.toUpperCase()}: ${v.broker_connected ? 'conn' : 'dc'}/${v.position || '?'}</span>`;
+    }).join('');
+    const eqStr = eq ? '$' + Number(eq).toLocaleString(undefined, {maximumFractionDigits: 0}) : '—';
+    const pauseWarn = pauseFlag ? '<span style="color:#ff9800;font-weight:bold;margin-left:12px;">⚠ PAUSE_ENTRIES active</span>' : '';
+    el.innerHTML = `<div style="background:${bg};border:1px solid ${border};border-radius:6px;padding:8px 14px;display:flex;flex-wrap:wrap;gap:14px;align-items:center;font-size:0.8em;">`
+      + `<span style="color:${labelColor};font-weight:bold;letter-spacing:2px;">${label}</span>`
+      + `<span style="color:#7b8ab8;">broker equity: <span style="color:#e0e0e0;">${eqStr}</span></span>`
+      + `<span style="color:#7b8ab8;">pairs:</span>${pairSummary}`
+      + pauseWarn
+      + `</div>`;
+  }).catch(()=>{});
+}
+loadGatewayStatus();
+setInterval(loadGatewayStatus, 30000);
+</script>
 
 <!-- FLEET HEALTH BAR (5 systems × status light) -->
 <div id="fleet-health" style="margin-bottom:14px;"></div>

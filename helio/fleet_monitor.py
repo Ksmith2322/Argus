@@ -680,6 +680,97 @@ def _check_control_files() -> dict:
     return out
 
 
+def _argus_all_brokers_healthy() -> bool:
+    """Return True if every ACTIVE Argus pair (from SYSTEMS['argus'] config)
+    has a fresh heartbeat with broker_connected=true and consecutive_errors=0.
+
+    Uses the fleet_monitor's own SYSTEMS["argus"]["heartbeats"] list, which
+    already reflects the 3 live pairs (USDJPY/GBPUSD/CADJPY post-AUDJPY kill).
+    This prevents stale heartbeats from killed/archived strategies from
+    blocking the auto-clear.
+    """
+    argus_cfg = SYSTEMS.get("argus", {})
+    heartbeats = argus_cfg.get("heartbeats", [])
+    if not heartbeats:
+        return False
+    any_pair = False
+    for hb_path in heartbeats:
+        if not hb_path.exists():
+            return False
+        age = time.time() - hb_path.stat().st_mtime
+        if age > 300:
+            return False
+        data = _load_json(hb_path) or {}
+        if data.get("broker_connected") is not True:
+            return False
+        if int(data.get("consecutive_errors") or 0) > 0:
+            return False
+        any_pair = True
+    return any_pair
+
+
+def _maybe_auto_clear_pause_entries(control_files_state: dict) -> str | None:
+    """If PAUSE_ENTRIES was created by watchdog gateway-supervision AND every
+    Argus pair now reports broker_connected=true, remove the file. Returns a
+    reason string on success for logging/alerting.
+
+    Conservative gates: requires content to start with "gateway_supervision"
+    so we never auto-clear an operator-created pause. Also requires file
+    age > 60s to avoid races with the watchdog itself.
+    """
+    pe = control_files_state.get("PAUSE_ENTRIES") or {}
+    if not pe.get("present"):
+        return None
+    if pe.get("age_s", 0) < 60:
+        return None
+    content = (pe.get("content") or "").strip().lower()
+    if "gateway_supervision" not in content:
+        return None  # operator or other source created it — don't touch
+    if not _argus_all_brokers_healthy():
+        return None
+    try:
+        PAUSE_ENTRIES_FILE.unlink()
+    except OSError:
+        return None
+    return f"PAUSE_ENTRIES auto-cleared (age {pe.get('age_s')}s, all Argus brokers healthy)"
+
+
+def _snapshot_broker_equity() -> None:
+    """Append broker equity to a history JSONL for charting. One-liner per cycle.
+    Enables a broker-equity-derived curve (blueprint §18.8 week 2 deliverable)
+    that is independent of trade-CSV derivation.
+    """
+    ro_path = REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
+    if not ro_path.exists():
+        return
+    try:
+        data = _load_json(ro_path) or {}
+        equity = data.get("broker_truth", {}).get("account_equity_usd")
+        if equity is None:
+            return
+        hist_path = REPO / "argus_flow" / "logs" / "broker_equity_history.jsonl"
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "broker_equity_usd": float(equity),
+            "fleet_pnl_usd": float(data.get("broker_truth", {}).get("fleet_unrealized_pnl_usd") or 0),
+            "fleet_open_risk_usd": float(data.get("broker_truth", {}).get("fleet_open_risk_usd") or 0),
+        }
+        # Rate limit: one sample per 5 min max (the fleet_monitor cycles every
+        # 60s but we don't need that density on the equity curve).
+        if hist_path.exists() and hist_path.stat().st_size > 0:
+            try:
+                last_mtime = hist_path.stat().st_mtime
+                if time.time() - last_mtime < 300:
+                    return
+            except OSError:
+                pass
+        with open(hist_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception as exc:
+        log.warning(f"broker equity snapshot failed: {exc}")
+
+
 def _check_risk_state() -> dict:
     """Read portfolio_risk_state + risk_oversight + portfolio_guard; flag
     disagreements across the three sources. All three write their own truth
@@ -753,6 +844,19 @@ def run_check_cycle(auto_restart: bool = True, legacy_execution_mode: str = "pap
     control = _check_control_files()
     overall["control_files"] = control
     overall["risk_state"] = _check_risk_state()
+
+    # Auto-clear PAUSE_ENTRIES if watchdog-created and gateway is now healthy.
+    # Blueprint §18.8 item: IBC/gateway resilience. Eliminates the recurring
+    # morning-login ritual where PAUSE_ENTRIES stays up after gateway recovers.
+    cleared = _maybe_auto_clear_pause_entries(control)
+    if cleared:
+        log.info(cleared)
+        send_discord(f"**AUTO-CLEARED PAUSE_ENTRIES** — {cleared}", system="pause_entries_autoclear")
+        # Re-read control files so fleet_status.json reflects the change this cycle
+        overall["control_files"] = _check_control_files()
+
+    # Sample broker equity for the history curve
+    _snapshot_broker_equity()
 
     # PAUSE_ENTRIES age alert (distinct key — won't be swallowed by restart cooldown)
     pe = control.get("PAUSE_ENTRIES", {})

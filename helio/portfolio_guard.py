@@ -48,6 +48,11 @@ DEFAULT_MAX_PER_FAMILY        = 3
 DEFAULT_MAX_DIRECTIONAL_BIAS  = 4
 DEFAULT_MAX_CORRELATED_PAIRS  = 2
 
+# PDT (Pattern Day Trader) enforcement REMOVED 2026-04-18 per operator:
+# SEC approved FINRA Rule 4210 amendments that replace the PDT framework with
+# new intraday margin standards (Release 34-105226, 2026-04-14). Day-trade
+# counting is no longer enforced by this module.
+
 # ---------------------------------------------------------------------------
 # Helpers - normalise instrument names for overlap detection
 # ---------------------------------------------------------------------------

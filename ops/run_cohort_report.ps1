@@ -69,6 +69,83 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] signal_freq WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    Write-Host "Generating promotion-readiness report..."
+    $promoOutput = & $python -m helio.promotion_readiness 2>&1
+    foreach ($line in @($promoOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] promotion_readiness: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] promotion_readiness WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running kill-rule watchdog..."
+    $killOutput = & $python -m helio.kill_watchdog 2>&1
+    foreach ($line in @($killOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] kill_watchdog: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] kill_watchdog WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running Apollo planned-trades (research-only execution skeleton)..."
+    $apolloPlanOutput = & $python -m apollo.execution.planned_trades 2>&1
+    foreach ($line in @($apolloPlanOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] apollo_plan: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] apollo_plan WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Backfilling canonical fills log..."
+    $fillsOutput = & $python -m helio.canonical_fills --backfill 2>&1
+    foreach ($line in @($fillsOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] canonical_fills: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] canonical_fills WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running Argus drift forensics (usdjpy/gbpusd/cadjpy)..."
+    $driftOutput = & $python -m argus_flow.ops.usdjpy_drift_forensics --all-pairs --window 14 2>&1
+    foreach ($line in @($driftOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] drift_forensics: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] drift_forensics WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Running reconciliation (canonical_fills vs trades.csv)..."
+    $reconOutput = & $python -m helio.reconciliation 2>&1
+    foreach ($line in @($reconOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] reconciliation: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] reconciliation DRIFT detected (exit $LASTEXITCODE, non-fatal — see report)"
+    }
+
+    Write-Host "Generating morning brief..."
+    $briefOutput = & $python -m helio.morning_brief 2>&1
+    foreach ($line in @($briefOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] morning_brief: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] morning_brief WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Hermes gap scanner..."
     $hermesOutput = & $python -m hermes.runner --dry-run --min-score 75 2>&1
     foreach ($line in @($hermesOutput)) {
