@@ -38,7 +38,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 log = setup_logging("wick_gbpusd")
 
 # Strategy parameters (frozen — change requires version bump in STRATEGY_SPEC.md)
-PARAMS = {
+# Loaded via registry with hardcoded fallback (Phase 2 pattern — see
+# forge/gld_pm_long/runner.py for the template).
+_HARDCODED_DEFAULTS = {
     "version": "v1",
     "symbol": "GBPUSD",
     "timeframe": "1d",
@@ -54,6 +56,33 @@ PARAMS = {
     # risk_pct + model_equity_usd removed 2026-04-17 — sourced from
     # helio.fleet_sizing tier system (strategy_label="forge_wick_gbpusd").
 }
+
+
+def _load_params_from_registry() -> dict:
+    """Pull from config/strategies.json with fallback. See
+    forge/gld_pm_long/runner.py for the full rationale."""
+    try:
+        from helio.strategy_registry import load_registry
+        reg = load_registry().wick_gbpusd
+        return {
+            "version": _HARDCODED_DEFAULTS["version"],
+            "symbol": reg.symbol,
+            "timeframe": reg.timeframe,
+            "uw_min": reg.uw_min,
+            "cp_max": reg.cp_max,
+            "bb_width_quantile_max": reg.bb_width_quantile_max,
+            "chop_quantile_min": reg.chop_quantile_min,
+            "regime_window": reg.regime_window,
+            "target_atr": reg.target_atr,
+            "stop_atr": reg.stop_atr,
+            "hold_bars": reg.hold_bars,
+            "atr_period": reg.atr_period,
+        }
+    except Exception:
+        return dict(_HARDCODED_DEFAULTS)
+
+
+PARAMS = _load_params_from_registry()
 
 TRADES_PATH = LOG_DIR / "trades.csv"
 SIGNALS_PATH = LOG_DIR / "signals.csv"
@@ -108,17 +137,14 @@ def signal_long(df: pd.DataFrame, feats: pd.DataFrame) -> pd.Series:
 # ────────────── Cohort tagging ──────────────
 
 def _config_hash() -> str:
-    return hashlib.sha256(json.dumps(PARAMS, sort_keys=True).encode()).hexdigest()[:16]
+    # Delegates to shared helper (2026-04-19 migration).
+    from helio.strategy_common import config_hash
+    return config_hash(PARAMS)
 
 
 def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(REPO), stderr=subprocess.DEVNULL, text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
+    from helio.strategy_common import git_sha
+    return git_sha(REPO)
 
 
 # ────────────── Persistence ──────────────
@@ -312,6 +338,30 @@ def _close_paper_trade(state: dict, df: pd.DataFrame, exit_idx: int, exit_px: fl
         "target_px": ot["target_px"],
     })
     log.info("PAPER LONG closed (%s) at %.5f — pnl %+.1f pips ($%+.2f)", reason, exit_px, pnl_pips, pnl_usd)
+
+    # Dual-write to canonical fills (additive — same pattern as gld_pm_long).
+    # Runs after the strategy-local CSV is written. Internal write_fill_typed
+    # try/except means a broken canonical log cannot break paper trading.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill
+        write_fill_typed(Fill(
+            strategy="forge_wick_gbpusd",
+            symbol="GBPUSD",
+            direction="long",
+            side="EXIT",
+            entry_ts=str(df.index[ot["entry_idx"]]),
+            exit_ts=str(df.index[exit_idx]),
+            entry_px=float(entry_px),
+            exit_px=float(exit_px),
+            size=float(ot["position_size"]),
+            risk_usd=float(ot.get("risk_usd") or 0.0),
+            pnl_usd=round(pnl_usd, 2),
+            exit_reason=reason,
+        ))
+    except Exception:
+        pass  # never let the canonical log break paper trading
+
     state["open_trade"] = None
 
 

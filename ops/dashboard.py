@@ -3383,62 +3383,15 @@ async def api_fleet():
     })
 
 
-def _read_canonical_with_freshness(path_rel: str, fresh_threshold_s: int = 900) -> dict:
-    """Read a canonical report file. Adds _meta.{source_file, mtime_s_ago,
-    fresh} so UI can show "loaded 42s ago" instead of silently trusting it.
-    """
-    path = REPO / path_rel
-    if not path.exists():
-        return {"error": f"missing {path_rel}", "_meta": {"source_file": path_rel, "fresh": False}}
-    try:
-        data = json.loads(path.read_text())
-    except Exception as e:
-        return {"error": str(e), "_meta": {"source_file": path_rel, "fresh": False}}
-    age = int(time.time() - path.stat().st_mtime)
-    data["_meta"] = {
-        "source_file": path_rel,
-        "mtime_s_ago": age,
-        "fresh": age < fresh_threshold_s,
-        "fresh_threshold_s": fresh_threshold_s,
-    }
-    return data
-
-
-def _parse_report_ts(raw: str | None) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                ts = datetime.strptime(str(raw).split(".")[0], fmt)
-                break
-            except ValueError:
-                ts = None
-        else:
-            return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts
-
-
-def _strategy_live_cutoffs() -> dict[str, datetime]:
-    """Live-only cutoffs used by dashboard trade/equity views.
-
-    This keeps historical back-fills, especially GDX/GLD, out of the
-    operator's recent-trades/account-balance views unless explicitly requested.
-    """
-    try:
-        cfg = json.loads((REPO / "argus_flow" / "configs" / "fleet_sizing.json").read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    out: dict[str, datetime] = {}
-    for label, raw in (cfg.get("strategy_live_cutoffs") or {}).items():
-        ts = _parse_report_ts(raw)
-        if ts is not None:
-            out[str(label)] = ts
-    return out
+# Data-source helpers extracted to ops/dashboard_data.py (2026-04-19).
+# The monolith re-exports them under their original private names so
+# every endpoint in this file continues to work. Phase 3 will migrate
+# endpoints to import from ops.dashboard_data directly.
+from ops.dashboard_data import (
+    read_canonical_with_freshness as _read_canonical_with_freshness,
+    parse_report_ts as _parse_report_ts,
+    strategy_live_cutoffs as _strategy_live_cutoffs,
+)
 
 
 @app.get("/api/fleet_health")
@@ -3618,7 +3571,8 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
                     if cutoff and ts < cutoff:
                         continue
                     live_cut = live_cutoffs.get(label)
-                    if not include_backfill and live_cut is not None and ts < live_cut:
+                    is_backfill = live_cut is not None and ts < live_cut
+                    if not include_backfill and is_backfill:
                         continue
                     pnl_raw = r.get("pnl_usd")
                     if pnl_raw in (None, ""):
@@ -3946,18 +3900,296 @@ async def api_drift_forensics():
     return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/drift_forensics_report.json", 26 * 3600))
 
 
+@app.get("/api/fleet_state_history")
+async def api_fleet_state_history(limit: int = 100):
+    """Compact time-series of fleet_state snapshots. Each row has the
+    fleet-level rollup + small per-strategy block (trades/PF/pnl/action).
+    Reads newest-first; pass ?limit=N for the last N rows."""
+    path = REPO / "argus_flow" / "logs" / "fleet_state_history.jsonl"
+    if not path.exists():
+        return JSONResponse({"rows": [], "count": 0})
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        return JSONResponse({"error": str(e), "rows": []})
+    rows: list[dict] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if limit and len(rows) >= limit:
+            break
+    return JSONResponse({"rows": rows, "count": len(rows)})
+
+
+@app.get("/api/fleet_state")
+async def api_fleet_state():
+    """Read model: consolidated per-strategy health + gates + watchdog +
+    reconciliation, plus a fleet-wide block. Phase 1 — additive to the
+    existing endpoints, which remain authoritative sources.
+
+    Regenerated nightly by run_cohort_report.ps1 (helio.fleet_state step).
+    The file is also safe to regenerate on demand.
+    """
+    path = REPO / "argus_flow" / "logs" / "fleet_state.json"
+    if not path.exists():
+        # Try to build it on demand if the nightly has not run
+        try:
+            from helio.fleet_state import build_fleet_state, write_fleet_state
+            write_fleet_state(build_fleet_state())
+        except Exception as e:
+            return JSONResponse({"error": str(e), "generated_at": None, "strategies": {}})
+    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_state.json", 26 * 3600))
+
+
+@app.get("/api/health")
+async def api_health():
+    """Dashboard healthcheck: verify every critical data surface is present
+    and fresh. Returns a status per surface + an overall verdict.
+
+    Surface checks:
+      - fleet_status.json       — heartbeat aggregator (< 10 min old)
+      - fleet_state.json        — read-model (< 26 h old)
+      - kill_watchdog_report    — < 26 h old
+      - reconciliation_report   — < 26 h old
+      - strategy_registry       — loads + validates via pydantic
+      - canonical_fills.jsonl   — readable, row count > 0
+
+    Cheap to call. Run from a browser or curl to detect silent dashboard
+    failures before the operator notices an empty chart.
+    """
+    import time as _time
+    results = []
+    all_ok = True
+
+    def _check_json_freshness(rel_path: str, max_age_s: int, name: str):
+        p = REPO / rel_path
+        if not p.exists():
+            return {"surface": name, "status": "MISSING", "age_s": None, "path": rel_path}
+        age = int(_time.time() - p.stat().st_mtime)
+        if age > max_age_s:
+            return {"surface": name, "status": "STALE", "age_s": age,
+                    "max_age_s": max_age_s, "path": rel_path}
+        return {"surface": name, "status": "OK", "age_s": age, "path": rel_path}
+
+    for rel, max_age, label in [
+        ("argus_flow/logs/fleet_status.json",           10 * 60, "fleet_status"),
+        ("argus_flow/logs/fleet_state.json",            26 * 3600, "fleet_state"),
+        ("argus_flow/logs/kill_watchdog_report.json",   26 * 3600, "kill_watchdog"),
+        ("argus_flow/logs/reconciliation_report.json",  26 * 3600, "reconciliation"),
+        ("argus_flow/logs/fleet_perf_summary.json",     26 * 3600, "fleet_perf_summary"),
+    ]:
+        r = _check_json_freshness(rel, max_age, label)
+        if r["status"] != "OK":
+            all_ok = False
+        results.append(r)
+
+    # Content checks — freshness alone lets a fresh file with STALE systems or
+    # DRIFT rows pass as OK. Parse the two files that summarise fleet health.
+    def _load_json(rel_path: str):
+        p = REPO / rel_path
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    fs = _load_json("argus_flow/logs/fleet_status.json")
+    if fs is not None:
+        systems = fs.get("systems", fs) if isinstance(fs, dict) else {}
+        stale = []
+        if isinstance(systems, dict):
+            for name, v in systems.items():
+                status = v.get("status") if isinstance(v, dict) else None
+                if status and status != "OK":
+                    stale.append({"name": name, "status": status})
+        elif isinstance(systems, list):
+            for v in systems:
+                status = v.get("status") if isinstance(v, dict) else None
+                if status and status != "OK":
+                    stale.append({"name": v.get("name"), "status": status})
+        if stale:
+            all_ok = False
+            results.append({
+                "surface": "fleet_status_content",
+                "status": "DEGRADED",
+                "non_ok_systems": stale,
+            })
+        else:
+            results.append({"surface": "fleet_status_content", "status": "OK"})
+
+    rr = _load_json("argus_flow/logs/reconciliation_report.json")
+    if rr is not None:
+        summary = rr.get("summary", {}) if isinstance(rr, dict) else {}
+        all_rec = summary.get("all_reconciled")
+        drift = summary.get("drift_strategies") or []
+        if all_rec is False or drift:
+            all_ok = False
+            results.append({
+                "surface": "reconciliation_content",
+                "status": "DRIFT",
+                "drift_strategies": drift,
+            })
+        else:
+            results.append({"surface": "reconciliation_content", "status": "OK"})
+
+    # Registry surface
+    try:
+        from helio.strategy_registry import load_registry, shortlist_labels
+        reg = load_registry()
+        labels = shortlist_labels()
+        results.append({
+            "surface": "strategy_registry",
+            "status": "OK",
+            "version": reg.version,
+            "shortlist_count": len(labels),
+        })
+    except Exception as e:
+        all_ok = False
+        results.append({
+            "surface": "strategy_registry",
+            "status": "BROKEN",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    # Canonical fills — must be readable and non-empty
+    try:
+        from helio.canonical_fills import read_fills
+        rows = read_fills(limit=1)
+        if not rows:
+            all_ok = False
+            results.append({
+                "surface": "canonical_fills",
+                "status": "EMPTY",
+                "note": "canonical_fills.jsonl is empty — run backfill",
+            })
+        else:
+            results.append({
+                "surface": "canonical_fills",
+                "status": "OK",
+                "latest_ts": rows[0].get("ts"),
+            })
+    except Exception as e:
+        all_ok = False
+        results.append({
+            "surface": "canonical_fills",
+            "status": "BROKEN",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    # strategy_confidence bridge — enumerate every expected artifact and
+    # report valid/invalid/missing. Invalid files are a hard signal that
+    # a writer regressed; missing files just mean a strategy hasn't been
+    # plumbed yet (its dashboard row stays HARDCODED).
+    try:
+        from helio.strategy_confidence import audit_artifacts
+        expected = [
+            "titan", "ares", "hermes", "apollo", "mamba", "cue_banks",
+            "tori", "vix_revert", "index_rebal", "sector_rot", "themis",
+        ]
+        audit = audit_artifacts(expected)
+        sc_status = "OK"
+        if audit["present_invalid"] > 0:
+            all_ok = False
+            sc_status = "INVALID"
+        elif audit["present_valid"] == 0:
+            sc_status = "EMPTY"  # not yet a failure — writers pending
+        results.append({
+            "surface": "strategy_confidence",
+            "status": sc_status,
+            "total_expected": audit["total_expected"],
+            "present_valid": audit["present_valid"],
+            "present_invalid": audit["present_invalid"],
+            "missing": audit["missing"],
+            "invalid_details": audit["invalid"][:10],
+        })
+    except Exception as e:
+        results.append({
+            "surface": "strategy_confidence",
+            "status": "BROKEN",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    # Disk space — writes fail silently (wrapped in try/except) so disk
+    # full would show as "no new data" with no obvious cause. Surface it.
+    # WARN below 5 GB free, CRITICAL below 1 GB.
+    try:
+        import shutil
+        usage = shutil.disk_usage(str(REPO))
+        free_gb = usage.free / (1024**3)
+        if free_gb < 1.0:
+            all_ok = False
+            status = "CRITICAL"
+        elif free_gb < 5.0:
+            all_ok = False
+            status = "WARN"
+        else:
+            status = "OK"
+        results.append({
+            "surface": "disk_space",
+            "status": status,
+            "free_gb": round(free_gb, 2),
+            "total_gb": round(usage.total / (1024**3), 2),
+        })
+    except Exception as e:
+        results.append({
+            "surface": "disk_space",
+            "status": "UNKNOWN",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    return JSONResponse({
+        "overall": "OK" if all_ok else "DEGRADED",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "surfaces": results,
+    })
+
+
+@app.get("/api/strategy_registry")
+async def api_strategy_registry():
+    """Validated view of config/strategies.json — single pane of every active
+    strategy's edge thresholds and the promotion gates. Phase 1 MIRROR only:
+    values here are kept in lockstep with runtime constants via
+    test_registry_equivalence. Changes in either place fail CI.
+    """
+    try:
+        from helio.strategy_registry import load_registry
+        reg = load_registry()
+        return JSONResponse({
+            "version": reg.version,
+            "promotion": reg.promotion.model_dump(),
+            "shortlist": [s.model_dump() for s in reg.shortlist],
+            "strategies": reg.strategies,
+            "source_of_truth_status": "MIRROR_ONLY",
+            "fresh": True,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e), "version": None, "strategies": {}})
+
+
 @app.get("/api/canonical_fills")
 async def api_canonical_fills(limit: int = 100, strategy: str | None = None):
     """Canonical fills log — one source of truth for all closed trades across
     every strategy. Generated nightly via `helio.canonical_fills --backfill`
     (idempotent). Preferred over /api/recent_trades for reconciliation use.
+
+    Rows are normalised through helio.domain.Fill so string-typed prices from
+    historical backfills (e.g. "159.736") come out as floats. Third
+    production consumer of the shared domain module.
     """
     try:
         from helio.canonical_fills import read_fills
-        rows = read_fills(limit=limit, strategy=strategy)
+        from helio.domain import Fill
+        raw_rows = read_fills(limit=limit, strategy=strategy)
+        rows = [Fill.from_canonical_row(r).to_canonical_row() for r in raw_rows]
     except Exception as e:
         return JSONResponse({"error": str(e), "rows": []})
-    total_pnl = sum((r.get("pnl_usd") or 0) for r in rows if isinstance(r.get("pnl_usd"), (int, float)))
+    total_pnl = sum(r["pnl_usd"] for r in rows if r.get("pnl_usd") is not None)
     return JSONResponse({
         "rows": rows,
         "count_returned": len(rows),
@@ -4176,8 +4408,83 @@ def _load_json(path: Path):
 
 @app.get("/api/strategy_performance")
 async def api_strategy_performance():
-    """Per-strategy backtest stats vs live performance for the dashboard."""
+    """Per-strategy backtest stats vs live performance for the dashboard.
+
+    Confidence source: "computed" rows pull P(expectancy>0) from the
+    canonical_fills-based confidence block in helio.fleet_state (seeded
+    1000-iteration bootstrap; None under the 10-trade sanity bar).
+    "hardcoded" rows are manually-entered placeholders — their confidence
+    number is NOT derived from data and the UI renders them with a badge.
+    """
     strategies = []
+
+    # Load canonical fills once so we can compute real confidence for the
+    # strategies that have a canonical fills stream.
+    try:
+        from helio.fleet_state import _canonical_fills_by_strategy, _confidence_summary
+        _fills_by_strat = _canonical_fills_by_strategy()
+    except Exception:
+        _fills_by_strat = {}
+        _confidence_summary = None  # type: ignore
+
+    def _compute_conf(*labels: str) -> dict | None:
+        """Aggregate canonical fills across 1+ strategy labels and run the
+        shared confidence summary over them. Returns None if confidence
+        can't be computed (helio.fleet_state unavailable)."""
+        if _confidence_summary is None:
+            return None
+        merged: list = []
+        for lab in labels:
+            merged.extend(_fills_by_strat.get(lab, []))
+        return _confidence_summary(merged)
+
+    def _pct(p: float | None) -> int | None:
+        return int(round(p * 100)) if p is not None else None
+
+    # Hardcoded→computed bridge: load artifacts for strategies that don't
+    # have canonical_fills. Canonical fills always win — an artifact is
+    # only consulted if the row doesn't already have a live stream.
+    try:
+        from helio.strategy_confidence import load_confidence_artifact
+    except Exception:
+        load_confidence_artifact = None  # type: ignore
+
+    def _apply_artifact(row: dict, label: str) -> dict:
+        """If a valid artifact exists for `label`, convert the row from
+        hardcoded to computed: overwrite bt_pf/bt_wr/bt_trades with
+        artifact values, set confidence from p_expectancy_positive, attach
+        the confidence_detail block. If no artifact, return row unchanged.
+        """
+        if load_confidence_artifact is None:
+            return row
+        if row.get("confidence_source") == "computed":
+            # Canonical fills already provided real confidence — never
+            # override live evidence with a backtest artifact.
+            return row
+        art = load_confidence_artifact(label)
+        if art is None:
+            return row
+        if art.bt_pf is not None:
+            row["backtest_pf"] = f"{art.bt_pf:.2f}"
+        if art.bt_wr is not None:
+            row["backtest_wr"] = f"{int(round(art.bt_wr * 100))}%"
+        if art.bt_trades is not None:
+            row["backtest_trades"] = art.bt_trades
+        row["confidence"] = _pct(art.p_expectancy_positive)
+        row["confidence_source"] = "computed"
+        row["confidence_detail"] = {
+            "n_total": art.n_total,
+            "n_live": art.n_live,
+            "n_paper": art.n_paper,
+            "expectancy_usd": art.expectancy_usd,
+            "expectancy_r": art.expectancy_r,
+            "p_expectancy_positive": art.p_expectancy_positive,
+            "evidence_bar": art.evidence_bar,
+            "sample_warning": art.sample_warning,
+            "artifact_source": art.source,
+            "artifact_generated_at": art.generated_at,
+        }
+        return row
 
     # ── ARGUS strategies ──────────────────────────────────────
     argus_live_trades = []
@@ -4196,6 +4503,7 @@ async def api_strategy_performance():
     argus_pf = (sum(p for p in argus_pnls if p > 0) / abs(sum(p for p in argus_pnls if p <= 0))
                 if any(p <= 0 for p in argus_pnls) else 999)
 
+    argus_conf = _compute_conf("argus_usdjpy", "argus_gbpusd", "argus_cadjpy")
     strategies.append({
         "system": "Argus",
         "strategy": "MTF Trend (4H/1H/5m)",
@@ -4209,7 +4517,9 @@ async def api_strategy_performance():
         "live_pf": round(argus_pf, 2) if argus_live_trades else 0,
         "live_pnl": round(sum(argus_pnls), 1),
         "live_unit": "pips",
-        "confidence": 45,
+        "confidence": _pct(argus_conf["p_expectancy_positive"]) if argus_conf else None,
+        "confidence_source": "computed" if argus_conf else "hardcoded",
+        "confidence_detail": argus_conf,
         "status": "BAKING",
     })
 
@@ -4239,6 +4549,7 @@ async def api_strategy_performance():
         "live_pnl": round(sum(titan_pnls), 1),
         "live_unit": "%",
         "confidence": 65,
+        "confidence_source": "hardcoded",
         "status": "BAKING",
     })
 
@@ -4257,6 +4568,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "%",
         "confidence": 55,
+        "confidence_source": "hardcoded",
         "status": "MONTHLY",
     })
 
@@ -4275,6 +4587,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "%",
         "confidence": 35,
+        "confidence_source": "hardcoded",
         "status": "SCANNING",
     })
 
@@ -4304,10 +4617,12 @@ async def api_strategy_performance():
         "live_pnl": round(sum(apollo_pnls), 1),
         "live_unit": "%",
         "confidence": 80,
+        "confidence_source": "hardcoded",
         "status": "WAITING_ER",
     })
 
     # ── FORGE: GDX/GLD Pairs ─────────────────────────────────
+    gdx_conf = _compute_conf("forge_gdx_gld")
     strategies.append({
         "system": "GDX/GLD",
         "strategy": "Log-Ratio Mean Reversion",
@@ -4321,7 +4636,9 @@ async def api_strategy_performance():
         "live_pf": 0,
         "live_pnl": 0,
         "live_unit": "%",
-        "confidence": 75,
+        "confidence": _pct(gdx_conf["p_expectancy_positive"]) if gdx_conf else 75,
+        "confidence_source": "computed" if gdx_conf else "hardcoded",
+        "confidence_detail": gdx_conf,
         "status": "SIGNAL_ONLY",
     })
 
@@ -4340,6 +4657,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "$",
         "confidence": 30,
+        "confidence_source": "hardcoded",
         "status": "SIGNAL_ONLY",
     })
 
@@ -4358,6 +4676,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "$",
         "confidence": 35,
+        "confidence_source": "hardcoded",
         "status": "SIGNAL_ONLY",
     })
 
@@ -4376,6 +4695,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "$",
         "confidence": 30,
+        "confidence_source": "hardcoded",
         "status": "SIGNAL_ONLY",
     })
 
@@ -4394,6 +4714,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "%",
         "confidence": 80,
+        "confidence_source": "hardcoded",
         "status": "WAITING_VIX",
     })
 
@@ -4412,6 +4733,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "%",
         "confidence": 85,
+        "confidence_source": "hardcoded",
         "status": "WAITING_EVENT",
     })
 
@@ -4430,6 +4752,7 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "%",
         "confidence": 55,
+        "confidence_source": "hardcoded",
         "status": "BUILT",
     })
 
@@ -4459,15 +4782,286 @@ async def api_strategy_performance():
         "live_pnl": 0,
         "live_unit": "$",
         "confidence": 50,
+        "confidence_source": "hardcoded",
         "status": f"{themis_signals} SIGNALS",
     })
 
+    # Bridge pass: for strategies without canonical fills, try a
+    # strategy_confidence/<label>.json artifact. Rows whose confidence_source
+    # is already "computed" (Argus / GDX/GLD today) are left alone — live
+    # evidence always beats a backtest artifact.
+    _LABEL_MAP = {
+        "Titan": "titan",               # artifact added 2026-04-20
+        "Ares": "ares",                 # artifact added 2026-04-20
+        "Hermes": "hermes",             # artifact added 2026-04-20
+        "Apollo": "apollo",             # artifact added 2026-04-20
+        "Mamba": "mamba",
+        "Cue Banks": "cue_banks",
+        "Tori": "tori",
+        "VIX Revert": "vix_revert",     # artifact added 2026-04-20
+        "Index Rebal": "index_rebal",   # artifact added 2026-04-20
+        "Sector Rot": "sector_rot",     # artifact added 2026-04-20
+        "Themis": "themis",             # hardcoded — signal-only system, no PnL to replay
+    }
+    for row in strategies:
+        label = _LABEL_MAP.get(row["system"])
+        if label:
+            _apply_artifact(row, label)
+
+    # Honest fleet_confidence: use the confidence rollup that the testing
+    # framework (project_testing_framework_20260419) specifies — evidence
+    # bars from live sample, not a hand-picked percentage. If nothing has
+    # hit the sanity bar yet, say so plainly; don't paint a 65% that's not
+    # supported by data.
+    computed_fleet = None
+    try:
+        from helio.fleet_state import _confidence_rollup
+        # Strategies keyed by the labels above so the rollup over this
+        # dashboard's slice matches what the user sees.
+        rollup_input = {}
+        for s in strategies:
+            rollup_input[s["system"]] = {"confidence": s.get("confidence_detail") or {}}
+        computed_fleet = _confidence_rollup(rollup_input)
+    except Exception:
+        computed_fleet = None
+
+    if computed_fleet and computed_fleet.get("strategies_at_sanity_bar", 0) > 0:
+        # Real sample exists somewhere — report fraction of sanity-bar
+        # strategies with P(exp>0) >= 0.90.
+        numer = computed_fleet.get("strategies_p_positive_gte_90pct", 0)
+        denom = computed_fleet.get("strategies_at_sanity_bar", 0)
+        fleet_confidence_pct = int(round(numer / denom * 100)) if denom else 0
+        fleet_confidence_source = "computed"
+        fleet_confidence_detail = (
+            f"{numer}/{denom} strategies at sanity bar meet P(exp>0) >= 0.90"
+        )
+    else:
+        fleet_confidence_pct = None
+        fleet_confidence_source = "insufficient_sample"
+        fleet_confidence_detail = "no strategy has 10+ trades yet"
+
+    # 2026-04-19 external audit #6: split confidence presentation so a
+    # 100%-backfill strategy doesn't inflate the fleet headline. A live-only
+    # view counts only strategies with n_live >= 10 AND live-weighted
+    # expectancy confidence. Today this is zero for every strategy (no live
+    # Tori/Mamba/Cue Banks yet), which is the honest signal.
+    live_only_passing = 0
+    live_only_at_sanity = 0
+    backfill_only_strategies = []
+    for s in strategies:
+        det = s.get("confidence_detail") or {}
+        n_live = int(det.get("n_live") or 0)
+        n_paper = int(det.get("n_paper") or 0)
+        p_pos = det.get("p_expectancy_positive")
+        if n_live >= 10:
+            live_only_at_sanity += 1
+            if p_pos is not None and p_pos >= 0.90:
+                live_only_passing += 1
+        elif n_paper > 0 and n_live == 0 and p_pos is not None and p_pos >= 0.90:
+            backfill_only_strategies.append(s["system"])
+
+    live_confidence = {
+        "strategies_at_live_sanity_bar": live_only_at_sanity,
+        "strategies_passing_90pct_live_only": live_only_passing,
+        "note": (
+            "live_only requires n_live >= 10. Zero under this gate means no "
+            "strategy has enough live/paper fills to prove edge yet — backfill "
+            "evidence is not counted here."
+        ),
+    }
+    backfill_warning = (
+        f"{len(backfill_only_strategies)} strategies "
+        f"({', '.join(backfill_only_strategies) or 'none'}) "
+        f"show P(exp>0)>=0.90 but are 100% backfill — do not conflate with "
+        f"live-proven edge"
+    ) if backfill_only_strategies else None
+
     return JSONResponse({
         "strategies": strategies,
-        "fleet_confidence": 65,
+        "fleet_confidence": fleet_confidence_pct,
+        "fleet_confidence_source": fleet_confidence_source,
+        "fleet_confidence_detail": fleet_confidence_detail,
+        "fleet_confidence_rollup": computed_fleet,
+        "live_confidence": live_confidence,
+        "backfill_dominant_warning": backfill_warning,
         "expected_annual": "40-75%",
+        "expected_annual_source": "hardcoded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+
+def _gather_backtest_trades_by_strategy() -> dict[str, list[dict]]:
+    """Walk each strategy's per-trade backtest source and produce
+    {strategy: [{date, pnl_usd}, ...]} for portfolio-correlation analysis.
+
+    Trade sources mirror the confidence-writer inputs:
+      tori      — forge/tori/backtest_results/trades_*.csv
+      mamba     — forge/mamba/backtest_results/trades_*.csv (pnl_pct*$1000)
+      hermes    — hermes/data/backtest_results/trades_*.csv (pnl_pct*$1000)
+      ares      — ares/data/backtest_results/backtest_*.json trade_list
+      cue_banks — forge/cuebanks/backtest_results/trades_*.csv
+      gdx_gld   — forge/logs/gdx_gld/trades.csv
+      index_rebal — forge/index_rebalance_trades.csv (alpha_ann_pct*$1000/100)
+    """
+    out: dict[str, list[dict]] = {}
+
+    def _latest(glob_pattern: str) -> Path | None:
+        parent = REPO / glob_pattern.rsplit("/", 1)[0]
+        name_glob = glob_pattern.rsplit("/", 1)[1]
+        if not parent.exists():
+            return None
+        cands = sorted(parent.glob(name_glob))
+        return cands[-1] if cands else None
+
+    def _load_csv(path: Path) -> list[dict]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
+
+    def _float(v) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Tori — pnl_usd present (synthesized in writer from pnl_points)
+    tori = REPO / "forge" / "logs" / "tori" / "backtest_trades.csv"
+    if tori.exists():
+        out["tori"] = [
+            {"date": r.get("exit_date") or r.get("entry_date"),
+             "pnl_usd": _float(r.get("pnl_usd"))}
+            for r in _load_csv(tori)
+            if _float(r.get("pnl_usd")) != 0.0
+        ]
+
+    # Mamba — pnl_usd, exit_time
+    mamba = REPO / "forge" / "logs" / "mamba" / "backtest_trades.csv"
+    if mamba.exists():
+        out["mamba"] = [
+            {"date": (r.get("exit_time") or r.get("entry_time") or "")[:10],
+             "pnl_usd": _float(r.get("pnl_usd"))}
+            for r in _load_csv(mamba)
+            if _float(r.get("pnl_usd")) != 0.0
+        ]
+
+    # Hermes — pnl_pct; synthesize pnl_usd from $1000 nominal (matches writer)
+    hermes = _latest("hermes/data/backtest_results/trades_*.csv")
+    if hermes:
+        rows = _load_csv(hermes)
+        hermes_out = []
+        for r in rows:
+            pnl = _float(r.get("pnl_pct")) / 100.0 * 1000.0
+            if pnl == 0.0:
+                continue
+            hermes_out.append({
+                "date": r.get("exit_date") or r.get("entry_date"),
+                "pnl_usd": pnl,
+            })
+        if hermes_out:
+            out["hermes"] = hermes_out
+
+    # Ares — JSON trade_list with pnl_usd + exit_date
+    ares_json = _latest("ares/data/backtest_results/backtest_*.json")
+    if ares_json:
+        try:
+            data = json.loads(ares_json.read_text(encoding="utf-8"))
+            out["ares"] = [
+                {"date": t.get("exit_date") or t.get("entry_date"),
+                 "pnl_usd": _float(t.get("pnl_usd"))}
+                for t in (data.get("trade_list") or [])
+                if _float(t.get("pnl_usd")) != 0.0
+            ]
+        except Exception:
+            pass
+
+    # Cue Banks — pnl_usd, date (no exit_date in this schema)
+    cb = REPO / "forge" / "logs" / "cuebanks" / "cuebanks_backtest_trades.csv"
+    if cb.exists():
+        out["cue_banks"] = [
+            {"date": r.get("date"), "pnl_usd": _float(r.get("pnl_usd"))}
+            for r in _load_csv(cb)
+            if _float(r.get("pnl_usd")) != 0.0
+        ]
+
+    # GDX/GLD — pnl_usd, exit_date
+    gdx = REPO / "forge" / "logs" / "gdx_gld" / "trades.csv"
+    if gdx.exists():
+        out["gdx_gld"] = [
+            {"date": r.get("exit_date"), "pnl_usd": _float(r.get("pnl_usd"))}
+            for r in _load_csv(gdx)
+            if _float(r.get("pnl_usd")) != 0.0
+        ]
+
+    # Index Rebal — alpha_ann_pct, effective_date
+    ir = REPO / "forge" / "index_rebalance_trades.csv"
+    if ir.exists():
+        rows = _load_csv(ir)
+        ir_out = []
+        for r in rows:
+            pnl = _float(r.get("alpha_ann_pct")) / 100.0 * 1000.0
+            if pnl == 0.0:
+                continue
+            ir_out.append({
+                "date": r.get("effective_date") or r.get("announce_date"),
+                "pnl_usd": pnl,
+            })
+        if ir_out:
+            out["index_rebal"] = ir_out
+
+    return out
+
+
+@app.get("/api/portfolio_correlation")
+async def api_portfolio_correlation(source: str = "backfill"):
+    """Pairwise daily-PnL correlation across strategies.
+
+    source=backfill (default): read each strategy's backtest trade file.
+    source=live: read canonical_fills.jsonl (real closed live trades only).
+
+    Correlations use only days where BOTH strategies have a trade —
+    zero-filling would dilute the signal and hide real correlation.
+    Min overlap of 5 shared days. Pairs at |r| >= 0.7 with >=10 overlap
+    are flagged as a diversification warning.
+    """
+    try:
+        from helio.fleet_state import _portfolio_correlation
+    except Exception as e:
+        return JSONResponse({"error": f"helio.fleet_state unavailable: {e}"})
+
+    if source == "live":
+        try:
+            from helio.canonical_fills import read_fills
+        except Exception as e:
+            return JSONResponse({"error": f"canonical_fills unavailable: {e}"})
+        fills = read_fills()
+        by_strat: dict[str, list[dict]] = {}
+        for f in fills:
+            strat = f.get("strategy") or "_unknown"
+            pnl = f.get("pnl_usd")
+            if pnl is None:
+                continue
+            d = f.get("exit_ts") or f.get("entry_ts") or f.get("ts")
+            if not d:
+                continue
+            by_strat.setdefault(strat, []).append(
+                {"date": str(d)[:10], "pnl_usd": pnl}
+            )
+        result = _portfolio_correlation(by_strat)
+    elif source == "backfill":
+        by_strat = _gather_backtest_trades_by_strategy()
+        result = _portfolio_correlation(by_strat)
+    else:
+        return JSONResponse({"error": f"unknown source: {source}"})
+
+    if result is None:
+        return JSONResponse({
+            "source": source,
+            "n_strategies": 0,
+            "note": "no trade data found",
+        })
+    return JSONResponse({"source": source, **result})
 
 
 @app.get("/api/fx_analytics")
@@ -5185,9 +5779,22 @@ function loadStrategyPerformance() {
     if (!el) return;
     const strategies = data.strategies || [];
 
+    const fleetConfText = data.fleet_confidence !== null && data.fleet_confidence !== undefined
+      ? data.fleet_confidence + '%'
+      : '—';
+    const fleetConfDetail = data.fleet_confidence_detail || '';
+    const fleetSrc = data.fleet_confidence_source || '';
+    const fleetBadge = fleetSrc === 'computed'
+      ? '<span style="background:#143021;color:#00e676;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="Computed from canonical_fills bootstrap">CALC</span>'
+      : (fleetSrc === 'insufficient_sample'
+        ? '<span style="background:#3a2f10;color:#ffc107;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="' + fleetConfDetail + '">INSUFFICIENT SAMPLE</span>'
+        : '<span style="background:#3a1010;color:#ff8888;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="Manual constant — not data-derived">HARDCODED</span>');
+    const expectedBadge = (data.expected_annual_source === 'hardcoded')
+      ? '<span style="background:#3a1010;color:#ff8888;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="Manual constant — not data-derived">HARDCODED</span>'
+      : '';
     let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
       + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">STRATEGY PERFORMANCE</div>'
-      + '<div style="font-size:0.7em;color:#7b8ab8;">Fleet confidence: ' + data.fleet_confidence + '% | Expected annual: ' + data.expected_annual + '</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;" title="' + fleetConfDetail + '">Fleet confidence: ' + fleetConfText + fleetBadge + ' | Expected annual: ' + data.expected_annual + expectedBadge + '</div>'
       + '</div>';
 
     html += '<table style="width:100%;border-collapse:collapse;font-size:0.72em;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;overflow:hidden;">';
@@ -5205,10 +5812,31 @@ function loadStrategyPerformance() {
       + '</tr></thead><tbody>';
 
     for (const s of strategies) {
-      const confColor = s.confidence >= 70 ? '#00ff88' : (s.confidence >= 50 ? '#ffc107' : '#ff4444');
+      const confHasNumber = s.confidence !== null && s.confidence !== undefined;
+      const confColor = !confHasNumber ? '#7b8ab8'
+        : (s.confidence >= 70 ? '#00ff88' : (s.confidence >= 50 ? '#ffc107' : '#ff4444'));
       const liveWrColor = s.live_wr >= 50 ? '#00ff88' : (s.live_wr >= 40 ? '#ffc107' : (s.live_wr > 0 ? '#ff4444' : '#7b8ab8'));
       const livePnlColor = s.live_pnl > 0 ? '#00ff88' : (s.live_pnl < 0 ? '#ff4444' : '#7b8ab8');
       const statusColor = s.status === 'BAKING' || s.status === 'SCANNING' || s.status === 'WAITING_ER' ? '#00d4ff' : '#7b8ab8';
+
+      // Confidence cell: number (or —) + source badge + sample warning tooltip
+      const detail = s.confidence_detail || {};
+      const warnText = detail.sample_warning || '';
+      const confText = confHasNumber ? (s.confidence + '%') : '—';
+      let confBadge = '';
+      if (s.confidence_source === 'computed') {
+        const bar = detail.evidence_bar || '';
+        const nTot = detail.n_total !== undefined ? detail.n_total : '';
+        const nLive = detail.n_live !== undefined ? detail.n_live : '';
+        const nPaper = detail.n_paper !== undefined ? detail.n_paper : '';
+        const tip = 'Computed: n=' + nTot + ' (live=' + nLive + ', paper=' + nPaper + '), bar=' + bar + (warnText ? ' — ' + warnText : '');
+        confBadge = '<span title="' + tip + '" style="background:#143021;color:#00e676;padding:1px 4px;margin-left:3px;border-radius:3px;font-size:0.8em;">CALC</span>';
+        if (warnText) {
+          confBadge += '<span title="' + warnText + '" style="color:#ffc107;margin-left:3px;">⚠</span>';
+        }
+      } else if (s.confidence_source === 'hardcoded') {
+        confBadge = '<span title="Manual constant — not data-derived" style="background:#3a1010;color:#ff8888;padding:1px 4px;margin-left:3px;border-radius:3px;font-size:0.8em;">HARDCODED</span>';
+      }
 
       html += '<tr style="border-top:1px solid #1e2a42;">'
         + '<td style="padding:8px;font-weight:bold;color:#00d4ff;">' + s.system + '</td>'
@@ -5219,7 +5847,7 @@ function loadStrategyPerformance() {
         + '<td style="padding:8px;text-align:right;color:#fff;">' + s.live_trades + '</td>'
         + '<td style="padding:8px;text-align:right;color:' + liveWrColor + ';">' + (s.live_wr || '-') + '%</td>'
         + '<td style="padding:8px;text-align:right;color:' + livePnlColor + ';">' + (s.live_pnl >= 0 ? '+' : '') + s.live_pnl + ' ' + s.live_unit + '</td>'
-        + '<td style="padding:8px;text-align:right;color:' + confColor + ';font-weight:bold;">' + s.confidence + '%</td>'
+        + '<td style="padding:8px;text-align:right;color:' + confColor + ';font-weight:bold;">' + confText + confBadge + '</td>'
         + '<td style="padding:8px;text-align:right;color:' + statusColor + ';font-size:0.85em;">' + s.status + '</td>'
         + '</tr>';
     }

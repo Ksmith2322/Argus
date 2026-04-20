@@ -44,22 +44,34 @@ SPECS = [
 PNL_DRIFT_TOLERANCE_USD = 0.01
 
 
-def _read_canonical_by_strategy() -> dict[str, list[dict]]:
-    path = _REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
-    by_strat: dict[str, list[dict]] = defaultdict(list)
-    if not path.exists():
-        return by_strat
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
+def _read_canonical_by_strategy() -> dict[str, list["Fill"]]:
+    """Read across current canonical_fills.jsonl AND any rotated archives
+    (canonical_fills_*.jsonl). Must agree with helio.canonical_fills.read_fills
+    so reconciliation doesn't flag false drift after rotation.
+
+    First real consumer of helio.domain.Fill in production code. Prior version
+    passed raw dicts; switching to Fill means a field rename in canonical_fills
+    will fail fast in the domain dataclass instead of silently misreconciling.
+    """
+    from helio.canonical_fills import _iter_canonical_paths  # private but in-repo
+    from helio.domain import Fill
+
+    by_strat: dict[str, list[Fill]] = defaultdict(list)
+    for path in _iter_canonical_paths():
         try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                fill = Fill.from_canonical_row(r)
+                if fill.strategy:
+                    by_strat[fill.strategy].append(fill)
+        except Exception:
             continue
-        strat = r.get("strategy")
-        if strat:
-            by_strat[strat].append(r)
     return by_strat
 
 
@@ -89,21 +101,23 @@ def _read_strategy_csv(spec: tuple) -> list[dict]:
     return rows
 
 
-def reconcile_strategy(spec: tuple, canonical_rows: list[dict]) -> dict:
+def reconcile_strategy(spec: tuple, canonical_fills: list) -> dict:
+    """Compare per-strategy CSV trades against canonical Fill objects.
+
+    `canonical_fills` is `list[helio.domain.Fill]`; typed-string avoided to
+    keep this module importable even if someone swaps the domain layer.
+    """
     label = spec[0]
     csv_rows = _read_strategy_csv(spec)
 
     csv_keys = {(r["entry_ts"], r["exit_ts"]) for r in csv_rows}
-    canonical_keys = {(r.get("entry_ts") or "", r.get("exit_ts") or "") for r in canonical_rows}
+    canonical_keys = {(f.entry_ts or "", f.exit_ts or "") for f in canonical_fills}
 
     missing_in_canonical = csv_keys - canonical_keys
     extra_in_canonical = canonical_keys - csv_keys
 
     csv_pnl_sum = sum(r["pnl_usd"] for r in csv_rows)
-    canonical_pnl_sum = sum(
-        float(r.get("pnl_usd") or 0) for r in canonical_rows
-        if r.get("pnl_usd") is not None
-    )
+    canonical_pnl_sum = sum(f.pnl_usd for f in canonical_fills if f.pnl_usd is not None)
     pnl_drift = abs(canonical_pnl_sum - csv_pnl_sum)
 
     drift_flags = []
@@ -117,7 +131,7 @@ def reconcile_strategy(spec: tuple, canonical_rows: list[dict]) -> dict:
     return {
         "strategy": label,
         "csv_row_count": len(csv_rows),
-        "canonical_row_count": len(canonical_rows),
+        "canonical_row_count": len(canonical_fills),
         "csv_pnl_sum_usd": round(csv_pnl_sum, 2),
         "canonical_pnl_sum_usd": round(canonical_pnl_sum, 2),
         "pnl_drift_usd": round(pnl_drift, 4),
@@ -130,7 +144,8 @@ def reconcile_strategy(spec: tuple, canonical_rows: list[dict]) -> dict:
 
 def build_report() -> dict:
     canonical_by_strat = _read_canonical_by_strategy()
-    results = [reconcile_strategy(spec, canonical_by_strat.get(spec[0], [])) for spec in SPECS]
+    results = [reconcile_strategy(spec, canonical_by_strat.get(spec[0], []))
+               for spec in SPECS]
     drift_strategies = [r["strategy"] for r in results if r["status"] == "DRIFT"]
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

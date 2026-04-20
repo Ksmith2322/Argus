@@ -1848,6 +1848,33 @@ class InstrumentRunner:
                     s.entry_regime or "",
                 ] + validity_fields + entry_feature_fields)
 
+        # Dual-write to canonical fills so Argus trades flow to the fleet-wide
+        # log live, not nightly. Gate on experiment validity to match the
+        # existing backfill filter (argus valid_filter=True), otherwise
+        # reconciliation would immediately flag DRIFT between canonical and CSV.
+        # Internal try/except swallows any broken log path — cannot break
+        # paper trading here. Matches the pattern used by the forge runners.
+        if valid:
+            try:
+                from helio.canonical_fills import write_fill_typed
+                from helio.domain import Fill
+                write_fill_typed(Fill(
+                    strategy=f"argus_{self.symbol.lower()}",
+                    symbol=self.symbol,
+                    direction=s.position.lower() if s.position else "",
+                    side="EXIT",
+                    entry_ts=s.entry_time.isoformat() if s.entry_time else None,
+                    exit_ts=now.isoformat(),
+                    entry_px=float(s.entry_price),
+                    exit_px=float(exit_price),
+                    size=float(s.position_size),
+                    risk_usd=float(s.entry_risk_usd or 0.0),
+                    pnl_usd=round(pnl_usd, 2),
+                    exit_reason=exit_reason,
+                ))
+            except Exception:
+                pass  # never let canonical log break paper trading
+
         # Clear entry features after trade close
         self._entry_features = {}
 
@@ -4565,14 +4592,10 @@ def run_with_reconnect(
     main._runtime_start = time.time()
     main._is_reconnect = False
 
-    # Capture git sha for cohort auditing
-    import subprocess as _sp
-    try:
-        main._git_sha = _sp.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=_sp.DEVNULL, text=True
-        ).strip()
-    except Exception:
-        main._git_sha = "unknown"
+    # Capture git sha for cohort auditing (delegates to shared helper —
+    # 2026-04-19 migration)
+    from helio.strategy_common import git_sha as _git_sha
+    main._git_sha = _git_sha()
 
     try:
         for attempt in range(max_retries):

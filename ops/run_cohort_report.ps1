@@ -132,7 +132,7 @@ try {
         }
     }
     if ($LASTEXITCODE -ne 0) {
-        Add-Content -Path $logFile -Value "[$timestamp] reconciliation DRIFT detected (exit $LASTEXITCODE, non-fatal — see report)"
+        Add-Content -Path $logFile -Value "[$timestamp] reconciliation DRIFT detected (exit $LASTEXITCODE, non-fatal -- see report)"
     }
 
     Write-Host "Generating morning brief..."
@@ -144,6 +144,17 @@ try {
     }
     if ($LASTEXITCODE -ne 0) {
         Add-Content -Path $logFile -Value "[$timestamp] morning_brief WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
+    Write-Host "Building fleet_state.json (Phase 1 read-model aggregator)..."
+    $fleetStateOutput = & $python -m helio.fleet_state 2>&1
+    foreach ($line in @($fleetStateOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] fleet_state: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] fleet_state WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
     Write-Host "Running Hermes gap scanner..."
@@ -212,16 +223,20 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] wick_gbpusd WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
-    Write-Host "Running Oracle Polymarket scanner..."
-    $oracleOutput = & $python -m oracle.runner --dry-run 2>&1
-    foreach ($line in @($oracleOutput)) {
-        if ($line) {
-            Add-Content -Path $logFile -Value "[$timestamp] oracle: $line"
-        }
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Add-Content -Path $logFile -Value "[$timestamp] oracle WARNING: exit code $LASTEXITCODE (non-fatal)"
-    }
+    # Oracle (Polymarket) paused 2026-04-19: Polymarket is geoblocked for US
+    # users, so there is no execution path. Kept in repo for a potential
+    # Kalshi pivot. To reactivate: uncomment this block and restore the
+    # "oracle" entry in helio/fleet_monitor.py SYSTEMS.
+    # Write-Host "Running Oracle Polymarket scanner..."
+    # $oracleOutput = & $python -m oracle.runner --dry-run 2>&1
+    # foreach ($line in @($oracleOutput)) {
+    #     if ($line) {
+    #         Add-Content -Path $logFile -Value "[$timestamp] oracle: $line"
+    #     }
+    # }
+    # if ($LASTEXITCODE -ne 0) {
+    #     Add-Content -Path $logFile -Value "[$timestamp] oracle WARNING: exit code $LASTEXITCODE (non-fatal)"
+    # }
 
     Write-Host "Running Titan scanner (refresh + long-only)..."
     $titanOutput = & $python -m titan.ops.scanner --refresh --long-only 2>&1

@@ -39,9 +39,34 @@ MATURED_PATH = APOLLO_LOGS / "matured_trades.jsonl"
 FORWARD_RETURNS_PATH = APOLLO_LOGS / "forward_returns.jsonl"
 
 MODE = "research_only"  # research_only | paper | live — flip when ready
-SCORE_FLOOR = 75        # match apollo/runner.py post-dedup threshold
-HORIZON_TRADING_DAYS = 3  # default T+3; strategy card can override
-MAX_PLANNED_PER_SYMBOL_PER_EARNINGS = 1  # dedupe
+# SCORE_FLOOR, HORIZON_TRADING_DAYS, MAX_PLANNED_* loaded via registry with
+# fallback (Phase 2 pattern). See forge/gld_pm_long/runner.py for the
+# template. Phase 1 equivalence test pins registry==defaults; this
+# migration is a no-op behavior change today.
+_HARDCODED_DEFAULTS = {
+    "SCORE_FLOOR": 75,       # match apollo/runner.py post-dedup threshold
+    "HORIZON_TRADING_DAYS": 3,  # default T+3; strategy card can override
+    "MAX_PLANNED_PER_SYMBOL_PER_EARNINGS": 1,  # dedupe
+}
+
+
+def _load_from_registry() -> dict:
+    try:
+        from helio.strategy_registry import load_registry
+        reg = load_registry().apollo_earnings_drift
+        return {
+            "SCORE_FLOOR": reg.score_floor,
+            "HORIZON_TRADING_DAYS": reg.horizon_trading_days,
+            "MAX_PLANNED_PER_SYMBOL_PER_EARNINGS": reg.max_planned_per_symbol_per_earnings,
+        }
+    except Exception:
+        return dict(_HARDCODED_DEFAULTS)
+
+
+_PARAMS = _load_from_registry()
+SCORE_FLOOR = _PARAMS["SCORE_FLOOR"]
+HORIZON_TRADING_DAYS = _PARAMS["HORIZON_TRADING_DAYS"]
+MAX_PLANNED_PER_SYMBOL_PER_EARNINGS = _PARAMS["MAX_PLANNED_PER_SYMBOL_PER_EARNINGS"]
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -185,16 +210,32 @@ def mature_tickets() -> list[dict]:
         if horizon_data is None:
             updated_planned.append(t)
             continue
-        # Compute counterfactual PnL at time of planning
+        # Compute counterfactual PnL at time of planning.
+        #
+        # HONEST MATH CAVEATS (see RESTRUCTURE_GUIDE §9 — 2026-04-19):
+        # This is a fictional PnL until MODE flips to 'paper' and real
+        # fills are captured. The assumptions:
+        #   1. risk_usd = compute_risk_usd(0.005) — 0.5% of anchor
+        #      (unproven-tier sizing; conservative)
+        #   2. deployed_usd = risk_usd / assumed_stop_pct
+        #      where assumed_stop_pct = 2% (typical PEAD stop distance).
+        #      This is a GUESS. Until MODE='paper' measures a real stop
+        #      distribution, we can't know whether 2% is representative.
+        #   3. counterfactual_pnl_usd = deployed_usd × ret_pct / 100
+        #      treats the T+N forward return as the full % move on
+        #      deployed capital. No slippage, no commission, no partial
+        #      fills. No overnight risk model. No real IBKR behavior.
+        #
+        # Consumer contract: matured rows carry `counterfactual: true`
+        # and assumptions in `math_assumptions` so the dashboard / morning
+        # brief can label these numbers HONESTLY as hypothetical.
+        #
+        # When MODE flips to 'paper': delete this block, capture real
+        # fills via canonical_fills dual-write, compute PnL from the
+        # actual buys/sells. The counterfactual story ends there.
         anchor_at_plan = float(t.get("anchor_at_plan_usd") or get_sizing_anchor_usd())
-        # Risk budget: at unproven tier 0.5% × anchor
-        risk_usd = compute_risk_usd(0.005)  # conservative unproven-tier sizing
+        risk_usd = compute_risk_usd(0.005)
         ret_pct = float(horizon_data.get("return_pct") or 0.0)
-        # Scale: counterfactual PnL is expressed against risk_usd, assuming
-        # stop is roughly at -2%-ish (typical for PEAD strategies). At
-        # research_only mode, we express ret_pct directly in a $50 risk budget.
-        # Conservative: ret_pct is treated as direct % on deployed capital.
-        # deployed = risk_usd / assumed_stop_pct (assume 2%)
         assumed_stop_pct = 0.02
         deployed_usd = risk_usd / assumed_stop_pct
         counterfactual_pnl_usd = round(deployed_usd * (ret_pct / 100.0), 2)
@@ -212,6 +253,16 @@ def mature_tickets() -> list[dict]:
             "exit_date": horizon_data.get("date"),
             "return_pct": ret_pct,
             "counterfactual_pnl_usd": counterfactual_pnl_usd,
+            "counterfactual": True,  # hard label for dashboard / morning brief
+            "math_assumptions": {
+                "risk_pct_of_anchor":    0.005,
+                "assumed_stop_pct":      assumed_stop_pct,
+                "slippage_bps_per_side": 0,  # not modeled
+                "commission_usd":        0,  # not modeled
+                "notes": ("counterfactual PnL = anchor × 0.5% / 2% × ret_pct. "
+                           "Not a real fill. Flip MODE to 'paper' to stop "
+                           "computing this and start measuring actual PnL."),
+            },
             "matured_at": datetime.now(timezone.utc).isoformat(),
             "mode": t.get("mode", MODE),
         }
@@ -236,8 +287,14 @@ def summary() -> dict:
     active = [p for p in planned if p.get("status") == "planned"]
     total_pnl = sum(m.get("counterfactual_pnl_usd") or 0 for m in matured)
     wins = sum(1 for m in matured if (m.get("counterfactual_pnl_usd") or 0) > 0)
+    # Surface the counterfactual nature explicitly — every consumer should
+    # SEE that this number is hypothetical, not treat it as realised PnL.
+    is_counterfactual = MODE == "research_only"
     return {
         "mode": MODE,
+        "is_counterfactual": is_counterfactual,
+        "pnl_label": ("counterfactual_pnl_usd (hypothetical — MODE=research_only)"
+                       if is_counterfactual else "realised_pnl_usd"),
         "planned_active": len(active),
         "planned_total_lifetime": len(planned),
         "matured_count": len(matured),

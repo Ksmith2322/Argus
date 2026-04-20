@@ -1,7 +1,11 @@
 # Tori Trades Complete Rulebook
 
 **Source:** Victoria Duke (@ToriTrades) — toritradez.com
-**Compiled from:** "Breaking Down My SIMPLE Trading Strategy," "How To Trade TRENDLINES (Full Guide)," Trendline Trading Playbook PDF, Masterclass content
+**Compiled from:** 9 transcripts (master class, exit criteria video, trendline maintenance video, trend reversal basics, 3-step beginner video, Apex 5m live, trendline rating video, live stream Q&A, and the original "Breaking Down My SIMPLE Trading Strategy")
+**Last updated:** 2026-04-19 — see v2 updates section at the bottom of this file.
+
+**Primary consolidated reference:** `memory/project_strategy_playbooks_20260419.md` §1 (Tori Trades).
+**Audit / subset-edge findings:** `memory/project_mamba_tori_review_20260419.md`.
 
 ---
 
@@ -198,3 +202,106 @@ GC (Gold):      Future("GC", exchange="COMEX")   — client ID 106
 YM (Dow):       Future("YM", exchange="CBOT")    — client ID 107
 # Or micro contracts: MPL, MCL, MGC, MYM for smaller sizing
 ```
+
+---
+
+## v2 updates from 2026-04-19 transcript consolidation (9 videos)
+
+### Exit-logic audit — CRITICAL ROOT CAUSE
+
+The current bot's `_find_opposing_safety` at `forge/tori/trendlines.py:414-434` returns `recent swing high + 0.3*ATR` (or low) — a **flat horizontal level**, not an angled trend line.
+
+CSV r-multiple distribution confirms the problem:
+- 44 of 65 losers at ~-1R (stops working)
+- 15 of 19 winners capped at 1-2R (trail too tight)
+- 1 outlier at 11.64R (the one Bounce-A winner that keeps the subset edge alive)
+- Sum of R-multiples = **-15.24**
+
+Tori's method requires the occasional 5-10R runner. Our swing-based trail pulls the stop in too tight, slicing off the right tail of the return distribution. **This alone explains why Break-A and Break-A+ setups lose despite passing her setup grading — the entry is right, the exit is wrong.**
+
+### Safety line is TWO stages (new mechanical insight)
+
+From the dedicated exit-criteria video:
+
+1. **At entry**: safety line = opposing trend line (angled), fixed at entry. Stop goes on the *other side* of this line (past it by 0.1-0.3%, never on it).
+2. **During trade, once move develops**: draw a NEW steeper trend line using:
+   - Point A = the last touch point from *before* the move
+   - Point B = the most recent post-entry higher-low (longs) or lower-high (shorts)
+   This steeper line **replaces** the original safety as the active stop.
+3. **Exit fires on whichever comes first**:
+   - Current safety line break
+   - HTF trend line contact
+   - S/R level contact
+
+### Grading formula (from her rating video)
+
+Concrete scoring to apply per trend line:
+```
+grade = touch_points_score + data_span_score − invalidation_penalty
+touch_points_score: 3+ = 5pts, 2 = 3pts, 1 = 0
+data_span_score: wide bar range = 5pts, narrow = 2pts
+invalidation_penalty: -1 per recent cross
+
+A+ (ready to trade at full conviction): ≥ 9
+A (acceptable): 7-8
+Borderline (smaller size): 6
+Delete: ≤ 3
+```
+
+### Line lifecycle — maintain, don't regenerate
+
+Current bot regenerates trend lines every bar by refitting `fit_ascending_trendline` / `fit_descending_trendline` on chunks of swing points. That's a **different architecture** from her method. Her rules:
+
+- Lines are stable objects with persistent identity
+- Adjust Point B to new swings as they form (only on closed candles, never open)
+- Delete if line becomes horizontal (→ it's now a key level, not a trend line) or inverted
+- Don't adjust lines **while in a trade** — entry attribution stays fixed
+- One attempt per trend line — once a line has been traded and failed, don't reuse it
+
+Faithful v2 needs a trend-line object store with create/adjust/delete semantics and stable IDs.
+
+### Time frame is context-dependent
+
+- **4H**: her default for personal capital, weekly/days-long holds
+- **1H**: intermediate, day-long holds
+- **5-minute**: for **Apex prop firm compliance** (no overnight holds), intra-day only
+
+Same rules at every TF. Only bar size and hold horizon change.
+
+### Entry timing (reconciled across 9 videos)
+
+- **Enter on the break, NOT candle close.** Live-stream Q&A: *"I do not wait for the candle to close."*
+- **Wait for candle close on EXIT when uncertain** — fakeout-check nuance from her rating video.
+
+### Subset edge (from `forge/logs/tori/backtest_trades.csv`)
+
+By setup × grade:
+| Bucket | Trades | WR | PnL$ | PF |
+|---|--:|--:|--:|--:|
+| Bounce A | 5 | 20% | +810 | **3.56** |
+| Break A | 44 | 32% | -1355 | 0.45 |
+| Break A+ | 12 | 33% | -484 | 0.44 |
+| Break Retest | 4 | 0% | -643 | 0.00 |
+
+By instrument:
+| Instrument | Trades | PF | PnL |
+|---|--:|--:|--:|
+| Dow | 22 | **1.85** | +835 |
+| Gold | 10 | 0.65 | -177 |
+| Platinum | 13 | 0.29 | -826 |
+| Crude Oil | 20 | 0.08 | -1503 |
+
+**Bounce-A-only and Dow-only are the positive subsets.** Break/Break-A+/Break-Retest lose badly — consistent with my exit-logic audit: even when setup grading passes, the wrong trail shape kills the trade.
+
+### Bridge plan (priority order)
+
+1. **Fix the exit logic first** — replace swing-based stop with two-stage trend-line trail. This alone should materially improve all break setups.
+2. **Add grading function** per the formula above.
+3. **Promote Bounce-A-only + Dow-only as active research candidates.** Disable other setups until they pass independent backtests with the new exit logic.
+4. Add HTF context (monthly/weekly/daily trend lines propagated into 4H or 5m scan).
+5. One-attempt-per-trend-line enforcement with stable `trendline_id`.
+6. (Longer term) rebuild trend-line store as persistent objects with maintain/adjust/delete lifecycle.
+
+### Honest expectation
+
+Filtered to Bounce-A + Dow-only, we get ~5 trades of 65. Even with a perfectly implemented v2, the confidence artifact's `p_expectancy_positive` should remain `null` below the 10-trade sanity bar. The narrow-scope rebuild is expected to produce lower trade frequency and require more time to earn a real confidence number.

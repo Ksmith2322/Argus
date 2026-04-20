@@ -1,0 +1,274 @@
+"""Hardcoded→computed confidence bridge.
+
+Loads and validates per-strategy confidence artifacts from
+`strategy_confidence/<label>.json`. The dashboard uses these to replace
+hardcoded placeholder numbers when a backtest pipeline has produced a
+validated artifact — but canonical_fills (live evidence) still takes
+priority.
+
+See `strategy_confidence/README.md` for the schema spec and writing rules.
+
+Design:
+  - Pydantic model enforces shape + three invariants (see docstring on
+    `StrategyConfidenceArtifact.validate_invariants`).
+  - Invalid files are **silently skipped** by the loader. A broken
+    artifact must never crash the dashboard or surface a misleading row.
+    The `_errors` dict captures validation failures for `/api/health`.
+  - No writer logic here — writers live with each strategy and import
+    this module to validate before writing.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+_REPO = Path(__file__).resolve().parents[1]
+ARTIFACT_DIR = _REPO / "strategy_confidence"
+SCHEMA_VERSION = 1
+
+# Files prefixed "_" are reserved (README, _example.json, etc.) and never
+# loaded as real artifacts, even if well-formed.
+_RESERVED_PREFIX = "_"
+
+
+EvidenceBar = Literal["insufficient", "sanity", "review", "promotion"]
+
+
+class CostStress(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pf_1x: float | None = None
+    pf_2x: float | None = None
+    pf_3x: float | None = None
+
+
+class WalkForward(BaseModel):
+    """Sequential fold analysis. Populated by helio.fleet_state._walk_forward_stability.
+
+    Extended 2026-04-19 to carry the richer output — stability_score and
+    per-fold detail — without breaking existing consumers (all fields
+    optional).
+    """
+    model_config = ConfigDict(extra="allow")
+    folds: int | None = None
+    stable_folds: int | None = None
+    pf_per_fold: list[float] | None = None
+    # New fields from _walk_forward_stability
+    n_folds: int | None = None
+    fold_size: int | None = None
+    positive_folds: int | None = None
+    stability_score: float | None = None
+    all_folds_positive: bool | None = None
+
+
+class CostStressExtended(BaseModel):
+    """Richer cost-stress output from _cost_stress. Replaces the original
+    CostStress incrementally — old CostStress model preserved for backwards
+    compat."""
+    model_config = ConfigDict(extra="forbid")
+    cost_per_trade_usd: float
+    pf_1x: float | None = None
+    pf_2x: float | None = None
+    pf_3x: float | None = None
+    total_pnl_1x: float | None = None
+    total_pnl_2x: float | None = None
+    total_pnl_3x: float | None = None
+    survives_2x: bool
+    survives_3x: bool
+
+
+class TopNSensitivity(BaseModel):
+    """Output of _top_n_sensitivity — PF as top N winners are removed."""
+    model_config = ConfigDict(extra="allow")
+    pf_full: float | None = None
+    pf_minus_top3: float | None = None
+    still_positive_after_top3_removed: bool
+
+
+class PerGroupProfitability(BaseModel):
+    """Output of _per_group_profitability — per-bucket PF for
+    per-instrument / per-hour / per-day gates."""
+    model_config = ConfigDict(extra="allow")
+    group_key: str
+    n_groups: int
+    positive_groups: int
+    all_positive: bool
+
+
+class MonteCarloStressTest(BaseModel):
+    """Output of helio.fleet_state._monte_carlo_shuffle.
+
+    Surfaces in a confidence artifact as `mc_stress` (optional). Reading
+    this field tells an operator whether the headline PF is driven by a
+    handful of outlier trades or by broad profitability. Critical context
+    for any strategy that shows `p_expectancy_positive >= 0.80`.
+    """
+    model_config = ConfigDict(extra="forbid")
+    shuffles: int
+    max_drawdown_usd: float
+    pct_shuffles_profitable: float = Field(..., ge=0.0, le=1.0)
+    ruin_fraction: float = Field(..., ge=0.0, le=1.0)
+    top1_pct_of_total_pnl: float
+    top3_pct_of_total_pnl: float
+    top5_pct_of_total_pnl: float
+    ex_top1_total_pnl_usd: float
+
+
+class StrategyConfidenceArtifact(BaseModel):
+    """Validated confidence record for one strategy.
+
+    Invariants (enforced in `validate_invariants`):
+      1. `bt_pf` must be a scalar float, not a range string.
+      2. `p_expectancy_positive` must be None when n_total < 10.
+      3. `p_expectancy_positive` must be None when source contains
+         "hardcoded_estimate".
+
+    Violating these rules raises ValidationError and the loader drops the
+    artifact — the dashboard row falls back to hardcoded + badge.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(..., description="must equal 1")
+    strategy: str
+    source: str
+    generated_at: str  # ISO-8601 UTC; kept as string for forward-compat
+
+    n_total: int = Field(..., ge=0)
+    n_live: int = Field(..., ge=0)
+    n_paper: int = Field(..., ge=0)
+    evidence_bar: EvidenceBar
+
+    # Backtest metadata — optional. When present, dashboard row's
+    # bt_pf/bt_wr/bt_trades are populated from these values.
+    bt_pf: float | None = None
+    bt_wr: float | None = None
+    bt_trades: int | None = Field(None, ge=0)
+
+    expectancy_usd: float | None = None
+    expectancy_r: float | None = None
+    p_expectancy_positive: float | None = Field(None, ge=0.0, le=1.0)
+    sample_warning: str | None = None
+
+    cost_stress: CostStress | CostStressExtended | None = None
+    walk_forward: WalkForward | None = None
+    mc_stress: MonteCarloStressTest | None = None
+    top_n_sensitivity: TopNSensitivity | None = None
+    per_instrument: PerGroupProfitability | None = None
+    per_day_of_week: PerGroupProfitability | None = None
+
+    @model_validator(mode="after")
+    def validate_invariants(self) -> "StrategyConfidenceArtifact":
+        if self.schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version must be {SCHEMA_VERSION}, got {self.schema_version}"
+            )
+        # Invariant 1: bt_pf is already typed as float | None by pydantic.
+        # A string range like "1.1-1.3" fails type-coercion before we get
+        # here — nothing to add in code, but documented for clarity.
+
+        # Invariant 2: sample below sanity bar → no scalar confidence
+        if self.n_total < 10 and self.p_expectancy_positive is not None:
+            raise ValueError(
+                f"p_expectancy_positive must be null when n_total < 10 "
+                f"(got n_total={self.n_total}, p={self.p_expectancy_positive}); "
+                f"bootstrap is not trustworthy below the sanity bar"
+            )
+        # Invariant 3: manual estimates cannot carry a confidence number
+        if (self.source and "hardcoded_estimate" in self.source.lower()
+                and self.p_expectancy_positive is not None):
+            raise ValueError(
+                "p_expectancy_positive must be null when source is a hardcoded_estimate"
+            )
+        # Consistency: n_live + n_paper == n_total
+        if self.n_live + self.n_paper != self.n_total:
+            raise ValueError(
+                f"n_live + n_paper ({self.n_live}+{self.n_paper}) != n_total ({self.n_total})"
+            )
+        return self
+
+
+def _artifact_path(label: str) -> Path:
+    return ARTIFACT_DIR / f"{label}.json"
+
+
+def load_confidence_artifact(label: str) -> StrategyConfidenceArtifact | None:
+    """Load and validate one artifact. Returns None if:
+      - filename is reserved (prefix `_`)
+      - file does not exist
+      - JSON is malformed
+      - schema validation fails
+
+    Never raises. A broken artifact is the dashboard's "absent" state,
+    same as no file at all.
+    """
+    if label.startswith(_RESERVED_PREFIX):
+        return None
+    path = _artifact_path(label)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        artifact = StrategyConfidenceArtifact.model_validate(raw)
+    except Exception:
+        return None
+    # Filename must match declared strategy — prevents accidentally
+    # copying one strategy's artifact as another's.
+    if artifact.strategy != label:
+        return None
+    return artifact
+
+
+def audit_artifacts(labels: list[str]) -> dict:
+    """Enumerate the state of every expected artifact. Used by /api/health
+    to surface bridge health at a glance.
+
+    Returns:
+      {
+        "total_expected": int,
+        "present_valid": int,
+        "present_invalid": int,
+        "missing": int,
+        "valid": [labels],
+        "invalid": [{"label": ..., "error": "..."}],
+        "absent": [labels],
+      }
+    """
+    valid: list[str] = []
+    invalid: list[dict] = []
+    absent: list[str] = []
+    for label in labels:
+        if label.startswith(_RESERVED_PREFIX):
+            continue
+        path = _artifact_path(label)
+        if not path.exists():
+            absent.append(label)
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            invalid.append({"label": label, "error": f"parse: {type(e).__name__}: {e}"})
+            continue
+        try:
+            art = StrategyConfidenceArtifact.model_validate(raw)
+            if art.strategy != label:
+                invalid.append({"label": label,
+                                "error": f"filename/strategy mismatch: file={label} strategy={art.strategy}"})
+                continue
+            valid.append(label)
+        except Exception as e:
+            invalid.append({"label": label, "error": f"schema: {e}"})
+    return {
+        "total_expected": len([l for l in labels if not l.startswith(_RESERVED_PREFIX)]),
+        "present_valid": len(valid),
+        "present_invalid": len(invalid),
+        "missing": len(absent),
+        "valid": valid,
+        "invalid": invalid,
+        "absent": absent,
+    }

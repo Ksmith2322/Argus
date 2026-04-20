@@ -34,12 +34,16 @@ import numpy as np
 import pandas as pd
 
 from forge.cuebanks.confluence import (
+    BreakTracker,
     compute_fib_levels,
+    detect_bearish_bat,
+    detect_bullish_bat,
     detect_consolidation_break,
     detect_exhaustion,
     detect_gap_at_session_open,
     detect_structure,
     find_horizontal_sr,
+    find_supply_demand_zones,
     find_swing_points,
     score_confluence,
 )
@@ -75,6 +79,28 @@ IBKR_CLIENT_ID = 108
 
 # Starting equity for backtest
 BACKTEST_EQUITY = 10_000.0
+
+# 2026-04-19: first faithful-rebuild increment from the Confluence 1.0
+# transcript audit. Cue Banks repeats "no retest, no entry" 10+ times — the
+# current bot doesn't enforce this. When True, after a confluence signal
+# fires, require that price was on the OPPOSITE side of the matched S/R
+# level in the last N bars (i.e., the level was broken and we're now
+# retesting it from the new side). Default False preserves v1 behavior
+# while the gate is validated. Flip to True + rerun backtest to compare.
+CUEBANKS_RETEST_REQUIRED = False
+CUEBANKS_RETEST_LOOKBACK_BARS = 10
+
+# 2026-04-19 v3: enable the two Confluence 1.0 factors his bot was missing.
+# A/B backtest result:
+#   Baseline (neither):  PF 0.89, -$514
+#   S/D zones ONLY:      PF 1.34, +$2,134   ← the actual fix
+#   Harmonics ONLY:      PF 0.93, -$335     (slight lift, not decisive)
+#   Both:                PF 1.34 (same as S/D only — harmonics add nothing here)
+# S/D zones flipped ON by default. Harmonics left OFF; the bullish/bearish
+# bat detector fires rarely on H4 and doesn't move the needle on this
+# sample. Keep the code for future tuning.
+CUEBANKS_USE_SD_ZONES = True
+CUEBANKS_USE_HARMONICS = False
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +234,20 @@ def run_backtest():
         if ny_bars.empty:
             continue
 
+        # Retest tracker: stateful per-level break + retest detection.
+        # Populated with today's H4 S/R levels; updated every M5 bar.
+        break_tracker = BreakTracker(tolerance_pct=0.002) if CUEBANKS_RETEST_REQUIRED else None
+        if break_tracker is not None:
+            break_tracker.register_levels(h4_sr_levels)
+
         for i in range(5, len(ny_bars)):
             if day_trades >= MAX_TRADES_PER_DAY:
                 break
 
             bar = ny_bars.iloc[i]
             bar_ts = ny_bars.index[i]
+            if break_tracker is not None:
+                break_tracker.update(i, bar)
             price = float(bar["Close"])
 
             # Get bar index in full df for exhaustion/consolidation
@@ -236,6 +270,18 @@ def run_backtest():
                 elif slope < 0 and price > float(recent_20["Close"].iloc[-1]) + abs(slope) * 5:
                     trendline_break = True  # broke uptrend
 
+            # Supply/demand zones (from H4 context) and harmonic patterns
+            # (from recent H4 swings). Both are optional, flag-gated for A/B.
+            sd_zones = None
+            if CUEBANKS_USE_SD_ZONES:
+                sd_zones = find_supply_demand_zones(prior_h4, lookback_bars=60)
+
+            harmonic = None
+            if CUEBANKS_USE_HARMONICS:
+                bull = detect_bullish_bat(h4_swing_highs, h4_swing_lows, price)
+                bear = detect_bearish_bat(h4_swing_highs, h4_swing_lows, price)
+                harmonic = bull or bear  # at most one can match at a given price
+
             # Score confluence
             result = score_confluence(
                 price=price,
@@ -247,6 +293,8 @@ def run_backtest():
                 consolidation_break=consol_break,
                 gap=gap if i < 12 else None,  # Gap only relevant early in session
                 tolerance_pct=0.002,
+                sd_zones=sd_zones,
+                harmonic=harmonic,
             )
 
             if not result["tradeable"]:
@@ -261,6 +309,17 @@ def run_backtest():
                 continue
             if daily_bias == "bearish" and direction != "SHORT":
                 continue
+
+            # Faithful retest gate (2026-04-19 v2): uses stateful BreakTracker
+            # to enforce Cue Banks' "no retest, no entry." The v1 naive check
+            # lost the A/B; this version detects actual body-close breaks and
+            # requires the current bar to touch the broken level from the new
+            # side within `recency_bars` of the touch. See BreakTracker
+            # docstring for details.
+            if break_tracker is not None:
+                matched_level = break_tracker.is_fresh_retest(i, direction)
+                if matched_level is None:
+                    continue
 
             # Confirmation: look for pullback + reversal in last 3 bars
             confirmed = False

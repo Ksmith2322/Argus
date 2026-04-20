@@ -371,6 +371,204 @@ def detect_consolidation_break(
 
 
 # ---------------------------------------------------------------------------
+# Supply/Demand zones (2026-04-19 — Confluence 1.0 transcript rule)
+# ---------------------------------------------------------------------------
+
+def find_supply_demand_zones(
+    df: pd.DataFrame,
+    lookback_bars: int = 60,
+    min_breakout_pct: float = 0.004,
+) -> list[dict]:
+    """Detect supply/demand zones per Cue Banks' Confluence 1.0 rule:
+    the zone is drawn from the PREVIOUS candle's wick to the breakout
+    candle's body.
+
+    A demand zone (support) forms when:
+      1. Consolidation or pullback candle prints (candle_a)
+      2. Next candle breaks upward strongly (candle_b), with its close
+         >= (1 + min_breakout_pct) × candle_a.close
+      3. Zone = [candle_a.low (wick), candle_b.open (body start)]
+
+    Supply zone (resistance) is the mirror: strong down candle after a
+    pullback, zone = [candle_b.open, candle_a.high].
+
+    Returns a list of zone dicts with price range, bar index, and type.
+    """
+    zones = []
+    if len(df) < 3:
+        return zones
+
+    start = max(0, len(df) - lookback_bars)
+    for i in range(start + 1, len(df)):
+        candle_a = df.iloc[i - 1]
+        candle_b = df.iloc[i]
+
+        # Demand: candle_b breaks UP strongly from candle_a
+        if float(candle_b["Close"]) >= float(candle_a["Close"]) * (1 + min_breakout_pct):
+            zone_bottom = float(candle_a["Low"])  # wick
+            zone_top = float(candle_b["Open"])    # breakout body start
+            if zone_bottom < zone_top:
+                zones.append({
+                    "type": "demand",
+                    "zone_bottom": round(zone_bottom, 2),
+                    "zone_top": round(zone_top, 2),
+                    "breakout_bar": i,
+                })
+
+        # Supply: candle_b breaks DOWN strongly
+        elif float(candle_b["Close"]) <= float(candle_a["Close"]) * (1 - min_breakout_pct):
+            zone_bottom = float(candle_b["Open"])  # breakout body start
+            zone_top = float(candle_a["High"])     # wick
+            if zone_bottom < zone_top:
+                zones.append({
+                    "type": "supply",
+                    "zone_bottom": round(zone_bottom, 2),
+                    "zone_top": round(zone_top, 2),
+                    "breakout_bar": i,
+                })
+
+    return zones
+
+
+def price_in_zone(price: float, zone: dict, tolerance_pct: float = 0.001) -> bool:
+    """True if `price` is inside the zone (optionally expanded by tolerance)."""
+    pad = zone["zone_top"] * tolerance_pct
+    return (zone["zone_bottom"] - pad) <= price <= (zone["zone_top"] + pad)
+
+
+# ---------------------------------------------------------------------------
+# Harmonic patterns (2026-04-19 — bullish bat + bearish bat)
+# ---------------------------------------------------------------------------
+
+def _swing_idx(s: dict) -> int:
+    """Swing-point index accessor that handles both {"index": ...} (helio/tori)
+    and {"bar_idx": ...} (cuebanks) conventions."""
+    if "index" in s:
+        return int(s["index"])
+    if "bar_idx" in s:
+        return int(s["bar_idx"])
+    raise KeyError("swing dict must carry 'index' or 'bar_idx'")
+
+
+def detect_bullish_bat(
+    swing_highs: list[dict],
+    swing_lows: list[dict],
+    current_price: float,
+    tolerance_pct: float = 0.015,
+) -> dict | None:
+    """Bullish Bat harmonic pattern per Cue Banks Confluence 1.0.
+
+    Points (X low, A high, B low, C high, D low):
+      X→A: initial up leg
+      A→B: retrace 50% of X→A (B is above X)
+      B→C: retrace 78.6% of A→B (C is below A, above B)
+      C→D: target 88.6% retracement of X→A (D is entry, below X)
+
+    Valid when the latest swing structure matches and current price is
+    near D. Returns pattern dict or None.
+    """
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None
+    highs_sorted = sorted(swing_highs, key=_swing_idx)
+    lows_sorted = sorted(swing_lows, key=_swing_idx)
+    if len(highs_sorted) < 2 or len(lows_sorted) < 2:
+        return None
+
+    try:
+        x, a, b, c = lows_sorted[-2], highs_sorted[-2], lows_sorted[-1], highs_sorted[-1]
+    except IndexError:
+        return None
+
+    if not (_swing_idx(x) < _swing_idx(a) < _swing_idx(b) < _swing_idx(c)):
+        return None
+
+    xa_leg = a["price"] - x["price"]
+    if xa_leg <= 0:
+        return None
+
+    ab_retrace = (a["price"] - b["price"]) / xa_leg
+    if not (0.5 - tolerance_pct <= ab_retrace <= 0.5 + tolerance_pct):
+        return None
+
+    ab_leg = a["price"] - b["price"]
+    if ab_leg <= 0:
+        return None
+    bc_retrace = (c["price"] - b["price"]) / ab_leg
+    if not (0.786 - tolerance_pct <= bc_retrace <= 0.786 + tolerance_pct):
+        return None
+
+    d_target = a["price"] - xa_leg * 0.886
+    d_tolerance = xa_leg * tolerance_pct
+
+    if abs(current_price - d_target) > d_tolerance:
+        return None
+
+    return {
+        "pattern": "bullish_bat",
+        "direction": "LONG",
+        "x": x["price"], "a": a["price"], "b": b["price"],
+        "c": c["price"], "d_entry": round(d_target, 2),
+        "stop_below": round(x["price"] - xa_leg * 0.03, 2),
+        "target_1": round(d_target + xa_leg * 0.382, 2),
+        "target_2": round(d_target + xa_leg * 0.618, 2),
+    }
+
+
+def detect_bearish_bat(
+    swing_highs: list[dict],
+    swing_lows: list[dict],
+    current_price: float,
+    tolerance_pct: float = 0.015,
+) -> dict | None:
+    """Bearish Bat — mirror of bullish. X high, A low, B high, C low, D high.
+    Entry at D above X, expecting reversion down."""
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None
+    highs_sorted = sorted(swing_highs, key=_swing_idx)
+    lows_sorted = sorted(swing_lows, key=_swing_idx)
+    if len(highs_sorted) < 2 or len(lows_sorted) < 2:
+        return None
+
+    try:
+        x, a, b, c = highs_sorted[-2], lows_sorted[-2], highs_sorted[-1], lows_sorted[-1]
+    except IndexError:
+        return None
+    if not (_swing_idx(x) < _swing_idx(a) < _swing_idx(b) < _swing_idx(c)):
+        return None
+
+    xa_leg = x["price"] - a["price"]
+    if xa_leg <= 0:
+        return None
+
+    ab_retrace = (b["price"] - a["price"]) / xa_leg
+    if not (0.5 - tolerance_pct <= ab_retrace <= 0.5 + tolerance_pct):
+        return None
+
+    ab_leg = b["price"] - a["price"]
+    if ab_leg <= 0:
+        return None
+    bc_retrace = (b["price"] - c["price"]) / ab_leg
+    if not (0.786 - tolerance_pct <= bc_retrace <= 0.786 + tolerance_pct):
+        return None
+
+    d_target = a["price"] + xa_leg * 0.886
+    d_tolerance = xa_leg * tolerance_pct
+
+    if abs(current_price - d_target) > d_tolerance:
+        return None
+
+    return {
+        "pattern": "bearish_bat",
+        "direction": "SHORT",
+        "x": x["price"], "a": a["price"], "b": b["price"],
+        "c": c["price"], "d_entry": round(d_target, 2),
+        "stop_above": round(x["price"] + xa_leg * 0.03, 2),
+        "target_1": round(d_target - xa_leg * 0.382, 2),
+        "target_2": round(d_target - xa_leg * 0.618, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Gap detection
 # ---------------------------------------------------------------------------
 
@@ -466,9 +664,15 @@ def score_confluence(
     consolidation_break: dict | None,
     gap: dict | None,
     tolerance_pct: float = 0.002,
+    sd_zones: list | None = None,
+    harmonic: dict | None = None,
 ) -> dict:
     """
     Score how many confluence factors align at the current price.
+
+    Added 2026-04-19 audit:
+      - sd_zones: list of supply/demand zones from find_supply_demand_zones
+      - harmonic: dict from detect_bullish_bat or detect_bearish_bat (or None)
 
     Returns:
         score, factors, tradeable, sniper, direction, nearest_sr,
@@ -480,6 +684,8 @@ def score_confluence(
     nearest_sr = None
     nearest_sr_dist = float("inf")
     matched_fib = None
+    matched_sd_zone = None
+    harmonic_pattern = None
 
     # 1. Horizontal S/R — within tolerance
     for sr in sr_levels:
@@ -538,6 +744,29 @@ def score_confluence(
         score += 1
         factors.append(f"Gap {gap['direction']} ({gap['gap_size_pct']:.2f}%)")
 
+    # 8. Supply/demand zone (2026-04-19 addition)
+    if sd_zones:
+        for z in sd_zones:
+            if price_in_zone(price, z, tolerance_pct=tolerance_pct):
+                score += 1
+                matched_sd_zone = z
+                factors.append(f"S/D {z['type']} zone [{z['zone_bottom']:.0f}-{z['zone_top']:.0f}]")
+                if direction is None:
+                    direction = "LONG" if z["type"] == "demand" else "SHORT"
+                break
+
+    # 9. Harmonic pattern (2026-04-19 addition)
+    if harmonic:
+        score += 1.5  # Harmonics are high-conviction per the transcript
+        harmonic_pattern = harmonic["pattern"]
+        factors.append(f"Harmonic {harmonic_pattern}")
+        if direction is None:
+            direction = harmonic["direction"]
+        elif direction != harmonic["direction"]:
+            # Conflict: harmonic disagrees with other signals — deprioritize
+            score -= 0.5
+            factors.append("!direction conflict with harmonic")
+
     # Determine direction from S/R type if still None
     if direction is None:
         for sr in sr_levels:
@@ -581,9 +810,150 @@ def score_confluence(
         "direction": direction,
         "nearest_sr": nearest_sr,
         "fib_level": matched_fib,
+        "sd_zone": matched_sd_zone,
+        "harmonic_pattern": harmonic_pattern,
         "entry_price": entry_price,
         "stop_price": stop_price,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Break + retest stateful tracker (2026-04-19)
+# ---------------------------------------------------------------------------
+
+class BreakTracker:
+    """Faithful implementation of Cue Banks' "no retest, no entry" rule.
+
+    The naive check ("price was on the other side at any point in the last N
+    bars") lost the A/B test because in volatile markets it's trivially
+    satisfied. This tracker implements what Cue Banks actually teaches:
+
+      1. A level is considered *broken* when a candle's body (not just wick)
+         closes past the level by more than a configurable tolerance.
+      2. After a break, the level is "armed for retest" — we watch for price
+         to return and touch that exact level from the new side.
+      3. The retest is valid for `retest_window_bars` after the break. Stale
+         breaks reset.
+      4. `is_fresh_retest` returns True only when the current bar touched a
+         broken level within the last `recency_bars` — that's the narrow
+         window Cue Banks teaches.
+
+    Usage per session/day:
+        tracker = BreakTracker()
+        tracker.register_levels(sr_levels)
+        for bar_idx in range(len(df)):
+            bar = df.iloc[bar_idx]
+            tracker.update(bar_idx, bar)
+            # later, when a confluence signal fires:
+            matched = tracker.is_fresh_retest(bar_idx, direction, tolerance_pct)
+            if matched is None:
+                continue  # no retest gate pass
+    """
+
+    def __init__(
+        self,
+        tolerance_pct: float = 0.002,
+        retest_window_bars: int = 30,
+        recency_bars: int = 3,
+    ):
+        self.levels: dict[float, dict] = {}
+        self.tolerance_pct = tolerance_pct
+        self.retest_window_bars = retest_window_bars
+        self.recency_bars = recency_bars
+
+    def register_levels(self, sr_levels: list[dict]) -> None:
+        """Call once with the session's active S/R levels. Levels pre-existing
+        in the tracker are preserved (their break state isn't reset)."""
+        for sr in sr_levels:
+            price = float(sr["level"])
+            if price not in self.levels:
+                self.levels[price] = {
+                    "type": sr.get("type"),
+                    "status": "armed",  # armed | broken | stale
+                    "broken_at_bar": None,
+                    "broken_direction": None,  # 'up' or 'down'
+                    "retest_touched_at": None,
+                    "prev_close": None,  # for cross-detection on first update
+                }
+
+    def update(self, bar_idx: int, bar: "pd.Series") -> None:
+        """Advance tracker state one bar. Detects new breaks and retest touches.
+
+        A break fires once per level: a candle closing past the level by more
+        than tolerance flips state from 'armed' to 'broken'. After the retest
+        window elapses without a touch, state permanently transitions to
+        'stale' (the level is not re-armed) — this prevents the thrashing
+        seen when price floats above a former-resistance line for many bars.
+        """
+        bar_close = float(bar["Close"])
+        bar_high = float(bar["High"])
+        bar_low = float(bar["Low"])
+
+        for level_price, state in self.levels.items():
+            tol = level_price * self.tolerance_pct
+            prev_close = state["prev_close"]
+
+            if state["status"] == "armed":
+                # Break requires a CROSS: prev_close was on one side, current
+                # close past tolerance on the other side. Without prev_close
+                # we can't tell whether this is a cross or a continuation, so
+                # the first bar only records position — no break registered.
+                if prev_close is not None:
+                    if bar_close > level_price + tol and prev_close <= level_price + tol:
+                        state["status"] = "broken"
+                        state["broken_at_bar"] = bar_idx
+                        state["broken_direction"] = "up"
+                    elif bar_close < level_price - tol and prev_close >= level_price - tol:
+                        state["status"] = "broken"
+                        state["broken_at_bar"] = bar_idx
+                        state["broken_direction"] = "down"
+
+            elif state["status"] == "broken":
+                age = bar_idx - state["broken_at_bar"]
+                if age > self.retest_window_bars:
+                    # Stale — do not re-arm; the level's time has passed
+                    state["status"] = "stale"
+                    continue
+
+                if state["retest_touched_at"] is None:
+                    if state["broken_direction"] == "up":
+                        # Retest = low reaches back to the level from above
+                        if level_price - tol <= bar_low <= level_price + tol:
+                            state["retest_touched_at"] = bar_idx
+                    else:
+                        # Retest = high reaches back to the level from below
+                        if level_price - tol <= bar_high <= level_price + tol:
+                            state["retest_touched_at"] = bar_idx
+            # stale: no further updates
+
+            # Record close for next-bar cross detection (used only by 'armed' branch)
+            state["prev_close"] = bar_close
+
+    def is_fresh_retest(
+        self,
+        bar_idx: int,
+        direction: str,
+        tolerance_pct: float | None = None,
+    ) -> float | None:
+        """Returns the matched level price if the current bar is at a fresh
+        retest touch in the given direction, else None.
+
+        Direction mapping:
+          - 'LONG'  needs a level broken upward (old resistance → new support)
+          - 'SHORT' needs a level broken downward (old support → new resistance)
+        """
+        for level_price, state in self.levels.items():
+            if state["retest_touched_at"] is None:
+                continue
+            age = bar_idx - state["retest_touched_at"]
+            if age < 0 or age > self.recency_bars:
+                continue
+            if direction == "LONG" and state["broken_direction"] == "up":
+                return level_price
+            if direction == "SHORT" and state["broken_direction"] == "down":
+                return level_price
+        return None

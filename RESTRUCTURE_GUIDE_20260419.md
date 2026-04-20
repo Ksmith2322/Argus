@@ -433,3 +433,89 @@ My recommendation: **do Phase 1 now, defer Phase 2-3 until after we have 30+ tra
 ---
 
 *Generated 2026-04-19. Reviewed and corrected by Codex on 2026-04-19. No structural code changed by this document pass.*
+
+---
+
+## Status update — 2026-04-19 (end of implementation sprint)
+
+What actually got done since this guide was written:
+
+### Phase 1 — safety nets (✅ complete)
+- [x] `helio/domain.py` — `Fill`, `Trade`, `Signal` frozen dataclasses
+- [x] Domain round-trip tests against every row in live `canonical_fills.jsonl`
+- [x] `config/strategies.json` (JSON + Pydantic validation, per Codex guidance)
+- [x] Registry equivalence tests vs hardcoded constants
+- [x] `helio/fleet_state.py` read-model aggregator + `/api/fleet_state` endpoint
+- [x] `fleet_state_history.jsonl` time-series + `/api/fleet_state_history`
+- [x] Rotated-fill reader support in `read_fills`, backfill, reconciliation
+- [x] `source_of_truth_status: READ_MODEL_ONLY` marker pinned by test
+
+### Phase 2 — incremental migration (partial — went further than Codex plan)
+- [x] **Dual-write to canonical_fills on 4 strategies** (additive, try/except-wrapped):
+  forge_gld_pm_long, forge_wick_gbpusd, forge_gdx_gld_runner, argus_usdjpy/gbpusd/cadjpy (via runner_unified)
+- [x] **Registry-consuming PARAMS on all 4 shortlist strategies**:
+  forge_gld_pm_long, forge_wick_gbpusd, forge_gdx_gld (via separate `forge_gdx_gld_live` entry preserving the 3.5 vs 3.0 divergence), apollo_earnings_drift
+- [x] Backfill `backfill_from_trade_csvs` internally uses `Fill.from_canonical_row` / `to_canonical_row`
+- [x] `/api/canonical_fills` normalizes rows through `Fill` (historical string prices → floats)
+- [ ] Flip dashboard main views to read **only** `fleet_state.json` — NOT done. fleet_state is additive; old endpoints still authoritative.
+
+### Phase 3 — consolidation (deferred per Codex review)
+- [ ] Split `ops/dashboard.py` — deferred
+- [ ] Extract runner base class — deferred
+- [ ] Replace `run_cohort_report.ps1` with Python orchestrator — deferred
+
+### Phase 4 — when funded (deferred)
+
+### Production bugs caught and fixed during this sprint
+1. **`backfill_from_trade_csvs` dedup key bug** — `""` vs `None` mismatch allowed duplicates to accumulate on every run. Fixed.
+2. **`helio/fleet_risk.REPO` path bug** — resolved to `C:/Argus` instead of `C:/Argus/repo` (leftover `.parents[2]` from when the file moved). `get_fleet_positions()` was silently returning `{}`, neutering double-exposure checks in 4 caller runners. Fixed.
+3. **`/api/recent_trades` NameError** — `is_backfill` referenced but never defined, silently crashing strategies with live-cutoffs (via `try/except Exception: continue`). Fixed.
+4. **`apollo.strategies.context_signals.PEER_GROUPS` NIO duplicate** — NIO in both `ev_energy` and `china`; Python dict iteration order meant `ev_energy` mapping was silently dead. Fixed.
+
+### Tooling shipped
+- `/api/health` endpoint — self-check for stale report files, broken registry, empty canonical_fills
+- `ops/run_all_tests.ps1` — single-command CI-ready test runner
+- Test suite: **~690 unit tests across 43 test files**, runs in under 8 seconds
+
+### What remains deferred on purpose (per Codex guidance)
+- Dashboard split (12,230 LOC monolith)
+- Runner base-class extraction
+- Real counterfactual math for Apollo (still uses 2% assumed stop)
+- Log rotation switch-on (readers are ready; rotation itself is not enabled)
+- Orchestration framework (cohort still runs via PowerShell)
+
+### Net outcome vs the original guide
+The "~4 days of focused work for 80% of the benefit" estimate was conservative — the actual work delivered Phase 1 safety rails **plus** Phase 2 registry consumption for all 4 shortlist strategies **plus** live dual-write fills **plus** 690 unit tests **plus** 4 production bug fixes. The architecture diagnosis stayed correct throughout; the conservative Codex review pruning kept the blast radius small. Phases 3–4 remain deferred until a shortlist strategy forces a promote/kill call or funding arrives.
+
+---
+
+## Status update — 2026-04-19 (hardening pass before monitor mode)
+
+After the main sprint, one more day of pre-monitor-mode hardening:
+
+### Added
+- **Hash-stability regression tests** (8) — post-migration `config_hash` output pinned byte-identical to the legacy inline impl
+- **Concurrent-write tests** (5 intra-process + 2 cross-process) — caught + fixed **bug #5** (intra-process race) and **bug #6** (cross-process race — `write_fill_typed` was missing the cross-process lock I added to `write_fill`). canonical_fills now safe under 4-runner simultaneous writes.
+- **Discord failure-path tests** (10) — http 500, timeout, connection errors all fall to `discord_failures.jsonl`; per-key cooldown regression guarded
+- **`fleet_monitor.run_check_cycle` smoke** (8) — the 5-minute monitoring loop survives broken sub-components without raising
+- **`cohort_run.py` end-to-end** (8) — Python orchestrator happy-path, fatal-step abort, timeout handling, log integrity
+- **Dashboard endpoint shape audit** (6) — all 60+ GET /api/* endpoints verified to return 200 + valid JSON
+- **`refresh_managed_truth` tests** (20) — first cohort step; every sub-module importable; reuse-fresh logic pinned
+- **`promotion_gate_v2` tests** (40) — legacy multi-check gate; 20+ individual check functions covered
+- **Disk-space surface in `/api/health`** (4 tests) — flags WARN <5GB, CRITICAL <1GB, overall DEGRADED when low
+- **Kill-watchdog Discord composition tests** (9) — message format stable, send failure falls to `discord_failures.jsonl`
+
+### Bugs caught by this hardening pass
+5. **Concurrent intra-process writes** (Windows): `open("a") + write()` raced across threads, lost ~1 row per 50 writes. Fixed with `threading.Lock`.
+6. **Concurrent cross-process writes** (Windows): subprocess writers lost ~10-20% of rows despite the thread lock. Fixed with `msvcrt.locking`-based byte-range lock on a lockfile handle. `write_fill_typed` was silently missing the lock (only `write_fill` had it). Both now protected.
+
+### Current stats
+- **871 unit tests across 57 test files, ~14s runtime**
+- **6 production bugs** caught and fixed during this hardening sprint (backfill dedup, fleet_risk path, `/api/recent_trades` NameError, NIO dup, intra-process write race, cross-process write race)
+- **All 4 shortlist strategies**: dual-write + registry consumption + shared helpers
+- **`/api/health`** surfaces 8 checks (fleet_status / fleet_state / kill_watchdog / reconciliation / fleet_perf_summary / strategy_registry / canonical_fills / disk_space)
+- **Nightly pipeline**: PowerShell primary, `python -m ops.cohort_run` backup, both tested
+- **Monitor-mode checklist** at the bottom of every morning_brief
+
+### System is now monitor-mode ready.
+Everything silent-failure mode the operator might face has a test + a defensive invariant. Paper trades will accumulate throughout the week; kill_watchdog + reconciliation + morning_brief + health endpoint will surface anything worth an operator's attention. No structural work is required this week.

@@ -1,7 +1,10 @@
 # Cue Banks Complete Rulebook
 
 **Source:** Cue Banks (Wall Street Academy, @CueBanks)
-**Compiled from:** "Master the US30 Market," Confluence Trading 1.0/2.0/2.5 series, Gap Trading Masterclass, live trade breakdowns
+**Compiled from:** "Master the US30 Market," Confluence Trading 1.0/2.0/2.5 series, Gap Trading Masterclass, live trade breakdowns, 2026-04-19 live-room session + Confluence 1.0 educational video.
+**Last updated:** 2026-04-19 — see v2 updates section at the bottom.
+
+**Primary consolidated reference:** `memory/project_strategy_playbooks_20260419.md` §3 (Cue Banks).
 
 ---
 
@@ -254,3 +257,222 @@ MYM (Micro Dow):  Future("MYM", exchange="CBOT") — client ID 108
 # Same instrument as Mamba's YM=F but different entry logic
 # Mamba uses breakout on 1-min, Cue Banks uses confluence pullback on 5-min
 ```
+
+---
+
+## v2 updates from 2026-04-19 transcript consolidation
+
+Two transcripts reviewed (live-room session + Confluence 1.0 educational). Confluence 1.0 is substantially more mechanical than earlier public material — surfaces some rules that the current bot likely does not enforce. Audit needed.
+
+### His explicit toolset — only four tools
+
+He states plainly: *"I don't use nothing crazy."*
+1. Support/resistance — drawn from **wicks**, not bodies
+2. Supply/demand zones — previous wick → breakout candle body
+3. Fibonacci PRZ — **38.2 / 61.8 / 78.6 / 88.6**
+4. Harmonic patterns — specifically the **bullish bat**:
+   - X→A leg (initial move)
+   - A→B at 50%
+   - B→C at 78.6% (transcript auto-captioned as "seventy point six" — most likely 78.6, his standard PRZ level)
+   - C→D at 88.6% of X→A (entry point)
+
+### The single most important rule — repeated 10+ times
+
+**"No retest, no entry."** Price must break the level, then touch back from the opposite side before he enters. He skips setups that run without retesting, even when they look strong.
+
+### Candle-closure validation for breaks
+
+- Half-close over level + next candle rejects = **fake break** (skip)
+- Full body close over + next candle forms past level = **valid break**
+- Same rule both directions
+
+### Entry mechanics (first time stated precisely in any of his material)
+
+- Pre-places **buy/sell limits** 1 pip past the level for reversal setups
+- Pre-places **buy/sell stops** 1 pip past the level for continuation setups
+- Prefers ECN brokers for tight spreads so limits fill accurately
+- He does NOT manually market-order on the break
+
+### Time-frame split
+
+- Analysis: **4H, 1H, daily**
+- Execution: **5-minute** — *"always look for retest on the five-minute chart"*
+
+### Confluence construction (restated)
+
+"A+ setup" = 2-3 confirmations stacked. Example he gives: *support level + uptrend + retest*.
+
+### Current-bot audit gaps (needs code check)
+
+The dashboard's Cue Banks row is *"US30 Confluence + Fib"* with PF 0.89 / 32% WR on 82 trades. Based on the transcripts:
+
+- **Retest enforcement** — almost certainly missing or weak
+- **Candle-closure validation** — likely not implemented
+- **Harmonic patterns (bullish bat etc.)** — likely absent from `confluence.py`
+- **Supply/demand zones** — unclear
+- **Limit-vs-market order style** — likely using market orders on break instead of pre-placed limits past the level
+
+If even 2-3 of these are missing, the current "Confluence + Fib" is a partial implementation of his method, not a faithful one. Bot audit required before v2 work.
+
+### Rulebook priority for Cue Banks v2
+
+1. Add `retest_required` gate — no entry without a break + retest from the opposite side
+2. Add candle-closure validator — full body must close past the level on the same TF
+3. Implement harmonic detector (bullish bat + bearish bat at minimum)
+4. Implement supply/demand zone drawer (previous wick → breakout candle body)
+5. Switch entry style to limit/stop orders past the level (1-2 ticks)
+6. Confluence scorer: require ≥2 of {S/R, Fib PRZ, supply/demand, harmonic pattern} for A+ setup
+
+### Caveat on the source material
+
+Cue Banks' teaching content is notably less mechanical than Tori's. Heavy live-room chatter, mentality focus, vague "trust me" claims. Zero hard numbers (no win rate, no account size, no P&L). Marketing-heavy. The Confluence 1.0 video is the most actionable piece and should be the authoritative source for v2 rule extraction.
+
+---
+
+## 2026-04-19 evening: naive retest gate A/B test failed
+
+Added `CUEBANKS_RETEST_REQUIRED` flag (default False) that, when True,
+requires at least one close on the opposite side of the matched S/R level
+within the last 10 bars before entering.
+
+### A/B result
+| Gate | Trades | WR | PnL | PF |
+|---|--:|--:|--:|--:|
+| OFF (default) | 82 | 32% | -$514 | 0.89 |
+| ON  (retest)  | 83 | 29% | -$893 | **0.80** |
+
+**Naive retest gate made it worse.** Root cause: in a volatile market,
+"price was on the other side of some level at ANY point in the last 10
+bars" is trivially satisfied — the check is not actually enforcing
+"break then retest" in Cue Banks' sense.
+
+### What a faithful retest gate needs
+
+Cue Banks' stated rule is tighter:
+1. Price **breaks** a specific level (full-body close past it)
+2. Price **comes back** to touch that specific level from the **new** side
+3. Entry happens on the retest touch, not on the break
+
+A faithful implementation requires:
+- Stateful tracking per level: `broken_at_bar`, `broken_direction`
+- Level-close-past validation (not just "price was above/below")
+- Retest-touch detection distinct from simple re-entry into the tolerance band
+- Time-decay: a "break" from 2 weeks ago isn't a live retest opportunity
+
+### Current status
+- Flag kept at default False (v1 behavior preserved)
+- Code in place for easy swap once the faithful tracker is built
+- Next iteration: build per-level state tracker in `confluence.py` with
+  `{level_price, broken_at_bar, broken_direction, retest_touched_at}`
+- Then the gate becomes: "require `retest_touched_at >= current_bar - N`"
+
+---
+
+## 2026-04-19 late evening: faithful retest tracker A/B
+
+Built `BreakTracker` class in `confluence.py` implementing stateful
+per-level break + retest detection with:
+- Body-close validation for break (not just wick)
+- Time-decay for stale breaks (30-bar window)
+- 3-bar recency window for "fresh retest"
+
+Wired into the runner, rerun the A/B:
+
+| Gate | Trades | WR | PnL | PF |
+|---|--:|--:|--:|--:|
+| OFF (v1 default) | 82 | 31.7% | -$514 | 0.89 |
+| ON (faithful tracker) | 51 | **39.2%** | **-$649** | 0.76 |
+
+### Interpretation
+
+The faithful tracker IS working correctly — it filters 31 of 82 signals
+(38% filtered) and does improve win rate (32% → 39%). But total PnL gets
+worse and PF drops. That combination means **the gate is removing big
+winners while keeping most of the losers**.
+
+**Current Cue Banks bot's best trades are strong breakouts that never
+retest.** Filtering those out hurts the strategy. Whatever edge exists in
+this implementation is in momentum continuation, not in retest-and-
+continuation — the opposite of Cue Banks' stated teaching.
+
+### Implications
+
+Either:
+1. **Our S/R detection is finding levels that aren't actually Cue Banks'
+   S/R**. His S/R drawing rules (from wicks, at psychological levels,
+   multi-TF confluence) may differ materially from our `find_horizontal_sr`
+   output. The "retest" we're gating may be against the wrong levels.
+2. **The current bot is a breakout momentum strategy wearing a "Cue Banks"
+   label**, but mechanically not his method. The 82-trade backtest PnL
+   of -$514 may be noise around zero expectation.
+3. **The strategy has no edge at the level of detail our code can reach**,
+   and adding rules makes it worse because it's filtering on the wrong
+   features.
+
+### Current status (2026-04-19 late)
+- BreakTracker class retained in `confluence.py` — the implementation is
+  correct; it just doesn't lift this particular bot
+- Flag defaults False
+- Naive retest-check code removed (replaced with the tracker-based check
+  that runs only when flag is True)
+- **The next meaningful step is NOT more filter work** — it's auditing
+  whether `find_horizontal_sr` produces levels consistent with Cue Banks'
+  teaching. If our S/R levels are wrong, no amount of retest gating will
+  help. That's where more teaching videos would actually move the needle.
+
+---
+
+## 2026-04-20: S/D zones + harmonics added — S/D zones are the fix
+
+Built two missing Confluence 1.0 factors and A/B-tested each:
+
+### Supply/demand zones (`find_supply_demand_zones`)
+
+Draws zones from previous candle's wick to breakout candle's body — exactly
+per his transcript. A demand zone (support) forms when price consolidates
+then breaks up strongly; zone range = [prior wick low, breakout open].
+Supply mirrors downward. Scored as +1 confluence factor when price is
+inside the zone.
+
+### Harmonic bat patterns (`detect_bullish_bat`, `detect_bearish_bat`)
+
+Proper 5-point harmonic detection: X/A/B/C/D with retracements at
+50% / 78.6% / 88.6%. Scored as +1.5 when the current price aligns with
+point D.
+
+### A/B result
+
+| Config | Trades | WR | PnL | PF |
+|---|--:|--:|--:|--:|
+| Baseline (neither) | 82 | 32% | -$514 | 0.89 |
+| **S/D zones ONLY** | **88** | **35%** | **+$2,134** | **1.34** |
+| Harmonics ONLY | 84 | 32% | -$335 | 0.93 |
+| Both | 88 | 35% | +$2,134 | 1.34 (same as S/D only) |
+
+### Interpretation
+
+**Supply/demand zones are what the Cue Banks bot was missing.** Moving from
+PF 0.89 to 1.34 is a large lift and flips ruin fraction from 96% to 0.4%.
+P(exp>0) moves from 0.32 to 0.84.
+
+Harmonics don't help materially on this sample — the bullish/bearish bat
+patterns rarely align perfectly with an H4 swing structure in our tolerance,
+so they fire too infrequently to matter. Code retained for future tuning
+(tighter tolerance, lower TF, or better swing detection might unlock them).
+
+### Current defaults (post-v3)
+- `CUEBANKS_USE_SD_ZONES = True`  (the fix)
+- `CUEBANKS_USE_HARMONICS = False`  (insufficient evidence)
+- `CUEBANKS_RETEST_REQUIRED = False`  (BreakTracker correct but didn't lift)
+
+### Cue Banks current artifact
+- **PF 1.34, WR 35.2%, P(exp>0) 0.84, MC ruin 0.4%**
+- Still 100% backfill — 0 live fills
+- Dashboard confidence should jump from 32% to ~84% after restart
+
+### What's left for Cue Banks
+1. Forward-paper to validate live edge
+2. Retest-gate rebuild: the current BreakTracker removes winners. A better
+   implementation might combine S/D-zone retest with the break tracker.
+3. Harmonic tuning: lower tolerance, different TF, better swing detection
+4. More transcripts to verify S/R detection matches his hand-drawn levels

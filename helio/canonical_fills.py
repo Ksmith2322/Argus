@@ -30,12 +30,140 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Intra-process write lock — serialises threads within one Python process.
+_WRITE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _cross_process_file_lock(path: Path):
+    """Best-effort cross-process exclusive lock on `path`. Uses
+    msvcrt.locking on Windows (SetFilePointer + LockFileEx under the
+    hood), fcntl.flock on POSIX. Falls back to no lock if neither is
+    available (shouldn't happen on supported platforms).
+
+    The lock is held against a dedicated lockfile (`path + .lock`) —
+    we can't reliably lock the append-mode file handle itself on
+    Windows because the handle position changes between lock + write.
+
+    Caught by test_canonical_fills_multiprocess: without this lock,
+    4 subprocesses × 25 writes each lose ~17% of rows on Windows.
+    """
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if os.name == "nt":
+        # Windows: hold an exclusive handle to the lockfile for the
+        # entire critical section. We create with O_CREAT (no O_EXCL —
+        # subsequent acquirers will wait on msvcrt.locking below) and
+        # then acquire a byte-range lock on offset 0. msvcrt.LK_LOCK
+        # blocks up to ~10s internally; we wrap it in a retry loop so
+        # we can wait longer.
+        import msvcrt
+        import time as _time
+
+        # Open once, then spin on msvcrt.locking.
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        acquired = False
+        deadline = _time.time() + 60.0
+        while _time.time() < deadline:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except OSError:
+                _time.sleep(0.002)
+        try:
+            yield
+        finally:
+            try:
+                if acquired:
+                    # msvcrt.LK_UNLCK needs the file pointer at 0
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    else:
+        # POSIX: fcntl.flock is robust and blocks atomically.
+        f = open(lock_path, "a+b")
+        try:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            yield
+        finally:
+            f.close()
+
 _REPO = Path(__file__).resolve().parents[1]
 CANONICAL_FILLS_PATH = _REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+
+# Reader-glob supports rotation: canonical_fills_YYYYMM.jsonl etc.
+# _CANONICAL_GLOB pattern matches archives. Readers use _iter_canonical_paths
+# to glob current + archived; writers rotate via rotate_if_needed().
+_CANONICAL_GLOB = "canonical_fills*.jsonl"
+# Rotation trigger: when the current file exceeds this size, rename it to
+# canonical_fills_YYYYMM.jsonl and start a fresh one. 5 MB keeps individual
+# archives comfortably reading in-memory; dashboard endpoints load only the
+# current file plus the latest archive for live views.
+_ROTATION_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _iter_canonical_paths() -> list[Path]:
+    """Return all canonical fill files (current + any rotated archives),
+    oldest-first by filename. A rotation that writes
+    canonical_fills_202604.jsonl is picked up automatically."""
+    log_dir = CANONICAL_FILLS_PATH.parent
+    if not log_dir.exists():
+        return []
+    # Sort by name: canonical_fills.jsonl sorts BEFORE canonical_fills_202604.jsonl
+    # so put the unnumbered (current) file LAST for most-recent-last semantics.
+    paths = sorted(log_dir.glob(_CANONICAL_GLOB))
+    current = CANONICAL_FILLS_PATH
+    archived = [p for p in paths if p != current]
+    return archived + ([current] if current.exists() else [])
+
+
+def rotate_if_needed() -> Path | None:
+    """If canonical_fills.jsonl is over the rotation threshold, rename it
+    to canonical_fills_YYYYMM.jsonl and start fresh. Returns the archive
+    path if rotation occurred, else None. Never raises — a rotation failure
+    must not break the writer.
+
+    Idempotent: if a stamp for this month already exists (rare edge after
+    clock skew), the rotation is skipped rather than overwriting it.
+    """
+    try:
+        if not CANONICAL_FILLS_PATH.exists():
+            return None
+        size = CANONICAL_FILLS_PATH.stat().st_size
+        if size < _ROTATION_SIZE_BYTES:
+            return None
+        stamp = datetime.now(timezone.utc).strftime("%Y%m")
+        archive = CANONICAL_FILLS_PATH.parent / f"canonical_fills_{stamp}.jsonl"
+        if archive.exists():
+            # Month stamp already used — don't overwrite. Next month's
+            # rotation will succeed naturally.
+            return None
+        CANONICAL_FILLS_PATH.rename(archive)
+        # Touch a fresh empty current file so subsequent appends land cleanly
+        CANONICAL_FILLS_PATH.touch()
+        return archive
+    except Exception:
+        return None
 
 
 def _current_anchor() -> float | None:
@@ -87,34 +215,86 @@ def write_fill(
         if extra:
             row["extra"] = extra
         CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=str) + "\n")
+        # Serialise rotation + append under BOTH:
+        #   - intra-process thread lock (stops thread races in one process)
+        #   - cross-process file lock (stops races between runner processes)
+        with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
+            rotate_if_needed()
+            with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
     except Exception:
         pass  # never let the logger break a trade
 
 
-def read_fills(limit: int | None = None, strategy: str | None = None) -> list[dict]:
-    """Read fills (most recent first). For dashboard + analytics."""
-    if not CANONICAL_FILLS_PATH.exists():
-        return []
+def write_fill_typed(fill, extra: dict[str, Any] | None = None) -> None:
+    """Write a helio.domain.Fill object to the canonical log.
+
+    Additive twin of write_fill(). Phase 2 runners can create a Fill with
+    their existing state, pass it here, and get the same behaviour. The
+    on-disk shape matches write_fill() exactly — extra arg is included only
+    when non-None (same asymmetry as the kwargs API). Never raises.
+
+    This closes the writer side of the domain module: read_fills, reconcile,
+    morning_brief, and dashboard already consume Fill; runners will produce
+    it once Phase 2 migrations begin.
+    """
     try:
-        lines = CANONICAL_FILLS_PATH.read_text(encoding="utf-8").splitlines()
+        # Duck-type rather than import — avoids a circular import risk if
+        # helio.domain ever depends on something in helio.canonical_fills.
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "strategy": getattr(fill, "strategy", ""),
+            "symbol": getattr(fill, "symbol", ""),
+            "direction": getattr(fill, "direction", ""),
+            "side": getattr(fill, "side", ""),
+            "entry_ts": getattr(fill, "entry_ts", None),
+            "exit_ts": getattr(fill, "exit_ts", None),
+            "entry_px": getattr(fill, "entry_px", None),
+            "exit_px": getattr(fill, "exit_px", None),
+            "size": getattr(fill, "size", None),
+            "risk_usd": getattr(fill, "risk_usd", None),
+            "pnl_usd": getattr(fill, "pnl_usd", None),
+            "exit_reason": getattr(fill, "exit_reason", None),
+            "broker_anchor_at_fill_usd": _current_anchor(),
+        }
+        if extra:
+            row["extra"] = extra
+        CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Both intra-process AND cross-process locks required — see write_fill()
+        with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
+            rotate_if_needed()
+            with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
     except Exception:
+        pass  # same invariant as write_fill: never break a live trade
+
+
+def read_fills(limit: int | None = None, strategy: str | None = None) -> list[dict]:
+    """Read fills (most recent first). Reads across the current file AND any
+    rotated archives (canonical_fills_*.jsonl). For dashboard + analytics."""
+    paths = _iter_canonical_paths()
+    if not paths:
         return []
-    rows = []
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
+    rows: list[dict] = []
+    # Iterate newest-to-oldest file, and within each file newest-to-oldest line
+    for path in reversed(paths):
         try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
             continue
-        if strategy and r.get("strategy") != strategy:
-            continue
-        rows.append(r)
-        if limit and len(rows) >= limit:
-            break
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if strategy and r.get("strategy") != strategy:
+                continue
+            rows.append(r)
+            if limit and len(rows) >= limit:
+                return rows
     return rows
 
 
@@ -127,19 +307,30 @@ def backfill_from_trade_csvs() -> int:
         CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
         CANONICAL_FILLS_PATH.touch()
 
+    # Collect dedup keys across current AND any rotated archives — otherwise
+    # after rotation, backfill would re-append rows that live in an archive.
+    # Normalise empty strings to None so the key computed from a stored JSONL
+    # row (where exit_ts was persisted as None) matches the key computed from
+    # a CSV reread (where the empty column reads as "").
+    def _key(strat, ets, xts) -> tuple:
+        return (strat, ets or None, xts or None)
+
     existing_keys = set()
-    try:
-        for line in CANONICAL_FILLS_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-                existing_keys.add((r.get("strategy"), r.get("entry_ts"), r.get("exit_ts")))
-            except json.JSONDecodeError:
-                continue
-    except Exception:
-        pass
+    for path in _iter_canonical_paths():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    existing_keys.add(_key(r.get("strategy"),
+                                          r.get("entry_ts"),
+                                          r.get("exit_ts")))
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            continue
 
     specs = [
         ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",   "ts",        True),
@@ -152,58 +343,70 @@ def backfill_from_trade_csvs() -> int:
         ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False),
     ]
     appended = 0
-    for label, path_rel, ts_col, valid_only in specs:
-        p = _REPO / path_rel
-        if not p.exists():
-            continue
+    # Backfill must share the same write critical section as live writers so a
+    # nightly backfill can't race with a live close on Windows. Hold the
+    # intra-process + cross-process locks for the whole batch, and call
+    # rotate_if_needed() up front (matches write_fill*).
+    with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
+        rotate_if_needed()
         try:
-            with open(p, encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    if valid_only and str(r.get("experiment_valid", "")).lower() != "true":
-                        continue
-                    entry_ts = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
-                    exit_ts = r.get("exit_ts") or r.get("exit_date") or ""
-                    key = (label, entry_ts, exit_ts)
-                    if key in existing_keys:
-                        continue
-                    pnl_raw = r.get("pnl_usd")
-                    try:
-                        pnl = float(pnl_raw) if pnl_raw not in (None, "") else None
-                    except ValueError:
-                        pnl = None
-                    risk_raw = r.get("risk_usd")
-                    try:
-                        risk = float(risk_raw) if risk_raw not in (None, "") else None
-                    except ValueError:
-                        risk = None
-                    size_raw = r.get("position_size") or r.get("gdx_shares") or r.get("shares") or ""
-                    try:
-                        size_val = float(size_raw) if size_raw not in (None, "") else None
-                    except ValueError:
-                        size_val = size_raw
-                    row = {
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "strategy": label,
-                        "symbol": r.get("symbol") or "",
-                        "direction": r.get("direction") or "",
-                        "side": "EXIT",
-                        "entry_ts": entry_ts or None,
-                        "exit_ts": exit_ts or None,
-                        "entry_px": r.get("entry_px") or r.get("gdx_entry") or None,
-                        "exit_px": r.get("exit_px") or r.get("gdx_exit") or None,
-                        "size": size_val,
-                        "risk_usd": risk,
-                        "pnl_usd": pnl,
-                        "exit_reason": r.get("exit_reason") or "",
-                        "broker_anchor_at_fill_usd": None,  # historical — no anchor at time
-                        "source": "backfill_from_trade_csv",
-                    }
-                    with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as out:
-                        out.write(json.dumps(row, default=str) + "\n")
-                    existing_keys.add(key)
-                    appended += 1
+            out = open(CANONICAL_FILLS_PATH, "a", encoding="utf-8")
         except Exception:
-            continue
+            return appended
+        try:
+            for label, path_rel, ts_col, valid_only in specs:
+                p = _REPO / path_rel
+                if not p.exists():
+                    continue
+                try:
+                    from helio.domain import Fill  # lazy circular-safe
+                    with open(p, encoding="utf-8") as f:
+                        for r in csv.DictReader(f):
+                            if valid_only and str(r.get("experiment_valid", "")).lower() != "true":
+                                continue
+                            # Skip rows without a realised pnl — they represent
+                            # open/timed-out trades, not closed fills. This
+                            # matches helio.reconciliation._read_strategy_csv;
+                            # without this filter, canonical picks up orphans
+                            # that reconcile flags as EXTRA_IN_CANONICAL.
+                            if r.get("pnl_usd") in (None, ""):
+                                continue
+                            entry_ts = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
+                            exit_ts = r.get("exit_ts") or r.get("exit_date") or ""
+                            key = _key(label, entry_ts, exit_ts)
+                            if key in existing_keys:
+                                continue
+
+                            raw = {
+                                "strategy": label,
+                                "symbol": r.get("symbol") or "",
+                                "direction": r.get("direction") or "",
+                                "side": "EXIT",
+                                "entry_ts": entry_ts or None,
+                                "exit_ts": exit_ts or None,
+                                "entry_px": r.get("entry_px") or r.get("gdx_entry"),
+                                "exit_px": r.get("exit_px") or r.get("gdx_exit"),
+                                "size": (r.get("position_size") or r.get("gdx_shares")
+                                          or r.get("shares") or None),
+                                "risk_usd": r.get("risk_usd"),
+                                "pnl_usd": r.get("pnl_usd"),
+                                "exit_reason": r.get("exit_reason") or "",
+                                "broker_anchor_at_fill_usd": None,
+                                "source": "backfill_from_trade_csv",
+                            }
+                            fill = Fill.from_canonical_row(raw)
+                            row = fill.to_canonical_row()
+                            row["ts"] = datetime.now(timezone.utc).isoformat()
+                            out.write(json.dumps(row, default=str) + "\n")
+                            existing_keys.add(key)
+                            appended += 1
+                except Exception:
+                    continue
+        finally:
+            try:
+                out.close()
+            except Exception:
+                pass
     return appended
 
 

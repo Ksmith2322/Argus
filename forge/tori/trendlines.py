@@ -284,6 +284,79 @@ def score_trendline_quality(trendline: dict, df: pd.DataFrame) -> dict:
     }
 
 
+def grade_trendline_tori_style(
+    trendline: dict,
+    df: pd.DataFrame,
+    invalidation_penalty: int = 0,
+) -> dict:
+    """
+    Tori-vocabulary 0-10 grade mirroring her rating video formula:
+
+        grade = touch_points_score + data_span_score − invalidation_penalty
+
+    Wraps `score_trendline_quality` for backwards compat but surfaces the
+    rating in the scale Tori uses:
+      - A+ ≥ 9  (ready to trade at full conviction)
+      - A  7-8  (acceptable, smaller size)
+      - B   6   (borderline)
+      - C   ≤ 3 (delete)
+
+    `invalidation_penalty` is an optional caller-supplied count of how many
+    times this particular trend line has been crossed and moved. The current
+    bot regenerates trend lines every bar (no persistent ID), so callers pass
+    0 by default. When the v2 persistent-trend-line store lands, it can feed
+    a real count here.
+    """
+    q = score_trendline_quality(trendline, df)
+    touches = q["touches"]
+    duration_bars = q["duration_bars"]
+    valid = q["valid"]
+
+    # touch_points_score: Tori's rating — 3+ = 5pts, 2 = 3pts, 1 = 0
+    if touches >= 3:
+        tp_score = 5
+    elif touches == 2:
+        tp_score = 3
+    else:
+        tp_score = 0
+
+    # data_span_score: "plenty of data" from the rating video — wide range of
+    # bars = high score. On 4H: 90+ bars ≈ 3 weeks; 30+ bars ≈ 1 week.
+    if duration_bars >= 90:
+        ds_score = 5
+    elif duration_bars >= 45:
+        ds_score = 3
+    elif duration_bars >= 15:
+        ds_score = 2
+    else:
+        ds_score = 0
+
+    raw_score = tp_score + ds_score - max(0, invalidation_penalty)
+    raw_score = max(0, raw_score)  # floor at 0
+
+    # If the trend line fails the "no intersection" rule, grade is C regardless
+    if not valid:
+        tori_grade = "C"
+    elif raw_score >= 9:
+        tori_grade = "A+"
+    elif raw_score >= 7:
+        tori_grade = "A"
+    elif raw_score >= 6:
+        tori_grade = "B"
+    else:
+        tori_grade = "C"
+
+    return {
+        "tori_grade": tori_grade,
+        "tori_score": int(raw_score),
+        "touch_points_score": tp_score,
+        "data_span_score": ds_score,
+        "invalidation_penalty": int(invalidation_penalty),
+        # Original score dict for legacy consumers
+        "legacy": q,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Setup detection
 # ---------------------------------------------------------------------------
@@ -415,23 +488,90 @@ def _find_opposing_safety(
     df: pd.DataFrame, bar_idx: int, trade_direction: str, atr: float,
 ) -> Optional[float]:
     """
-    Find the opposing Safety Line (recent swing high for SHORT, swing low for LONG).
-    Returns the safety price level or None.
+    Legacy flat-swing trailing stop. Kept for config-flag fallback only.
+
+    Returns a horizontal level = recent swing high (for SHORT) or low (for LONG)
+    plus a 0.3 ATR buffer. This was the default trail until 2026-04-19; the
+    Tori backtest audit showed it clipped winners at ~2R because a horizontal
+    level can't track an angled trend the way her actual method does. Retained
+    as a fallback when not enough post-entry swings exist to build an angled
+    trailing trend line.
     """
     lookback = min(bar_idx, 60)  # look back up to 60 bars
     window = df.iloc[max(0, bar_idx - lookback) : bar_idx + 1]
 
     if trade_direction == "SHORT":
-        # Safety = recent swing high + buffer
         highs = find_swing_highs(window, left=3, right=2)
         if highs:
             return float(max(h["price"] for h in highs[-3:])) + 0.3 * atr
     else:
-        # Safety = recent swing low - buffer
         lows = find_swing_lows(window, left=3, right=2)
         if lows:
             return float(min(l["price"] for l in lows[-3:])) - 0.3 * atr
     return None
+
+
+def _find_trailing_trendline_stop(
+    df: pd.DataFrame,
+    bar_idx: int,
+    entry_bar: int,
+    trade_direction: str,
+    atr: float,
+) -> Optional[float]:
+    """
+    Tori's "steeper trend line" trail — the v2 exit-logic fix.
+
+    Fits an angled trend line through post-entry swings. For LONG, ascending
+    line through post-entry swing lows; for SHORT, descending line through
+    post-entry swing highs. Stop sits 0.3 ATR on the safe side of the line.
+
+    Why this matters: the previous flat-swing trail (see `_find_opposing_safety`)
+    truncated winners at ~2R because a horizontal stop can't track an angled
+    trend. Fitting a line through post-entry swings drags the stop with price
+    at the same slope as the move itself, preserving the right-tail of winners
+    that Tori's no-take-profit method depends on.
+
+    Returns None if fewer than 2 post-entry swings exist — in which case the
+    caller should fall back to the initial opposing-trend-line stop (set at
+    entry) until enough structure has formed.
+    """
+    # Need ~5+ bars since entry to have 2+ pivots with left=2/right=2
+    if bar_idx - entry_bar < 5:
+        return None
+
+    # Anchor start a few bars before entry so we pick up the "previous touch
+    # point" that Tori calls Point A in her exit-criteria video
+    start_idx = max(0, entry_bar - 5)
+    window = df.iloc[start_idx : bar_idx + 1]
+
+    if trade_direction == "LONG":
+        swings = find_swing_lows(window, left=2, right=2)
+        if len(swings) < 2:
+            return None
+        # Shift window-relative indices back to absolute df indices
+        abs_swings = [
+            {"index": s["index"] + start_idx, "price": s["price"]}
+            for s in swings
+        ]
+        tl = fit_ascending_trendline(abs_swings)
+        if tl is None or tl.get("slope", 0) <= 0:
+            return None
+        line_val = tl["slope"] * bar_idx + tl["intercept"]
+        return float(line_val - 0.3 * atr)
+
+    # SHORT
+    swings = find_swing_highs(window, left=2, right=2)
+    if len(swings) < 2:
+        return None
+    abs_swings = [
+        {"index": s["index"] + start_idx, "price": s["price"]}
+        for s in swings
+    ]
+    tl = fit_descending_trendline(abs_swings)
+    if tl is None or tl.get("slope", 0) >= 0:
+        return None
+    line_val = tl["slope"] * bar_idx + tl["intercept"]
+    return float(line_val + 0.3 * atr)
 
 
 def check_retest(

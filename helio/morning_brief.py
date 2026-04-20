@@ -118,27 +118,31 @@ def build_brief() -> dict:
         "risk_disagreement": fs.get("risk_state", {}).get("disagreement"),
     }
 
-    # 2. Overnight new trades from canonical_fills
-    fills = _load_jsonl(_REPO / "argus_flow" / "logs" / "canonical_fills.jsonl")
-    new_fills = []
-    for f in fills:
-        # canonical_fills writes ts at write time; filter by that
-        ts = _parse_ts(f.get("ts", ""))
+    # 2. Overnight new trades from canonical_fills.
+    # Second consumer of helio.domain.Fill (after reconciliation.py). Uses
+    # read_fills() which already globs rotated archives, so this section is
+    # rotation-safe without any change needed if canonical rotation starts.
+    from helio.canonical_fills import read_fills
+    from helio.domain import Fill
+
+    raw_fills = read_fills()
+    new_fills: list[Fill] = []
+    for r in raw_fills:
+        ts = _parse_ts(r.get("ts", ""))
         if ts and ts >= cutoff:
-            new_fills.append(f)
-    total_new_pnl = sum(float(f.get("pnl_usd") or 0) for f in new_fills)
+            new_fills.append(Fill.from_canonical_row(r))
+    total_new_pnl = sum((f.pnl_usd or 0.0) for f in new_fills)
     brief["sections"]["new_trades"] = {
         "count": len(new_fills),
         "total_pnl_usd": round(total_new_pnl, 2),
         "by_strategy": {},
     }
     for f in new_fills:
-        strat = f.get("strategy", "unknown")
         by = brief["sections"]["new_trades"]["by_strategy"].setdefault(
-            strat, {"count": 0, "pnl_usd": 0.0}
+            f.strategy or "unknown", {"count": 0, "pnl_usd": 0.0}
         )
         by["count"] += 1
-        by["pnl_usd"] += float(f.get("pnl_usd") or 0)
+        by["pnl_usd"] += (f.pnl_usd or 0.0)
     for strat, v in brief["sections"]["new_trades"]["by_strategy"].items():
         v["pnl_usd"] = round(v["pnl_usd"], 2)
 
@@ -261,8 +265,103 @@ def render_text(brief: dict) -> str:
     if b.get("latest_equity_usd"):
         lines.append(f"BROKER EQUITY: ${b['latest_equity_usd']:,.2f}  "
                      f"({b['samples_collected']} samples lifetime)")
+    lines.append("")
+
+    # Monitor-mode checklist — the Mon–Fri glance view. All-OK means the
+    # operator can move on. Anything else surfaces with a link/action.
+    lines.append("=== MONITOR-MODE CHECKLIST ===")
+    cl = _build_checklist(brief)
+    for item in cl["items"]:
+        marker = "[OK]" if item["ok"] else "[!!]"
+        lines.append(f"  {marker} {item['label']}")
+        if not item["ok"] and item.get("detail"):
+            lines.append(f"        -> {item['detail']}")
+    lines.append("")
+    lines.append(f"  Overall: {cl['overall']}")
 
     return "\n".join(lines)
+
+
+def _build_checklist(brief: dict) -> dict:
+    """Monitor-mode summary: 7 yes/no questions the operator should
+    answer each morning. Returns {items: [...], overall: OK|ATTENTION}.
+
+    Each item has:
+      - label:  short description
+      - ok:     boolean
+      - detail: if not ok, what to look at
+    """
+    items = []
+    fh = brief["sections"]["fleet_health"]
+    kw = brief["sections"]["kill_watchdog"]
+    d  = brief["sections"]["drift"]
+    p  = brief["sections"]["promotion"]
+    ctrl = fh.get("control_files", {})
+
+    # 1. All systems heartbeat fresh
+    fleet_ok = not fh["non_ok"]
+    items.append({
+        "label": "All systems healthy (heartbeats fresh, processes alive)",
+        "ok": fleet_ok,
+        "detail": f"non-OK systems: {fh['non_ok']}" if not fleet_ok else "",
+    })
+
+    # 2. No risk disagreement
+    no_risk_drift = not fh.get("risk_disagreement")
+    items.append({
+        "label": "No broker-vs-paper risk drift",
+        "ok": no_risk_drift,
+        "detail": f"disagreement: {fh.get('risk_disagreement')}" if not no_risk_drift else "",
+    })
+
+    # 3. No PAUSE_ENTRIES blocking new trades
+    no_pause = not (ctrl.get("PAUSE_ENTRIES", {}).get("present"))
+    items.append({
+        "label": "Entries not paused (PAUSE_ENTRIES absent)",
+        "ok": no_pause,
+        "detail": (f"age {ctrl.get('PAUSE_ENTRIES', {}).get('age_s', 0)}s "
+                   "— auto-clear triggers if gateway supervision created it"
+                   if not no_pause else ""),
+    })
+
+    # 4. Kill-watchdog: no kill candidates
+    no_kill = not kw["kill_candidates"]
+    items.append({
+        "label": "No kill candidates flagged by watchdog",
+        "ok": no_kill,
+        "detail": f"candidates: {', '.join(kw['kill_candidates'])}" if not no_kill else "",
+    })
+
+    # 5. No severe drift
+    no_severe = not d["severe"]
+    items.append({
+        "label": "No severe signal-frequency drift",
+        "ok": no_severe,
+        "detail": f"severe: {', '.join(d['severe'])}" if not no_severe else "",
+    })
+
+    # 6. Apollo: forward-returns backfill running (new records appearing)
+    a = brief["sections"]["apollo"]
+    apollo_flowing = a.get("total_forward_records", 0) > 0
+    items.append({
+        "label": "Apollo forward-returns pipeline producing data",
+        "ok": apollo_flowing,
+        "detail": "no forward returns captured — check apollo.ops.backfill_forward_returns"
+                  if not apollo_flowing else "",
+    })
+
+    # 7. Broker equity was captured overnight
+    b = brief["sections"]["broker"]
+    has_equity = bool(b.get("latest_equity_usd"))
+    items.append({
+        "label": "Broker equity snapshot captured",
+        "ok": has_equity,
+        "detail": "no equity samples — fleet_monitor may not be running"
+                  if not has_equity else "",
+    })
+
+    overall = "OK" if all(i["ok"] for i in items) else "ATTENTION"
+    return {"items": items, "overall": overall}
 
 
 def _discord_brief(text: str) -> None:

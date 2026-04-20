@@ -1,13 +1,21 @@
-"""apollo/ops/fleet_risk.py -- Cross-system position check.
+"""helio/fleet_risk.py -- Cross-system position check.
 
-Before Apollo enters any position, check what Titan, Ares, and Hermes hold.
-Prevents double exposure (e.g., Titan long NVDA + Apollo long NVDA for earnings).
+Before any family (Apollo/Titan/Hermes) enters a position, check what the
+other families hold. Prevents double exposure (e.g., Titan long NVDA +
+Apollo long NVDA for earnings).
+
+Note 2026-04-19: REPO path fixed from .parents[2] (which pointed one level
+above the repo when this file moved from apollo/ops/ to helio/) to
+.parents[1]. Previously get_fleet_positions() silently returned {} because
+every positions.json lookup missed. Callers (apollo/runner, hermes/runner,
+titan/runner, forge/conviction) had their double-exposure check neutered
+until this fix.
 """
 import json
 import logging
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 _log = logging.getLogger("apollo.risk")
 
 

@@ -567,7 +567,8 @@ class SectorRotation:
 
         return {"months": total_months, "win_rate": round(winning_months / max(total_months, 1) * 100, 1),
                 "pf": round(pf, 2), "strategy_return": round(strat_total, 2),
-                "spy_return": round(spy_total, 2), "alpha": round(strat_total - spy_total, 2)}
+                "spy_return": round(spy_total, 2), "alpha": round(strat_total - spy_total, 2),
+                "detail": records}
 
 
 # ===================================================================

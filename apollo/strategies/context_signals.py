@@ -35,7 +35,7 @@ PEER_GROUPS = {
                     "FTNT", "PANW", "INTU"],
     "fintech": ["SOFI", "HOOD", "COIN", "UPST", "AFRM", "NU"],
     "banks": ["JPM", "BAC", "GS", "MS"],
-    "ev_energy": ["TSLA", "RIVN", "LCID", "NIO", "PLUG", "FSLR", "ENPH"],
+    "ev_energy": ["TSLA", "RIVN", "LCID", "PLUG", "FSLR", "ENPH"],
     "biotech": ["MRNA", "BNTX", "CRSP", "EDIT", "REGN", "VRTX", "GILD", "AMGN"],
     "retail_consumer": ["WMT", "COST", "HD", "LOW", "MCD", "SBUX", "KO", "PEP", "PG"],
     "industrials": ["CAT", "GE", "HON", "RTX", "UPS"],

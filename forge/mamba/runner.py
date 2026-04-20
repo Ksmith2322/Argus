@@ -62,6 +62,27 @@ MAX_HOLD_BARS_5MIN = 12  # 60 min max on 5-min bars (safety)
 RR_CONSERVATIVE = 3.0    # 50% off at 1:3
 RR_FULL = 5.0            # trail remainder to 1:5
 
+# Entry-gate mode (2026-04-19 transcript consolidation).
+#   "strict_5" (default) — the v1 rule: all 5 confluences + 1m structure.
+#     Empirically optimal on current synthetic-1m backtest, but not faithful
+#     to Mamba's stated teaching.
+#   "transcript_3" — his stated "3-confirmation stack": S/R break + trend-line
+#     break + rejection wick. No volume or 1m-structure requirement.
+#     Intended for testing once real-1m data is available.
+# See forge/mamba/MAMBAFX_RULEBOOK.md v2 updates for the derivation.
+MAMBA_ENTRY_MODE = "strict_5"
+
+# 1m data source (2026-04-19 scaffold for real-1m pipeline).
+#   "synthetic" (default) — resample 1m from the 5m feed we already have.
+#     Works for backtest continuity; known to misrepresent intrabar
+#     microstructure that Mamba's edge depends on.
+#   "real" — load real 1m bars from helio.bar_store (parquet files at
+#     forge/data/mamba/1m/<ticker>.parquet). Any ingestion script (IBKR,
+#     Polygon, Databento, Alpaca) must conform to the bar_store schema.
+# The runner silently falls back to "synthetic" if MAMBA_1M_SOURCE="real"
+# but the bar file is missing — logs a warning so you notice.
+MAMBA_1M_SOURCE = "synthetic"
+
 IBKR_CLIENT_IDS = {"NQ=F": 102, "YM=F": 103}
 
 # ---------------------------------------------------------------------------
@@ -164,6 +185,61 @@ def synthesize_1min_from_5min(df_5min: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# Cache of real 1m DataFrames keyed by ticker — loaded once per backtest run
+_REAL_1M_CACHE: dict[str, "pd.DataFrame | None"] = {}
+
+
+def _load_real_1min(ticker: str) -> "pd.DataFrame | None":
+    """Load real 1-minute bars for `ticker` from helio.bar_store. Cached for
+    the lifetime of the process. Returns None if the file is missing so
+    callers can fall back to synthetic without crashing."""
+    if ticker in _REAL_1M_CACHE:
+        return _REAL_1M_CACHE[ticker]
+    try:
+        from helio.bar_store import load_bars
+        df = load_bars("mamba", "1m", ticker, min_rows=100)
+        _REAL_1M_CACHE[ticker] = df
+        return df
+    except Exception as e:
+        # Log once per ticker so the operator notices the fallback
+        if ticker not in _REAL_1M_CACHE:
+            log.warning(
+                f"real 1m bars unavailable for {ticker} ({e}); "
+                f"falling back to synthetic"
+            )
+        _REAL_1M_CACHE[ticker] = None
+        return None
+
+
+def _fetch_1min_window(
+    ticker: str,
+    trade_bars: "pd.DataFrame",
+    bar_pos: int,
+    bar_time,
+    lookback_5m: int = 6,
+) -> "pd.DataFrame | None":
+    """Return ~8 minutes of 1m bars ending at `bar_time`. Honors
+    MAMBA_1M_SOURCE: if "real", prefers real 1m from bar_store; silently
+    falls back to synthetic when real data is missing."""
+    if MAMBA_1M_SOURCE == "real":
+        real = _load_real_1min(ticker)
+        if real is not None:
+            # Window: 8 minutes ending at bar_time
+            end_ts = bar_time
+            start_ts = bar_time - pd.Timedelta(minutes=8)
+            window = real.loc[start_ts:end_ts]
+            if len(window) >= 3:
+                return window
+            # Too few real bars at this timestamp — fall through to synthetic
+
+    # Synthetic: resample from recent 5m bars
+    struct_start = max(0, bar_pos - lookback_5m)
+    recent_5min = trade_bars.iloc[struct_start:bar_pos + 1].copy()
+    if len(recent_5min) < 3:
+        return None
+    return synthesize_1min_from_5min(recent_5min)
+
+
 def is_ny_session(ts, phase: str = "trade") -> bool:
     """Check if timestamp is in the NY session window."""
     h, m = ts.hour, ts.minute
@@ -258,6 +334,13 @@ def run_backtest(
     all_trades = []
     lookback = 60  # 5 hours of 5-min bars
 
+    # Strategy-wide daily trade counter. Previously lived inside the ticker
+    # loop which let NQ and YM each take MAX_TRADES_PER_DAY independently —
+    # doubling the effective cap. MAX_TRADES_PER_DAY is defined in the
+    # MAMBAFX rulebook as a per-day total across instruments, so the
+    # counter must be shared. Fixed 2026-04-19 after external audit.
+    daily_trade_count: dict[str, int] = defaultdict(int)
+
     for ticker, df in datasets.items():
         point_value = POINT_VALUES.get(ticker, 2.0)
         micro = TICKER_TO_MICRO.get(ticker, ticker)
@@ -267,8 +350,6 @@ def run_backtest(
         # Group bars by trading date
         df["_date"] = df.index.date
         trading_days = sorted(df["_date"].unique())
-
-        daily_trade_count: dict[str, int] = defaultdict(int)
 
         for day in trading_days:
             day_str = str(day)
@@ -479,16 +560,16 @@ def run_backtest(
                             has_tl_break = True
                             break
 
-                # 3. 1-min structure (synthesize from recent 5-min bars)
-                struct_start = max(0, bar_pos - 6)
-                recent_5min = trade_bars.iloc[struct_start:bar_pos + 1].copy()
-                if len(recent_5min) >= 3:
-                    synth_1min = synthesize_1min_from_5min(recent_5min)
-                    if len(synth_1min) >= 8:
-                        structure = detect_1min_structure(synth_1min, direction)
-                        has_structure = structure is not None and structure["confirmed"]
-                    else:
-                        has_structure = False
+                # 3. 1-min structure — route through configured source.
+                # Real 1m needs bars from helio.bar_store; synthetic 1m is
+                # a resample-from-5m fallback that misrepresents intrabar
+                # microstructure (documented limitation).
+                one_min_bars = _fetch_1min_window(
+                    ticker, trade_bars, bar_pos, bar_time,
+                )
+                if one_min_bars is not None and len(one_min_bars) >= 8:
+                    structure = detect_1min_structure(one_min_bars, direction)
+                    has_structure = structure is not None and structure["confirmed"]
                 else:
                     has_structure = False
 
@@ -511,12 +592,29 @@ def run_backtest(
                     candle_quality=has_candle,
                 )
 
+                # Entry gate: default = "strict_5" mode (empirical best-performer
+                # on synthetic-1m data).
+                #
                 # Per-confluence-bucket backtest (2026-04-16) showed:
                 #   3-conf: 13% WR, -$576 (noise)
                 #   4-conf: 26% WR, +$13 (breakeven)
                 #   5-conf: 36% WR, +$176 (matches rulebook 35-45% target)
-                # Edge lives ONLY in 5-confluence sniper setups. Structure is mandatory.
-                if confluences < 5 or not has_structure:
+                # Edge lives ONLY in 5-confluence sniper setups.
+                #
+                # Alternative: "transcript_3" mode — from 2026-04-19 transcript
+                # consolidation (see forge/mamba/MAMBAFX_RULEBOOK.md v2 updates).
+                # Mamba's stated "3-confirmation stack" is specifically:
+                #   1. Rejection wick  (== has_candle here)
+                #   2. Trend-line break (== has_tl_break)
+                #   3. S/R level break (== has_sr_break)
+                # Volume + 1m-structure are NOT in his transcript-stated method;
+                # they were added by our v1 implementation. Enable transcript_3
+                # mode when real-1m data arrives and we can test his actual rules.
+                if MAMBA_ENTRY_MODE == "transcript_3":
+                    passes_gate = has_sr_break and has_tl_break and has_candle
+                else:  # strict_5 (default)
+                    passes_gate = confluences >= 5 and has_structure
+                if not passes_gate:
                     continue
 
                 # --- ENTRY ---

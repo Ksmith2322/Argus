@@ -195,14 +195,9 @@ SYSTEMS = {
         "artifact_max_age_s": 93600,  # 26h — daily run + buffer
         "no_restart": True,  # scheduled externally, don't auto-restart
     },
-    "oracle": {
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "oracle.runner",
-        "artifact_glob": str(REPO / "oracle" / "logs" / "scan_*.json"),
-        "artifact_max_age_s": 93600,
-        "no_restart": True,
-    },
+    # oracle (Polymarket) paused 2026-04-19 — geoblocked for US users, no
+    # execution path. Re-add this entry + uncomment the block in
+    # ops/run_cohort_report.ps1 if/when migrating to Kalshi.
 }
 
 PYTHON = r"C:\Argus\.venv\Scripts\python.exe"

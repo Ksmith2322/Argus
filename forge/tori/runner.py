@@ -74,6 +74,13 @@ STARTING_EQUITY = 10_000.0
 BASE_RISK_PCT = 0.015  # 1.5%
 MIN_RR = 2.0  # 2R minimum target
 
+# 2026-04-19: 2-year backtest across all 4 instruments showed bounce setups
+# lose on all 4 (Platinum/Crude/Gold/Dow) while break setups profit on all 4.
+# Current detector produces few signals that cluster around line failures
+# (fast -1R stops, avg hold 1-11 bars). Disabled until the detector is
+# rebuilt. Flip to True to re-enable for comparison runs.
+TORI_ENABLE_BOUNCE = False
+
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
@@ -167,8 +174,8 @@ def run_backtest(
         fit_ascending_trendline, fit_descending_trendline,
         score_trendline_quality, _trendline_value_at,
         check_bounce, check_break, check_retest,
-        _find_opposing_safety, _is_rejection_candle,
-        _deduplicate_trendlines,
+        _find_opposing_safety, _find_trailing_trendline_stop,
+        _is_rejection_candle, _deduplicate_trendlines,
     )
 
     all_trades = []
@@ -198,12 +205,21 @@ def run_backtest(
                 bar = df.iloc[i]
                 trade = open_trade
 
-                # Update trailing Safety Line
+                # Update trailing Safety Line.
+                # v2 (2026-04-19): angled trend-line trail per Tori's "steeper
+                # trend line" method. Falls back to the legacy flat-swing
+                # trail only when not enough post-entry swings exist yet to
+                # fit a valid angled line. See forge/tori/TORITRADES_RULEBOOK.md
+                # v2 updates for the audit that motivated this change.
                 pnl_points = 0
+                entry_bar = trade.get("entry_bar", i)
                 if trade["direction"] == "LONG":
                     pnl_points = bar["Close"] - trade["entry_price"]
-                    # Trail: move stop up to recent swing low
-                    new_safety = _find_opposing_safety(df.iloc[:i+1], i, "LONG", atr)
+                    new_safety = _find_trailing_trendline_stop(
+                        df, i, entry_bar, "LONG", atr
+                    )
+                    if new_safety is None:
+                        new_safety = _find_opposing_safety(df.iloc[:i+1], i, "LONG", atr)
                     if new_safety and new_safety > trade["stop_price"]:
                         trade["stop_price"] = new_safety
 
@@ -220,7 +236,11 @@ def run_backtest(
 
                 else:  # SHORT
                     pnl_points = trade["entry_price"] - bar["Close"]
-                    new_safety = _find_opposing_safety(df.iloc[:i+1], i, "SHORT", atr)
+                    new_safety = _find_trailing_trendline_stop(
+                        df, i, entry_bar, "SHORT", atr
+                    )
+                    if new_safety is None:
+                        new_safety = _find_opposing_safety(df.iloc[:i+1], i, "SHORT", atr)
                     if new_safety and new_safety < trade["stop_price"]:
                         trade["stop_price"] = new_safety
 
@@ -301,12 +321,18 @@ def run_backtest(
                 tl_mapped = {**tl, "start_idx": tl["start_idx"] + offset,
                              "end_idx": tl["end_idx"] + offset}
 
-                # Check bounce
-                bounce = check_bounce(df, tl_mapped, i, atr)
-                if bounce and g_rank < best_grade_rank:
-                    bounce["quality"] = quality
-                    best_setup = bounce
-                    best_grade_rank = g_rank
+                # Check bounce (2026-04-19 validation: our bounce detector
+                # produces a handful of signals per 2-year window and all
+                # lose across all 4 instruments, while break setups profit
+                # on all 4. Likely a detector/stop-logic issue, not a
+                # validation of her teaching. Disabled by default until
+                # the detector is rebuilt.)
+                if TORI_ENABLE_BOUNCE:
+                    bounce = check_bounce(df, tl_mapped, i, atr)
+                    if bounce and g_rank < best_grade_rank:
+                        bounce["quality"] = quality
+                        best_setup = bounce
+                        best_grade_rank = g_rank
 
                 # Check break
                 brk = check_break(df, tl_mapped, i, atr)
@@ -627,8 +653,10 @@ def run_scan(datasets: dict[str, pd.DataFrame]):
             direction_label = "ascending" if tl["direction"] == "ascending" else "descending"
             status = ""
 
-            # Check for active setups
-            bounce = check_bounce(df, tl, last_bar, atr)
+            # Check for active setups (bounce gated by TORI_ENABLE_BOUNCE
+            # after the 2026-04-19 validation showed bounce lost on every
+            # instrument while break profited on every instrument)
+            bounce = check_bounce(df, tl, last_bar, atr) if TORI_ENABLE_BOUNCE else None
             brk = check_break(df, tl, last_bar, atr)
 
             if bounce:

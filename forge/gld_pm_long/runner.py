@@ -37,7 +37,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 log = setup_logging("gld_pm_long")
 
-PARAMS = {
+_HARDCODED_DEFAULTS = {
     "version": "v1",
     "symbol": "GLD",
     "timeframe": "1h",
@@ -51,6 +51,34 @@ PARAMS = {
     # auto-sets from measured live performance). See strategy_label
     # "forge_gld_pm_long" in fleet_sizing.json tiers config.
 }
+
+
+def _load_params_from_registry() -> dict:
+    """Phase 2 migration: pull edge thresholds from config/strategies.json
+    when available. Falls back to _HARDCODED_DEFAULTS on any failure — a
+    broken registry cannot break the runner. Phase 1 equivalence test
+    (test_registry_equivalence) guarantees the registry values match the
+    hardcoded defaults, so this is a no-op behavior change today. The win
+    is that future threshold edits happen in ONE file (strategies.json)
+    instead of two (strategies.json + runner.py)."""
+    try:
+        from helio.strategy_registry import load_registry
+        reg = load_registry().gld_pm_long
+        return {
+            "version": _HARDCODED_DEFAULTS["version"],
+            "symbol": reg.symbol,
+            "timeframe": reg.timeframe,
+            "signal_hours_utc": list(reg.signal_hours_utc),
+            "target_atr": reg.target_atr,
+            "stop_atr": reg.stop_atr,
+            "hold_bars": reg.hold_bars,
+            "atr_period": reg.atr_period,
+        }
+    except Exception:
+        return dict(_HARDCODED_DEFAULTS)
+
+
+PARAMS = _load_params_from_registry()
 
 TRADES_PATH = LOG_DIR / "trades.csv"
 SIGNALS_PATH = LOG_DIR / "signals.csv"
@@ -66,17 +94,16 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def _config_hash() -> str:
-    return hashlib.sha256(json.dumps(PARAMS, sort_keys=True).encode()).hexdigest()[:16]
+    # Delegates to shared helper (2026-04-19 migration). Shape-identical
+    # output to the prior local impl; covered by
+    # test_strategy_common.TestConfigHash.test_matches_existing_runner_implementations
+    from helio.strategy_common import config_hash
+    return config_hash(PARAMS)
 
 
 def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(REPO), stderr=subprocess.DEVNULL, text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
+    from helio.strategy_common import git_sha
+    return git_sha(REPO)
 
 
 TRADE_FIELDS = [
@@ -277,6 +304,31 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
         "signal_hour_utc": ot["signal_hour_utc"],
     })
     log.info("PAPER LONG closed (%s) @ %.2f — pnl %+.4f pts ($%+.2f)", reason, exit_px, pnl_pts, pnl_usd)
+
+    # Dual-write to canonical fills so the fleet-wide log sees trades as
+    # they close, not only after the nightly backfill. Uses write_fill_typed
+    # (helio.domain.Fill path). write_fill_typed is wrapped in its own
+    # try/except — a broken canonical log cannot break paper trading here.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill
+        write_fill_typed(Fill(
+            strategy="forge_gld_pm_long",
+            symbol="GLD",
+            direction="long",
+            side="EXIT",
+            entry_ts=str(ot["entry_ts"]),
+            exit_ts=str(exit_ts),
+            entry_px=float(ot["entry_px"]),
+            exit_px=float(exit_px),
+            size=float(ot["position_size"]),
+            risk_usd=float(ot.get("risk_usd") or 0.0),
+            pnl_usd=round(pnl_usd, 2),
+            exit_reason=reason,
+        ))
+    except Exception:
+        pass  # never let the canonical log break paper trading
+
     state["open_trade"] = None
 
 

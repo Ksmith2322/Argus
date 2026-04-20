@@ -60,17 +60,14 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def _config_hash() -> str:
-    return hashlib.sha256(json.dumps(PARAMS, sort_keys=True).encode()).hexdigest()[:16]
+    # Delegates to shared helper (2026-04-19 migration).
+    from helio.strategy_common import config_hash
+    return config_hash(PARAMS)
 
 
 def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(REPO), stderr=subprocess.DEVNULL, text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
+    from helio.strategy_common import git_sha
+    return git_sha(REPO)
 
 
 TRADE_FIELDS = [

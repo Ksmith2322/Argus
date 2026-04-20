@@ -2,6 +2,10 @@
 
 **Source:** Anthony Alvarenga (@mambafx) — 671K YouTube subscribers
 **Compiled from:** "The ONLY Trading Strategy You Need for 2026," "This Strategy Makes You Profitable INSTANTLY," "The Only 1-Minute Scalping Strategy You'll EVER NEED," "This NEW 2026 Futures Strategy is INSANE"
+**Last updated:** 2026-04-19 — consolidated from 5 transcripts including regime-indicator video, candle-pattern video, 6-step breakout video, and Legacy prop-firm walkthrough.
+
+**Primary consolidated reference:** `memory/project_strategy_playbooks_20260419.md` §2 (Mamba FX).
+**Audit / subset-edge findings:** `memory/project_mamba_tori_review_20260419.md`.
 
 ---
 
@@ -166,3 +170,72 @@ Each confirmation adds to conviction:
   2 confluences = good (standard size)
   3+ confluences = sniper (max size, highest conviction)
 ```
+
+---
+
+## v2 updates from 2026-04-19 transcript consolidation
+
+Five Mamba videos reviewed produced the following **consolidated entry stack** that supersedes the older 5-confluence counter. Treat this as the authoritative rule set for future Mamba bot work.
+
+### The 3-confirmation stack (primary trigger)
+
+All three must align for high-conviction entry:
+
+1. **Rejection wick** on a candle at a level — showing a failed attempt by the opposite side
+2. **Trend-line break** in the intended direction
+3. **S/R level break** co-located with the trend-line break
+
+Where our current bot requires 5 confluences, the unified Mamba method is **3**, and they are *specific* (wick + trend line + S/R), not *any five of N*.
+
+### Two-candle engulfing alternative trigger
+
+Also valid as a single-pattern trigger (with S/R break):
+- Bullish candle pushes up by N points
+- Next 2 bearish candles' combined range ≥ N (the bullish candle is swallowed)
+- Paired with S/R break in bearish direction → short
+- Symmetric logic for longs
+
+### Regime filter (directional bias)
+
+Mamba names "Trend Indicator A" on TradingView. Exact author is unspecified. For implementation, substitute one of:
+- SuperTrend
+- Fast-slow EMA cross (e.g., 8/18)
+- MACD-histogram-sign
+
+Bullish regime = longs only; bearish = shorts only.
+
+### Tiered position sizing (new in 2026-04-19 consolidation)
+
+- **Normal breakout** (single confirmation): 2% risk
+- **3-confirmation stack OR two-candle engulfing with S/R**: 3-5% risk
+
+### R:R targets — his videos vary
+
+Stated targets across five videos: 1:2, 1:3, 1:4, 1:5. Use **1:3 as the pragmatic mid-point** for backtesting. Actual live runs can vary.
+
+### Real 1-minute data requirement
+
+The current backtest synthesizes 1-minute bars from 5-minute bars (`forge/mamba/runner.py:120`). **This invalidates any Mamba confidence number**, because the entire edge (wick rejection, sweep-reclaim, structure confirmation) lives in real intrabar behavior that synthetic 1m cannot represent.
+
+Any Mamba v2 must be validated against **real 1-minute data** before its confidence artifact is trustworthy.
+
+### Subset edge (from `forge/logs/mamba/backtest_trades.csv`)
+
+| Ticker | Trades | WR | PnL$ | PF |
+|---|--:|--:|--:|--:|
+| NQ | 14 | 14.3% | -190.80 | 0.62 |
+| YM | 15 | 33.3% | +117.22 | **1.98** |
+
+**YM is the positive subset.** Run YM-only mode; keep NQ in `research_only` until real-1m validation passes.
+
+### Entry timing: stated rule is ambiguous
+
+Two videos show mutually-exclusive rules:
+- Older video: *"We closed above. That's what I like to see."* (candle close)
+- Newer video: *"As it starts to push below."* (pre-close, aggressive)
+
+Default to **aggressive on-push entry** for the 3-confirmation stack (higher conviction), **candle-close entry** for single-confirmation setups (more confirmation needed).
+
+### Backtest timing anomaly
+
+Our CSV shows entries at 09:50-09:55 ET. His stated window is 09:30 ET. The bot is 20-25 minutes late. Audit the signal-detection logic to find the lag source.

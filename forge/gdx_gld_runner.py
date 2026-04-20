@@ -51,10 +51,39 @@ from helio.fleet_sizing import get_initial_capital_usd, pnl_pct_of_fleet
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-ZSCORE_ENTRY = 2.0
-ZSCORE_EXIT = 0.0
-ZSCORE_STOP = 3.5  # widened from 3.0 per sensitivity analysis (PF 1.56 -> 1.88)
-ZSCORE_LOOKBACK = 60          # rolling window for z-score
+# z-score thresholds load via registry (forge_gdx_gld_live — distinct from
+# the backtest forge_gdx_gld entry because zscore_stop diverges: live uses
+# 3.5 per sensitivity analysis (PF 1.56 -> 1.88), backtest stays at 3.0).
+# Fallback to hardcoded defaults if registry unavailable — a broken registry
+# cannot break the runner.
+_HARDCODED_DEFAULTS = {
+    "ZSCORE_ENTRY":    2.0,
+    "ZSCORE_EXIT":     0.0,
+    "ZSCORE_STOP":     3.5,  # widened from 3.0 per sensitivity analysis (PF 1.56 -> 1.88)
+    "ZSCORE_LOOKBACK": 60,   # rolling window for z-score
+}
+
+
+def _load_constants_from_registry() -> dict:
+    try:
+        from helio.strategy_registry import load_registry
+        reg = load_registry().gdx_gld_live
+        return {
+            "ZSCORE_ENTRY":    reg.zscore_entry,
+            "ZSCORE_EXIT":     reg.zscore_exit,
+            "ZSCORE_STOP":     reg.zscore_stop,
+            "ZSCORE_LOOKBACK": reg.zscore_lookback,
+        }
+    except Exception:
+        return dict(_HARDCODED_DEFAULTS)
+
+
+_RC = _load_constants_from_registry()
+ZSCORE_ENTRY    = _RC["ZSCORE_ENTRY"]
+ZSCORE_EXIT     = _RC["ZSCORE_EXIT"]
+ZSCORE_STOP     = _RC["ZSCORE_STOP"]  # 3.5 live (diverges from backtest 3.0)
+ZSCORE_LOOKBACK = _RC["ZSCORE_LOOKBACK"]
+
 RISK_PER_TRADE_PCT = 0.02     # 2% of equity
 IBKR_CLIENT_ID = 101          # reserved range 100-199 for forge
 IBKR_DEFAULT_PORT = 7497      # paper trading
@@ -317,7 +346,12 @@ def append_trade_row(
     gdx_exit: float, gld_exit: float,
     pnl_pct: float, exit_reason: str,
     equity_usd: Optional[float] = None,
+    emit_canonical: bool = False,
 ) -> None:
+    # emit_canonical defaults to False so run_backtest() (historical replay)
+    # cannot pollute canonical_fills.jsonl with 2006–2026 rows that would look
+    # like live fills to the dashboard, reconciliation, and promotion gates.
+    # Live/paper paths pass emit_canonical=True explicitly.
     _init_csv(TRADES_CSV, TRADE_COLS)
     if equity_usd is None:
         equity_usd = get_initial_capital_usd()
@@ -334,6 +368,37 @@ def append_trade_row(
             gdx_shares, gld_shares, f"{equity_usd:.2f}",
             f"{pnl_usd:.2f}", f"{pnl_pct_of_fleet(pnl_usd):.4f}",
         ])
+
+    if not emit_canonical:
+        return
+
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill
+        direction_norm = "long" if direction == "LONG_SPREAD" else "short"
+        write_fill_typed(Fill(
+            strategy="forge_gdx_gld",
+            symbol="GDX/GLD",
+            direction=direction_norm,
+            side="EXIT",
+            entry_ts=str(entry_date),
+            exit_ts=str(exit_date),
+            entry_px=float(gdx_entry),
+            exit_px=float(gdx_exit),
+            size=float(gdx_shares),
+            risk_usd=None,
+            pnl_usd=round(pnl_usd, 2),
+            exit_reason=exit_reason,
+        ), extra={
+            "gld_entry": float(gld_entry),
+            "gld_exit": float(gld_exit),
+            "gld_shares": int(gld_shares),
+            "entry_z": float(entry_z),
+            "exit_z": float(exit_z),
+            "equity_at_entry_usd": float(equity_usd),
+        })
+    except Exception:
+        pass  # never let the canonical log break paper trading
 
 
 # ---------------------------------------------------------------------------

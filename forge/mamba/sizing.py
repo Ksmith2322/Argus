@@ -30,6 +30,7 @@ def compute_mamba_size(
     conviction_multiplier: float = 1.0,
     instrument: str = "MNQ",
     daily_risk_used: float = 0.0,
+    transcript_mode: bool = False,
 ) -> dict:
     """
     Compute position size for a Mamba trade.
@@ -40,7 +41,13 @@ def compute_mamba_size(
         confluence_count: number of confluences (2+ required to trade)
         conviction_multiplier: from fleet conviction scorer (0.25-2.0)
         instrument: "MNQ" or "MYM"
-        daily_risk_used: risk already used today as fraction of equity (0.0-0.03)
+        daily_risk_used: risk already used today as fraction of equity
+        transcript_mode: when True, use the risk tiers from 2026-04-19 transcript
+            consolidation — base 2% (his stated "normal trade risk"), enhanced
+            4% at 5 confluences (his stated "3-5% on enhanced pattern"). Daily
+            cap raised to 8% to accommodate two enhanced trades per day.
+            When False (default), preserves the v1 tiered sizing that was
+            calibrated against the existing synthetic-1m backtest.
 
     Returns:
         {contracts: int, risk_usd: float, risk_pct: float, skip: bool, reason: str}
@@ -56,22 +63,33 @@ def compute_mamba_size(
         return {"contracts": 0, "risk_usd": 0.0, "risk_pct": 0.0,
                 "skip": True, "reason": f"only {confluence_count} confluence(s), need 2+"}
 
-    # Base risk: 1% of equity
-    base_risk_pct = 0.01
-    base_risk_usd = equity * base_risk_pct
-
-    # Confluence multiplier
-    if confluence_count >= 4:
-        conf_mult = 1.5
-    elif confluence_count >= 3:
-        conf_mult = 1.25
+    if transcript_mode:
+        # Transcript-stated tiers: 2% base, 4% at full 5-confluence ("enhanced pattern")
+        base_risk_pct = 0.02
+        base_risk_usd = equity * base_risk_pct
+        if confluence_count >= 5:
+            conf_mult = 2.0  # 4% total at 5-conf
+        elif confluence_count >= 4:
+            conf_mult = 1.5  # 3% at 4-conf
+        else:
+            conf_mult = 1.0  # 2% at 2-3 conf
+        daily_cap_pct = 0.08
     else:
-        conf_mult = 1.0  # 2 confluences
+        # v1 calibrated sizing
+        base_risk_pct = 0.01
+        base_risk_usd = equity * base_risk_pct
+        if confluence_count >= 4:
+            conf_mult = 1.5
+        elif confluence_count >= 3:
+            conf_mult = 1.25
+        else:
+            conf_mult = 1.0
+        daily_cap_pct = 0.03
 
     adjusted_risk = base_risk_usd * conf_mult * conviction_multiplier
 
-    # Cap at 3% equity per day
-    max_daily_risk = equity * 0.03
+    # Daily risk cap (3% v1, 8% transcript_mode)
+    max_daily_risk = equity * daily_cap_pct
     remaining_risk = max_daily_risk - (daily_risk_used * equity)
     if remaining_risk <= 0:
         return {"contracts": 0, "risk_usd": 0.0, "risk_pct": 0.0,
