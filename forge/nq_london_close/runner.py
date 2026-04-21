@@ -45,6 +45,11 @@ TRADES_PATH = LOG_DIR / "trades.csv"
 SIGNALS_PATH = LOG_DIR / "signals.csv"
 HEARTBEAT_PATH = LOG_DIR / "heartbeat.json"
 
+RESEARCH_ONLY = True  # 2026-04-21: 60d backtest PF 0.90 / 4.6 trades/wk — negative
+# edge. Params need tuning (overshoot threshold too low? RSI window wrong?) before
+# this is more than research. Runner still produces paper trades; flag the artifact.
+# Re-enable for production by flipping to False after PF > 1.2 on a 90d+ backtest.
+
 PARAMS = {
     "version": "v1",
     "ticker": "NQ=F",

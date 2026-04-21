@@ -257,26 +257,14 @@ try {
 
     # 2026-04-20: gdx_gld has real IBKR execution (ib_insync placeOrder path)
     # but wasn't scheduled. Running --live so signals convert to paper fills.
-    # 2026-04-21 volume-push: two new custom strategies firing in their
-    # native sessions. --evaluate is one-shot per cohort run; for higher
-    # cadence register as scheduled ONLOGON tasks with --loop.
-    Write-Host "Running NQ London Close scalp evaluation..."
-    $nqLdnOutput = & $python -m forge.nq_london_close.runner --evaluate 2>&1
-    foreach ($line in @($nqLdnOutput)) {
-        if ($line) { Add-Content -Path $logFile -Value "[$timestamp] nq_london_close: $line" }
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Add-Content -Path $logFile -Value "[$timestamp] nq_london_close WARNING: exit code $LASTEXITCODE (non-fatal)"
-    }
-
-    Write-Host "Running AUD Asian breakout evaluation..."
-    $audOrbOutput = & $python -m forge.aud_asian_breakout.runner --evaluate 2>&1
-    foreach ($line in @($audOrbOutput)) {
-        if ($line) { Add-Content -Path $logFile -Value "[$timestamp] aud_asian_breakout: $line" }
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Add-Content -Path $logFile -Value "[$timestamp] aud_asian_breakout WARNING: exit code $LASTEXITCODE (non-fatal)"
-    }
+    # 2026-04-21: nq_london_close + aud_asian_breakout are session-specific.
+    # A 23:00 UTC --evaluate is a no-op for both (out of session window).
+    # They must run via --loop mode, registered as ONLOGON scheduled tasks:
+    #   ArgusNqLondonCloseLoop  — fires 5m cadence during 16:00 UTC hour
+    #   ArgusAudOrbLoop         — fires hourly during 01-07 UTC
+    # See ops/register_remaining_tasks.ps1 for the schtasks commands.
+    # Removed the nightly --evaluate invocations since they don't produce signals
+    # outside the strategies' session windows.
 
     Write-Host "Running GDX/GLD pair runner..."
     $gdxOutput = & $python -m forge.gdx_gld_runner --live 2>&1

@@ -79,6 +79,20 @@ def _cross_process_file_lock(path: Path):
                 break
             except OSError:
                 _time.sleep(0.002)
+        if not acquired:
+            # DO NOT proceed without the lock — concurrent writers would
+            # race and some writes would silently drop. Raise loudly so
+            # the caller's try/except can log the fact; the record is
+            # also copied to a fallback jsonl for later reconciliation.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise TimeoutError(
+                f"canonical_fills lock timeout after 60s on {lock_path} — "
+                f"did not proceed to avoid a silent-drop race. Caller must log "
+                f"and the failover path will pick up the record."
+            )
         try:
             yield
         finally:
@@ -110,6 +124,9 @@ def _cross_process_file_lock(path: Path):
 
 _REPO = Path(__file__).resolve().parents[1]
 CANONICAL_FILLS_PATH = _REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+# Failover log for records that couldn't acquire the main lock. A reconciler
+# should periodically drain this into the primary ledger.
+CANONICAL_FAILOVER_PATH = _REPO / "argus_flow" / "logs" / "canonical_fills_failover.jsonl"
 
 # Reader-glob supports rotation: canonical_fills_YYYYMM.jsonl etc.
 # _CANONICAL_GLOB pattern matches archives. Readers use _iter_canonical_paths
@@ -218,10 +235,15 @@ def write_fill(
         # Serialise rotation + append under BOTH:
         #   - intra-process thread lock (stops thread races in one process)
         #   - cross-process file lock (stops races between runner processes)
-        with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
-            rotate_if_needed()
-            with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, default=str) + "\n")
+        try:
+            with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
+                rotate_if_needed()
+                with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, default=str) + "\n")
+        except TimeoutError:
+            # Lock acquisition timed out. Don't silently drop — write to the
+            # failover jsonl so a reconciler can fold it back later.
+            _write_failover(row, reason="lock_timeout")
     except Exception:
         pass  # never let the logger break a trade
 
@@ -261,12 +283,35 @@ def write_fill_typed(fill, extra: dict[str, Any] | None = None) -> None:
             row["extra"] = extra
         CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Both intra-process AND cross-process locks required — see write_fill()
-        with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
-            rotate_if_needed()
-            with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, default=str) + "\n")
+        try:
+            with _WRITE_LOCK, _cross_process_file_lock(CANONICAL_FILLS_PATH):
+                rotate_if_needed()
+                with open(CANONICAL_FILLS_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, default=str) + "\n")
+        except TimeoutError:
+            _write_failover(row, reason="lock_timeout")
     except Exception:
         pass  # same invariant as write_fill: never break a live trade
+
+
+def _write_failover(row: dict, reason: str) -> None:
+    """Last-resort append to the failover log when the main lock is unobtainable.
+
+    The failover file has no lock (append-only, one row per line, duplicates
+    tolerated). A reconciler should periodically drain records from failover
+    into the main ledger when the main lock is available again.
+    """
+    try:
+        CANONICAL_FAILOVER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**row, "_failover_reason": reason,
+                   "_failover_ts": datetime.now(timezone.utc).isoformat()}
+        with open(CANONICAL_FAILOVER_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        # If even the failover fails, we've exhausted options. The trade is
+        # still logged in the per-strategy CSV by the runner's _close path;
+        # reconciler can catch it later via CSV-vs-canonical diff.
+        pass
 
 
 def read_fills(limit: int | None = None, strategy: str | None = None) -> list[dict]:

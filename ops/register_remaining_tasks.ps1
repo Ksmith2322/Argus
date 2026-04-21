@@ -1,43 +1,62 @@
-# Register remaining scheduled tasks (2026-04-20 session hand-off).
+# Register / update Argus scheduled tasks.
 #
 # MUST BE RUN FROM AN ELEVATED POWERSHELL.
-# The Claude Code sandbox correctly blocks privilege-escalation / persistence
-# changes, so these three commands were parked for manual execution.
-#
-# Right-click PowerShell -> Run as Administrator, then:
+# Run as Administrator, then:
 #   cd C:\Argus\repo
 #   .\ops\register_remaining_tasks.ps1
 #
 # Safe to re-run — each uses /F to overwrite if the task already exists.
+# After running, if any task needs to survive RDP disconnect, also run:
+#   schtasks /change /TN "<TaskName>" /RU "$env:USERDOMAIN\$env:USERNAME" /RP *
 
 $ErrorActionPreference = "Stop"
 
-# 1) GLD PM Long: runs the runner's --loop mode so it wakes at signal hours
-#    18/19/20 UTC per the runner's internal schedule. ONLOGON trigger means
-#    it starts when you log in; no stored password needed.
+# 1) GLD PM Long — runs 18/19/20 UTC signal hours via --loop.
 Write-Host "Registering ArgusGldPmLoop..."
 schtasks.exe /create /TN "ArgusGldPmLoop" `
   /TR "C:\Argus\.venv\Scripts\python.exe -m forge.gld_pm_long.runner --loop" `
   /SC ONLOGON /RL LIMITED /F
 
-# 2) Watchdog: auto-restart runner_unified if it dies. ONLOGON so it's up
-#    whenever the session is. For always-on, change /SC to ONSTART once
-#    you're ready to grant Run-Whether-User-Logged-On-Or-Not (needs password).
+# 2) Watchdog — auto-restart runner_unified on crash.
 Write-Host "Registering ArgusWatchdog..."
 schtasks.exe /create /TN "ArgusWatchdog" `
   /TR "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\Argus\repo\ops\watchdog.ps1" `
   /SC ONLOGON /RL HIGHEST /F
 
-# 3) ArgusCohortReport: current setup is "Interactive only" so it fails with
-#    ERROR_NO_SUCH_LOGON_SESSION (-2147020576) when the RDP session is
-#    disconnected. Flip to "Run whether user is logged on or not." Requires
-#    your Windows password — prompt is interactive below.
+# 3) ArgusCohortReport — flip to survive RDP disconnect (needs password prompt).
 Write-Host "Re-registering ArgusCohortReport (will prompt for password)..."
 $user = "$env:USERDOMAIN\$env:USERNAME"
 schtasks.exe /change /TN "ArgusCohortReport" /RU $user /RP *
 
+# 4) NQ London Close Loop — 5m cadence during 16:00 UTC hour. PF 0.90 in
+#    backtest (research-only), still paper-safe for data collection.
+Write-Host "Registering ArgusNqLondonCloseLoop..."
+schtasks.exe /create /TN "ArgusNqLondonCloseLoop" `
+  /TR "C:\Argus\.venv\Scripts\python.exe -m forge.nq_london_close.runner --loop" `
+  /SC ONLOGON /RL LIMITED /F
+
+# 5) AUD Asian Breakout Loop — hourly cadence during 01-07 UTC. PF 1.71 in
+#    180d backtest, 26 trades.
+Write-Host "Registering ArgusAudOrbLoop..."
+schtasks.exe /create /TN "ArgusAudOrbLoop" `
+  /TR "C:\Argus\.venv\Scripts\python.exe -m forge.aud_asian_breakout.runner --loop" `
+  /SC ONLOGON /RL LIMITED /F
+
+# 6) Meta-watchdog — periodically restarts watchdog + fleet_monitor if dead.
+#    Fires every 15 min regardless of logon state (uses SYSTEM account).
+Write-Host "Registering ArgusMetaWatchdog (every 15 min)..."
+schtasks.exe /create /TN "ArgusMetaWatchdog" `
+  /TR "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File C:\Argus\repo\ops\meta_watchdog.ps1" `
+  /SC MINUTE /MO 15 /RU SYSTEM /RL HIGHEST /F
+
 Write-Host ""
-Write-Host "Done. Verify with:"
-Write-Host "  schtasks /query /TN ArgusGldPmLoop /FO LIST /V | Select-String 'Status|Next Run|Last Run|Last Result'"
-Write-Host "  schtasks /query /TN ArgusWatchdog /FO LIST /V | Select-String 'Status|Next Run|Last Run|Last Result'"
-Write-Host "  schtasks /query /TN ArgusCohortReport /FO LIST /V | Select-String 'Status|Next Run|Last Run|Last Result|Logon Mode'"
+Write-Host "Done. All tasks registered or updated."
+Write-Host ""
+Write-Host "To have the two new --loop tasks survive RDP disconnect (recommended):"
+Write-Host "  schtasks /change /TN ArgusNqLondonCloseLoop /RU `"`$env:USERDOMAIN\`$env:USERNAME`" /RP *"
+Write-Host "  schtasks /change /TN ArgusAudOrbLoop         /RU `"`$env:USERDOMAIN\`$env:USERNAME`" /RP *"
+Write-Host "  schtasks /change /TN ArgusGldPmLoop          /RU `"`$env:USERDOMAIN\`$env:USERNAME`" /RP *"
+Write-Host "  schtasks /change /TN ArgusWatchdog           /RU `"`$env:USERDOMAIN\`$env:USERNAME`" /RP *"
+Write-Host ""
+Write-Host "Verify with:"
+Write-Host "  schtasks /query /TN ArgusNqLondonCloseLoop /FO LIST /V | Select-String 'Status|Logon Mode|Last Result'"
