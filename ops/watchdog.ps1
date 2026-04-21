@@ -23,17 +23,18 @@ $staleThresholdSeconds = 900  # 15 minutes
 $checkIntervalSeconds = 60
 $maxRestartsPerHour = 3
 
-# Active configs — dynamically discovered via deployment pipeline
-# Fallback to hardcoded if pipeline fails
-$fxConfigs = @(& $python -m argus_flow.ops.deployment_pipeline --emit-configs watcher,paper 2>$null)
-if ($fxConfigs.Count -eq 0) {
-    # Fallback: hardcoded active configs (updated 2026-04-17 — AUDJPY killed/archived)
-    $fxConfigs = @(
-        "argus_flow/configs/usdjpy_mtf_paper_v1.json",
-        "argus_flow/configs/gbpusd_range_paper_v1.json",
-        "argus_flow/configs/cadjpy_mtf_paper_v1.json"
-    )
-}
+# Active configs — MUST match the exact --configs list runner_unified is
+# launched with. Previously tried dynamic discovery via deployment_pipeline
+# but that can drift from the actual launch (e.g. CADJPY at stage=watcher
+# is running but wouldn't show up in "paper"-only emit, and watcher-stage
+# new configs like eurusd/audusd would show up but aren't launched).
+# Keep this list EXACTLY in sync with the argument list in
+# reference_reboot_recovery.md / CLAUDE.md.
+$fxConfigs = @(
+    "argus_flow/configs/usdjpy_mtf_paper_v1.json",
+    "argus_flow/configs/gbpusd_range_paper_v1.json",
+    "argus_flow/configs/cadjpy_mtf_paper_v1.json"
+)
 
 # No futures configs (all killed in fleet consolidation 2026-04-07)
 $futuresConfigs = @()
@@ -134,10 +135,10 @@ function Is-RunnerAlive($type) {
 function Restart-Runner($type) {
     if ($type -eq "fx") {
         $argsList = @("-m", "argus_flow.runner_unified", "--configs") + $fxConfigs
-        Log "Restarting FX runner (8 pairs)..."
+        Log "Restarting FX runner ($($fxConfigs.Count) pairs)..."
     } else {
         $argsList = @("-m", "argus_flow.runner_unified", "--configs") + $futuresConfigs
-        Log "Restarting Futures runner (6 instruments)..."
+        Log "Restarting Futures runner ($($futuresConfigs.Count) instruments)..."
     }
 
     try {
@@ -209,20 +210,25 @@ while ($true) {
         Send-Discord "FX runner is **BACK ONLINE** and healthy." "green"
     }
 
-    # Futures runner check
-    if (-not $futuresAlive) {
-        $wasDown["futures"] = $true
-        Log "ALERT: Futures runner NOT FOUND!"
-        if ($restartTimestamps.Count -lt $maxRestartsPerHour) {
-            Restart-Runner "futures"
-            $restartTimestamps += $now
-        } else {
-            Log "MAX RESTARTS reached. Not restarting Futures."
+    # Futures runner check — skipped entirely when no futures configs are
+    # active. Previously this alerted "Futures runner NOT FOUND!" every
+    # cycle even though $futuresConfigs = @(), triggering spurious restarts
+    # into a broken arg list ("Cannot bind argument to parameter 'Path'").
+    if ($futuresConfigs.Count -gt 0) {
+        if (-not $futuresAlive) {
+            $wasDown["futures"] = $true
+            Log "ALERT: Futures runner NOT FOUND!"
+            if ($restartTimestamps.Count -lt $maxRestartsPerHour) {
+                Restart-Runner "futures"
+                $restartTimestamps += $now
+            } else {
+                Log "MAX RESTARTS reached. Not restarting Futures."
+            }
+        } elseif ($wasDown["futures"]) {
+            $wasDown["futures"] = $false
+            Log "Futures runner BACK ONLINE"
+            Send-Discord "Futures runner is **BACK ONLINE** and healthy." "green"
         }
-    } elseif ($wasDown["futures"]) {
-        $wasDown["futures"] = $false
-        Log "Futures runner BACK ONLINE"
-        Send-Discord "Futures runner is **BACK ONLINE** and healthy." "green"
     }
 
     # ── Gap Fix #1: API port check (detect TWS API disabled mid-session) ──
