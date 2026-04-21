@@ -252,6 +252,28 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
         "signal_hour_utc": ot["signal_hour_utc"],
     })
     log.info("PAPER LONG closed (%s) @ %.2f — pnl %+.2f pts ($%+.2f)", reason, exit_px, pnl_pts, pnl_usd)
+
+    # Dual-write to canonical_fills for fleet-wide aggregation.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill
+        write_fill_typed(Fill(
+            strategy="forge_nq_overnight",
+            symbol="MNQ",
+            direction="long",
+            side="EXIT",
+            entry_ts=str(ot["entry_ts"]),
+            exit_ts=str(exit_ts),
+            entry_px=float(ot["entry_px"]),
+            exit_px=float(exit_px),
+            size=float(ot["position_size"]),
+            risk_usd=float(ot.get("risk_usd") or 0.0),
+            pnl_usd=round(pnl_usd, 2),
+            exit_reason=reason,
+        ))
+    except Exception as e:
+        log.warning(f"canonical dual-write failed (non-fatal): {e}")
+
     state["open_trade"] = None
 
 

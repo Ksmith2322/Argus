@@ -236,6 +236,31 @@ def _close(state: dict, sym: str, exit_ts, exit_px: float, reason: str) -> None:
     pip_value = 10.0
     pnl_usd = pnl_pips * pip_value * (ot["position_size"] / 100_000)
     state["trade_count"] += 1
+
+    # Dual-write to canonical_fills.jsonl for fleet-wide aggregation.
+    # Without this, new trades show up in the per-strategy trades.csv but
+    # are invisible to fleet_perf_summary, broker_equity_curve, and holdout
+    # evaluation — causing the dashboard's recent_trades vs canonical-fills
+    # divergence observed 2026-04-21.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill
+        write_fill_typed(Fill(
+            strategy="forge_jpy_pm_short",
+            symbol=sym,
+            direction="short",
+            side="EXIT",
+            entry_ts=str(ot["entry_ts"]),
+            exit_ts=str(exit_ts),
+            entry_px=float(ot["entry_px"]),
+            exit_px=float(exit_px),
+            size=float(ot["position_size"]),
+            risk_usd=float(ot.get("risk_usd") or 0.0),
+            pnl_usd=round(pnl_usd, 2),
+            exit_reason=reason,
+        ))
+    except Exception as e:
+        log.warning(f"canonical dual-write failed (non-fatal): {e}")
     duration_min = (pd.to_datetime(exit_ts, utc=True) - pd.to_datetime(ot["entry_ts"], utc=True)).total_seconds() / 60
     _append_trade({
         "ts": ot["entry_ts"],
