@@ -383,6 +383,71 @@ def _per_group_profitability(
     }
 
 
+def _max_drawdown(pnls: list[float], starting_equity_usd: float | None = None) -> dict | None:
+    """Real peak-to-trough drawdown on the actual trade sequence.
+
+    Distinct from `_monte_carlo_shuffle.max_drawdown_usd`, which reports
+    the WORST drawdown across 5000 random orderings. This one reports
+    what actually happened on the real trade sequence — the operator
+    sees "this is the DD we lived through" not "this is the DD a pathological
+    ordering would produce".
+
+    Returns:
+        {
+          "max_drawdown_usd": float (positive number, magnitude of worst DD),
+          "max_drawdown_pct": float (as pct of starting_equity or peak),
+          "peak_equity_usd": float,
+          "trough_equity_usd": float,
+        }
+        None if pnls is empty.
+
+    `starting_equity_usd` anchors the pct. Defaults to None → pct is
+    computed relative to the peak-equity basis instead. The funding gate
+    (project_funding_checklist.md) calls for DD <= 8% against anchor
+    capital; pass `get_sizing_anchor_usd()` at the caller to match that
+    framing. If omitted, the function reports DD as % of peak-to-trough
+    (peak-relative), which is the standard backtest convention.
+    """
+    if not pnls:
+        return None
+
+    equity = starting_equity_usd if starting_equity_usd is not None else 0.0
+    peak = equity
+    trough = equity
+    max_dd = 0.0
+    max_dd_peak = equity
+    max_dd_trough = equity
+
+    for p in pnls:
+        equity += p
+        if equity > peak:
+            peak = equity
+            trough = equity  # reset trough when a new peak is hit
+        elif equity < trough:
+            trough = equity
+            dd = peak - trough
+            if dd > max_dd:
+                max_dd = dd
+                max_dd_peak = peak
+                max_dd_trough = trough
+
+    # pct basis: prefer anchor when given (absolute % of capital), else peak
+    if starting_equity_usd is not None and starting_equity_usd > 0:
+        dd_pct = (max_dd / starting_equity_usd) * 100.0
+    elif max_dd_peak > 0:
+        dd_pct = (max_dd / max_dd_peak) * 100.0
+    else:
+        dd_pct = 0.0
+
+    return {
+        "max_drawdown_usd": round(max_dd, 2),
+        "max_drawdown_pct": round(dd_pct, 4),
+        "peak_equity_usd": round(max_dd_peak, 2),
+        "trough_equity_usd": round(max_dd_trough, 2),
+        "pct_basis": "starting_equity" if starting_equity_usd is not None else "peak_relative",
+    }
+
+
 _CORRELATION_MIN_OVERLAP = 5
 
 

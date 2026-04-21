@@ -66,7 +66,14 @@ def _resolve_model_start_equity(raw_value) -> float:
 # Legacy active fleet. Future additions can opt in by adding:
 #   "deployment": {"managed": true, "stage": "watcher"}
 LEGACY_MANAGED_CONFIGS: dict[str, dict[str, str]] = {
+    # Active cohort (what runner_unified actually loads). Stages here are
+    # fallbacks; the config file's own `stage` field wins via infer_stage.
+    # GBPUSD + USDJPY are stage=paper (in cohort). CADJPY is stage=watcher
+    # (trading but not yet qualified for formal cohort — 0 live trades).
     "gbpusd_range_paper_v1.json": {"stage": STAGE_PAPER, "name": "GBP/USD"},
+    "usdjpy_mtf_paper_v1.json": {"stage": STAGE_PAPER, "name": "USD/JPY"},
+    "cadjpy_mtf_paper_v1.json": {"stage": STAGE_WATCHER, "name": "CAD/JPY"},
+    # Legacy / not currently present on disk — kept for registry continuity
     "eurusd_t4_paper_v1.json": {"stage": STAGE_PAPER, "name": "EUR/USD"},
     "eurjpy_t4_paper_v1.json": {"stage": STAGE_PAPER, "name": "EUR/JPY"},
     "gbpjpy_t4_paper_v1.json": {"stage": STAGE_WATCHER, "name": "GBP/JPY"},

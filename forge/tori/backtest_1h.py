@@ -136,6 +136,9 @@ def build_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]

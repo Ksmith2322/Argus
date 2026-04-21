@@ -312,8 +312,13 @@ def backfill_from_trade_csvs() -> int:
     # Normalise empty strings to None so the key computed from a stored JSONL
     # row (where exit_ts was persisted as None) matches the key computed from
     # a CSV reread (where the empty column reads as "").
-    def _key(strat, ets, xts) -> tuple:
-        return (strat, ets or None, xts or None)
+    #
+    # Include symbol in the key: a multi-symbol strategy (e.g. forge_jpy_pm_short
+    # trading USDJPY+CADJPY) can open two rows at the same entry_ts with no
+    # exit_ts yet. Without the symbol discriminator, the second row gets
+    # collapsed as a duplicate and never reaches canonical.
+    def _key(strat, ets, xts, sym) -> tuple:
+        return (strat, ets or None, xts or None, sym or None)
 
     existing_keys = set()
     for path in _iter_canonical_paths():
@@ -326,21 +331,28 @@ def backfill_from_trade_csvs() -> int:
                     r = json.loads(line)
                     existing_keys.add(_key(r.get("strategy"),
                                           r.get("entry_ts"),
-                                          r.get("exit_ts")))
+                                          r.get("exit_ts"),
+                                          r.get("symbol")))
                 except json.JSONDecodeError:
                     continue
         except Exception:
             continue
 
+    # 5th element = symbol_hint. For single-symbol strategies the live
+    # writer stamps a concrete symbol (e.g. "GLD") on canonical rows; if the
+    # CSV schema lacks a symbol column, the backfill would otherwise write
+    # symbol="" and the dedup key (which now includes symbol) would treat
+    # live and backfilled rows as distinct → duplicate insertion. `None`
+    # means "read from CSV symbol column" (multi-symbol strategies).
     specs = [
-        ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",   "ts",        True),
-        ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",   "ts",        True),
-        ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",        True),
-        ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",        False),
-        ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",        False),
-        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",        False),
-        ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",        False),
-        ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False),
+        ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",   "ts",        True,  "USDJPY"),
+        ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",   "ts",        True,  "GBPUSD"),
+        ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",        True,  "CADJPY"),
+        ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",        False, "GLD"),
+        ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",        False, "GBPUSD"),
+        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",        False, "NQ"),
+        ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",        False, None),
+        ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False, None),
     ]
     appended = 0
     # Backfill must share the same write critical section as live writers so a
@@ -354,7 +366,7 @@ def backfill_from_trade_csvs() -> int:
         except Exception:
             return appended
         try:
-            for label, path_rel, ts_col, valid_only in specs:
+            for label, path_rel, ts_col, valid_only, symbol_hint in specs:
                 p = _REPO / path_rel
                 if not p.exists():
                     continue
@@ -373,13 +385,14 @@ def backfill_from_trade_csvs() -> int:
                                 continue
                             entry_ts = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
                             exit_ts = r.get("exit_ts") or r.get("exit_date") or ""
-                            key = _key(label, entry_ts, exit_ts)
+                            symbol = r.get("symbol") or symbol_hint or ""
+                            key = _key(label, entry_ts, exit_ts, symbol)
                             if key in existing_keys:
                                 continue
 
                             raw = {
                                 "strategy": label,
-                                "symbol": r.get("symbol") or "",
+                                "symbol": symbol,
                                 "direction": r.get("direction") or "",
                                 "side": "EXIT",
                                 "entry_ts": entry_ts or None,

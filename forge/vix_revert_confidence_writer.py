@@ -49,7 +49,7 @@ def build_vix_revert_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     if not BACKTEST_CSV.exists():
@@ -107,6 +107,9 @@ def build_vix_revert_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]

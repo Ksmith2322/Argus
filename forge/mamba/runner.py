@@ -45,7 +45,15 @@ from forge.logging_setup import setup_logging
 log = setup_logging("mamba")
 
 # Instruments
-TICKERS = ["NQ=F", "YM=F"]
+#
+# 2026-04-20 scope_down: TICKERS narrowed to YM=F only. Rationale:
+# multi-pair (NQ+YM) backtest PF=1.00 with ruin_fraction=0.95; YM-only
+# subset backtests cleanly at PF 1.98 / P(exp>0)=0.84 (see
+# strategy_confidence/mamba_ym.json). The disposition on mamba.json
+# is `scope_down` — this TICKERS change honors that at runtime. Do not
+# re-add NQ=F without re-running the YM-only validation and lifting
+# the disposition to `paper_only` or better.
+TICKERS = ["YM=F"]
 TICKER_TO_MICRO = {"NQ=F": "MNQ", "YM=F": "MYM"}
 POINT_VALUES = {"NQ=F": 2.0, "YM=F": 0.50}  # micro contract values
 

@@ -38,6 +38,48 @@ _RESERVED_PREFIX = "_"
 EvidenceBar = Literal["insufficient", "sanity", "review", "promotion"]
 
 
+# Kill-or-rework disposition. Surfaces a structured decision alongside the
+# statistical evidence so a reader knows whether to promote, park, or scope
+# a strategy down — regardless of the raw PF number.
+#
+# promote_candidate — positive evidence, advance toward paper/live
+# paper_only        — positive evidence, hold at paper pending more sample
+# research_only     — signal-only, no capital risk
+# scope_down        — only a subset works; narrow the universe before promoting
+# shelve            — pause further work, evidence insufficient or flawed
+# kill              — evidence is negative or misleading, do not promote
+DispositionStatus = Literal[
+    "promote_candidate", "paper_only", "research_only",
+    "scope_down", "shelve", "kill",
+]
+
+
+class Disposition(BaseModel):
+    """Structured kill-or-rework decision. Optional — absent means the
+    operator hasn't ruled yet and the statistical evidence stands alone."""
+    model_config = ConfigDict(extra="forbid")
+    status: DispositionStatus
+    reason: str = Field(..., min_length=10)
+    decided_at: str  # ISO-8601
+    next_review_date: str | None = None
+
+
+class Drawdown(BaseModel):
+    """Real peak-to-trough drawdown on the actual trade sequence.
+
+    Distinct from mc_stress.max_drawdown_usd which reports the WORST DD
+    across 5000 random shuffles — this is the DD that actually happened
+    on the real sequence. Relevant to the funding gate (DD <= 8% against
+    anchor capital per project_funding_checklist.md).
+    """
+    model_config = ConfigDict(extra="forbid")
+    max_drawdown_usd: float = Field(..., ge=0.0)
+    max_drawdown_pct: float = Field(..., ge=0.0)
+    peak_equity_usd: float
+    trough_equity_usd: float
+    pct_basis: Literal["starting_equity", "peak_relative"]
+
+
 class CostStress(BaseModel):
     model_config = ConfigDict(extra="forbid")
     pf_1x: float | None = None
@@ -158,6 +200,8 @@ class StrategyConfidenceArtifact(BaseModel):
     top_n_sensitivity: TopNSensitivity | None = None
     per_instrument: PerGroupProfitability | None = None
     per_day_of_week: PerGroupProfitability | None = None
+    disposition: Disposition | None = None
+    drawdown: Drawdown | None = None
 
     @model_validator(mode="after")
     def validate_invariants(self) -> "StrategyConfidenceArtifact":

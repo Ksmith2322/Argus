@@ -54,7 +54,7 @@ def build_ares_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     json_path = _latest_backtest_json()
@@ -103,6 +103,9 @@ def build_ares_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]
@@ -120,6 +123,26 @@ def build_ares_artifact() -> dict:
     per_sym = _per_group_profitability(trades, group_key="symbol")
     if per_sym is not None:
         artifact["per_instrument"] = per_sym
+
+    # Monitor disposition (decided 2026-04-19). Union is already strong
+    # (PF 2.70 / WR 63% / exp $198 on n=35), but a clean subset-edge
+    # exists when we exclude risk_off exits: rotation-only trades show
+    # PF 4.63 / exp $306 on n=27 (see strategy_confidence/ares_validated.json).
+    # The full union continues to pass evidence bar; the sibling tracks
+    # the scope_down path in case we later wire a regime gate into
+    # ares.runner to skip entries during risk_off classification.
+    artifact["disposition"] = {
+        "status": "paper_only",
+        "reason": (
+            f"Union: PF {pf:.2f} / exp ${sum(pnls)/n if n else 0:.2f}/trade "
+            f"on n={n}. Strong enough to run as-is in paper while live "
+            "confirmation accumulates. A cleaner scope_down sibling "
+            "exists on rotation-only exits (see ares_validated.json, "
+            "PF 4.63 / exp $306 on n=27); track separately and lift to "
+            "promote_candidate if the filter holds on live trades."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
     return artifact

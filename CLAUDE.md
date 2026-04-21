@@ -12,9 +12,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The active trading system is `argus_flow/runner_unified.py` — a single-process, single-connection runner managing 3 FX pairs via Interactive Brokers TWS.
 
-**Active cohort (Class A):** GBP/USD, EUR/USD, EUR/JPY
-**Connection:** TWS port 7496, account U24860535, Read-Only API
-**Goal:** 30 valid trades per pair for promotion to micro-live
+**Active cohort (Class A, stage=paper):** GBP/USD, USD/JPY
+**Observer (stage=watcher, trading but not in cohort):** CAD/JPY
+**Connection:** TWS port 7497 (paper), account DUP472829
+**Goal:** 30 valid trades per PAPER pair for promotion to micro-live
+**Note:** CADJPY promotes to PAPER when it accumulates enough live trades to qualify.
 
 ### Common Commands
 
@@ -25,7 +27,7 @@ The active trading system is `argus_flow/runner_unified.py` — a single-process
 
 **Launch unified runner only:**
 ```powershell
-Start-Process -FilePath 'C:\Argus\.venv\Scripts\python.exe' -ArgumentList '-m','argus_flow.runner_unified','--configs','argus_flow/configs/gbpusd_range_paper_v1.json','argus_flow/configs/eurusd_t4_paper_v1.json','argus_flow/configs/eurjpy_t4_paper_v1.json' -WorkingDirectory 'C:\Argus\repo' -WindowStyle Hidden
+Start-Process -FilePath 'C:\Argus\.venv\Scripts\python.exe' -ArgumentList '-m','argus_flow.runner_unified','--configs','argus_flow/configs/gbpusd_range_paper_v1.json','argus_flow/configs/usdjpy_mtf_paper_v1.json','argus_flow/configs/cadjpy_mtf_paper_v1.json' -WorkingDirectory 'C:\Argus\repo' -WindowStyle Hidden
 ```
 
 **Monitoring & reports:**

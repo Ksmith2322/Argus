@@ -70,7 +70,7 @@ def build_tori_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     if not BACKTEST_CSV.exists():
@@ -137,6 +137,9 @@ def build_tori_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
 
     # Full stress battery (2026-04-19 discovery-test phase)
     wf = _walk_forward_stability(pnls, n_folds=4)
@@ -187,6 +190,38 @@ def build_tori_artifact() -> dict:
         per_dow = _per_group_profitability(rows_with_dow, group_key="_dow")
         if per_dow is not None:
             artifact["per_day_of_week"] = per_dow
+
+    # Scope-down disposition (decided 2026-04-19). Tori's union is
+    # already healthy (PF 2.21, n=665), but a structural subset —
+    # instrument == 'Dow' AND direction == 'LONG' — carves a cleaner
+    # edge: PF 3.65 / WR 61.5% / exp $1,080 on n=78 (see
+    # strategy_confidence/tori_validated.json). Dow carries the book's
+    # edge (PF 2.48 vs PL 1.52 / CL 1.57 / Gold 1.84) and LONG beats
+    # SHORT across the whole book (3.36 vs 1.74); the two effects
+    # compound on Dow+LONG. Both filter terms are pre-entry-knowable,
+    # so the subset is implementable as a runner gate. Unblock to
+    # paper_only when n>=30 accumulates on the Dow+LONG subset with
+    # backfill+live combined, OR the filter is wired into
+    # forge.tori.runner as a gate.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            "Union is healthy (PF 2.21 on n=665) but broader than the "
+            "real edge. Filter-scoped subset (name=='Dow' AND direction=="
+            "'LONG') shows cleaner structure: PF 3.65 / WR 61.5% / exp "
+            "$1,080/trade on n=78 (see strategy_confidence/"
+            "tori_validated.json). Dow dominates the book (PF 2.48 vs "
+            "PL 1.52 / CL 1.57 / Gold 1.84); LONG beats SHORT across all "
+            "instruments (PF 3.36 vs 1.74) with a structural reason — "
+            "US equity indices carry a persistent long drift so trend-"
+            "bounce longs on YM trade with the flow while shorts fight "
+            "it. Wire the Dow+LONG gate into forge.tori.runner, or run "
+            "scope_down signal-only while the subset accumulates live "
+            "trades; unblock to paper_only when n>=30 on the subset."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "next_review_date": "2026-07-19",
+    }
 
     return artifact
 

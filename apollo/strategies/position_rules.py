@@ -26,6 +26,15 @@ What DOESN'T work (all backtested negative):
 from dataclasses import dataclass
 
 
+# Scope_down (2026-04-20): validated subset is surprise 10-20% AND gap>=2% —
+# PF 4.59 / P(exp>0)=0.986 on n=15 (strategy_confidence/apollo_validated.json).
+# Apollo disposition is research_only until 2026-07-20; the rework gate is
+# "narrow universe to validated subset, collect n>=10 per symbol before
+# advancing." Flip to False for research runs reconstructing the union.
+SCOPE_APOLLO_VALIDATED_FILTER = True
+SCOPE_APOLLO_VALIDATED_UNIVERSE = ("MU", "ORCL", "UPS", "PLUG", "SNOW", "GOOGL")
+
+
 @dataclass
 class PostERPlan:
     """Post-earnings drift trade plan."""
@@ -61,6 +70,12 @@ def should_enter_post_er(
     abs_gap = abs(gap_pct)
     if abs_gap < 6:
         return None  # below 6% = breakeven or negative per backtest sweep
+
+    if SCOPE_APOLLO_VALIDATED_FILTER:
+        # Validated subset: surprise 10-20% AND gap >= 2% (gap check above at
+        # 6% is already stricter). Further restrict surprise to [10, 20].
+        if not (10.0 <= surprise_pct <= 20.0):
+            return None
 
     direction = None
     reasons = []

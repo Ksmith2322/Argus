@@ -74,7 +74,7 @@ def build_apollo_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     csv_path = _latest_backtest_csv()
@@ -137,6 +137,9 @@ def build_apollo_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]
@@ -161,6 +164,28 @@ def build_apollo_artifact() -> dict:
     )
     if per_sym is not None:
         artifact["per_instrument"] = per_sym
+
+    # Scope-down disposition (decided 2026-04-20, updated after
+    # filter-scope re-run). Union post_er has no edge (PF 0.69, P(exp>0)=0.012,
+    # MC ruin 82%). A filter-scoped subset (surprise 10-20% + gap 2%+)
+    # backtests cleanly: PF 4.59 / p_exp>0=0.986 on n=15 (see
+    # strategy_confidence/apollo_validated.json). Mapped to the
+    # `scope_down` status since the filter is interpretable (sweet-spot
+    # beat + market confirmation), not a post-hoc symbol cherry-pick.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            "Union post_er: PF 0.69, P(exp>0)=0.012, MC ruin 82% (n=205). "
+            "Filter-scoped subset (surprise 10-20%% + gap 2%+) shows "
+            "real edge: PF 4.59 / P(exp>0)=0.986 / MC ruin 0% on n=15 "
+            "(see strategy_confidence/apollo_validated.json). Wire the "
+            "surprise+gap filter into apollo.execution.planned_trades "
+            "as a gate; unblock to paper_only when n>=30 accumulated on "
+            "the scoped subset."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "next_review_date": "2026-07-20",
+    }
 
     return artifact
 

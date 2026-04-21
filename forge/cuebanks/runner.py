@@ -102,6 +102,14 @@ CUEBANKS_RETEST_LOOKBACK_BARS = 10
 CUEBANKS_USE_SD_ZONES = True
 CUEBANKS_USE_HARMONICS = False
 
+# Scope_down (2026-04-20): validated subset is entries whose factors list
+# contains 'S/D supply zone' — PF 3.63 / P(exp>0)=0.998 / WF 4/4 on n=30
+# (see strategy_confidence/cue_banks_validated.json). Demand-zone-only cohort
+# (n=45) is net-negative (PF 0.55) and drags the union. Non-obvious: higher
+# confluence_score is WORSE (score>=5 PF 0.64, score>=4 PF 1.29) — the S/D
+# supply-zone factor is the actual edge carrier. Flip to False for research.
+SCOPE_SD_SUPPLY_ZONE_ONLY = True
+
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -299,6 +307,10 @@ def run_backtest():
 
             if not result["tradeable"]:
                 continue
+
+            if SCOPE_SD_SUPPLY_ZONE_ONLY:
+                if "S/D supply zone" not in (result.get("factors") or []):
+                    continue
 
             direction = result["direction"]
             if direction is None:

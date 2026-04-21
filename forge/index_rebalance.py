@@ -523,6 +523,12 @@ def print_predictions(candidates: list[dict]):
 # ---------------------------------------------------------------------------
 # Part 4: Active signal generation
 # ---------------------------------------------------------------------------
+# Scope_down: only emit ADD signals. Per strategy_confidence/index_rebal_validated.json
+# (2026-04-20), DELETE action PF=0.49 is anti-edge while ADD PF=7.04 carries all alpha.
+# Flip to False only for research runs reconstructing the full union.
+SCOPE_ONLY_ADDS = True
+
+
 def get_active_rebalance_signals() -> list[dict]:
     """
     Check if any announced rebalances have open trading windows.
@@ -533,6 +539,8 @@ def get_active_rebalance_signals() -> list[dict]:
     signals = []
 
     for ann_date, eff_date, ticker, action, replacing in SP500_CHANGES:
+        if SCOPE_ONLY_ADDS and action != "ADD":
+            continue
         ann_ts = pd.Timestamp(ann_date)
         eff_ts = pd.Timestamp(eff_date)
 

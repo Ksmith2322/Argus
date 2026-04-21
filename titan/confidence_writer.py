@@ -57,7 +57,7 @@ def build_titan_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     csv_path = _latest_backtest_csv()
@@ -112,6 +112,9 @@ def build_titan_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]
@@ -134,6 +137,33 @@ def build_titan_artifact() -> dict:
     )
     if per_sym is not None:
         artifact["per_instrument"] = per_sym
+
+    # Scope-down disposition (decided 2026-04-20). Union is mildly
+    # positive (PF 1.52, n=298) but spans four sub-strategies with
+    # BREAKOUT (PF 0.58) and TRENDLINE (PF 0.37) dragging, plus shorts
+    # (PF 1.13) underperforming longs (PF 1.87). A structural subset
+    # (strategy=='TREND_FOLLOW' AND direction=='long') backtests
+    # cleanly: PF 2.09 / WR 55.7% / exp $24.05/trade on n=174, all 4
+    # walk-forward folds positive, survives 3x costs (see
+    # strategy_confidence/titan_validated.json). Both filter terms are
+    # known at entry -> implementable as a scanner gate.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            "Union: PF 1.52 / WR 49% on n=298, but BREAKOUT (PF 0.58) "
+            "and TRENDLINE (PF 0.37) sub-strategies are net-losers and "
+            "shorts (PF 1.13) underperform longs (PF 1.87). Scoped "
+            "subset strategy=='TREND_FOLLOW' AND direction=='long' "
+            "shows cleaner edge: PF 2.09 / WR 55.7% / exp $24.05/trade "
+            "on n=174, all 4 walk-forward folds positive (see "
+            "strategy_confidence/titan_validated.json). Wire the "
+            "strategy+direction filter into titan.ops.scanner as a "
+            "gate; unblock to paper_only when n>=30 accumulated on the "
+            "scoped subset."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "next_review_date": "2026-07-20",
+    }
 
     return artifact
 

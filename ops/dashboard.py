@@ -4089,8 +4089,13 @@ async def api_health():
     try:
         from helio.strategy_confidence import audit_artifacts
         expected = [
-            "titan", "ares", "hermes", "apollo", "mamba", "cue_banks",
-            "tori", "vix_revert", "index_rebal", "sector_rot", "themis",
+            "titan", "titan_validated", "ares", "ares_validated",
+            "hermes", "hermes_validated",
+            "apollo", "apollo_validated", "mamba", "mamba_ym",
+            "cue_banks", "cue_banks_validated",
+            "tori", "tori_validated",
+            "vix_revert", "index_rebal", "index_rebal_validated",
+            "sector_rot", "themis",
         ]
         audit = audit_artifacts(expected)
         sc_status = "OK"
@@ -4484,6 +4489,43 @@ async def api_strategy_performance():
             "artifact_source": art.source,
             "artifact_generated_at": art.generated_at,
         }
+        # Surface drawdown at the row level so the funding-gate DD<=8%
+        # threshold is visible inline (vs buried in mc_stress). Uses the
+        # real trade-sequence DD, not the worst-case shuffle DD.
+        if art.drawdown is not None:
+            row["max_drawdown_usd"] = art.drawdown.max_drawdown_usd
+            row["max_drawdown_pct"] = art.drawdown.max_drawdown_pct
+            row["drawdown_basis"] = art.drawdown.pct_basis
+        # Walk-forward stability: "stable folds / total folds" indicates
+        # whether the edge holds across the sample window. A strategy
+        # with 1/4 folds positive is dependent on a single regime.
+        if art.walk_forward is not None:
+            wf = art.walk_forward.model_dump()
+            total = wf.get("n_folds") or wf.get("folds") or 0
+            stable = wf.get("positive_folds") or wf.get("stable_folds") or 0
+            row["walk_forward_stable"] = f"{stable}/{total}" if total else "-"
+            row["walk_forward_stability_score"] = wf.get("stability_score")
+        # Surface the kill-or-rework disposition so a reader immediately
+        # sees whether to trust, scope, or ignore the computed confidence.
+        # Also override the Status column so a strategy with a blocking
+        # disposition can't appear as "BUILT" / "MONTHLY" / etc. and be
+        # mistaken for a promotable row.
+        if art.disposition is not None:
+            row["disposition"] = {
+                "status": art.disposition.status,
+                "reason": art.disposition.reason,
+                "decided_at": art.disposition.decided_at,
+                "next_review_date": art.disposition.next_review_date,
+            }
+            # Map disposition → Status column value
+            _status_override = {
+                "kill": "KILLED",
+                "shelve": "SHELVED",
+                "scope_down": "SCOPE_DOWN",
+                "research_only": "RESEARCH_ONLY",
+            }
+            if art.disposition.status in _status_override:
+                row["status"] = _status_override[art.disposition.status]
         return row
 
     # ── ARGUS strategies ──────────────────────────────────────
@@ -4553,6 +4595,30 @@ async def api_strategy_performance():
         "status": "BAKING",
     })
 
+    # Titan Validated (scope_down sibling added 2026-04-20). Filter:
+    # strategy=='TREND_FOLLOW' AND direction=='long'. Backtest PF 2.09
+    # / WR 55.7% / exp $24.05 on n=174, all 4 walk-forward folds
+    # positive, survives 3x costs. Promotion-bar evidence — the filter
+    # still needs to be wired into titan.ops.scanner as a gate and
+    # accumulate live trades on the scoped subset.
+    strategies.append({
+        "system": "Titan Validated",
+        "strategy": "TREND_FOLLOW long-only (filtered)",
+        "instruments": "scoped subset of Titan universe",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 65,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
+    })
+
     # ── ARES ───────────────────────────────────────────────────
     strategies.append({
         "system": "Ares",
@@ -4572,6 +4638,28 @@ async def api_strategy_performance():
         "status": "MONTHLY",
     })
 
+    # Ares Validated (scope_down sibling added 2026-04-19). Filter:
+    # exit_reason == "rotation" — excludes the risk_off cohort (n=8,
+    # PF 0.26) that systematically bleeds edge. Backtest PF 4.63 / WR
+    # 70% / exp $306/trade on n=27, p_exp>0=1.0, WF 3/4 folds positive.
+    strategies.append({
+        "system": "Ares Validated",
+        "strategy": "Sector Rotation filtered (rotation exits only)",
+        "instruments": "scoped subset of Ares universe — regime gate",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 60,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
+    })
+
     # ── HERMES ─────────────────────────────────────────────────
     strategies.append({
         "system": "Hermes",
@@ -4589,6 +4677,27 @@ async def api_strategy_performance():
         "confidence": 35,
         "confidence_source": "hardcoded",
         "status": "SCANNING",
+    })
+
+    # Hermes Validated (scope_down sibling added 2026-04-20). Filter:
+    # score >= 80 AND long AND GAP_DOWN — mirrors runner gate today.
+    # Backtest PF 2.06 / WR 65% on n=92, p_exp>0=1.0, all WF folds positive.
+    strategies.append({
+        "system": "Hermes Validated",
+        "strategy": "Gap Fill filtered (score>=80 + long + GAP_DOWN)",
+        "instruments": "scoped subset of Hermes universe",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "%",
+        "confidence": 60,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
     })
 
     # ── APOLLO ─────────────────────────────────────────────────
@@ -4619,6 +4728,27 @@ async def api_strategy_performance():
         "confidence": 80,
         "confidence_source": "hardcoded",
         "status": "WAITING_ER",
+    })
+
+    # Apollo Validated (scope_down sibling added 2026-04-20). Filter:
+    # surprise 10-20% + gap 2%+. Backtest PF 4.59 on n=15, p_exp>0=0.986.
+    # Sanity-bar evidence — needs n>=30 to lift to paper_only.
+    strategies.append({
+        "system": "Apollo Validated",
+        "strategy": "Post-ER filtered (surprise 10-20%% + gap 2%+)",
+        "instruments": "scoped subset of Apollo universe",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
     })
 
     # ── FORGE: GDX/GLD Pairs ─────────────────────────────────
@@ -4661,6 +4791,27 @@ async def api_strategy_performance():
         "status": "SIGNAL_ONLY",
     })
 
+    # ── FORGE: Mamba YM-only (scope_down sibling) ────────────
+    # Tracks the YM=F subset edge separately from the NQ+YM union.
+    # Subset backtests cleanly (PF 1.98) while the union is break-even.
+    strategies.append({
+        "system": "Mamba YM",
+        "strategy": "US30 Breakout — YM-only subset",
+        "instruments": "YM=F (MYM)",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
+    })
+
     # ── FORGE: Cue Banks ───────────────────────────────────────
     strategies.append({
         "system": "Cue Banks",
@@ -4680,6 +4831,28 @@ async def api_strategy_performance():
         "status": "SIGNAL_ONLY",
     })
 
+    # Cue Banks Validated (scope_down sibling added 2026-04-19). Filter:
+    # factors contains "S/D supply zone". Backtest PF 3.63 on n=30,
+    # p_exp>0=0.998. Demand-zone cohort (n=45, PF 0.55) is net-negative
+    # and drags the union.
+    strategies.append({
+        "system": "Cue Banks Validated",
+        "strategy": "US30 filtered (S/D supply zone only)",
+        "instruments": "YM=F (MYM) — supply-zone factor gate",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
+    })
+
     # ── FORGE: Tori ────────────────────────────────────────────
     strategies.append({
         "system": "Tori",
@@ -4697,6 +4870,30 @@ async def api_strategy_performance():
         "confidence": 30,
         "confidence_source": "hardcoded",
         "status": "SIGNAL_ONLY",
+    })
+
+    # Tori Validated (scope_down sibling added 2026-04-19). Filter:
+    # name=='Dow' AND direction=='LONG'. Backtest PF 3.65 on n=78
+    # (vs union PF 2.21 on n=665). Dow carries the book's edge
+    # (PF 2.48 vs PL/CL/Gold 1.52-1.84); LONG beats SHORT across
+    # every instrument (PF 3.36 vs 1.74). Both filter terms are
+    # pre-entry-knowable so the subset is runner-gateable.
+    strategies.append({
+        "system": "Tori Validated",
+        "strategy": "4H Trendline Swing filtered (Dow+LONG only)",
+        "instruments": "YM=F (Dow) — LONG trades only",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
     })
 
     # ── FORGE: VIX Mean Reversion ──────────────────────────────
@@ -4735,6 +4932,28 @@ async def api_strategy_performance():
         "confidence": 85,
         "confidence_source": "hardcoded",
         "status": "WAITING_EVENT",
+    })
+
+    # Index Rebal Validated (scope_down sibling added 2026-04-19). Filter:
+    # action == "ADD" (index-inclusion effect). Backtest PF 7.04 on n=19
+    # vs union PF 2.08. DELETE side is PF 0.49 (structurally different).
+    # Sanity-bar evidence — needs n>=30 to lift to paper_only.
+    strategies.append({
+        "system": "Index Rebal Validated",
+        "strategy": "S&P 500 additions only (index-inclusion effect)",
+        "instruments": "scoped subset of Index Rebal universe",
+        "backtest_pf": "—",
+        "backtest_trades": 0,
+        "backtest_wr": "—",
+        "live_trades": 0,
+        "live_wins": 0,
+        "live_wr": 0,
+        "live_pf": 0,
+        "live_pnl": 0,
+        "live_unit": "$",
+        "confidence": 50,
+        "confidence_source": "hardcoded",
+        "status": "SCOPE_DOWN",
     })
 
     # ── FORGE: Sector Rotation ─────────────────────────────────
@@ -4791,17 +5010,25 @@ async def api_strategy_performance():
     # is already "computed" (Argus / GDX/GLD today) are left alone — live
     # evidence always beats a backtest artifact.
     _LABEL_MAP = {
-        "Titan": "titan",               # artifact added 2026-04-20
-        "Ares": "ares",                 # artifact added 2026-04-20
-        "Hermes": "hermes",             # artifact added 2026-04-20
-        "Apollo": "apollo",             # artifact added 2026-04-20
+        "Titan": "titan",                        # artifact added 2026-04-20
+        "Titan Validated": "titan_validated",    # scope_down sibling added 2026-04-20
+        "Ares": "ares",                          # artifact added 2026-04-20
+        "Ares Validated": "ares_validated",      # scope_down sibling added 2026-04-19
+        "Hermes": "hermes",                      # artifact added 2026-04-20
+        "Hermes Validated": "hermes_validated",  # scope_down sibling added 2026-04-20
+        "Apollo": "apollo",                      # artifact added 2026-04-20
+        "Apollo Validated": "apollo_validated",  # scope_down sibling added 2026-04-20
         "Mamba": "mamba",
+        "Mamba YM": "mamba_ym",                  # scope_down sibling added 2026-04-20
         "Cue Banks": "cue_banks",
+        "Cue Banks Validated": "cue_banks_validated",  # scope_down sibling added 2026-04-19
         "Tori": "tori",
-        "VIX Revert": "vix_revert",     # artifact added 2026-04-20
-        "Index Rebal": "index_rebal",   # artifact added 2026-04-20
-        "Sector Rot": "sector_rot",     # artifact added 2026-04-20
-        "Themis": "themis",             # hardcoded — signal-only system, no PnL to replay
+        "Tori Validated": "tori_validated",      # scope_down sibling added 2026-04-19
+        "VIX Revert": "vix_revert",              # artifact added 2026-04-20
+        "Index Rebal": "index_rebal",            # artifact added 2026-04-20
+        "Index Rebal Validated": "index_rebal_validated",  # scope_down sibling added 2026-04-19
+        "Sector Rot": "sector_rot",              # artifact added 2026-04-20
+        "Themis": "themis",                      # hardcoded — signal-only, no PnL
     }
     for row in strategies:
         label = _LABEL_MAP.get(row["system"])
@@ -4956,7 +5183,7 @@ def _gather_backtest_trades_by_strategy() -> dict[str, list[dict]]:
             if pnl == 0.0:
                 continue
             hermes_out.append({
-                "date": r.get("exit_date") or r.get("entry_date"),
+                "date": r.get("exit_date") or r.get("entry_date") or r.get("date"),
                 "pnl_usd": pnl,
             })
         if hermes_out:

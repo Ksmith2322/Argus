@@ -27,18 +27,27 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 from helio.fleet_sizing import compute_strategy_stats, get_sizing_anchor_usd  # noqa: E402
+from helio.strategy_confidence import load_confidence_artifact  # noqa: E402
 
-# Shortlist from blueprint §18.6
+# Shortlist from blueprint §18.6. `artifact_label` maps the shortlist label
+# to the matching strategy_confidence artifact name — used to consult the
+# artifact's kill-or-rework disposition before any promotion advance. None
+# means "no artifact exists for this strategy yet".
 SHORTLIST = [
-    {"label": "forge_gdx_gld",       "card": "research/strategy_cards/forge_gdx_gld.md"},
-    {"label": "forge_gld_pm_long",   "card": "research/strategy_cards/forge_gld_pm_long.md"},
-    {"label": "forge_wick_gbpusd",   "card": "research/strategy_cards/forge_wick_gbpusd.md"},
-    {"label": "apollo_earnings_drift","card": "research/strategy_cards/apollo_earnings_drift.md"},
+    {"label": "forge_gdx_gld",        "card": "research/strategy_cards/forge_gdx_gld.md",          "artifact_label": None},
+    {"label": "forge_gld_pm_long",    "card": "research/strategy_cards/forge_gld_pm_long.md",      "artifact_label": None},
+    {"label": "forge_wick_gbpusd",    "card": "research/strategy_cards/forge_wick_gbpusd.md",      "artifact_label": None},
+    {"label": "apollo_earnings_drift","card": "research/strategy_cards/apollo_earnings_drift.md",  "artifact_label": "apollo"},
     # Argus pairs — included to show they're below even the 30-trade gate
-    {"label": "argus_usdjpy",        "card": None},
-    {"label": "argus_gbpusd",        "card": None},
-    {"label": "argus_cadjpy",        "card": None},
+    {"label": "argus_usdjpy",         "card": None,                                                 "artifact_label": None},
+    {"label": "argus_gbpusd",         "card": None,                                                 "artifact_label": None},
+    {"label": "argus_cadjpy",         "card": None,                                                 "artifact_label": None},
 ]
+
+# Disposition statuses that block promotion advancement. A strategy with
+# any of these MUST NOT be promoted, regardless of stats — the operator
+# has ruled that the computed evidence is negative or misleading.
+BLOCKING_DISPOSITION_STATUSES = frozenset({"kill", "shelve", "scope_down"})
 
 # Gate thresholds (blueprint §18.10 + canonical promotion_gate_v2)
 REVIEW_GATE = {"min_trades": 30, "min_pf": 1.20, "min_expectancy": 0.0}
@@ -59,6 +68,27 @@ def _evaluate_gate(stats: dict, gate: dict) -> tuple[bool, list[str]]:
     return len(blockers) == 0, blockers
 
 
+def _check_disposition(artifact_label: str | None) -> dict | None:
+    """Return disposition info if the artifact carries a blocking
+    kill/shelve/scope_down ruling, else None. Non-blocking statuses
+    (promote_candidate, paper_only, research_only) return None — the gate
+    doesn't care about them; they're informational only."""
+    if not artifact_label:
+        return None
+    art = load_confidence_artifact(artifact_label)
+    if art is None or art.disposition is None:
+        return None
+    if art.disposition.status in BLOCKING_DISPOSITION_STATUSES:
+        return {
+            "status": art.disposition.status,
+            "reason": art.disposition.reason,
+            "decided_at": art.disposition.decided_at,
+            "next_review_date": art.disposition.next_review_date,
+            "artifact_label": artifact_label,
+        }
+    return None
+
+
 def evaluate_strategy(spec: dict) -> dict:
     label = spec["label"]
     stats = compute_strategy_stats(label)
@@ -68,8 +98,18 @@ def evaluate_strategy(spec: dict) -> dict:
     review_ok, review_blockers = _evaluate_gate(stats, REVIEW_GATE)
     canonical_ok, canonical_blockers = _evaluate_gate(stats, CANONICAL_GATE)
 
+    # Disposition check trumps the stat-based gates. A kill/shelve/scope_down
+    # ruling means the operator has ruled the evidence negative regardless of
+    # what the live stats happen to show.
+    blocking_disposition = _check_disposition(spec.get("artifact_label"))
+
     # Determine near-term action per blueprint §18.10
-    if canonical_ok and has_card:
+    if blocking_disposition is not None:
+        action = (
+            f"BLOCKED_BY_DISPOSITION ({blocking_disposition['status']}) — "
+            f"do not promote; see artifact {blocking_disposition['artifact_label']}.json"
+        )
+    elif canonical_ok and has_card:
         action = "PROMOTION_ELIGIBLE"
     elif review_ok and has_card:
         action = "REVIEW_GATE_PASSED — 30-day new-strategy freeze active"
@@ -91,6 +131,7 @@ def evaluate_strategy(spec: dict) -> dict:
         "canonical_gate_passed": canonical_ok,
         "canonical_gate_blockers": canonical_blockers,
         "next_action": action,
+        "blocking_disposition": blocking_disposition,
     }
 
 
@@ -100,16 +141,42 @@ def build_report() -> dict:
     promotion_eligible = [r["strategy"] for r in results if r["next_action"] == "PROMOTION_ELIGIBLE"]
     review_passed = [r["strategy"] for r in results if r["next_action"].startswith("REVIEW_GATE_PASSED")]
     kill_candidates = [r["strategy"] for r in results if r["next_action"].startswith("KILL_CANDIDATE")]
+    disposition_blocked = [r["strategy"] for r in results if r["next_action"].startswith("BLOCKED_BY_DISPOSITION")]
+
+    # Scan every artifact for a disposition — surfaces strategies that are
+    # NOT on the shortlist but still carry a kill/shelve/scope_down ruling
+    # (e.g. mamba, sector_rot, vix_revert). This makes the report the
+    # single place to see every active promotion block.
+    all_dispositions = []
+    try:
+        from helio.strategy_confidence import ARTIFACT_DIR
+        for p in sorted(ARTIFACT_DIR.glob("*.json")):
+            label = p.stem
+            art = load_confidence_artifact(label)
+            if art is None or art.disposition is None:
+                continue
+            all_dispositions.append({
+                "artifact_label": label,
+                "status": art.disposition.status,
+                "reason": art.disposition.reason,
+                "decided_at": art.disposition.decided_at,
+                "next_review_date": art.disposition.next_review_date,
+            })
+    except Exception:
+        pass
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "anchor_usd": anchor,
         "review_gate": REVIEW_GATE,
         "canonical_gate": CANONICAL_GATE,
         "strategies": results,
+        "all_dispositions": all_dispositions,
         "summary": {
             "promotion_eligible": promotion_eligible,
             "review_gate_passed": review_passed,
             "kill_candidates": kill_candidates,
+            "disposition_blocked": disposition_blocked,
             "total_evaluated": len(results),
         },
     }

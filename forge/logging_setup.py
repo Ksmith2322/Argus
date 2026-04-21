@@ -9,6 +9,8 @@ every Forge runner writes to a rotating file under forge/logs/<name>/.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -16,11 +18,30 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _in_test_context() -> bool:
+    """True when imported under pytest / unittest.
+
+    Fixes a bug where test_forge_dual_writes calling _close_paper_trade with a
+    stub state wrote 'PAPER LONG closed' log lines into the production runner
+    log (wick_gbpusd phantom-close, 2026-04-20). Under test, we skip the file
+    handler so logs are stream-only and never touch forge/logs/<name>/runner.log.
+    """
+    if os.environ.get("FORGE_DISABLE_FILELOG"):
+        return True
+    if "pytest" in sys.modules or "unittest" in sys.modules:
+        return True
+    arg0 = (sys.argv[0] if sys.argv else "").lower()
+    return "pytest" in arg0 or arg0.endswith(("unittest", "test_runner.py"))
+
+
 def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     """Configure a Forge runner's logger with both file and stream output.
 
     Writes to forge/logs/<name>/runner.log with 10MB rotation, 5 backups.
     Idempotent — safe to call from a runner that's also called by tests.
+
+    When running under pytest/unittest, the file handler is suppressed so test
+    invocations don't pollute the production runner.log.
     """
     log_dir = REPO / "forge" / "logs" / name
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -34,10 +55,11 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     if any(getattr(h, "_forge_setup", False) for h in logger.handlers):
         return logger  # already configured
 
-    file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    file_handler._forge_setup = True
-    logger.addHandler(file_handler)
+    if not _in_test_context():
+        file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        file_handler._forge_setup = True
+        logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)

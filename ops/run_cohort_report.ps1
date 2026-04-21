@@ -201,7 +201,14 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] nq_overnight WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
-    Write-Host "Running GLD PM Long evaluation..."
+    # 2026-04-20: gld_pm_long no longer fires from this nightly cohort.
+    # Strategy's signal_hours_utc = [18, 19, 20] but nightly runs ~23:00 UTC,
+    # so last_ts.hour is always 20 and hours 18/19 are never seen as "last bar."
+    # Correct launch is --loop mode during the 18-21 UTC window. See
+    # scheduled task "ArgusGldPmLoop" (registered separately). The nightly
+    # one-shot is retained below as --evaluate for position management only
+    # (manages open positions; won't open new ones outside signal window anyway).
+    Write-Host "Running GLD PM Long position-management sweep (--evaluate)..."
     $gldPmOutput = & $python -m forge.gld_pm_long.runner --evaluate 2>&1
     foreach ($line in @($gldPmOutput)) {
         if ($line) {

@@ -74,6 +74,13 @@ TRADE_CSV_FIELDS = [
     "position_size", "risk_usd",
 ]
 
+# Scope_down: Titan union backtest was broad (n=298, PF=1.52). The validated
+# subset strategy=='TREND_FOLLOW' AND direction=='long' is n=174, PF=2.09,
+# P(exp>0)=1.00, WF=4/4 (see strategy_confidence/titan_validated.json, 2026-04-20).
+# Pullback/breakout sub-strategies and shorts drag the union. Flip to False only
+# for research runs reconstructing the full union.
+SCOPE_TREND_FOLLOW_LONG_ONLY = True
+
 
 class TitanRunner:
     """Daily swing trade position manager."""
@@ -168,6 +175,12 @@ class TitanRunner:
 
             if self.long_only and sig["direction"] == "SHORT":
                 continue
+
+            if SCOPE_TREND_FOLLOW_LONG_ONLY:
+                if sig.get("strategy") != "TREND_FOLLOW":
+                    continue
+                if str(sig.get("direction", "")).upper() != "LONG":
+                    continue
 
             # Minimum signal strength
             if sig["strength"] < 65:

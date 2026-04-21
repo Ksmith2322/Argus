@@ -71,7 +71,7 @@ def build_hermes_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     csv_path = _latest_backtest_csv()
@@ -129,6 +129,9 @@ def build_hermes_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]
@@ -151,6 +154,26 @@ def build_hermes_artifact() -> dict:
     )
     if score_groups is not None:
         artifact["per_score_bucket"] = score_groups
+
+    # Disposition note — the union is weakly positive (PF 1.11) but the
+    # edge lives in score>=80 + long + GAP_DOWN, which the runner already
+    # enforces. That subset is tracked separately in hermes_validated.json
+    # for cleaner bookkeeping; the union artifact stays as the full
+    # backtest record for auditability.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            f"Union PF {pf:.2f} / WR {wins/n*100 if n else 0:.0f}% on n={n} "
+            "hides the real edge at score>=80 (PF 1.91, WR 63%). The live "
+            "runner already gates on MIN_SCORE_TO_ENTER=80 + long-only + "
+            "GAP_DOWN. Validated subset (PF 2.06 on n=92) is tracked "
+            "separately at strategy_confidence/hermes_validated.json — see "
+            "hermes.confidence_writer_validated. This union artifact is "
+            "retained for audit / per-bucket visibility but the scope-down "
+            "sibling is the operational truth."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
     return artifact

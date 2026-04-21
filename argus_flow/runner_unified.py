@@ -3611,6 +3611,13 @@ class PortfolioRiskManager:
     LONDON_CLUSTER = {"GBPUSD", "EURJPY", "GBPJPY", "CADJPY"}
     MAX_LONDON_CLUSTER_POSITIONS = 3
 
+    # Minimum banked PnL (in R) before the drawdown breaker arms. Prevents the
+    # "tiny-peak tyranny" where +5R peak → +2R current reads as 60% drawdown and
+    # locks entries despite net-positive PnL. Below this floor, we're still in
+    # warmup and the breaker is disabled. Floor tuned for paper: at 10R banked
+    # we've proven enough edge for % drawdown to be meaningful.
+    MIN_PEAK_R_FOR_BREAKER = 10.0
+
     # Persistent state file for drawdown pause (survives restart)
     _STATE_FILE = REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
 
@@ -3735,30 +3742,34 @@ class PortfolioRiskManager:
 
     def can_enter(self, symbol: str, direction: str, instruments: list, candidate_risk_usd: float = 0.0) -> tuple[bool, str]:
         """Master gate: check all portfolio-level risk guards."""
-        # 1. Drawdown breaker
-        if self._peak_pnl > 0:
+        # 1. Drawdown breaker — only arms once peak_pnl clears MIN_PEAK_R floor
+        if self._peak_pnl >= self.MIN_PEAK_R_FOR_BREAKER:
             dd = (self._peak_pnl - self._current_pnl) / abs(self._peak_pnl)
             if dd >= self.max_drawdown_pct:
                 if not self._drawdown_pause:
                     log.warning(f"DRAWDOWN BREAKER: {dd:.1%} from peak. ALL entries paused.")
                     self._drawdown_pause = True
                 return False, "DRAWDOWN_PAUSE"
-            if self._drawdown_pause:
-                # Only reset at session boundary (midnight UTC) or via manual flag file
-                reset_file = REPO / "RESET_DRAWDOWN"
-                now_utc = datetime.now(timezone.utc)
-                session_reset = (now_utc.hour == 0 and now_utc.minute < 2)
-                manual_reset = reset_file.exists()
-                if session_reset or manual_reset:
-                    log.info(f"DRAWDOWN BREAKER: reset ({'session_boundary' if session_reset else 'manual_flag'}). Entries resumed.")
-                    self._drawdown_pause = False
-                    if manual_reset:
-                        try:
-                            reset_file.unlink()
-                        except OSError:
-                            pass
+        # Reset conditions checked even if peak fell below the floor — otherwise
+        # a stale pause flag can trap entries forever.
         if self._drawdown_pause:
-            return False, "DRAWDOWN_PAUSE"
+            reset_file = REPO / "RESET_DRAWDOWN"
+            now_utc = datetime.now(timezone.utc)
+            session_reset = (now_utc.hour == 0 and now_utc.minute < 2)
+            manual_reset = reset_file.exists()
+            below_floor = self._peak_pnl < self.MIN_PEAK_R_FOR_BREAKER
+            if session_reset or manual_reset or below_floor:
+                why = ("session_boundary" if session_reset else
+                       "manual_flag" if manual_reset else "below_min_peak_floor")
+                log.info(f"DRAWDOWN BREAKER: reset ({why}). Entries resumed.")
+                self._drawdown_pause = False
+                if manual_reset:
+                    try:
+                        reset_file.unlink()
+                    except OSError:
+                        pass
+            else:
+                return False, "DRAWDOWN_PAUSE"
 
         # 2. Daily max loss per instrument
         if symbol in self._daily_paused:
@@ -4390,6 +4401,16 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         local_pos = inst.state.position
                         broker_flat = (bp == 0)
                         local_flat = (local_pos == "FLAT")
+                        # Paper mode: positions are simulated locally, broker is
+                        # always flat for that pair — a local-SHORT vs broker-0
+                        # is expected, not drift. Clear any stale block and skip.
+                        if getattr(inst, "execution_mode", "") == "paper":
+                            if getattr(inst, "_recon_blocked", False):
+                                log.info(f"RECON_DRIFT CLEARED: {inst.symbol} (paper mode — drift check skipped)")
+                            inst._recon_blocked = False
+                            inst._recon_block_reason = ""
+                            _sync_entry_block_state(inst)
+                            continue
                         if broker_flat != local_flat:
                             log.warning(
                                 f"RECON_DRIFT: {inst.symbol} local={local_pos} "
@@ -4452,6 +4473,12 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     if not broker_ok:
                         inst._reconciliation = ReconcileResult.BROKER_UNAVAILABLE
                         inst._reconciliation_detail = broker_error or "Could not query broker positions"
+                    elif getattr(inst, "execution_mode", "") == "paper":
+                        # Paper mode: local position is simulation-only, broker
+                        # is always flat. Label as paper-sim rather than drift
+                        # so dashboards and incident logs don't pollute.
+                        inst._reconciliation = ReconcileResult.CLEAN_FLAT if local_pos == "FLAT" else ReconcileResult.CLEAN_OPEN_MATCHED
+                        inst._reconciliation_detail = f"paper-sim: local={local_pos} (broker not queried for paper)"
                     elif local_pos == "FLAT" and broker_dir == "FLAT":
                         inst._reconciliation = ReconcileResult.CLEAN_FLAT
                         inst._reconciliation_detail = "Both local and broker flat"

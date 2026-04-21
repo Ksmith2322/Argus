@@ -49,7 +49,7 @@ def build_sector_rot_artifact() -> dict:
     from helio.fleet_state import (
         _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle,
         _walk_forward_stability, _cost_stress, _top_n_sensitivity,
-        _per_group_profitability,
+        _per_group_profitability, _max_drawdown,
     )
 
     if not BACKTEST_CSV.exists():
@@ -107,6 +107,9 @@ def build_sector_rot_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
     wf = _walk_forward_stability(pnls, n_folds=4)
     if wf is not None:
         pfs = [f["profit_factor"] for f in wf["fold_details"]
@@ -133,6 +136,24 @@ def build_sector_rot_artifact() -> dict:
     if per_regime is not None:
         artifact["per_instrument"] = per_regime
 
+    # Kill disposition (decided 2026-04-20). Per-month PF of 1.55 is
+    # misleading — the cumulative strategy return (+60.4%) underperforms
+    # SPY buy-and-hold (+130.6%) over 2020-2026 by roughly 70 percentage
+    # points. The monthly-PF framing converts SPY's bull-market drift into
+    # an "edge" that doesn't exist when measured against the benchmark.
+    artifact["disposition"] = {
+        "status": "kill",
+        "reason": (
+            "PF 1.55 per-month but strategy return +60.4% underperforms "
+            "SPY buy-and-hold +130.6% over 2020-2026 (-70pp alpha). "
+            "The positive PF reflects long-equity beta during a bull run, "
+            "not rotation alpha. Do not promote. If revisited, must be "
+            "re-specced to compute SPY-relative returns (alpha-PF), not "
+            "absolute monthly returns."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+
     return artifact
 
 
@@ -147,10 +168,24 @@ def write_sector_rot_artifact(dry_run: bool = False) -> Path | dict:
     return ARTIFACT_PATH
 
 
+# Disposition=kill (2026-04-20, see project_kill_or_rework_20260420.md).
+# Flip to True only to intentionally re-run the writer for audit. Nightly
+# cohort pipeline short-circuits when False to stop regenerating a
+# killed-strategy artifact on every run. Existing artifact on disk is
+# preserved; delete it manually if/when the strategy is re-specced.
+SECTOR_ROT_WRITER_ENABLED = False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="Run despite kill disposition (audit only).")
     args = ap.parse_args()
+    if not SECTOR_ROT_WRITER_ENABLED and not args.force:
+        print("sector_rot writer disabled (disposition=kill). "
+              "Existing artifact preserved. Use --force to re-run.")
+        return 0
     result = write_sector_rot_artifact(dry_run=args.dry_run)
     if args.dry_run:
         print(json.dumps(result, indent=2))

@@ -65,7 +65,7 @@ def _bucket_stats(rows: list[dict], key_fn) -> dict[str, dict]:
 
 
 def build_cuebanks_artifact() -> dict:
-    from helio.fleet_state import _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle
+    from helio.fleet_state import _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle, _max_drawdown
 
     if not BACKTEST_CSV.exists():
         raise FileNotFoundError(f"missing {BACKTEST_CSV}")
@@ -136,6 +136,34 @@ def build_cuebanks_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
+
+    # Scope-down disposition (decided 2026-04-19). Union is mediocre
+    # (PF 1.34 on n=88). A filter-scoped subset — trades whose `factors`
+    # field contains "S/D supply zone" — carries the edge: PF 3.63 /
+    # P(exp>0)=0.998 / MC ruin 0% on n=30 (see
+    # strategy_confidence/cue_banks_validated.json). The demand-zone
+    # cohort (n=45) is net-negative (PF 0.55, -$1,948) and drags the
+    # union. Wire the supply-zone factor gate into forge.cuebanks.runner
+    # and/or drop demand-zone-only entries; unblock to paper_only when
+    # n>=30 accumulates on the scoped subset.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            "Union: PF 1.34 mediocre (n=88). Filter-scoped subset "
+            "(factors contains 'S/D supply zone') shows real edge: "
+            "PF 3.63 / P(exp>0)=0.998 / MC ruin 0% on n=30 (see "
+            "strategy_confidence/cue_banks_validated.json). Demand-zone "
+            "cohort (n=45) is net-negative (PF 0.55, -$1,948). Wire the "
+            "supply-zone filter into forge.cuebanks.runner as a factor "
+            "gate (or drop demand-zone-only entries); unblock to "
+            "paper_only when n>=30 accumulated on the scoped subset."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "next_review_date": "2026-07-19",
+    }
     return artifact
 
 

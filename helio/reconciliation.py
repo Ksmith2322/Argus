@@ -31,14 +31,23 @@ _REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = _REPO / "argus_flow" / "logs" / "reconciliation_report.json"
 
 SPECS = [
-    ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",   "ts",         True),
-    ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",   "ts",         True),
-    ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",         True),
-    ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",         False),
-    ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",         False),
-    ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",         False),
-    ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",         False),
-    ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False),
+    # Fields: (label, path, ts_col, valid_only, symbol_hint, csv_has_exit_ts)
+    # symbol_hint — for single-symbol strategies whose CSV lacks a symbol
+    #   column, supplies the symbol the live writer stamps on canonical
+    #   rows. None = multi-symbol (read from CSV column).
+    # csv_has_exit_ts — False for runners whose CSV records the completed
+    #   trade in-row but doesn't persist exit_ts as a separate column
+    #   (e.g. gld_pm_long). When False, reconciliation drops exit_ts from
+    #   the key on BOTH sides so a canonical row with a real exit_ts still
+    #   matches the CSV row with no exit_ts recorded.
+    ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",   "ts",         True,  "USDJPY", False),
+    ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",   "ts",         True,  "GBPUSD", False),
+    ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",         True,  "CADJPY", False),
+    ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",         False, "GLD",    False),
+    ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",         False, "GBPUSD", False),
+    ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",         False, "NQ",     False),
+    ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",         False, None,     False),
+    ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False, None,     True),
 ]
 
 PNL_DRIFT_TOLERANCE_USD = 0.01
@@ -76,7 +85,10 @@ def _read_canonical_by_strategy() -> dict[str, list["Fill"]]:
 
 
 def _read_strategy_csv(spec: tuple) -> list[dict]:
-    label, path_rel, ts_col, valid_only = spec
+    # spec is (label, path, ts_col, valid_only, symbol_hint); older 4-tuple
+    # shape still supported for defensive upgrades.
+    label, path_rel, ts_col, valid_only = spec[:4]
+    symbol_hint = spec[4] if len(spec) >= 5 else None
     p = _REPO / path_rel
     if not p.exists():
         return []
@@ -94,6 +106,7 @@ def _read_strategy_csv(spec: tuple) -> list[dict]:
                 rows.append({
                     "entry_ts": entry_ts,
                     "exit_ts": exit_ts,
+                    "symbol": r.get("symbol") or symbol_hint or "",
                     "pnl_usd": float(pnl_raw),
                 })
     except Exception:
@@ -108,10 +121,21 @@ def reconcile_strategy(spec: tuple, canonical_fills: list) -> dict:
     keep this module importable even if someone swaps the domain layer.
     """
     label = spec[0]
+    csv_has_exit_ts = spec[5] if len(spec) >= 6 else True
     csv_rows = _read_strategy_csv(spec)
 
-    csv_keys = {(r["entry_ts"], r["exit_ts"]) for r in csv_rows}
-    canonical_keys = {(f.entry_ts or "", f.exit_ts or "") for f in canonical_fills}
+    # Include symbol in the key. Multi-symbol strategies (e.g.
+    # forge_jpy_pm_short trading USDJPY+CADJPY) can open simultaneous rows at
+    # the same entry_ts; without symbol, the second row collapses and the
+    # reconciliation silently reports row counts match while pnl_usd drifts.
+    # When the CSV doesn't record exit_ts, drop it from both sides so the
+    # canonical's real exit_ts isn't flagged as extra.
+    if csv_has_exit_ts:
+        csv_keys = {(r["entry_ts"], r["exit_ts"], r.get("symbol", "")) for r in csv_rows}
+        canonical_keys = {(f.entry_ts or "", f.exit_ts or "", f.symbol or "") for f in canonical_fills}
+    else:
+        csv_keys = {(r["entry_ts"], r.get("symbol", "")) for r in csv_rows}
+        canonical_keys = {(f.entry_ts or "", f.symbol or "") for f in canonical_fills}
 
     missing_in_canonical = csv_keys - canonical_keys
     extra_in_canonical = canonical_keys - csv_keys

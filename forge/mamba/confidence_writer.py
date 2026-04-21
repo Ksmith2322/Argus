@@ -65,7 +65,7 @@ def _bucket_stats(rows: list[dict], key_fn) -> dict[str, dict]:
 
 
 def build_mamba_artifact() -> dict:
-    from helio.fleet_state import _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle
+    from helio.fleet_state import _bootstrap_p_positive, _evidence_bar, _monte_carlo_shuffle, _max_drawdown
 
     if not BACKTEST_CSV.exists():
         raise FileNotFoundError(f"missing {BACKTEST_CSV}")
@@ -131,6 +131,31 @@ def build_mamba_artifact() -> dict:
     mc = _monte_carlo_shuffle(pnls)
     if mc is not None:
         artifact["mc_stress"] = mc
+    dd = _max_drawdown(pnls, starting_equity_usd=1000.0)
+    if dd is not None:
+        artifact["drawdown"] = dd
+
+    # Scope-down disposition (decided 2026-04-20, updated after YM-only
+    # re-run). Union PF 1.00 / P(exp>0)=0.47 / MC ruin 95% confirms the
+    # multi-pair bot has no edge. BUT the YM-only subset backtests
+    # cleanly at PF 1.98 / P(exp>0)=0.84 on n=15 (see mamba_ym.json).
+    # That's a real subset edge worth narrowing to. IBKR extended-window
+    # validation attempted but MIDPOINT data lacks volume → strict_5 can't
+    # run; that's the remaining gate for lifting to paper_only.
+    artifact["disposition"] = {
+        "status": "scope_down",
+        "reason": (
+            "Union (NQ+YM) PF 1.00, P(exp>0)=0.47, MC ruin 95% (n=25) — "
+            "no edge on the multi-pair bot. YM-only subset shows real "
+            "edge: PF 1.98 / P(exp>0)=0.84 / MC ruin 0% on n=15 "
+            "(see strategy_confidence/mamba_ym.json). Scope runner to "
+            "TICKERS=['YM=F']. Unblock to paper_only when: (a) YM-only "
+            "n>=30 combined backfill+live, or (b) IBKR volume "
+            "subscription enables strict_5 validation on extended window."
+        ),
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+
     return artifact
 
 

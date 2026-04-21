@@ -21,17 +21,12 @@ from argus_flow.ops.fleet_registry import STAGE_PAPER, discover_managed_runners
 REPO = Path(__file__).resolve().parents[2]
 
 # -- Active Cohort (Class A) — must match runner_unified.py and dashboard.py --
+# 2026-04-20: reconciled to the 3 configs runner_unified actually loads.
+# Legacy entries (EUR/USD, EUR/JPY, etc.) retained as comments for history.
 COHORT_RUNNERS = [
-    # London session
     {"name": "GBP/USD", "symbol": "GBPUSD", "log_dir": "argus_flow/logs/gbpusd", "config": "argus_flow/configs/gbpusd_range_paper_v1.json", "unit": "pips"},
-    {"name": "EUR/USD", "symbol": "EURUSD", "log_dir": "argus_flow/logs/eurusd", "config": "argus_flow/configs/eurusd_t4_paper_v1.json", "unit": "pips"},
-    {"name": "EUR/JPY", "symbol": "EURJPY", "log_dir": "argus_flow/logs/eurjpy", "config": "argus_flow/configs/eurjpy_t4_paper_v1.json", "unit": "pips"},
-    {"name": "GBP/JPY", "symbol": "GBPJPY", "log_dir": "argus_flow/logs/gbpjpy", "config": "argus_flow/configs/gbpjpy_t4_paper_v1.json", "unit": "pips"},
-    {"name": "CAD/JPY", "symbol": "CADJPY", "log_dir": "argus_flow/logs/cadjpy", "config": "argus_flow/configs/cadjpy_t4_paper_v1.json", "unit": "pips"},
-    # Asia session
-    {"name": "AUD/JPY", "symbol": "AUDJPY", "log_dir": "argus_flow/logs/audjpy", "config": "argus_flow/configs/audjpy_t4_paper_v1.json", "unit": "pips"},
-    {"name": "USD/JPY", "symbol": "USDJPY", "log_dir": "argus_flow/logs/usdjpy", "config": "argus_flow/configs/usdjpy_ny_paper_v1.json", "unit": "pips"},
-    {"name": "AUD/USD", "symbol": "AUDUSD", "log_dir": "argus_flow/logs/audusd", "config": "argus_flow/configs/audusd_ny_paper_v1.json", "unit": "pips"},
+    {"name": "USD/JPY", "symbol": "USDJPY", "log_dir": "argus_flow/logs/usdjpy", "config": "argus_flow/configs/usdjpy_mtf_paper_v1.json", "unit": "pips"},
+    {"name": "CAD/JPY", "symbol": "CADJPY", "log_dir": "argus_flow/logs/cadjpy", "config": "argus_flow/configs/cadjpy_mtf_paper_v1.json", "unit": "pips"},
 ]
 
 PROMOTION_THRESHOLD = 60   # valid trades needed

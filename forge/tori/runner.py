@@ -48,8 +48,18 @@ RESEARCH_ONLY = True  # 2026-04-17: not yet promotion candidate. Sizing module
 # uses a local backtest equity; not aligned to fleet_sizing.json. Do not
 # include in fleet USD roll-up until cohort-tagged + walk-forward-validated.
 
+# Scope_down (2026-04-20): Tori validated subset is name=='Dow' AND direction=='LONG'
+# (see strategy_confidence/tori_validated.json: PF 3.65 / P(exp>0)=1.00 / WF 4/4
+# on n=78). Dow PF 2.48 dominates PL 1.52 / CL 1.57 / GC 1.84; SHORT PF 1.74 vs
+# LONG 3.36 — US-equity upward drift asymmetry. Flip SCOPE_DOW_LONG_ONLY to False
+# for research runs reconstructing the union. Narrow TICKERS to YM=F to match.
+SCOPE_DOW_LONG_ONLY = True
+
 # Instruments
-TICKERS = ["PL=F", "CL=F", "GC=F", "YM=F"]
+if SCOPE_DOW_LONG_ONLY:
+    TICKERS = ["YM=F"]
+else:
+    TICKERS = ["PL=F", "CL=F", "GC=F", "YM=F"]
 TICKER_NAMES = {
     "PL=F": "Platinum",
     "CL=F": "Crude Oil",
@@ -361,6 +371,9 @@ def run_backtest(
                             best_grade_rank = g_rank
 
             if best_setup is None:
+                continue
+
+            if SCOPE_DOW_LONG_ONLY and str(best_setup.get("direction", "")).upper() != "LONG":
                 continue
 
             # --- Open trade ---

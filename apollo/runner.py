@@ -559,8 +559,19 @@ def main():
     for d in macro["details"]:
         print(f"    {d}")
 
+    from apollo.strategies.position_rules import (
+        SCOPE_APOLLO_VALIDATED_UNIVERSE,
+        SCOPE_APOLLO_VALIDATED_FILTER,
+    )
+
+    scan_universe = (
+        list(SCOPE_APOLLO_VALIDATED_UNIVERSE)
+        if SCOPE_APOLLO_VALIDATED_FILTER
+        else UNIVERSE
+    )
+
     results = []
-    for i, sym in enumerate(UNIVERSE):
+    for i, sym in enumerate(scan_universe):
         data = get_earnings_data(sym)
         if data is None:
             continue
@@ -633,7 +644,7 @@ def main():
                         scored["conviction"] = "high" if abs(gap) >= 10 else "medium"
             results.append(scored)
         if (i + 1) % 10 == 0:
-            print(f"  Scanned {i+1}/{len(UNIVERSE)}...")
+            print(f"  Scanned {i+1}/{len(scan_universe)}...")
             time.sleep(0.5)
 
     results.sort(key=lambda x: x["score"], reverse=True)

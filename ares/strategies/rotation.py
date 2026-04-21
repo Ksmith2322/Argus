@@ -17,6 +17,15 @@ import numpy as np
 import pandas as pd
 
 
+# Scope_down (2026-04-20): validated subset is exit_reason=='rotation' only —
+# PF 4.63 / P(exp>0)=1.00 / WF 3/4 on n=27 (strategy_confidence/ares_validated.json).
+# risk_off exits are PF 0.26 on n=8: the "panic to cash on SPY<200EMA" override
+# fires late and exits into washouts, destroying net alpha. Normal monthly
+# rotation exits hold the edge. Flip to False to re-enable the risk_off override
+# for research / stress-test runs.
+SCOPE_DISABLE_RISK_OFF_EXIT = True
+
+
 # Default sector universe
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "GDX", "XLE", "SMH", "XBI"]
 
@@ -160,7 +169,7 @@ def generate_signal(
     # Top N symbols
     top_symbols = [r["symbol"] for r in rankings[:top_n]]
 
-    if risk_off:
+    if risk_off and not SCOPE_DISABLE_RISK_OFF_EXIT:
         # Risk-off: sell everything, go to cash
         return RotationSignal(
             date=datetime.now().strftime("%Y-%m-%d"),
