@@ -50,6 +50,22 @@ schtasks.exe /create /TN "ArgusSpyMeanRevLoop" `
   /TR "C:\Argus\.venv\Scripts\python.exe -m forge.spy_mean_rev.runner --loop" `
   /SC ONLOGON /RL LIMITED /F
 
+# 5c) VIX Intraday Mean-Rev Loop — 15m cadence during NY session.
+#     Backtest: 15.2 trades/wk, PF 0.99. Adds volatility asset class.
+#     RESEARCH_ONLY; collecting data for param tuning.
+Write-Host "Registering ArgusVixIntradayLoop..."
+schtasks.exe /create /TN "ArgusVixIntradayLoop" `
+  /TR "C:\Argus\.venv\Scripts\python.exe -m forge.vix_intraday.runner --loop" `
+  /SC ONLOGON /RL LIMITED /F
+
+# 5d) Multi-Instrument ORB Loop — 5m cadence, SPY/QQQ/IWM/GLD opening-range
+#     breakout. Backtest: 19.3 trades/wk, PF 1.17 (positive edge, best of
+#     the 3 high-cadence strategies shipped 2026-04-21).
+Write-Host "Registering ArgusMultiOrbLoop..."
+schtasks.exe /create /TN "ArgusMultiOrbLoop" `
+  /TR "C:\Argus\.venv\Scripts\python.exe -m forge.multi_orb.runner --loop" `
+  /SC ONLOGON /RL LIMITED /F
+
 # 6) Meta-watchdog — periodically restarts watchdog + fleet_monitor if dead.
 #    Fires every 15 min regardless of logon state (uses SYSTEM account).
 Write-Host "Registering ArgusMetaWatchdog (every 15 min)..."
