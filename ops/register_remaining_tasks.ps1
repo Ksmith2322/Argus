@@ -42,6 +42,14 @@ schtasks.exe /create /TN "ArgusAudOrbLoop" `
   /TR "C:\Argus\.venv\Scripts\python.exe -m forge.aud_asian_breakout.runner --loop" `
   /SC ONLOGON /RL LIMITED /F
 
+# 5b) SPY Mean-Reversion Loop — 5m cadence during NY session (14-20 UTC).
+#     Backtest: 34.6 trades/wk (cadence target MET), PF 1.03 (marginal).
+#     RESEARCH_ONLY until params tuned; ships paper trades for OOS data.
+Write-Host "Registering ArgusSpyMeanRevLoop..."
+schtasks.exe /create /TN "ArgusSpyMeanRevLoop" `
+  /TR "C:\Argus\.venv\Scripts\python.exe -m forge.spy_mean_rev.runner --loop" `
+  /SC ONLOGON /RL LIMITED /F
+
 # 6) Meta-watchdog — periodically restarts watchdog + fleet_monitor if dead.
 #    Fires every 15 min regardless of logon state (uses SYSTEM account).
 Write-Host "Registering ArgusMetaWatchdog (every 15 min)..."
