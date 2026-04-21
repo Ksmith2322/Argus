@@ -70,6 +70,17 @@ Register-LoopTask "ArgusVixIntradayLoop" "forge.vix_intraday.runner"
 Write-Host "Registering ArgusMultiOrbLoop..."
 Register-LoopTask "ArgusMultiOrbLoop" "forge.multi_orb.runner"
 
+# 5e) Tori Paper Bridge — 4H rerun-backtest-diff model, narrowed to
+#     YM=F Dow+LONG validated subset (PF 3.65 on 78 trades in-sample).
+#     Low cadence by design; paper data accumulates for OOS verdict.
+Write-Host "Registering ArgusToriPaperLoop..."
+Register-LoopTask "ArgusToriPaperLoop" "forge.tori.paper_bridge"
+
+# 5f) Cue Banks Paper Bridge — 15m cadence during 13:30-20:00 UTC NY session.
+#     Narrowed to S/D supply zone factor subset (PF 3.63 on 30 trades).
+Write-Host "Registering ArgusCueBanksPaperLoop..."
+Register-LoopTask "ArgusCueBanksPaperLoop" "forge.cuebanks.paper_bridge"
+
 # 6) Meta-watchdog — periodically restarts watchdog + fleet_monitor if dead.
 #    Fires every 15 min regardless of logon state (uses SYSTEM account).
 Write-Host "Registering ArgusMetaWatchdog (every 15 min)..."
