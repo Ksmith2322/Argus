@@ -140,6 +140,34 @@ class PerGroupProfitability(BaseModel):
     all_positive: bool
 
 
+class HoldoutFreeze(BaseModel):
+    """Prospective-holdout framing for a scope_down subset claim.
+
+    Scope_down subsets (e.g., Tori "Dow+LONG only", Apollo "surprise 10-20%")
+    are identified by scanning the data for which slice looks best. That's
+    in-sample selection and inflates reported PF. Honest testing requires
+    freezing the claim now and comparing against trades that land AFTER
+    frozen_at. This block captures the frozen hypothesis so later sessions
+    can compute an unbiased OOS read.
+
+    Flow:
+      1. At freeze time: populate in_sample_claim with the PF/WR/n/expectancy
+         observed on the data used to identify the subset.
+      2. Runner enforces the subset going forward (e.g., SCOPE_* flag).
+      3. After oos_eval_earliest, helio.holdout_eval compares live/paper
+         fills since frozen_at against in_sample_claim. Degradation > 30%
+         is a red flag; absolute PF < 1.2 on OOS is a kill candidate.
+    """
+    model_config = ConfigDict(extra="forbid")
+    frozen_at: str  # ISO-8601 UTC
+    filter_statement: str  # Plain-English rule ("name=='Dow' AND direction=='LONG'")
+    in_sample_claim: dict  # {pf, wr, n_trades, expectancy_usd, p_expectancy_positive}
+    oos_eval_earliest: str  # ISO-8601 UTC — don't compare before this date
+    oos_eval_target_n: int = Field(..., ge=10)  # min OOS trades for meaningful comparison
+    degradation_alert_pct: float = Field(0.30, ge=0.0, le=1.0)  # e.g. 0.30 = 30% PF drop
+    notes: str | None = None
+
+
 class MonteCarloStressTest(BaseModel):
     """Output of helio.fleet_state._monte_carlo_shuffle.
 
@@ -202,6 +230,7 @@ class StrategyConfidenceArtifact(BaseModel):
     per_day_of_week: PerGroupProfitability | None = None
     disposition: Disposition | None = None
     drawdown: Drawdown | None = None
+    holdout_freeze: HoldoutFreeze | None = None
 
     @model_validator(mode="after")
     def validate_invariants(self) -> "StrategyConfidenceArtifact":
