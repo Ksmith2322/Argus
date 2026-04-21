@@ -234,19 +234,19 @@ while ($true) {
     # ── Gap Fix #1: API port check (detect TWS API disabled mid-session) ──
     $portListening = $false
     try {
-        $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -WarningAction SilentlyContinue
+        $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 7497 -WarningAction SilentlyContinue
         $portListening = $conn.TcpTestSucceeded
     } catch {}
 
     if (-not $portListening -and $fxAlive) {
         if (-not $script:portWarnSent) {
-            Log "ALERT: API port 7496 NOT LISTENING but runners are alive!"
-            Send-Discord "**WARNING: IBKR API port 7496 not responding!** Runners alive but may not be receiving data. Check TWS API settings." "red"
+            Log "ALERT: API port 7497 NOT LISTENING but runners are alive!"
+            Send-Discord "**WARNING: IBKR API port 7497 not responding!** Runners alive but may not be receiving data. Check TWS API settings." "red"
             $script:portWarnSent = $true
         }
     } elseif ($portListening -and $script:portWarnSent) {
-        Log "API port 7496 restored"
-        Send-Discord "API port 7496 is **BACK** and listening." "green"
+        Log "API port 7497 restored"
+        Send-Discord "API port 7497 is **BACK** and listening." "green"
         $script:portWarnSent = $false
     }
 
