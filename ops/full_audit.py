@@ -581,13 +581,183 @@ LENSES = {
 }
 
 
-def run_all() -> dict:
+# ---------------- aspirational gap table ----------------
+
+# Fantasy: the unrealistic ideal north star — aggressive all-weather bot.
+# Realistic: top-1% retail systematic (what's actually achievable solo).
+# Each tuple: (metric name, fantasy value, realistic target, higher_is_better)
+ASPIRATIONAL_TARGETS = [
+    ("weekly_pnl_positive_rate", 1.00, 0.80, True),        # fraction of weeks net-positive
+    ("annual_return_pct",        100,  30,   True),        # projected
+    ("fleet_sharpe",             3.0,  1.5,  True),
+    ("max_drawdown_pct",         3.0,  15.0, False),       # lower better
+    ("profit_factor",            3.0,  1.8,  True),
+    ("trades_per_week",          60,   30,   True),
+    ("signal_to_entry_pct",      70,   40,   True),
+    ("session_coverage_pct",     80,   50,   True),        # % of trading hours w/ active strategies
+    ("asset_class_count",        6,    4,    True),        # fx/eq/cmdty/rates/vol/crypto
+    ("active_strategy_count",    10,   6,    True),        # firing at least 1 trade/week
+    ("uptime_pct",               99.9, 99.0, True),
+    ("oos_pf_to_insample_ratio", 1.0,  0.70, True),        # how well OOS holds up
+]
+
+
+def _current_weekly_win_rate(rows: list[dict], weeks: int = 8) -> float:
+    """Rolling fraction of weeks with positive PnL. Returns None if insufficient data."""
+    now = _now()
+    by_week: dict[int, float] = defaultdict(float)
+    for r in rows:
+        if r.get("source") == "backfill_from_trade_csv":
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("exit_ts") or r.get("ts") or "").replace("Z", "+00:00"))
+        except Exception:
+            continue
+        weeks_ago = int((now - ts).total_seconds() // (7 * 86400))
+        if weeks_ago < 0 or weeks_ago >= weeks:
+            continue
+        try:
+            by_week[weeks_ago] += float(r.get("pnl_usd") or 0)
+        except Exception:
+            pass
+    if not by_week:
+        return 0.0
+    pos = sum(1 for w, pnl in by_week.items() if pnl > 0)
+    return pos / max(len(by_week), 1)
+
+
+def _current_annual_return_pct(rows: list[dict]) -> float:
+    """Annualized return from last 30 days of live fills vs $1M anchor. Rough."""
+    now = _now()
+    recent = []
+    for r in rows:
+        if r.get("source") == "backfill_from_trade_csv":
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("exit_ts") or r.get("ts") or "").replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if (now - ts).days > 30:
+            continue
+        try:
+            recent.append(float(r.get("pnl_usd") or 0))
+        except Exception:
+            pass
+    if not recent:
+        return 0.0
+    pnl_30d = sum(recent)
+    # Annualize: pnl_30d * (365/30) / anchor * 100
+    return round(pnl_30d * (365 / 30) / 1_000_000 * 100, 2)
+
+
+def _current_pf(rows: list[dict]) -> float:
+    wins = [float(r.get("pnl_usd") or 0) for r in rows
+            if r.get("source") != "backfill_from_trade_csv" and float(r.get("pnl_usd") or 0) > 0]
+    losses = [abs(float(r.get("pnl_usd") or 0)) for r in rows
+              if r.get("source") != "backfill_from_trade_csv" and float(r.get("pnl_usd") or 0) < 0]
+    if not losses or sum(losses) == 0:
+        return float("inf") if wins else 0.0
+    return round(sum(wins) / sum(losses), 2)
+
+
+def _active_strategies(rows: list[dict]) -> int:
+    now = _now()
+    active = set()
+    for r in rows:
+        if r.get("source") == "backfill_from_trade_csv":
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("exit_ts") or r.get("ts") or "").replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if (now - ts).days <= 7:
+            active.add(r.get("strategy", "?"))
+    return len(active)
+
+
+def _session_coverage_pct() -> float:
+    """Rough: count how many of 24 hours (UTC) have at least one strategy
+    whose signal_hour or active window touches them. Approximate."""
+    # Known strategy session windows (UTC)
+    windows = [
+        set(range(7, 16)),   # Argus FX (London/NY overlap)
+        set(range(18, 21)),  # forge_gld_pm_long
+        {16},                # forge_nq_london_close
+        set(range(1, 8)),    # forge_aud_asian_breakout (Tokyo)
+        set(range(14, 22)),  # forge_nq_overnight (NY afternoon)
+        {19},                # forge_jpy_pm_short
+        {0},                 # forge_wick_gbpusd (daily eval)
+    ]
+    covered = set()
+    for w in windows:
+        covered |= w
+    return round(len(covered) / 24 * 100, 1)
+
+
+def lens_aspirational(report: dict) -> dict:
+    """Compute gap between current metrics and fantasy/realistic targets."""
+    out: dict = {"lens": "aspirational", "ts": _now().isoformat()}
+    rows = _load_canonical_fills()
+
+    # Current values
+    current = {
+        "weekly_pnl_positive_rate": round(_current_weekly_win_rate(rows), 2),
+        "annual_return_pct": _current_annual_return_pct(rows),
+        "fleet_sharpe": None,  # not yet computed
+        "max_drawdown_pct": report.get("risk", {}).get("dd_pct", 0),
+        "profit_factor": _current_pf(rows),
+        "trades_per_week": report.get("trading", {}).get("last_7d", {}).get("total_trades", 0),
+        "signal_to_entry_pct": report.get("signals", {}).get("signal_to_entry_pct", 0),
+        "session_coverage_pct": _session_coverage_pct(),
+        "asset_class_count": 2,  # FX + equity futures today; update as we add
+        "active_strategy_count": _active_strategies(rows),
+        "uptime_pct": None,  # not tracked
+        "oos_pf_to_insample_ratio": None,  # only valid post-holdout window
+    }
+
+    gaps = []
+    for name, fantasy, realistic, higher_better in ASPIRATIONAL_TARGETS:
+        cur = current.get(name)
+        row = {"metric": name, "fantasy": fantasy, "realistic": realistic, "current": cur}
+        if cur is None:
+            row["gap_to_realistic"] = None
+            row["status"] = "UNKNOWN"
+        else:
+            if higher_better:
+                row["gap_to_realistic"] = round(realistic - cur, 2)
+                row["gap_to_fantasy"] = round(fantasy - cur, 2)
+                if cur >= fantasy: row["status"] = "FANTASY_MET"
+                elif cur >= realistic: row["status"] = "REALISTIC_MET"
+                else: row["status"] = "BELOW_REALISTIC"
+            else:  # lower better
+                row["gap_to_realistic"] = round(cur - realistic, 2)
+                row["gap_to_fantasy"] = round(cur - fantasy, 2)
+                if cur <= fantasy: row["status"] = "FANTASY_MET"
+                elif cur <= realistic: row["status"] = "REALISTIC_MET"
+                else: row["status"] = "BELOW_REALISTIC"
+        gaps.append(row)
+
+    out["gaps"] = gaps
+    # Summary stats
+    out["below_realistic_count"] = sum(1 for g in gaps if g["status"] == "BELOW_REALISTIC")
+    out["realistic_met_count"] = sum(1 for g in gaps if g["status"] == "REALISTIC_MET")
+    out["fantasy_met_count"] = sum(1 for g in gaps if g["status"] == "FANTASY_MET")
+    out["unknown_count"] = sum(1 for g in gaps if g["status"] == "UNKNOWN")
+    return out
+
+
+def run_all(include_aspirational: bool = False) -> dict:
     results = {}
     for name, fn in LENSES.items():
         try:
             results[name] = fn()
         except Exception as e:
             results[name] = {"lens": name, "error": str(e)[:200]}
+    if include_aspirational:
+        try:
+            results["aspirational"] = lens_aspirational(results)
+        except Exception as e:
+            results["aspirational"] = {"lens": "aspirational", "error": str(e)[:200]}
     return results
 
 
@@ -692,6 +862,20 @@ def _summarize_markdown(report: dict) -> str:
         lines.append(f"- Pending (parked in _pending/): {pending}")
     lines.append("")
 
+    asp = report.get("aspirational")
+    if asp and "gaps" in asp:
+        lines.append("## Aspirational Gap (vs Fantasy / Realistic Targets)")
+        lines.append("")
+        lines.append("| metric | current | realistic | fantasy | status |")
+        lines.append("|---|---|---|---|---|")
+        for g in asp["gaps"]:
+            cur = g.get("current")
+            cur_s = f"{cur}" if cur is not None else "—"
+            lines.append(f"| {g['metric']} | {cur_s} | {g['realistic']} | {g['fantasy']} | {g['status']} |")
+        lines.append("")
+        lines.append(f"Summary: {asp['fantasy_met_count']} FANTASY / {asp['realistic_met_count']} REALISTIC / {asp['below_realistic_count']} BELOW / {asp['unknown_count']} UNKNOWN")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -747,6 +931,7 @@ def main() -> int:
     ap.add_argument("--lens", help="Run only this lens (e.g., fleet, risk, trading, ...)")
     ap.add_argument("--json", action="store_true", help="Print JSON to stdout, don't save")
     ap.add_argument("--diff", action="store_true", help="Include diff vs previous audit")
+    ap.add_argument("--aspirational", action="store_true", help="Include gap table vs fantasy/realistic targets")
     args = ap.parse_args()
 
     if args.lens:
@@ -759,7 +944,7 @@ def main() -> int:
         return 0
 
     stamp = _now().strftime("%Y%m%d_%H%M")
-    report = run_all()
+    report = run_all(include_aspirational=args.aspirational)
     report["_stamp"] = stamp
     report["_generated_at"] = _now().isoformat()
 
