@@ -25,8 +25,11 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] drift_detector WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    # 2026-04-20: flipped from --dry-run to --live so apollo actually places
+    # paper orders against DUP472829 on high-conviction post-ER signals. This
+    # lets the research_only disposition accumulate real OOS evidence.
     Write-Host "Running Apollo earnings scanner..."
-    $apolloOutput = & $python -m apollo.runner --dry-run --days 14 2>&1
+    $apolloOutput = & $python -m apollo.runner --live --days 14 2>&1
     foreach ($line in @($apolloOutput)) {
         if ($line) {
             Add-Content -Path $logFile -Value "[$timestamp] apollo: $line"
@@ -157,8 +160,11 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] fleet_state WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    # 2026-04-20: flipped from --dry-run to --execute so Hermes places paper
+    # orders on its score>=80 + long + GAP_DOWN gated signals against
+    # DUP472829. Accumulates live-subset evidence.
     Write-Host "Running Hermes gap scanner..."
-    $hermesOutput = & $python -m hermes.runner --dry-run --min-score 75 2>&1
+    $hermesOutput = & $python -m hermes.runner --execute --min-score 75 2>&1
     foreach ($line in @($hermesOutput)) {
         if ($line) {
             Add-Content -Path $logFile -Value "[$timestamp] hermes: $line"
@@ -168,8 +174,12 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] hermes WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    # 2026-04-20: flipped from --dry-run to --execute. Ares runs a monthly
+    # rebalance guard internally (argus_flow.runner.run_evaluation:149) so the
+    # daily cohort call is a no-op except on rebalance days. With SCOPE_DISABLE_RISK_OFF_EXIT=True
+    # the validated rotation-only subset is enforced.
     Write-Host "Running Ares sector rotation..."
-    $aresOutput = & $python -m ares.runner --dry-run 2>&1
+    $aresOutput = & $python -m ares.runner --execute 2>&1
     foreach ($line in @($aresOutput)) {
         if ($line) {
             Add-Content -Path $logFile -Value "[$timestamp] ares: $line"
@@ -245,6 +255,19 @@ try {
     #     Add-Content -Path $logFile -Value "[$timestamp] oracle WARNING: exit code $LASTEXITCODE (non-fatal)"
     # }
 
+    # 2026-04-20: gdx_gld has real IBKR execution (ib_insync placeOrder path)
+    # but wasn't scheduled. Running --live so signals convert to paper fills.
+    Write-Host "Running GDX/GLD pair runner..."
+    $gdxOutput = & $python -m forge.gdx_gld_runner --live 2>&1
+    foreach ($line in @($gdxOutput)) {
+        if ($line) {
+            Add-Content -Path $logFile -Value "[$timestamp] gdx_gld: $line"
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -Path $logFile -Value "[$timestamp] gdx_gld WARNING: exit code $LASTEXITCODE (non-fatal)"
+    }
+
     Write-Host "Running Titan scanner (refresh + long-only)..."
     $titanOutput = & $python -m titan.ops.scanner --refresh --long-only 2>&1
     foreach ($line in @($titanOutput)) {
@@ -256,8 +279,11 @@ try {
         Add-Content -Path $logFile -Value "[$timestamp] titan_scanner WARNING: exit code $LASTEXITCODE (non-fatal)"
     }
 
+    # 2026-04-20: flipped from --dry-run to --live. Titan uses IBKRExecutor
+    # (titan/runner.py:105) to place paper bracket orders. With
+    # SCOPE_TREND_FOLLOW_LONG_ONLY=True only the validated subset fires.
     Write-Host "Running Titan runner (check exits + evaluate entries)..."
-    $titanRunnerOutput = & $python -m titan.runner --dry-run 2>&1
+    $titanRunnerOutput = & $python -m titan.runner --live 2>&1
     foreach ($line in @($titanRunnerOutput)) {
         if ($line) {
             Add-Content -Path $logFile -Value "[$timestamp] titan_runner: $line"
