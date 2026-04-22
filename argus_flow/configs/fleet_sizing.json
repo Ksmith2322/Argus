@@ -5,6 +5,9 @@
   "fallback_anchor_usd": 10000.0,
   "_fallback_note": "Used only when risk_oversight_report.json is missing/stale. Guards against divide-by-zero on cold start.",
 
+  "max_anchor_usd": 10000.0,
+  "_max_anchor_note": "Hard CEILING on broker-reported equity. IBKR paper accounts ship preloaded with ~$1M virtual balance. Without a cap, fleet_anchored_risk_pct sizes 100x the intended $10K-equivalent risk (trade #3 2026-04-20 GLD risked $5K on a 0.5% policy). When you fund real capital and the real account grows, bump this to match.",
+
   "max_risk_pct_per_trade_ceiling": 0.03,
   "fleet_max_open_risk_pct": 0.06,
 
@@ -32,5 +35,5 @@
   },
   "_notional_caps_note": "Position notional_usd must be <= anchor * multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK (e.g., $48K GLD on $10K cash account).",
 
-  "version": "2026-04-17.v3"
+  "version": "2026-04-21.v4"
 }

@@ -30,10 +30,41 @@ class TestSizingAnchor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ro_path = Path(tmp) / "risk_oversight_report.json"
             ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 50_000}}))
-            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
+            cfg_path = Path(tmp) / "fleet_sizing.json"
+            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
+                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
                 fs.invalidate_cache()
                 anchor = fs.get_sizing_anchor_usd()
             self.assertAlmostEqual(anchor, 50_000, places=2)
+
+    def test_anchor_caps_broker_equity_at_max_anchor_usd(self):
+        """Regression guard: IBKR paper accounts ship with $1M virtual balance.
+        Without the cap, every fleet_anchored_risk_pct trade sizes 100x the
+        intended $10K-equivalent risk. See trade #3 forge_gld_pm_long 2026-04-20."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = Path(tmp) / "risk_oversight_report.json"
+            ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 1_000_000}}))
+            cfg_path = Path(tmp) / "fleet_sizing.json"
+            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000, "max_anchor_usd": 10_000}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
+                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
+                fs.invalidate_cache()
+                anchor = fs.get_sizing_anchor_usd()
+            self.assertAlmostEqual(anchor, 10_000, places=2)
+
+    def test_anchor_below_cap_passes_through(self):
+        """Broker equity below max_anchor_usd should not be clamped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = Path(tmp) / "risk_oversight_report.json"
+            ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 7_500}}))
+            cfg_path = Path(tmp) / "fleet_sizing.json"
+            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000, "max_anchor_usd": 10_000}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
+                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
+                fs.invalidate_cache()
+                anchor = fs.get_sizing_anchor_usd()
+            self.assertAlmostEqual(anchor, 7_500, places=2)
 
     def test_anchor_falls_back_when_broker_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,7 +90,11 @@ class TestSizingAnchor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ro_path = Path(tmp) / "risk_oversight_report.json"
             ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 10_000}}))
-            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
+            cfg_path = Path(tmp) / "fleet_sizing.json"
+            # No max_anchor_usd: cap disabled so we're testing cache behavior, not clamp
+            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
+                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
                 fs.invalidate_cache()
                 first = fs.get_sizing_anchor_usd()
                 # Update file
@@ -72,6 +107,9 @@ class TestSizingAnchor(unittest.TestCase):
 
 class TestTierEvaluation(unittest.TestCase):
     """Tier boundary tests — critical that these gates are off-by-one safe."""
+
+    def setUp(self):
+        fs.invalidate_cache()
 
     def test_unproven_with_zero_trades(self):
         stats = {"trades": 0, "profit_factor": 0, "win_rate": 0, "pnl_usd": 0}
@@ -140,6 +178,9 @@ class TestTierEvaluation(unittest.TestCase):
 
 
 class TestComputeRiskUsd(unittest.TestCase):
+    def setUp(self):
+        fs.invalidate_cache()
+
     def test_label_based_uses_tier(self):
         with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
              mock.patch.object(fs, "compute_strategy_stats",
@@ -159,6 +200,9 @@ class TestComputeRiskUsd(unittest.TestCase):
 
 
 class TestNotionalCaps(unittest.TestCase):
+    def setUp(self):
+        fs.invalidate_cache()
+
     def test_stock_cap_is_2x_anchor(self):
         with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000):
             self.assertAlmostEqual(fs.max_notional_usd("stock"), 20_000, places=2)
@@ -177,6 +221,9 @@ class TestNotionalCaps(unittest.TestCase):
 
 
 class TestFleetMaxOpenRisk(unittest.TestCase):
+    def setUp(self):
+        fs.invalidate_cache()
+
     def test_derived_from_anchor(self):
         with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=100_000):
             self.assertAlmostEqual(fs.get_fleet_max_open_risk_usd(), 6000.0, places=2)

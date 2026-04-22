@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 _REPO = Path(__file__).resolve().parents[1]
 _CONFIG_PATH = _REPO / "argus_flow" / "configs" / "fleet_sizing.json"
@@ -84,6 +87,11 @@ def get_broker_equity_usd() -> float | None:
 def get_sizing_anchor_usd() -> float:
     """Current anchor capital — broker equity if available, else fallback.
 
+    Broker equity is clamped to config.max_anchor_usd. Rationale: IBKR paper
+    accounts ship with ~$1M virtual balance, which would make every
+    fleet_anchored_risk_pct trade size 100x the intended risk. The cap keeps
+    paper-mode sizing honest. Bump max_anchor_usd when funding real capital.
+
     Cached briefly (30s) to avoid repeated disk reads on hot paths. Call
     `invalidate_cache()` after manually patching state.
     """
@@ -93,9 +101,23 @@ def get_sizing_anchor_usd() -> float:
     with _anchor_lock:
         if _cached_anchor is not None and (now - _cached_anchor[1]) < _ANCHOR_CACHE_S:
             return _cached_anchor[0]
+        cfg = _load_config()
         eq = get_broker_equity_usd()
         if eq is None or eq <= 0:
-            eq = float(_load_config().get("fallback_anchor_usd", _FALLBACK_ANCHOR))
+            eq = float(cfg.get("fallback_anchor_usd", _FALLBACK_ANCHOR))
+        else:
+            cap = cfg.get("max_anchor_usd")
+            if cap is not None:
+                try:
+                    cap = float(cap)
+                except (TypeError, ValueError):
+                    cap = None
+                if cap is not None and cap > 0 and eq > cap:
+                    _log.warning(
+                        "ANCHOR_CAPPED: broker reported $%.0f; clamped to $%.0f via max_anchor_usd",
+                        eq, cap,
+                    )
+                    eq = cap
         _cached_anchor = (eq, now)
         return eq
 

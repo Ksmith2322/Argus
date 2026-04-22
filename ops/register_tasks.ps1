@@ -1,11 +1,27 @@
 # ops/register_tasks.ps1 -- Register all Argus scheduled tasks
 # Run from elevated (Admin) PowerShell prompt
-# Usage: .\ops\register_tasks.ps1
+# Usage:
+#   .\ops\register_tasks.ps1                                  # legacy: interactive-only
+#   .\ops\register_tasks.ps1 -Credential (Get-Credential)     # runs whether logged on or not
+param(
+    [System.Management.Automation.PSCredential]$Credential
+)
 
 $ErrorActionPreference = "Stop"
 
+$useCreds = $null -ne $Credential
+if ($useCreds) {
+    $credUser = $Credential.UserName
+    $credPass = $Credential.GetNetworkCredential().Password
+}
+
 Write-Host "=== Argus Task Scheduler Registration ===" -ForegroundColor Cyan
 Write-Host "Requires elevated (Admin) prompt" -ForegroundColor Yellow
+if ($useCreds) {
+    Write-Host "Mode: stored credentials ($credUser) - runs whether logged on or not" -ForegroundColor Green
+} else {
+    Write-Host "Mode: interactive-only (pass -Credential (Get-Credential) to run when disconnected)" -ForegroundColor DarkYellow
+}
 Write-Host ""
 
 $tasks = @(
@@ -102,6 +118,10 @@ foreach ($task in $tasks) {
     }
     elseif ($task.Schedule -eq "ONSTART") {
         $args += @("/SC", "ONSTART")
+    }
+
+    if ($useCreds) {
+        $args += @("/RU", $credUser, "/RP", $credPass, "/RL", "HIGHEST")
     }
 
     try {
