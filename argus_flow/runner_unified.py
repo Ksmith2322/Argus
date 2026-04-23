@@ -1096,6 +1096,11 @@ def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
 
     dist = features["dist_from_low"]
     direction_cfg = cfg.get("direction", {})
+    # MTF-strategy configs (e.g. CADJPY, USDJPY) use string direction like "both" / "long_only".
+    # Those configs run through the MTF engine path in live, but the walkforward harness calls
+    # this function directly. Fall through to default thresholds when direction isn't a dict.
+    if not isinstance(direction_cfg, dict):
+        direction_cfg = {}
     if dist < direction_cfg.get("dist_long_threshold", 0.4):
         return "long"
     elif dist > direction_cfg.get("dist_short_threshold", 0.6):

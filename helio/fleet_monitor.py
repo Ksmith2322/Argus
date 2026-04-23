@@ -178,6 +178,36 @@ SYSTEMS = {
         "artifact_max_age_s": 7200,  # 2h
         "no_restart": True,
     },
+    "forge_multi_orb": {
+        "heartbeats": [REPO / "forge" / "logs" / "multi_orb" / "heartbeat.json"],
+        "stale_threshold_s": 900,  # 15 min (evaluates every 5min during NY session)
+        "process_match": "forge.multi_orb.runner",
+        "restart_args": ["-m", "forge.multi_orb.runner", "--loop"],
+    },
+    "forge_vix_intraday": {
+        "heartbeats": [REPO / "forge" / "logs" / "vix_intraday" / "heartbeat.json"],
+        "stale_threshold_s": 1800,  # 30 min (15m bars)
+        "process_match": "forge.vix_intraday.runner",
+        "restart_args": ["-m", "forge.vix_intraday.runner", "--loop"],
+    },
+    "forge_spy_mean_rev": {
+        "heartbeats": [REPO / "forge" / "logs" / "spy_mean_rev" / "heartbeat.json"],
+        "stale_threshold_s": 900,  # 15 min (5m bars during 14-20 UTC)
+        "process_match": "forge.spy_mean_rev.runner",
+        "restart_args": ["-m", "forge.spy_mean_rev.runner", "--loop"],
+    },
+    "forge_nq_london_close": {
+        "heartbeats": [REPO / "forge" / "logs" / "nq_london_close" / "heartbeat.json"],
+        "stale_threshold_s": 5400,  # 90 min (hourly cycle during London close session)
+        "process_match": "forge.nq_london_close.runner",
+        "restart_args": ["-m", "forge.nq_london_close.runner", "--loop"],
+    },
+    "forge_aud_asian_breakout": {
+        "heartbeats": [REPO / "forge" / "logs" / "aud_asian_breakout" / "heartbeat.json"],
+        "stale_threshold_s": 5400,  # 90 min (hourly during Asian session)
+        "process_match": "forge.aud_asian_breakout.runner",
+        "restart_args": ["-m", "forge.aud_asian_breakout.runner", "--loop"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,
