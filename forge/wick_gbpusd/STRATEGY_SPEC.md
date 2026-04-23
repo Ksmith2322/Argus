@@ -24,7 +24,7 @@ At GBPUSD daily bar close, enter LONG **next bar's open** if ALL of:
 - **Order of evaluation per bar:** stop first, then target (conservative)
 
 ## Position sizing
-- Risk per trade: 1.0% of model equity ($10,000 default)
+- Risk per trade: 1.0% of live broker equity (dynamic — pulled via `helio.fleet_sizing.get_sizing_anchor_usd()` at eval time; no hardcoded default)
 - Position size = (risk_usd) / (stop_distance × pip_value)
 - Pip value GBPUSD ~$10 per pip per 100K lot
 

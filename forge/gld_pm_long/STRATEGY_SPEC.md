@@ -26,7 +26,7 @@ At any of hours 18:00, 19:00, 20:00 UTC (top of hour), enter LONG GLD if:
 - **Order of evaluation per bar:** stop first, then target
 
 ## Position sizing
-- Risk per trade: 1.0% of model equity ($10,000 default)
+- Risk per trade: 1.0% of live broker equity (dynamic — pulled via `helio.fleet_sizing.get_sizing_anchor_usd()` at eval time; no hardcoded default)
 - Position size = risk_usd / stop_distance_usd
 - GLD ~$200 share price; ATR ~$1; stop ~$0.50 → ~200 shares per trade
 

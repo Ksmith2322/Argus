@@ -1,12 +1,8 @@
 {
-  "_comment": "Central fleet sizing. Risk = risk_pct * broker_equity. Anchor is DYNAMIC — pulled from risk_oversight_report.json each trade. Going live means IBKR account switches; broker equity updates automatically, sizing follows.",
+  "_comment": "Central fleet sizing. Risk = risk_pct × broker_equity. Anchor is strictly dynamic from broker truth — no fallback, no ceiling. If broker is unavailable, runners enter READ_ONLY mode and refuse new entries (see BrokerEquityUnavailableError in helio/fleet_sizing.py). When switching paper→live, the same code path reads real broker equity — no config change needed.",
+  "_architecture": "2026-04-23: removed fallback_anchor_usd and max_anchor_usd. Preprod now fully mirrors prod. IBKR paper account must be reset to the intended starting balance in Client Portal; there is no safety net.",
 
   "sizing_mode": "broker_equity_dynamic",
-  "fallback_anchor_usd": 10000.0,
-  "_fallback_note": "Used only when risk_oversight_report.json is missing/stale. Guards against divide-by-zero on cold start.",
-
-  "max_anchor_usd": 10000.0,
-  "_max_anchor_note": "Hard CEILING on broker-reported equity. IBKR paper accounts ship preloaded with ~$1M virtual balance. Without a cap, fleet_anchored_risk_pct sizes 100x the intended $10K-equivalent risk (trade #3 2026-04-20 GLD risked $5K on a 0.5% policy). When you fund real capital and the real account grows, bump this to match.",
 
   "max_risk_pct_per_trade_ceiling": 0.03,
   "fleet_max_open_risk_pct": 0.06,
@@ -22,10 +18,8 @@
   "tier_window_days": 90,
   "drawdown_brake_threshold": 0.5,
 
-  "_strategy_live_cutoffs_note": "ISO-8601 timestamp per strategy. Trades with ts before this are excluded from tier stats (e.g. gdx_gld back-filled historicals). If unset, all trades count.",
-  "strategy_live_cutoffs": {
-    "forge_gdx_gld": "2026-04-17T00:00:00+00:00"
-  },
+  "_strategy_live_cutoffs_note": "ISO-8601 timestamp per strategy. Trades with ts before this are excluded from tier stats. If unset, all trades count.",
+  "strategy_live_cutoffs": {},
 
   "notional_caps_by_asset_class": {
     "stock": 2.0,
@@ -33,7 +27,7 @@
     "fx":    20.0,
     "micro_future": 5.0
   },
-  "_notional_caps_note": "Position notional_usd must be <= anchor * multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK (e.g., $48K GLD on $10K cash account).",
+  "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK.",
 
-  "version": "2026-04-21.v4"
+  "version": "2026-04-23.v5"
 }

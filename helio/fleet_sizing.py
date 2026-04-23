@@ -1,14 +1,15 @@
 """helio/fleet_sizing.py — Central sizing for the whole fleet.
 
-Key changes 2026-04-17.v3:
-  - Anchor is now the **broker account equity** (read from risk_oversight_report
-    or a live broker call). No more hardcoded $10K.
+2026-04-23.v5: fallback + ceiling REMOVED. Preprod mirrors prod.
+  - Anchor = broker account equity, always. No fallback_anchor_usd, no
+    max_anchor_usd clamp. If the broker read fails and the last-known-good
+    cache expires, get_sizing_anchor_usd() raises BrokerEquityUnavailableError
+    and runners enter READ_ONLY (manage open positions, refuse new entries).
   - risk_pct is auto-selected per strategy based on measured live performance
     via `get_effective_risk_pct(strategy_label)`. More trades + better PF = higher tier.
   - Hard ceiling: 3% per trade. Drawdown brake halves the tier when current
     dd > 50% of peak_pnl.
-  - Going live = IBKR account swaps from paper to live, broker equity updates,
-    sizing follows. No code change.
+  - Paper → live transition: no code change; same path reads real broker equity.
 
 The old `get_initial_capital_usd()` is kept as an alias that returns the
 current broker equity, so older callers continue to work without edits.
@@ -31,13 +32,21 @@ _CONFIG_PATH = _REPO / "argus_flow" / "configs" / "fleet_sizing.json"
 _RISK_OVERSIGHT_PATH = _REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
 _PORTFOLIO_RISK_STATE = _REPO / "argus_flow" / "logs" / "_risk" / "portfolio_risk_state.json"
 
-_FALLBACK_ANCHOR = 10000.0
-_FALLBACK_RISK_PCT = 0.005  # unproven-tier default
+_FALLBACK_RISK_PCT = 0.005  # unproven-tier default (not a money fallback — just the baseline tier risk%)
 
 _cached_config: dict[str, Any] | None = None
-_cached_anchor: tuple[float, float] | None = None  # (equity, ts)
+_cached_anchor: tuple[float, float] | None = None  # (equity, ts)  last-known-good from broker
 _anchor_lock = threading.Lock()
-_ANCHOR_CACHE_S = 30  # re-read broker equity at most every 30s
+_ANCHOR_CACHE_S = 30  # re-read broker equity at most every 30s during normal operation
+_STALENESS_CEILING_S = 60  # after a broker outage, keep serving last-known-good only this long before raising
+
+
+class BrokerEquityUnavailableError(RuntimeError):
+    """Broker equity cannot be read and last-known-good cache has expired.
+    Runners catching this should log CRITICAL, enter READ_ONLY mode (manage
+    open positions, refuse new entries), and retry on the next cycle. Never
+    fall back to a hardcoded anchor — paper and prod both go through this
+    same code path."""
 
 
 def _load_config() -> dict[str, Any]:
@@ -47,8 +56,9 @@ def _load_config() -> dict[str, Any]:
     try:
         _cached_config = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        # Minimal in-memory default if config file is missing — tiers/caps only,
+        # NO money defaults. If broker is also unavailable, sizing will raise.
         _cached_config = {
-            "fallback_anchor_usd": _FALLBACK_ANCHOR,
             "max_risk_pct_per_trade_ceiling": 0.03,
             "fleet_max_open_risk_pct": 0.06,
             "tiers": [{"name": "unproven", "min_valid_trades": 0, "min_profit_factor": 0, "risk_pct": _FALLBACK_RISK_PCT}],
@@ -70,9 +80,9 @@ def invalidate_cache() -> None:
 def get_broker_equity_usd() -> float | None:
     """Read current broker equity from risk_oversight_report.json.
 
-    Returns None if the file is missing/stale/malformed — caller should fall
-    back to fallback_anchor_usd.
-    """
+    Returns None if the file is missing/stale/malformed. The caller decides
+    what to do with None (this module's get_sizing_anchor_usd handles it via
+    stale-cache + raise)."""
     try:
         data = json.loads(_RISK_OVERSIGHT_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -85,41 +95,41 @@ def get_broker_equity_usd() -> float | None:
 
 
 def get_sizing_anchor_usd() -> float:
-    """Current anchor capital — broker equity if available, else fallback.
+    """Current anchor capital = broker equity. No fallback, no ceiling.
 
-    Broker equity is clamped to config.max_anchor_usd. Rationale: IBKR paper
-    accounts ship with ~$1M virtual balance, which would make every
-    fleet_anchored_risk_pct trade size 100x the intended risk. The cap keeps
-    paper-mode sizing honest. Bump max_anchor_usd when funding real capital.
+    Behavior contract:
+      - Fresh broker read (>0) → return it, refresh last-known-good cache.
+      - Broker unavailable, but last-known-good cache < STALENESS_CEILING old
+        → return last-known-good (brief TWS disconnect tolerated).
+      - Broker unavailable, cache stale/absent → raise BrokerEquityUnavailableError.
+        Runner catches and enters READ_ONLY mode.
 
     Cached briefly (30s) to avoid repeated disk reads on hot paths. Call
-    `invalidate_cache()` after manually patching state.
-    """
+    `invalidate_cache()` after manually patching state."""
     global _cached_anchor
     import time
     now = time.time()
     with _anchor_lock:
+        # Return fresh cache if recent
         if _cached_anchor is not None and (now - _cached_anchor[1]) < _ANCHOR_CACHE_S:
             return _cached_anchor[0]
-        cfg = _load_config()
         eq = get_broker_equity_usd()
-        if eq is None or eq <= 0:
-            eq = float(cfg.get("fallback_anchor_usd", _FALLBACK_ANCHOR))
-        else:
-            cap = cfg.get("max_anchor_usd")
-            if cap is not None:
-                try:
-                    cap = float(cap)
-                except (TypeError, ValueError):
-                    cap = None
-                if cap is not None and cap > 0 and eq > cap:
-                    _log.warning(
-                        "ANCHOR_CAPPED: broker reported $%.0f; clamped to $%.0f via max_anchor_usd",
-                        eq, cap,
-                    )
-                    eq = cap
-        _cached_anchor = (eq, now)
-        return eq
+        if eq is not None and eq > 0:
+            _cached_anchor = (eq, now)
+            return eq
+        # Broker returned None or non-positive — try last-known-good window
+        if _cached_anchor is not None and (now - _cached_anchor[1]) < _STALENESS_CEILING_S:
+            _log.warning(
+                "BROKER_EQUITY_STALE: broker unavailable; serving last-known-good $%.2f (age=%ds)",
+                _cached_anchor[0], int(now - _cached_anchor[1]),
+            )
+            return _cached_anchor[0]
+        # No fresh read, no usable cache — refuse to size
+        raise BrokerEquityUnavailableError(
+            f"broker equity unavailable and last-known-good cache "
+            f"{'expired' if _cached_anchor else 'absent'}; "
+            f"risk_oversight_report path: {_RISK_OVERSIGHT_PATH}"
+        )
 
 
 # Back-compat alias — old callers continue working unchanged.
@@ -361,13 +371,8 @@ def max_notional_usd(asset_class: str) -> float:
     return get_sizing_anchor_usd() * mult
 
 
-def _aligned_env() -> None:
-    """Keep Argus's ARGUS_DEFAULT_ACCOUNT_EQUITY_USD env var synced if unset.
-    Argus now reads the anchor dynamically for paper stage, but this env
-    alignment is a safety net for any path that reads it at module load.
-    """
-    if "ARGUS_DEFAULT_ACCOUNT_EQUITY_USD" not in os.environ:
-        os.environ["ARGUS_DEFAULT_ACCOUNT_EQUITY_USD"] = str(get_sizing_anchor_usd())
-
-
-_aligned_env()
+# _aligned_env() removed 2026-04-23: ARGUS_DEFAULT_ACCOUNT_EQUITY_USD env var
+# was a back-compat safety net for code paths that read equity at module load.
+# Now all sizing flows through get_sizing_anchor_usd() which is broker-truth
+# only. If any residual code reads the env var, it's either dead or needs
+# refactor — not something we want to silently backstop.

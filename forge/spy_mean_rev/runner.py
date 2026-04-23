@@ -50,7 +50,7 @@ SIGNALS_PATH = LOG_DIR / "signals.csv"
 HEARTBEAT_PATH = LOG_DIR / "heartbeat.json"
 
 PARAMS = {
-    "version": "v1",
+    "version": "v2",  # v2 2026-04-23: added trend filter (trend_ema_period)
     "ticker": "SPY",
     "timeframe": "5m",
     "session_start_utc": 14,   # 14:30 UTC = NY open
@@ -65,6 +65,13 @@ PARAMS = {
     "stop_atr_mult": 0.6,      # slightly wider stop than target (mean-rev is tight)
     "risk_pct_default": 0.003, # smaller per-trade risk for high cadence
     "point_value_usd": 1.0,    # shares: 1 share = $price
+    # Trend filter 2026-04-23: standard Connors/Alvarez RSI(2) pattern.
+    # On a trending day, mean-rev keeps buying the dip which keeps dipping
+    # (whipsaw loss cascade). Only take LONG when price > trend_ema (uptrend),
+    # only SHORT when price < trend_ema (downtrend). For 5m bars, 50-period
+    # EMA = 250 min ≈ 4 hrs — captures intraday regime without being too slow.
+    "trend_ema_period": 50,
+    "trend_filter_enabled": True,
 }
 
 TRADE_FIELDS = [
@@ -176,10 +183,28 @@ def signal_check(df: pd.DataFrame) -> tuple[str, dict]:
     if a / close < PARAMS["min_atr_pct"]:
         return "none", {"reason": "atr_too_small", "atr_pct": a / close}
 
+    # Trend filter (added 2026-04-23 v2). Only allow direction when aligned
+    # with intraday trend. Ignored if there isn't enough history to compute
+    # the EMA (first ~trend_ema_period bars of the day).
+    trend_bias = "neutral"
+    if PARAMS.get("trend_filter_enabled", False):
+        period = PARAMS.get("trend_ema_period", 50)
+        if len(df) >= period:
+            trend_ema = df["Close"].ewm(span=period, adjust=False).mean()
+            ema_now = float(trend_ema.iloc[last_idx])
+            if close > ema_now:
+                trend_bias = "up"
+            elif close < ema_now:
+                trend_bias = "down"
+
     if r < PARAMS["rsi_long_threshold"]:
-        return "long", {"entry": close, "atr": a, "rsi": r}
+        if trend_bias == "down":  # counter-trend long blocked
+            return "none", {"reason": "trend_filter_block_long", "rsi": r, "trend_bias": trend_bias}
+        return "long", {"entry": close, "atr": a, "rsi": r, "trend_bias": trend_bias}
     if r > PARAMS["rsi_short_threshold"]:
-        return "short", {"entry": close, "atr": a, "rsi": r}
+        if trend_bias == "up":  # counter-trend short blocked
+            return "none", {"reason": "trend_filter_block_short", "rsi": r, "trend_bias": trend_bias}
+        return "short", {"entry": close, "atr": a, "rsi": r, "trend_bias": trend_bias}
     return "none", {"reason": f"rsi_neutral_{r:.1f}", "rsi": r}
 
 

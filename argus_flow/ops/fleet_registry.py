@@ -40,28 +40,30 @@ STAGE_ORDER = {
     STAGE_QUARANTINE: 3,
     STAGE_KILLED: 4,
 }
-try:
-    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
-    _MODEL_EQUITY = _fleet_anchor()
-except Exception:
-    _MODEL_EQUITY = 10000.0
+# _MODEL_EQUITY was a module-load-time snapshot that fell back to 10000 if
+# broker was cold. Removed 2026-04-23 — fleet anchor must be resolved live
+# at the point of use so config reloads pick up the current broker equity,
+# not a stale import-time value. See _resolve_model_start_equity below.
 RISK_POLICY_DEFAULTS = {
-    "model_start_equity_usd": _MODEL_EQUITY,
+    "model_start_equity_usd": "fleet_anchor",  # sentinel — resolves live
     "base_risk_pct": 0.005,
     "earned_cap_pct": 0.03,
     "manual_step_up_required": False,
 }
 
 
-def _resolve_model_start_equity(raw_value) -> float:
-    """Resolve model equity, including the fleet-anchor sentinel.
+def _resolve_model_start_equity(raw_value) -> float | str:
+    """Resolve model equity. Returns the string "fleet_anchor" verbatim for
+    the sentinel case, so downstream (_get_account_equity in runner_unified)
+    can do a LIVE broker read per-trade. Previously baked the broker equity
+    at module-import time, which went stale after paper resets.
 
-    Active paper configs use the string "fleet_anchor" so changing
-    fleet_sizing.json moves Argus sizing without editing every config.
-    """
+    Numeric raw_value is returned as a float (test/override path)."""
     if isinstance(raw_value, str) and raw_value.strip().lower() == "fleet_anchor":
-        return float(RISK_POLICY_DEFAULTS["model_start_equity_usd"])
-    return float(raw_value or RISK_POLICY_DEFAULTS["model_start_equity_usd"])
+        return "fleet_anchor"  # preserved as sentinel — runner resolves live
+    if raw_value is None or raw_value == "" or raw_value == 0:
+        return "fleet_anchor"  # default to live broker rather than hardcoded number
+    return float(raw_value)
 
 # Legacy active fleet. Future additions can opt in by adding:
 #   "deployment": {"managed": true, "stage": "watcher"}

@@ -27,63 +27,80 @@ class TestSizingAnchor(unittest.TestCase):
         fs.invalidate_cache()
 
     def test_anchor_uses_broker_equity_when_available(self):
+        """Happy path: broker reports equity → anchor is that value, no clamp."""
         with tempfile.TemporaryDirectory() as tmp:
             ro_path = Path(tmp) / "risk_oversight_report.json"
             ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 50_000}}))
-            cfg_path = Path(tmp) / "fleet_sizing.json"
-            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000}))
-            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
-                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
                 fs.invalidate_cache()
                 anchor = fs.get_sizing_anchor_usd()
             self.assertAlmostEqual(anchor, 50_000, places=2)
 
-    def test_anchor_caps_broker_equity_at_max_anchor_usd(self):
-        """Regression guard: IBKR paper accounts ship with $1M virtual balance.
-        Without the cap, every fleet_anchored_risk_pct trade sizes 100x the
-        intended $10K-equivalent risk. See trade #3 forge_gld_pm_long 2026-04-20."""
+    def test_anchor_returns_high_broker_equity_unclamped(self):
+        """2026-04-23 architecture: no max_anchor_usd clamp. Whatever broker
+        reports, we use. If paper account is $1M, we size against $1M. The
+        solution is setting the paper balance correctly, not a code-side cap."""
         with tempfile.TemporaryDirectory() as tmp:
             ro_path = Path(tmp) / "risk_oversight_report.json"
             ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 1_000_000}}))
-            cfg_path = Path(tmp) / "fleet_sizing.json"
-            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000, "max_anchor_usd": 10_000}))
-            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
-                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
                 fs.invalidate_cache()
                 anchor = fs.get_sizing_anchor_usd()
-            self.assertAlmostEqual(anchor, 10_000, places=2)
+            self.assertAlmostEqual(anchor, 1_000_000, places=2)
 
-    def test_anchor_below_cap_passes_through(self):
-        """Broker equity below max_anchor_usd should not be clamped."""
-        with tempfile.TemporaryDirectory() as tmp:
-            ro_path = Path(tmp) / "risk_oversight_report.json"
-            ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 7_500}}))
-            cfg_path = Path(tmp) / "fleet_sizing.json"
-            cfg_path.write_text(json.dumps({"fallback_anchor_usd": 10_000, "max_anchor_usd": 10_000}))
-            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path), \
-                 mock.patch.object(fs, "_CONFIG_PATH", cfg_path):
-                fs.invalidate_cache()
-                anchor = fs.get_sizing_anchor_usd()
-            self.assertAlmostEqual(anchor, 7_500, places=2)
-
-    def test_anchor_falls_back_when_broker_missing(self):
+    def test_raises_when_broker_missing_and_no_cache(self):
+        """No fallback: missing broker report + cold cache → raise, not default."""
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "does_not_exist.json"
             with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", missing):
                 fs.invalidate_cache()
-                anchor = fs.get_sizing_anchor_usd()
-            # Falls back to fallback_anchor_usd from fleet_sizing.json ($10K default)
-            self.assertGreater(anchor, 0)
+                with self.assertRaises(fs.BrokerEquityUnavailableError):
+                    fs.get_sizing_anchor_usd()
 
-    def test_anchor_falls_back_on_zero_equity(self):
-        """Catastrophe guard: broker reports 0 or negative → fallback."""
+    def test_raises_when_broker_zero_and_no_cache(self):
+        """Broker reports 0 (disconnected state) + cold cache → raise, not fallback."""
         with tempfile.TemporaryDirectory() as tmp:
             ro_path = Path(tmp) / "risk_oversight_report.json"
             ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 0}}))
             with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
                 fs.invalidate_cache()
-                anchor = fs.get_sizing_anchor_usd()
-            self.assertGreater(anchor, 0)  # must NOT be 0
+                with self.assertRaises(fs.BrokerEquityUnavailableError):
+                    fs.get_sizing_anchor_usd()
+
+    def test_serves_last_known_good_during_brief_outage(self):
+        """Broker briefly unavailable after a good read → serve stale cache
+        until STALENESS_CEILING_S expires (tolerates TWS hiccups without
+        killing sizing)."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = Path(tmp) / "risk_oversight_report.json"
+            ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 12_000}}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
+                fs.invalidate_cache()
+                first = fs.get_sizing_anchor_usd()  # fresh read → cached
+                self.assertAlmostEqual(first, 12_000, places=2)
+                # Simulate broker going dark — delete report
+                ro_path.unlink()
+                # Force past 30s read-cache but still within staleness window
+                fs._cached_anchor = (first, time.time() - 35)
+                stale = fs.get_sizing_anchor_usd()
+                self.assertAlmostEqual(stale, 12_000, places=2)
+
+    def test_stale_cache_expires_then_raises(self):
+        """After STALENESS_CEILING_S elapses with no fresh read → raise, stop
+        serving stale data."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = Path(tmp) / "risk_oversight_report.json"
+            ro_path.write_text(json.dumps({"broker_truth": {"account_equity_usd": 12_000}}))
+            with mock.patch.object(fs, "_RISK_OVERSIGHT_PATH", ro_path):
+                fs.invalidate_cache()
+                fs.get_sizing_anchor_usd()  # prime cache
+                ro_path.unlink()  # broker goes dark
+                # Force cache older than staleness ceiling
+                fs._cached_anchor = (12_000.0, time.time() - (fs._STALENESS_CEILING_S + 10))
+                with self.assertRaises(fs.BrokerEquityUnavailableError):
+                    fs.get_sizing_anchor_usd()
 
     def test_anchor_cache_rereads_after_invalidate(self):
         """Cache must re-read on invalidate_cache()."""

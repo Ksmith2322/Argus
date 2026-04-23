@@ -24,7 +24,7 @@ At 19:00 UTC top-of-hour (≈ 3pm NY), enter SHORT both USDJPY and CADJPY if:
 - Order: stop first, then target
 
 ## Position sizing
-- Risk per trade: 1.0% of model equity ($10,000 per pair = $20K total notional)
+- Risk per trade: 1.0% of live broker equity per pair (dynamic — pulled via `helio.fleet_sizing.get_sizing_anchor_usd()` at eval time; fleet-level cap is `fleet_max_open_risk_pct` in `argus_flow/configs/fleet_sizing.json`)
 - FX 100K lot, ~$10/pip per 100K
 - Pos = risk_usd / (stop_pips * pip_value/100K)
 

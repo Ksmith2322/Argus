@@ -26,8 +26,8 @@ At top of hours 20:00, 21:00, 22:00, 23:00 UTC OR 00:00 UTC enter LONG NQ if:
 - **Order of evaluation per bar:** stop first, then target
 
 ## Position sizing
-- Risk per trade: 1.0% of model equity ($10,000)
-- NQ contract: $20 per point. Use micro NQ (MNQ) at $2 per point for $10K equity.
+- Risk per trade: 1.0% of live broker equity (dynamic — pulled via `helio.fleet_sizing.get_sizing_anchor_usd()` at eval time; no hardcoded default)
+- NQ contract: $20 per point. Use micro NQ (MNQ) at $2 per point for sub-$25K equity accounts.
 
 ## Cadence
 - 5 candidate hours × ~252 weekdays = ~1,260 candidate signals/year

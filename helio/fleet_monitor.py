@@ -147,12 +147,11 @@ SYSTEMS = {
         "restart_args": ["-m", "forge.rebalance_runner", "--loop"],
     },
     "forge_wick_gbpusd": {
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.wick_gbpusd.runner",  # short-lived; rarely alive
-        "artifact_glob": str(REPO / "forge" / "logs" / "wick_gbpusd" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h — daily run via run_cohort_report.ps1
-        "no_restart": True,  # scheduled externally
+        "heartbeats": [REPO / "forge" / "logs" / "wick_gbpusd" / "heartbeat.json"],
+        "stale_threshold_s": 7200,  # 2h — now runs hourly via --loop mode
+        "process_match": "forge.wick_gbpusd.runner",
+        "restart_args": ["-m", "forge.wick_gbpusd.runner", "--loop"],
+        "_status_note": "Fixed 2026-04-23: added --loop mode + phantom-close bug fix (entry_ts vs entry_idx)",
     },
     "forge_gld_pm_long": {
         "heartbeats": [],
@@ -208,6 +207,18 @@ SYSTEMS = {
         "process_match": "forge.aud_asian_breakout.runner",
         "restart_args": ["-m", "forge.aud_asian_breakout.runner", "--loop"],
     },
+    "forge_fomc_drift": {
+        "heartbeats": [REPO / "forge" / "logs" / "fomc_drift" / "heartbeat.json"],
+        "stale_threshold_s": 7200,  # 2h — daemon writes every 1h cycle
+        "process_match": "forge.fomc_drift.runner",
+        "restart_args": ["-m", "forge.fomc_drift.runner", "--loop"],
+    },
+    "forge_tom_international": {
+        "heartbeats": [REPO / "forge" / "logs" / "tom_international" / "heartbeat.json"],
+        "stale_threshold_s": 7200,  # 2h — daemon writes every 1h cycle
+        "process_match": "forge.tom_international.runner",
+        "restart_args": ["-m", "forge.tom_international.runner", "--loop"],
+    },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only
         "stale_threshold_s": 0,
@@ -222,8 +233,12 @@ SYSTEMS = {
         "stale_threshold_s": 0,
         "process_match": "ares.runner",
         "artifact_glob": str(REPO / "ares" / "logs" / "signal_*.json"),
-        "artifact_max_age_s": 93600,  # 26h — daily run + buffer
-        "no_restart": True,  # scheduled externally, don't auto-restart
+        # 2026-04-23: ares is MONTHLY sector rotation (evaluates at month-end).
+        # Previous 26h threshold dashboard-DOWN-flagged it every single day.
+        # 35-day max so it only goes red if a month-end rotation genuinely fails.
+        "artifact_max_age_s": 3024000,  # 35 days (monthly + buffer)
+        "no_restart": True,
+        "_status_note": "monthly sector rotation; DOWN between month-ends is by design",
     },
     # oracle (Polymarket) paused 2026-04-19 — geoblocked for US users, no
     # execution path. Re-add this entry + uncomment the block in

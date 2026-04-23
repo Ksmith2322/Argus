@@ -3401,6 +3401,257 @@ async def api_fleet_health():
     return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180))
 
 
+@app.get("/api/exit_reasons")
+async def api_exit_reasons():
+    """Aggregate exit-reason distribution per strategy post-reset cutoff.
+    Surfaces whether a strategy is mostly stop-hitting vs target-hitting vs
+    time-stopping. Uses the same per-strategy CSV list as operational_maturity."""
+    cutoff = datetime(2026, 4, 23, 14, 0, tzinfo=timezone.utc)  # post-reset
+    specs = [
+        ("argus_usdjpy",            "argus_flow/logs/usdjpy/trades.csv",             "ts",        True),
+        ("argus_gbpusd",            "argus_flow/logs/gbpusd/trades.csv",             "ts",        True),
+        ("argus_cadjpy",            "argus_flow/logs/cadjpy/trades.csv",             "ts",        True),
+        ("forge_gdx_gld",           "forge/logs/gdx_gld/trades.csv",                 "exit_date", False),
+        ("forge_gld_pm_long",       "forge/logs/gld_pm_long/trades.csv",             "ts",        False),
+        ("forge_jpy_pm_short",      "forge/logs/jpy_pm_short/trades.csv",            "ts",        False),
+        ("forge_nq_overnight",      "forge/logs/nq_overnight/trades.csv",            "ts",        False),
+        ("forge_spy_mean_rev",      "forge/logs/spy_mean_rev/trades.csv",            "ts",        False),
+        ("forge_multi_orb",         "forge/logs/multi_orb/trades.csv",               "ts",        False),
+        ("forge_vix_intraday",      "forge/logs/vix_intraday/trades.csv",            "ts",        False),
+        ("forge_wick_gbpusd",       "forge/logs/wick_gbpusd/trades.csv",             "ts",        False),
+    ]
+    per_strategy: dict[str, dict] = {}
+    for label, path_rel, ts_col, valid_filter in specs:
+        p = REPO / path_rel
+        if not p.exists():
+            continue
+        counts: dict[str, int] = {}
+        total = 0
+        try:
+            with p.open(encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if valid_filter and str(r.get("experiment_valid", "")).lower() != "true":
+                        continue
+                    ts_raw = r.get(ts_col) or r.get("entry_ts") or r.get("entry_date") or ""
+                    ts = _parse_report_ts(ts_raw)
+                    if ts is None or ts < cutoff:
+                        continue
+                    reason = str(r.get("exit_reason", "unknown")).strip().lower() or "unknown"
+                    counts[reason] = counts.get(reason, 0) + 1
+                    total += 1
+        except Exception:
+            continue
+        if total == 0:
+            continue
+        per_strategy[label] = {
+            "total": total,
+            "by_reason": counts,
+            "pct_by_reason": {k: round(v / total * 100, 1) for k, v in counts.items()},
+        }
+    return JSONResponse({
+        "post_reset_cutoff": cutoff.isoformat(),
+        "strategies": per_strategy,
+    })
+
+
+@app.get("/api/promotion_ladder")
+async def api_promotion_ladder():
+    """Per-strategy distance to next tier. Uses the fleet_sizing.json tier
+    schedule + operational_maturity_latest.json (live trade count + PF)."""
+    tiers = [
+        {"name": "unproven",    "min_valid_trades": 0,   "min_profit_factor": 0.0,  "risk_pct": 0.005},
+        {"name": "emerging",    "min_valid_trades": 10,  "min_profit_factor": 1.00, "risk_pct": 0.010},
+        {"name": "validated",   "min_valid_trades": 30,  "min_profit_factor": 1.20, "risk_pct": 0.015},
+        {"name": "promoted",    "min_valid_trades": 60,  "min_profit_factor": 1.30, "risk_pct": 0.020},
+        {"name": "exceptional", "min_valid_trades": 100, "min_profit_factor": 1.50, "risk_pct": 0.030},
+    ]
+    mat_path = REPO / "argus_flow" / "logs" / "operational_maturity_latest.json"
+    strategies: list[dict] = []
+    try:
+        mat = json.loads(mat_path.read_text(encoding="utf-8"))
+    except Exception:
+        return JSONResponse({"error": "operational_maturity_latest.json unavailable", "strategies": []})
+    for s in mat.get("strategies", []):
+        n = s.get("live_trades") or 0
+        pf = s.get("live_pf") if s.get("live_pf") not in (None, float("inf")) else None
+        # Current tier = highest tier whose thresholds are met
+        current = tiers[0]
+        for t in tiers:
+            if n >= t["min_valid_trades"] and (pf or 0) >= t["min_profit_factor"]:
+                current = t
+        # Next tier
+        try:
+            next_idx = tiers.index(current) + 1
+            next_tier = tiers[next_idx] if next_idx < len(tiers) else None
+        except Exception:
+            next_tier = None
+        if next_tier:
+            trades_needed = max(0, next_tier["min_valid_trades"] - n)
+            pf_gap = None if pf is None else round(next_tier["min_profit_factor"] - pf, 2)
+            # Progress = min of (trade-count progress, PF progress) — both must reach
+            # 100% for promotion, so the smaller gap is the real blocker. If live_pf
+            # isn't available yet (pf is None), show trade-count-only progress.
+            if next_tier["min_valid_trades"] > 0:
+                trade_progress = min(100.0, n / next_tier["min_valid_trades"] * 100.0)
+            else:
+                trade_progress = 100.0
+            min_pf = next_tier["min_profit_factor"]
+            if pf is None:
+                pf_progress = None
+            elif min_pf > 0:
+                pf_progress = max(0.0, min(100.0, pf / min_pf * 100.0))
+            else:
+                pf_progress = 100.0
+            if pf_progress is None:
+                progress_pct = round(trade_progress, 1)
+            else:
+                progress_pct = round(min(trade_progress, pf_progress), 1)
+        else:
+            trades_needed = 0
+            pf_gap = None
+            trade_progress = 100.0
+            pf_progress = 100.0
+            progress_pct = 100.0
+        strategies.append({
+            "strategy": s.get("strategy"),
+            "verdict": s.get("verdict"),
+            "live_trades": n,
+            "live_pf": pf,
+            "backtest_pf": s.get("backtest_pf"),
+            "current_tier": current["name"],
+            "current_risk_pct": current["risk_pct"],
+            "next_tier": next_tier["name"] if next_tier else None,
+            "next_tier_risk_pct": next_tier["risk_pct"] if next_tier else None,
+            "trades_needed": trades_needed,
+            "pf_gap": pf_gap,
+            "progress_pct": progress_pct,
+            "trade_progress_pct": round(trade_progress, 1),
+            "pf_progress_pct": None if pf_progress is None else round(pf_progress, 1),
+        })
+    # Sort by progress (nearest to promotion first)
+    strategies.sort(key=lambda x: (-x["progress_pct"], x["strategy"]))
+    return JSONResponse({"strategies": strategies})
+
+
+@app.get("/api/positions_open")
+async def api_positions_open():
+    """Scan all strategy heartbeat.json files for open_trade. Returns
+    flat list of current open positions across the entire fleet + aggregate
+    risk numbers. Reads are fast (cheap JSON) so no caching."""
+    positions: list[dict] = []
+    hb_roots = [
+        REPO / "argus_flow" / "logs",
+        REPO / "forge" / "logs",
+        REPO / "apollo" / "logs",
+        REPO / "hermes" / "logs",
+        REPO / "titan" / "logs",
+    ]
+    for root in hb_roots:
+        if not root.exists():
+            continue
+        # argus_flow has per-symbol subdirs; forge has per-strategy subdirs; others are flat
+        candidates = list(root.glob("*/heartbeat.json")) + list(root.glob("heartbeat.json"))
+        for hb_path in candidates:
+            try:
+                hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            open_trade = hb.get("open_trade")
+            open_trades = hb.get("open_trades")  # some strategies use plural
+            system = hb.get("system") or hb_path.parent.name
+            if open_trade and isinstance(open_trade, dict):
+                positions.append({
+                    "strategy": system,
+                    "entry_ts": open_trade.get("entry_ts") or open_trade.get("signal_ts") or "",
+                    "entry_px": open_trade.get("entry_px"),
+                    "direction": open_trade.get("direction") or open_trade.get("side") or "long",
+                    "size": open_trade.get("position_size") or open_trade.get("size"),
+                    "risk_usd": open_trade.get("risk_usd"),
+                    "target_px": open_trade.get("target_px"),
+                    "stop_px": open_trade.get("stop_px"),
+                    "session_id": open_trade.get("session_id", ""),
+                })
+            if open_trades and isinstance(open_trades, dict):
+                for key, t in open_trades.items():
+                    positions.append({
+                        "strategy": system,
+                        "instrument": key,
+                        "entry_ts": t.get("entry_ts") or "",
+                        "entry_px": t.get("entry_px"),
+                        "direction": t.get("direction") or "long",
+                        "size": t.get("position_size") or t.get("size"),
+                        "risk_usd": t.get("risk_usd"),
+                        "target_px": t.get("target_px"),
+                        "stop_px": t.get("stop_px"),
+                    })
+
+    # Aggregate risk
+    total_risk = sum(float(p.get("risk_usd") or 0) for p in positions)
+    try:
+        from helio.fleet_sizing import get_sizing_anchor_usd
+        anchor = float(get_sizing_anchor_usd())
+    except Exception:
+        anchor = 0
+    pct_of_anchor = (total_risk / anchor * 100.0) if anchor > 0 else 0
+    # Fleet budget: 6% cap from fleet_sizing.json
+    fleet_budget_pct = 6.0
+    fleet_budget_usd = anchor * fleet_budget_pct / 100.0
+
+    return JSONResponse({
+        "positions": positions,
+        "count": len(positions),
+        "total_risk_usd": round(total_risk, 2),
+        "anchor_usd": round(anchor, 2),
+        "pct_of_anchor": round(pct_of_anchor, 3),
+        "fleet_budget_pct": fleet_budget_pct,
+        "fleet_budget_usd": round(fleet_budget_usd, 2),
+        "pct_of_budget_used": round(total_risk / fleet_budget_usd * 100.0, 1) if fleet_budget_usd > 0 else 0,
+    })
+
+
+@app.get("/api/operational_maturity")
+async def api_operational_maturity():
+    """Per-strategy maturity verdict — from argus_flow/logs/operational_maturity_latest.json
+    (refreshed daily at 05:00 UTC by managed_truth_loop)."""
+    p = REPO / "argus_flow" / "logs" / "operational_maturity_latest.json"
+    if not p.exists():
+        return JSONResponse({"error": "operational_maturity_latest.json not yet written"})
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+    return JSONResponse({
+        "generated_at": data.get("generated_at"),
+        "post_clamp_cutoff": data.get("post_clamp_cutoff"),
+        "totals": data.get("totals", {}),
+        "strategies": data.get("strategies", []),
+    })
+
+
+@app.get("/api/silent_block_alerts")
+async def api_silent_block_alerts():
+    """Silent-block detector results — from argus_flow/logs/silent_block_alerts.json
+    (refreshed every 3 min by managed_truth_loop daemon)."""
+    p = REPO / "argus_flow" / "logs" / "silent_block_alerts.json"
+    if not p.exists():
+        return JSONResponse({"error": "silent_block_alerts.json not yet written", "flagged": [], "ok_count": 0})
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse({"error": str(e), "flagged": [], "ok_count": 0})
+    flagged = [r for r in data.get("results", []) if r.get("status") == "SILENT_BLOCK"]
+    ok_count = sum(1 for r in data.get("results", []) if r.get("status") == "OK")
+    out_of_session = sum(1 for r in data.get("results", []) if r.get("status") == "OUT_OF_SESSION")
+    return JSONResponse({
+        "checked_at": data.get("checked_at"),
+        "flagged_count": len(flagged),
+        "ok_count": ok_count,
+        "out_of_session_count": out_of_session,
+        "total_checked": data.get("strategies_checked", 0),
+        "flagged": flagged,
+    })
+
+
 @app.get("/api/fleet_perf")
 async def api_fleet_perf():
     """Canonical fleet performance — from argus_flow/logs/fleet_perf_summary.json
@@ -3531,14 +3782,29 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
     reference fleet_sizing.json manually.
     """
     specs = [
-        ("argus_usdjpy",       "argus_flow/logs/usdjpy/trades.csv",  "USDJPY",  "IBKR", "ts",        True),
-        ("argus_gbpusd",       "argus_flow/logs/gbpusd/trades.csv",  "GBPUSD",  "IBKR", "ts",        True),
-        ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",  "CADJPY",  "IBKR", "ts",        True),
-        ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",  "GLD",     "IBKR", "ts",        False),
-        ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",  "GBPUSD",  "IBKR", "ts",        False),
-        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv", "MNQ",     "IBKR", "ts",        False),
-        ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv", "USD/CAD-JPY", "IBKR", "ts",    False),
-        ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",      "GDX/GLD", "IBKR", "exit_date", False),
+        ("argus_usdjpy",            "argus_flow/logs/usdjpy/trades.csv",             "USDJPY",  "IBKR", "ts",        True),
+        ("argus_gbpusd",            "argus_flow/logs/gbpusd/trades.csv",             "GBPUSD",  "IBKR", "ts",        True),
+        ("argus_cadjpy",            "argus_flow/logs/cadjpy/trades.csv",             "CADJPY",  "IBKR", "ts",        True),
+        ("forge_gld_pm_long",       "forge/logs/gld_pm_long/trades.csv",             "GLD",     "IBKR", "ts",        False),
+        ("forge_wick_gbpusd",       "forge/logs/wick_gbpusd/trades.csv",             "GBPUSD",  "IBKR", "ts",        False),
+        ("forge_nq_overnight",      "forge/logs/nq_overnight/trades.csv",            "MNQ",     "IBKR", "ts",        False),
+        ("forge_jpy_pm_short",      "forge/logs/jpy_pm_short/trades.csv",            "USD/CAD-JPY", "IBKR", "ts",    False),
+        ("forge_gdx_gld",           "forge/logs/gdx_gld/trades.csv",                 "GDX/GLD", "IBKR", "exit_date", False),
+        ("forge_spy_mean_rev",      "forge/logs/spy_mean_rev/trades.csv",            "SPY",     "IBKR", "ts",        False),
+        ("forge_multi_orb",         "forge/logs/multi_orb/trades.csv",               "SPY/QQQ/IWM/GLD", "IBKR", "ts", False),
+        ("forge_vix_intraday",      "forge/logs/vix_intraday/trades.csv",            "UVXY",    "IBKR", "ts",        False),
+        ("forge_nq_london_close",   "forge/logs/nq_london_close/trades.csv",         "NQ",      "IBKR", "ts",        False),
+        ("forge_aud_asian_breakout","forge/logs/aud_asian_breakout/trades.csv",      "AUDUSD",  "IBKR", "ts",        False),
+        ("forge_mamba",             "forge/logs/mamba/trades.csv",                   "NQ/YM",   "IBKR", "ts",        False),
+        ("forge_tori",              "forge/logs/tori/trades.csv",                    "PL/CL/GC/YM", "IBKR", "ts",    False),
+        ("forge_cuebanks",          "forge/logs/cuebanks/trades.csv",                "YM",      "IBKR", "ts",        False),
+        ("forge_vix_revert",        "forge/logs/vix_revert/trades.csv",              "SPY",     "IBKR", "ts",        False),
+        ("forge_rebalance",         "forge/logs/rebalance/trades.csv",               "S&P500",  "IBKR", "ts",        False),
+        ("forge_fomc_drift",        "forge/logs/fomc_drift/trades.csv",              "SPY",     "IBKR", "entry_ts",  False),
+        ("forge_tom_international", "forge/logs/tom_international/trades.csv",       "EEM/EWJ/VGK", "IBKR", "entry_ts", False),
+        ("apollo",                  "apollo/logs/trades.csv",                        "equity",  "IBKR", "ts",        False),
+        ("hermes",                  "hermes/logs/trades.csv",                        "equity",  "IBKR", "ts",        False),
+        ("titan",                   "titan/logs/trades.csv",                         "equity",  "IBKR", "ts",        False),
     ]
     cutoff = None
     if window_days and window_days > 0:
@@ -3596,21 +3862,30 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
                         except (TypeError, ValueError): return 0.0
                     notional_usd = None
                     sym_upper = str(r.get("symbol") or symbol_default).upper().replace("/", "")
+
+                    # FX strategies — size is in base-currency units
+                    FX_LABELS = ("argus_usdjpy", "argus_gbpusd", "argus_cadjpy",
+                                 "forge_wick_gbpusd", "forge_jpy_pm_short",
+                                 "forge_aud_asian_breakout")
                     if label == "forge_gdx_gld":
                         notional_usd = (_safe_f(r.get("gdx_shares")) * _safe_f(r.get("gdx_entry"))
                                         + _safe_f(r.get("gld_shares")) * _safe_f(r.get("gld_entry")))
-                    elif label.startswith("argus_") or label in ("forge_wick_gbpusd", "forge_jpy_pm_short"):
+                    elif label in FX_LABELS or label.startswith("argus_"):
                         sz = _safe_f(size)
                         ep = _safe_f(r.get("entry_px"))
                         if sym_upper.startswith("USD"):        # USDJPY, USDCAD etc — base = USD
                             notional_usd = sz
-                        elif sym_upper.endswith("USD"):        # GBPUSD, EURUSD — entry IS USD/base
+                        elif sym_upper.endswith("USD"):        # GBPUSD, EURUSD, AUDUSD — entry IS USD/base
                             notional_usd = sz * ep
                         elif sym_upper.endswith("JPY"):        # cross-JPY — rough 1:1 USD approx
                             notional_usd = sz   # approximation; actual depends on base-to-USD rate
                         else:
                             notional_usd = sz * ep if ep > 0 else sz
-                    elif label in ("forge_gld_pm_long", "forge_nq_overnight"):
+                    else:
+                        # Default: equity-style (shares × entry_px). Covers spy_mean_rev,
+                        # multi_orb, vix_intraday, nq_london_close, gld_pm_long, nq_overnight,
+                        # mamba, tori, cuebanks, vix_revert, rebalance, fomc_drift,
+                        # tom_international, apollo, hermes, titan.
                         notional_usd = _safe_f(size) * _safe_f(r.get("entry_px"))
                     notional_usd = round(notional_usd, 2) if notional_usd else None
 
@@ -3720,6 +3995,8 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
         ("apollo",                  "apollo/logs/trades.csv",                        "ts",        "pnl_usd", False),
         ("hermes",                  "hermes/logs/trades.csv",                        "ts",        "pnl_usd", False),
         ("titan",                   "titan/logs/trades.csv",                         "ts",        "pnl_usd", False),
+        ("forge_fomc_drift",        "forge/logs/fomc_drift/trades.csv",              "entry_ts",  "pnl_usd", False),
+        ("forge_tom_international", "forge/logs/tom_international/trades.csv",       "entry_ts",  "pnl_usd", False),
     ]
     cutoff = None
     if window_days and window_days > 0:
@@ -3825,8 +4102,11 @@ async def api_gateway_status():
     ) and any(p.get("present") for p in out["per_pair"].values())
     out["pause_entries_present"] = (REPO / "PAUSE_ENTRIES").exists()
     try:
-        ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+        ro_path = REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
+        ro = json.loads(ro_path.read_text())
         out["broker_equity_usd"] = ro.get("broker_truth", {}).get("account_equity_usd")
+        # Freshness — powers the stale-data dashboard banner
+        out["risk_oversight_age_s"] = int(time.time() - ro_path.stat().st_mtime)
     except Exception:
         pass
     return JSONResponse(out)
@@ -5735,6 +6015,275 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- Gateway/broker status banner — one-line top-of-page pulse -->
 <div id="gateway-status-banner" style="margin-bottom:10px;"></div>
+<div id="stale-data-banner" style="margin-bottom:10px;"></div>
+<div id="silent-block-banner" style="margin-bottom:10px;"></div>
+<div id="maturity-summary-banner" style="margin-bottom:10px;"></div>
+<div id="risk-exposure-banner" style="margin-bottom:10px;"></div>
+<div id="open-positions-panel" style="margin-bottom:10px;"></div>
+<div id="promotion-ladder-panel" style="margin-bottom:10px;"></div>
+<div id="exit-reasons-panel" style="margin-bottom:10px;"></div>
+<script>
+// ─── OPEN POSITIONS + RISK EXPOSURE ───────────────────────────────
+function loadPositionsAndRisk() {
+  fetch('/api/positions_open').then(r=>r.json()).then(data=>{
+    // Risk banner
+    const rb = document.getElementById('risk-exposure-banner');
+    if (rb) {
+      const usedPct = data.pct_of_budget_used || 0;
+      const bg = usedPct >= 80 ? '#2a0f0f' : usedPct >= 50 ? '#2a2010' : '#0d1321';
+      const border = usedPct >= 80 ? '#ff4444' : usedPct >= 50 ? '#ffaa00' : '#1e2a42';
+      const color = usedPct >= 80 ? '#ff4444' : usedPct >= 50 ? '#ffaa00' : '#00d4ff';
+      rb.innerHTML = '<div style="background:' + bg + ';border:1px solid ' + border + ';border-radius:4px;padding:8px 12px;font-size:0.72em;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">'
+        + '<div><span style="color:' + color + ';font-weight:bold;letter-spacing:2px;">RISK EXPOSURE</span>'
+        + ' <span style="color:#7b8ab8;">' + data.count + ' open positions</span></div>'
+        + '<div style="color:#9da8c7;">'
+        + 'Open risk: <span style="color:#e0e0e0;font-weight:bold;">$' + (data.total_risk_usd||0).toFixed(2) + '</span>'
+        + ' / $' + (data.fleet_budget_usd||0).toFixed(0) + ' budget'
+        + ' · <span style="color:' + color + ';font-weight:bold;">' + usedPct.toFixed(1) + '% used</span>'
+        + ' · anchor $' + (data.anchor_usd||0).toLocaleString(undefined,{maximumFractionDigits:0})
+        + '</div></div>';
+    }
+    // Open positions table
+    const pp = document.getElementById('open-positions-panel');
+    if (!pp) return;
+    if (data.count === 0) {
+      pp.innerHTML = '<div style="background:#0d1c11;border:1px solid #143021;border-radius:4px;padding:6px 12px;font-size:0.7em;color:#00e676;">'
+        + '<span style="letter-spacing:1px;">OPEN POSITIONS</span>: fleet is FLAT (no live exposure)</div>';
+      return;
+    }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">OPEN POSITIONS (' + data.count + ')</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.72em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:4px;">Strategy</th>'
+      + '<th style="text-align:left;padding:4px;">Entry (local)</th>'
+      + '<th style="text-align:left;padding:4px;">Dir</th>'
+      + '<th style="text-align:right;padding:4px;">Entry $</th>'
+      + '<th style="text-align:right;padding:4px;">Stop</th>'
+      + '<th style="text-align:right;padding:4px;">Target</th>'
+      + '<th style="text-align:right;padding:4px;">Size</th>'
+      + '<th style="text-align:right;padding:4px;">Risk $</th>'
+      + '</tr></thead><tbody>';
+    for (const p of data.positions) {
+      let entryLocal = '—';
+      try {
+        const d = new Date(p.entry_ts);
+        if (!isNaN(d.getTime())) {
+          const pad = n => String(n).padStart(2, '0');
+          entryLocal = pad(d.getMonth()+1)+'/'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes());
+        }
+      } catch(e){}
+      const dirColor = p.direction === 'long' ? '#00ff88' : p.direction === 'short' ? '#ff4444' : '#9da8c7';
+      html += '<tr style="border-bottom:1px solid #151c2c;">'
+        + '<td style="padding:4px;color:#00d4ff;">' + (p.strategy||'—') + (p.instrument ? ' <span style="color:#7b8ab8;">['+p.instrument+']</span>':'') + '</td>'
+        + '<td style="padding:4px;color:#9da8c7;">' + entryLocal + '</td>'
+        + '<td style="padding:4px;color:' + dirColor + ';">' + (p.direction||'—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#e0e0e0;">' + (p.entry_px ? Number(p.entry_px).toFixed(4).replace(/\.?0+$/, '') : '—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + (p.stop_px ? Number(p.stop_px).toFixed(4).replace(/\.?0+$/, '') : '—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + (p.target_px ? Number(p.target_px).toFixed(4).replace(/\.?0+$/, '') : '—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + (p.size||'—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#ffaa00;">' + (p.risk_usd ? '$' + Number(p.risk_usd).toFixed(2) : '—') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    pp.innerHTML = html;
+  }).catch(()=>{});
+}
+loadPositionsAndRisk();
+setInterval(loadPositionsAndRisk, 30000);
+
+// ─── PROMOTION LADDER ─────────────────────────────────────────────
+function loadPromotionLadder() {
+  fetch('/api/promotion_ladder').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('promotion-ladder-panel');
+    if (!el) return;
+    if (data.error || !data.strategies) { el.innerHTML = ''; return; }
+    // Only show strategies with at least 1 live trade OR within 5 of starting
+    const activeOnly = data.strategies.filter(s => s.live_trades > 0);
+    if (activeOnly.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:8px;">PROMOTION LADDER</div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;">';
+    for (const s of activeOnly) {
+      const pfStr = s.live_pf === null ? '—' : Number(s.live_pf).toFixed(2);
+      const verdictColor = s.verdict === 'VALIDATED' ? '#00ff88' : s.verdict === 'DEGRADED' ? '#ff4444' : s.verdict === 'EMERGING' ? '#ffc107' : '#7b8ab8';
+      const pct = s.progress_pct;
+      const barColor = pct >= 75 ? '#00ff88' : pct >= 50 ? '#ffc107' : '#7b8ab8';
+      html += '<div style="background:#0d1117;border:1px solid #1e2a42;border-radius:4px;padding:8px 10px;">'
+        + '<div style="display:flex;justify-content:space-between;font-size:0.78em;margin-bottom:4px;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;">' + s.strategy + '</span>'
+        + '<span style="color:' + verdictColor + ';font-weight:bold;font-size:0.9em;">' + s.verdict + '</span>'
+        + '</div>'
+        + '<div style="font-size:0.7em;color:#9da8c7;margin-bottom:4px;">'
+        + 'tier: <span style="color:#00d4ff;">' + s.current_tier + ' (' + (s.current_risk_pct*100).toFixed(2) + '%)</span>';
+      if (s.next_tier) {
+        html += ' → ' + s.next_tier + ' (' + (s.next_tier_risk_pct*100).toFixed(2) + '%)</div>'
+          + '<div style="background:#1a1f2e;border-radius:3px;height:6px;overflow:hidden;">'
+          + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div></div>'
+          + '<div style="font-size:0.65em;color:#7b8ab8;margin-top:4px;">'
+          + s.live_trades + ' trades · need ' + s.trades_needed + ' more'
+          + (s.pf_gap != null && s.pf_gap > 0 ? ' · PF gap ' + s.pf_gap.toFixed(2) : '')
+          + ' · live PF ' + pfStr
+          + '</div>'
+          + '<div style="font-size:0.6em;color:#7b8ab8;margin-top:2px;">'
+          + 'trades ' + (s.trade_progress_pct != null ? s.trade_progress_pct.toFixed(0) + '%' : '—')
+          + ' · PF ' + (s.pf_progress_pct != null ? s.pf_progress_pct.toFixed(0) + '%' : '—')
+          + ' <span style="color:#5a6585;">(overall = min)</span>'
+          + '</div>';
+      } else {
+        html += '</div><div style="color:#00ff88;font-size:0.7em;">At max tier (exceptional)</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadPromotionLadder();
+setInterval(loadPromotionLadder, 120000);
+
+// ─── EXIT REASON DISTRIBUTION ─────────────────────────────────────
+function loadExitReasons() {
+  fetch('/api/exit_reasons').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('exit-reasons-panel');
+    if (!el) return;
+    const strats = data.strategies || {};
+    const names = Object.keys(strats);
+    if (names.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:8px;">EXIT REASON DISTRIBUTION (post-reset)</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.72em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:4px;">Strategy</th>'
+      + '<th style="text-align:right;padding:4px;">Trades</th>'
+      + '<th style="text-align:left;padding:4px;">Distribution</th>'
+      + '</tr></thead><tbody>';
+    const reasonColors = {target:'#00ff88', stop:'#ff4444', time:'#ffc107', timeout:'#ffc107', unknown:'#7b8ab8'};
+    for (const name of names.sort()) {
+      const s = strats[name];
+      html += '<tr style="border-bottom:1px solid #151c2c;">'
+        + '<td style="padding:4px;color:#e0e0e0;">' + name + '</td>'
+        + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + s.total + '</td>'
+        + '<td style="padding:4px;"><div style="display:flex;height:12px;border-radius:2px;overflow:hidden;">';
+      for (const [reason, pct] of Object.entries(s.pct_by_reason)) {
+        const c = reasonColors[reason] || '#888';
+        html += '<div style="background:' + c + ';width:' + pct + '%;" title="' + reason + ': ' + pct + '% (' + s.by_reason[reason] + ')"></div>';
+      }
+      html += '</div><div style="font-size:0.6em;color:#7b8ab8;margin-top:2px;">';
+      html += Object.entries(s.pct_by_reason).map(([r,p]) => r + ' ' + p + '%').join(' · ');
+      html += '</div></td></tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadExitReasons();
+setInterval(loadExitReasons, 60000);
+</script>
+<script>
+// Maturity verdict banner — one-glance summary of operational maturity state
+function loadMaturityBanner() {
+  fetch('/api/operational_maturity').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('maturity-summary-banner');
+    if (!el) return;
+    if (data.error) { el.innerHTML = ''; return; }
+    const totals = data.totals || {};
+    const counts = totals.verdict_counts || {};
+    const N = totals.strategies_count || 0;
+    const nTrades = totals.total_live_trades || 0;
+    const pnl = totals.total_live_pnl_usd || 0;
+    const degraded = (counts.DEGRADED || 0);
+    const validated = (counts.VALIDATED || 0);
+    const emerging = (counts.EMERGING || 0);
+    const insuf = (counts.INSUFFICIENT_DATA || 0);
+    const waiting = (counts.WAITING || 0);
+    const flagged = data.strategies.filter(s => s.verdict === 'DEGRADED').map(s => s.strategy);
+    const bgColor = degraded > 0 ? '#2a0f0f' : '#0d1321';
+    const borderColor = degraded > 0 ? '#ff4444' : '#1e2a42';
+    const pnlColor = pnl >= 0 ? '#00ff88' : '#ff4444';
+    const titleColor = degraded > 0 ? '#ff4444' : '#00d4ff';
+    let html = '<div style="background:' + bgColor + ';border:1px solid ' + borderColor + ';border-radius:4px;padding:8px 12px;font-size:0.72em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+      + '<div><span style="color:' + titleColor + ';font-weight:bold;letter-spacing:2px;">OPERATIONAL MATURITY</span>'
+      + ' <span style="color:#7b8ab8;">(' + N + ' strategies, ' + nTrades + ' post-reset trades)</span></div>'
+      + '<div style="color:#9da8c7;">'
+      + '<span style="color:#00ff88;">' + validated + ' VALIDATED</span>'
+      + ' <span style="color:#ffc107;">· ' + emerging + ' EMERGING</span>'
+      + ' <span style="color:' + (degraded > 0 ? '#ff4444' : '#7b8ab8') + ';">· ' + degraded + ' DEGRADED</span>'
+      + ' <span style="color:#7b8ab8;">· ' + insuf + ' INSUFFICIENT · ' + waiting + ' WAITING</span>'
+      + ' · <span style="color:' + pnlColor + ';font-weight:bold;">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</span>'
+      + '</div></div>';
+    if (flagged.length > 0) {
+      html += '<div style="margin-top:6px;color:#ff9999;">Degraded: ' + flagged.join(', ')
+        + ' (live_pf below 60% of backtest)</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadMaturityBanner();
+setInterval(loadMaturityBanner, 60000);
+</script>
+<script>
+// Stale-data banner: red alert if managed_truth_loop has died and reports have stopped refreshing.
+// Checks the age of risk_oversight_report.json + silent_block_alerts.json.
+function loadStaleDataBanner() {
+  fetch('/api/gateway_status').then(r=>r.json()).then(g=>{
+    // We derive staleness from the risk_oversight_report.json age (the daemon writes it every 3min)
+    const reportAgeS = g.risk_oversight_age_s || 0;
+    const el = document.getElementById('stale-data-banner');
+    if (!el) return;
+    if (reportAgeS > 900) {  // >15 min stale → daemon likely dead
+      el.innerHTML = '<div style="background:#2a0f0f;border:1px solid #ff4444;border-radius:4px;padding:10px 14px;">'
+        + '<div style="color:#ff4444;font-weight:bold;font-size:0.85em;letter-spacing:2px;">&#9888; STALE-DATA ALERT</div>'
+        + '<div style="font-size:0.75em;margin-top:4px;">risk_oversight_report.json hasn\'t refreshed in ' + Math.round(reportAgeS/60) + ' min. '
+        + 'The managed_truth_loop daemon may be dead. Check: <code>Get-Process -Name python | Where-Object { $_.CommandLine -like \'*managed_truth_loop*\' }</code></div>'
+        + '</div>';
+    } else if (reportAgeS > 400) {  // 6-15 min: warn but not alarm
+      el.innerHTML = '<div style="background:#2a2010;border:1px solid #ffaa00;border-radius:4px;padding:6px 12px;font-size:0.72em;color:#ffaa00;">'
+        + '&#9432; risk_oversight_report slightly stale (' + Math.round(reportAgeS/60) + ' min old). Daemon cadence is 3 min — this is borderline.'
+        + '</div>';
+    } else {
+      el.innerHTML = '';  // healthy, silent
+    }
+  }).catch(()=>{});
+}
+loadStaleDataBanner();
+setInterval(loadStaleDataBanner, 30000);
+</script>
+<script>
+function loadSilentBlock() {
+  fetch('/api/silent_block_alerts').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('silent-block-banner');
+    if (!el) return;
+    const flagged = data.flagged || [];
+    if (data.error) {
+      el.innerHTML = ''; // silent if file not yet written
+      return;
+    }
+    if (flagged.length === 0) {
+      // Subtle green confirmation — tells you the checker is running
+      el.innerHTML = '<div style="background:#0d1c11;border:1px solid #143021;border-radius:4px;padding:6px 12px;font-size:0.7em;color:#00e676;">'
+        + '<span style="letter-spacing:1px;">SILENT-BLOCK</span>: all ' + (data.ok_count || 0) + ' active strategies emitting signals normally'
+        + ' <span style="color:#7b8ab8;">(' + (data.out_of_session_count || 0) + ' out-of-session)</span>'
+        + '</div>';
+      return;
+    }
+    // Red alert panel for any flagged
+    const strategyList = flagged.map(f =>
+      '<div style="margin:4px 0;"><span style="color:#ff4444;font-weight:bold;">' + f.strategy + '</span> '
+      + '<span style="color:#9da8c7;">— ' + (f.reason || '?') + '</span></div>'
+    ).join('');
+    el.innerHTML = '<div style="background:#2a0f0f;border:1px solid #ff4444;border-radius:4px;padding:10px 14px;">'
+      + '<div style="color:#ff4444;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">&#9888; SILENT-BLOCK ALERT — ' + flagged.length + ' strategy' + (flagged.length !== 1 ? 'ies' : '') + ' mute during active session</div>'
+      + '<div style="font-size:0.75em;">' + strategyList + '</div>'
+      + '<div style="font-size:0.65em;color:#7b8ab8;margin-top:6px;">Checked ' + (data.checked_at || '?') + '. Runner alive but emitting no signals — probable data feed issue or stuck eval loop.</div>'
+      + '</div>';
+  }).catch(()=>{});
+}
+loadSilentBlock();
+setInterval(loadSilentBlock, 30000);
+</script>
 <script>
 function loadGatewayStatus() {
   fetch('/api/gateway_status').then(r=>r.json()).then(d=>{
@@ -5772,8 +6321,11 @@ setInterval(loadGatewayStatus, 30000);
 <!-- Overall equity curve: cumulative USD PnL across every strategy -->
 <div id="fleet-equity-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
 
+<!-- Per-strategy equity curves (small multiples) — added 2026-04-23 Tier 1 dashboard expansion -->
+<div id="per-strategy-equity-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
+
 <!-- Recent trades table: flat chronological list of every trade -->
-<div id="recent-trades-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
+<!-- Recent Trades panel moved below Strategy Performance 2026-04-23 (user request) -->
 
 <!-- Dynamic risk tier table: shows why each strategy gets its current risk % -->
 <!-- Dynamic Risk Tiers panel removed — tier + risk $ now shown inline in Strategy Performance table below -->
@@ -5810,7 +6362,7 @@ function loadRecentTrades() {
     html += '<div style="overflow-x:auto;">';
     html += '<table style="width:100%;border-collapse:collapse;font-size:0.72em;">';
     html += '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
-      + '<th style="text-align:left;padding:6px 4px;">When</th>'
+      + '<th style="text-align:left;padding:6px 4px;">When <span style="font-weight:normal;color:#555;font-size:0.85em;">(' + Intl.DateTimeFormat().resolvedOptions().timeZone + ')</span></th>'
       + '<th style="text-align:left;padding:6px 4px;">Strategy</th>'
       + '<th style="text-align:left;padding:6px 4px;">Symbol</th>'
       + '<th style="text-align:left;padding:6px 4px;">Dir</th>'
@@ -5825,7 +6377,22 @@ function loadRecentTrades() {
       + '</tr></thead><tbody>';
 
     for (const t of trades) {
-      const tsShort = (t.ts || '').replace('T', ' ').substring(0, 19);
+      // Convert UTC ts to browser-local time (so Austin = CDT/CST auto-adjusts).
+      // API returns ISO-8601 UTC; Date() handles the conversion.
+      let tsShort = '';
+      try {
+        const d = new Date(t.ts);
+        if (!isNaN(d.getTime())) {
+          // en-CA gives YYYY-MM-DD; split for readable "YYYY-MM-DD HH:MM:SS" local
+          const pad = n => String(n).padStart(2, '0');
+          tsShort = d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+            + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+        } else {
+          tsShort = (t.ts || '').replace('T', ' ').substring(0, 19);
+        }
+      } catch (e) {
+        tsShort = (t.ts || '').replace('T', ' ').substring(0, 19);
+      }
       const pnlColor = (t.pnl_usd || 0) >= 0 ? '#00ff88' : '#ff4444';
       const sign = (t.pnl_usd || 0) >= 0 ? '+' : '';
       const risk = t.risk_usd != null ? '$' + Number(t.risk_usd).toFixed(2) : '—';
@@ -5972,6 +6539,69 @@ function loadFleetEquityCurve() {
 }
 loadFleetEquityCurve();
 setInterval(loadFleetEquityCurve, 60000);
+
+// Per-strategy small-multiples equity curves — reuses renderEquityCurve
+function loadPerStrategyEquity() {
+  fetch('/api/fleet_equity_curve?window_days=90&include_backfill=false').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('per-strategy-equity-panel');
+    if (!el) return;
+    const anchor = data.anchor_capital_usd || 10000;
+    const points = data.points || [];
+
+    // Group by strategy and compute per-strategy cumulative
+    const byStrat = new Map();
+    for (const p of points) {
+      const s = p.strategy || 'unknown';
+      if (!byStrat.has(s)) byStrat.set(s, []);
+      byStrat.get(s).push(p);
+    }
+    const cards = [];
+    for (const [label, rows] of byStrat.entries()) {
+      rows.sort((a,b) => new Date(a.ts) - new Date(b.ts));
+      let cum = 0;
+      const pts = rows.map(r => {
+        cum += (r.trade_pnl_usd || 0);
+        return { ts: r.ts, cumulative_pnl_usd: Math.round(cum*100)/100 };
+      });
+      const finalPnl = pts.length ? pts[pts.length-1].cumulative_pnl_usd : 0;
+      const color = finalPnl > 0 ? '#00ff88' : (finalPnl < 0 ? '#ff4444' : '#7b8ab8');
+      cards.push({ label, pts, finalPnl, color, trades: rows.length });
+    }
+    // Sort by absolute PnL impact so biggest movers render first
+    cards.sort((a,b) => Math.abs(b.finalPnl) - Math.abs(a.finalPnl));
+
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">PER-STRATEGY EQUITY CURVES</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">live-only last ' + (data.window_days || 90) + 'd | ' + cards.length + ' strategies with trades</div>'
+      + '</div>';
+
+    if (!cards.length) {
+      html += '<div style="color:#7b8ab8;font-size:0.75em;padding:10px;">No strategies with live trades in window.</div>';
+      el.innerHTML = html;
+      return;
+    }
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;">';
+    for (const c of cards) {
+      const sign = c.finalPnl >= 0 ? '+' : '';
+      html += '<div style="background:#0d1321;border:1px solid #1e2a42;border-left:3px solid ' + c.color + ';border-radius:4px;padding:8px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:6px;">'
+        + '<div style="color:#e0e0e0;font-size:0.75em;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + c.label + '</div>'
+        + '<div style="color:' + c.color + ';font-size:0.75em;font-weight:bold;white-space:nowrap;">' + sign + '$' + c.finalPnl.toFixed(2) + '</div>'
+        + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.65em;margin-bottom:4px;">' + c.trades + ' trades</div>'
+        + renderEquityCurve(c.pts, 260, 90, anchor)
+        + '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch((e)=>{
+    const el = document.getElementById('per-strategy-equity-panel');
+    if (el) el.innerHTML = '<div style="color:#ff4444;font-size:0.75em;">per-strategy equity error: ' + e + '</div>';
+  });
+}
+loadPerStrategyEquity();
+setInterval(loadPerStrategyEquity, 60000);
 </script>
 <script>
 function loadFleetHealth() {
@@ -6010,6 +6640,8 @@ setInterval(loadFleetHealth, 30000);
 
 <!-- STRATEGY PERFORMANCE TABLE -->
 <div id="strategy-performance" style="margin-bottom:14px;"></div>
+<!-- Recent Trades moved here 2026-04-23 (user request — was above the equity curve) -->
+<div id="recent-trades-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
 <script>
 function loadStrategyPerformance() {
   // Fetch both endpoints in parallel, then merge tier/risk$ into each strategy row

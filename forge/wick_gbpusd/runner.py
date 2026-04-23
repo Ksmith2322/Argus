@@ -238,9 +238,14 @@ def fetch_history(period: str = "180d") -> pd.DataFrame:
 
 # ────────────── Position management ──────────────
 
-def _check_exit(open_trade: dict, today_bar: dict, today_idx: int) -> tuple[str, float] | None:
-    """Returns (reason, exit_px) if exit triggered today, else None."""
-    bars_held = today_idx - open_trade["entry_idx"]
+def _check_exit(open_trade: dict, today_bar: dict, today_idx: int, entry_idx: int | None = None) -> tuple[str, float] | None:
+    """Returns (reason, exit_px) if exit triggered today, else None.
+    entry_idx must be passed (resolved fresh from entry_ts) to compute
+    bars_held accurately after the 2026-04-23 phantom-close fix."""
+    # Back-compat: if caller didn't pass entry_idx, fall back to stored value
+    if entry_idx is None:
+        entry_idx = open_trade.get("entry_idx", today_idx)
+    bars_held = today_idx - entry_idx
     if today_bar["Low"] <= open_trade["stop_px"]:
         return "stop", open_trade["stop_px"]
     if today_bar["High"] >= open_trade["target_px"]:
@@ -268,6 +273,18 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
         log.warning("NOTIONAL_CAP: GBPUSD units %d > cap %d", pos_size, cap_units)
         pos_size = cap_units
     risk_usd = stop_distance_pips * pip_value * (pos_size / 100_000)
+    # Store entry_ts (TIMESTAMP) not entry_idx. Previously this was stored as
+    # an integer position in the df, but the df window shifts on each run
+    # (yfinance returns a rolling window), causing entry_idx to drift from
+    # the actual entry bar — the "phantom close" bug that led to 0 trades
+    # in 5 months. Post-fix 2026-04-23: resolve ts → idx fresh each run.
+    entry_ts = None
+    if signal_idx + 1 < len(df):
+        entry_ts = str(df.index[signal_idx + 1])  # next bar's timestamp
+    else:
+        # Signal fired on the last loaded bar — entry happens on a future bar.
+        # Mark as None for now; _settle_pending_fill resolves once next bar arrives.
+        entry_ts = None
     state["open_trade"] = {
         "signal_ts": str(df.index[signal_idx]),
         "signal_close": entry_anchor,
@@ -275,7 +292,7 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
         "target_px": target,
         "stop_px": stop,
         "atr_entry": a,
-        "entry_idx": signal_idx + 1,  # entry happens NEXT bar
+        "entry_ts": entry_ts,  # canonical timestamp (was: "entry_idx" integer — buggy)
         "position_size": pos_size,
         "risk_usd": risk_usd,
         "session_id": state["session_id"],
@@ -287,12 +304,34 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
              df.index[signal_idx], target, stop, a, pos_size)
 
 
+def _resolve_idx_from_ts(df: pd.DataFrame, ts_str: str | None) -> int | None:
+    """Resolve a timestamp string to its current integer position in df.
+    Returns None if the ts isn't in df (e.g., it's in the future or df was
+    rolled). This is the phantom-close-bug fix — never trust a stale
+    integer index across runs."""
+    if not ts_str:
+        return None
+    try:
+        ts = pd.Timestamp(ts_str)
+        if ts in df.index:
+            return int(df.index.get_loc(ts))
+    except Exception:
+        pass
+    return None
+
+
 def _settle_pending_fill(state: dict, df: pd.DataFrame) -> None:
     """The day after signal, fill at the open of that day."""
     ot = state["open_trade"]
     if not ot or not ot.get("pending_fill"):
         return
-    entry_idx = ot["entry_idx"]
+    # Back-compat: older state.json may have entry_idx (integer). Prefer entry_ts
+    # when present; fall back to legacy entry_idx only if ts isn't available.
+    entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts"))
+    if entry_idx is None:
+        entry_idx = ot.get("entry_idx")  # legacy fallback (buggy but better than nothing)
+        if entry_idx is None or entry_idx >= len(df):
+            return
     if entry_idx >= len(df):
         return
     actual_entry = float(df["Open"].iloc[entry_idx])
@@ -300,6 +339,9 @@ def _settle_pending_fill(state: dict, df: pd.DataFrame) -> None:
     ot["entry_px"] = actual_entry
     ot["target_px"] = actual_entry + PARAMS["target_atr"] * a
     ot["stop_px"] = actual_entry - PARAMS["stop_atr"] * a
+    # Update entry_ts now that we've resolved it (in case it was empty on signal-day)
+    if not ot.get("entry_ts"):
+        ot["entry_ts"] = str(df.index[entry_idx])
     ot["pending_fill"] = False
     log.info("PAPER LONG filled at %.5f — target %.5f stop %.5f", actual_entry, ot["target_px"], ot["stop_px"])
 
@@ -310,9 +352,12 @@ def _close_paper_trade(state: dict, df: pd.DataFrame, exit_idx: int, exit_px: fl
     pnl_pips = (exit_px - entry_px) / 0.0001
     pnl_usd = pnl_pips * 10.0 * (ot["position_size"] / 100_000)
     state["trade_count"] += 1
-    duration_min = (df.index[exit_idx] - df.index[ot["entry_idx"]]).total_seconds() / 60
+    # Resolve entry idx fresh from entry_ts (phantom-close-bug fix)
+    entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts")) or ot.get("entry_idx") or 0
+    entry_ts_str = ot.get("entry_ts") or str(df.index[entry_idx])
+    duration_min = (df.index[exit_idx] - pd.Timestamp(entry_ts_str)).total_seconds() / 60
     _append_trade({
-        "ts": str(df.index[ot["entry_idx"]]),
+        "ts": entry_ts_str,
         "direction": "long",
         "entry_px": entry_px,
         "exit_px": exit_px,
@@ -350,7 +395,7 @@ def _close_paper_trade(state: dict, df: pd.DataFrame, exit_idx: int, exit_px: fl
             symbol="GBPUSD",
             direction="long",
             side="EXIT",
-            entry_ts=str(df.index[ot["entry_idx"]]),
+            entry_ts=entry_ts_str,
             exit_ts=str(df.index[exit_idx]),
             entry_px=float(entry_px),
             exit_px=float(exit_px),
@@ -382,14 +427,20 @@ def evaluate_once() -> None:
     # Manage open position
     if state.get("open_trade") and not state["open_trade"].get("pending_fill"):
         ot = state["open_trade"]
+        # Resolve entry idx fresh from timestamp (phantom-close-bug fix 2026-04-23).
+        # Previously used stored entry_idx integer which drifted when df shifted.
+        entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts"))
+        if entry_idx is None:
+            entry_idx = ot.get("entry_idx")  # legacy back-compat
         # Replay every bar between entry and today to check for exit
         exit_event = None
-        for j in range(ot["entry_idx"], today_idx + 1):
-            bar = df.iloc[j].to_dict()
-            ev = _check_exit(ot, bar, j)
-            if ev:
-                exit_event = (j, ev[0], ev[1])
-                break
+        if entry_idx is not None and entry_idx < len(df):
+            for j in range(entry_idx, today_idx + 1):
+                bar = df.iloc[j].to_dict()
+                ev = _check_exit(ot, bar, j, entry_idx=entry_idx)
+                if ev:
+                    exit_event = (j, ev[0], ev[1])
+                    break
         if exit_event:
             j, reason, exit_px = exit_event
             _close_paper_trade(state, df, j, exit_px, reason)
@@ -473,12 +524,32 @@ def backtest(period: str = "5y") -> None:
     print(f"Period: {td.date.min()} -> {td.date.max()}")
 
 
+def main_loop() -> int:
+    """Daemon mode — evaluate_once() per cycle. Added 2026-04-23; pairs with
+    phantom-close fix above. Prior to these two changes, wick_gbpusd had
+    0 trades in 5 months because (a) nothing was running continuously and
+    (b) the stale-entry-idx bug invalidated the few trades that did happen."""
+    import time
+    interval_s = 3600  # once/hour is plenty for a daily-bar strategy
+    log.info("wick_gbpusd --loop started (interval=%ds)", interval_s)
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            evaluate_once()
+            log.info("cycle %d complete", cycle)
+        except Exception as e:
+            log.error("cycle %d FAILED: %s", cycle, e)
+        time.sleep(interval_s)
+
+
 def main():
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--evaluate", action="store_true", help="One daily eval cycle")
     g.add_argument("--scan", action="store_true", help="Read-only: print today's status")
     g.add_argument("--backtest", action="store_true", help="Run backtest on cached/recent data")
+    g.add_argument("--loop", action="store_true", help="Continuous daemon: re-evaluate every hour")
     p.add_argument("--period", default="5y", help="Backtest period (default 5y)")
     args = p.parse_args()
     if args.evaluate:
@@ -487,6 +558,8 @@ def main():
         scan()
     elif args.backtest:
         backtest(args.period)
+    elif args.loop:
+        main_loop()
 
 
 if __name__ == "__main__":

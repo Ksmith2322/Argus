@@ -80,7 +80,14 @@ IBKR_CLIENT_IDS = {"PL=F": 104, "CL=F": 105, "GC=F": 106, "YM=F": 107}
 # Sizing
 from forge.tori.sizing import POINT_VALUES, TICKER_TO_MICRO, compute_tori_size
 
-STARTING_EQUITY = 10_000.0
+def _broker_anchor_or_raise() -> float:
+    """Resolve equity from the live broker. No hardcoded fallback —
+    aligned with 2026-04-23 architecture. Called lazily so that module
+    import doesn't fail if the broker is cold."""
+    from helio.fleet_sizing import get_sizing_anchor_usd
+    return get_sizing_anchor_usd()
+
+
 BASE_RISK_PCT = 0.015  # 1.5%
 MIN_RR = 2.0  # 2R minimum target
 
@@ -167,7 +174,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 def run_backtest(
     datasets: dict[str, pd.DataFrame],
-    equity: float = STARTING_EQUITY,
+    equity: float | None = None,
 ) -> list[dict]:
     """
     Walk-forward backtest on 4H bars:
@@ -189,7 +196,7 @@ def run_backtest(
     )
 
     all_trades = []
-    current_equity = equity
+    current_equity = equity if equity is not None else _broker_anchor_or_raise()
     equity_curve = [current_equity]
 
     # Minimum bars needed before we start looking for setups
@@ -774,7 +781,7 @@ def main():
     group.add_argument("--loop", action="store_true", help="Continuous scan every 4 hours")
     group.add_argument("--live", action="store_true", help="IBKR execution (placeholder)")
     parser.add_argument("--period", default="6mo", help="Data period (default: 6mo)")
-    parser.add_argument("--equity", type=float, default=STARTING_EQUITY, help="Starting equity")
+    parser.add_argument("--equity", type=float, default=None, help="Starting equity (default: pull from broker)")
     args = parser.parse_args()
 
     if args.live:

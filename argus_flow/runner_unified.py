@@ -125,11 +125,30 @@ REPO = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = Path("argus_flow/configs")
 LOGS_ROOT = Path("argus_flow/logs")
 HASHES_FILE = CONFIGS_DIR / "hashes.json"
-try:
-    from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
-    DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "") or _fleet_anchor())
-except Exception:
-    DEFAULT_ACCOUNT_EQUITY_USD = float(os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "10000"))
+# DEFAULT_ACCOUNT_EQUITY_USD used to fall back to a hardcoded 10000 at module
+# load if broker couldn't be read. That was the silent-fallback pattern we
+# removed on 2026-04-23. Now:
+#   - Try to read broker at module load.
+#   - If successful: snapshot the value (for book-keeping init only).
+#   - If broker is cold at load time: leave it at 0.0. Call sites that need
+#     a real number (trade sizing) MUST call get_sizing_anchor_usd() per-trade
+#     and handle BrokerEquityUnavailableError. The 0.0 sentinel exists only
+#     for init-time bookkeeping paths that would otherwise crash on import.
+#   - Env var ARGUS_DEFAULT_ACCOUNT_EQUITY_USD is still honored as an
+#     explicit override (useful for tests / backtest replay).
+_override_env = os.getenv("ARGUS_DEFAULT_ACCOUNT_EQUITY_USD", "")
+if _override_env:
+    DEFAULT_ACCOUNT_EQUITY_USD = float(_override_env)
+else:
+    try:
+        from helio.fleet_sizing import get_initial_capital_usd as _fleet_anchor
+        DEFAULT_ACCOUNT_EQUITY_USD = float(_fleet_anchor())
+    except Exception:
+        # Broker cold at import. Set to 0.0 sentinel — callers that need a
+        # real number should call get_sizing_anchor_usd() live (which will
+        # raise BrokerEquityUnavailableError if still unavailable at that
+        # point, letting the runner enter READ_ONLY).
+        DEFAULT_ACCOUNT_EQUITY_USD = 0.0
 GOVERNOR_MODEL_PATH = Path("argus_flow/data/fx_governor.pkl")
 AUTO_GROUP_CLIENT_ID_BASE = 1000
 AUTO_GROUP_CLIENT_ID_SPAN = 8000
