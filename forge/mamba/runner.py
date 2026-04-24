@@ -1064,10 +1064,136 @@ def run_signal_loop():
 # ---------------------------------------------------------------------------
 
 def run_live():
-    """Placeholder for live IBKR execution on MNQ + MYM."""
-    log.error("Live mode not yet implemented. Use --loop for signal-only.")
-    log.error(f"  Would use client IDs: {IBKR_CLIENT_IDS}")
-    sys.exit(1)
+    """Live IBKR paper execution. Wraps the signal_loop with order submission
+    via helio.signal_executor.
+
+    2026-04-24: previous version was sys.exit(1) placeholder. Now: each scan
+    cycle, submit any new breakout signals as bracket orders, check existing
+    positions for fills/time-stops.
+    """
+    from forge.mamba.trendlines import scan_for_setups
+    from helio import ibkr_execution as ibkr
+    from helio import signal_executor as sx
+    from helio.fleet_sizing import compute_risk_usd, max_notional_usd
+
+    IBKR_CLIENT_ID = 114  # forge range; mamba dedicated
+    IB_INTERVAL_S = 300  # 5 min
+
+    # state.json for live execution
+    state_path = LOG_DIR / "live_state.json"
+    state = {"open_trades": {}, "trade_count": 0}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    log.info(f"mamba LIVE mode starting (client_id={IBKR_CLIENT_ID})")
+
+    while True:
+        try:
+            now = datetime.now(timezone(timedelta(hours=-4)))  # EST approx
+            in_window = is_ny_session(now, phase="trade")
+
+            ib = None
+            try:
+                ib = ibkr.connect(IBKR_CLIENT_ID)
+            except Exception as exc:
+                log.warning("IBKR connect failed: %s", exc)
+
+            try:
+                # 1. Check existing open positions for bracket fills / time stops
+                if ib is not None and state.get("open_trades"):
+                    closed = sx.check_open_positions(state, ib)
+                    for c in closed:
+                        log.info(f"CLOSED {c['symbol']} ({c['reason']}) @ {c['fill_price']:.2f} pnl=${c['pnl_usd']:.2f}")
+                        state["trade_count"] = state.get("trade_count", 0) + 1
+
+                if not in_window:
+                    write_heartbeat(status="waiting_for_ny", extra={"note": f"Current: {now.strftime('%H:%M')} EST"})
+                else:
+                    write_heartbeat(status="scanning_live")
+
+                    # 2. Scan for new setups
+                    if ib is not None and in_window:
+                        for ticker in TICKERS:
+                            try:
+                                df = download_data(ticker, period="5d")
+                                df = compute_atr(df)
+                                setups = scan_for_setups(df, min_touches=2)
+
+                                for s in setups:
+                                    if not s.get("breakout"):
+                                        continue
+                                    bo = s["breakout"]
+                                    direction = bo["direction"]
+                                    entry_anchor = float(bo["break_price"])
+                                    atr_now = float(df["ATR"].dropna().iloc[-1]) if not df["ATR"].dropna().empty else 0
+                                    if atr_now <= 0:
+                                        continue
+                                    # Mamba uses 1× ATR stop, 2× ATR conservative target
+                                    if direction == "long":
+                                        stop_px = entry_anchor - atr_now
+                                        target_px = entry_anchor + atr_now * 2.0
+                                    else:
+                                        stop_px = entry_anchor + atr_now
+                                        target_px = entry_anchor - atr_now * 2.0
+
+                                    # Sizing — micro contract = $0.50/pt for MYM ($2/pt for MNQ)
+                                    micro = TICKER_TO_MICRO.get(ticker, ticker)
+                                    pt_usd = POINT_VALUES.get(ticker, 0.50)
+                                    risk_budget = compute_risk_usd(strategy_label="forge_mamba")
+                                    stop_dist_pts = abs(entry_anchor - stop_px)
+                                    contracts = max(1, int(risk_budget / max(stop_dist_pts * pt_usd, 1e-6)))
+                                    cap = max_notional_usd("micro_future")
+                                    notional = entry_anchor * pt_usd * contracts
+                                    if cap > 0 and notional > cap:
+                                        contracts = max(1, int(cap / max(entry_anchor * pt_usd, 1e-6)))
+
+                                    sig = sx.SignalEntry(
+                                        symbol=micro,
+                                        direction=direction,
+                                        size=contracts,
+                                        stop_px=stop_px,
+                                        target_px=target_px,
+                                        instrument_type="micro_future",
+                                        price_decimals=0,
+                                        max_hold_bars=12,  # 1 hour at 5min bars
+                                    )
+                                    submitted = sx.submit_signal(state, ib, sig)
+                                    if submitted:
+                                        log.info(f"LIVE SIGNAL {direction} {micro} entry={entry_anchor:.0f} stop={stop_px:.0f} target={target_px:.0f}")
+                                        signal_log = {
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "ticker": ticker,
+                                            "direction": direction,
+                                            "entry": entry_anchor,
+                                            "stop": stop_px,
+                                            "target1": target_px,
+                                            "target2": target_px,
+                                            "confluences": s.get("touches", 0),
+                                            "bias": determine_bias(df.iloc[-60:]),
+                                            "volume_ratio": bo.get("volume_ratio", 0),
+                                        }
+                                        append_signal(signal_log)
+                            except Exception as e:
+                                log.error(f"live scan error {ticker}: {e}")
+            finally:
+                if ib is not None:
+                    ibkr.disconnect(ib)
+                # Persist state
+                try:
+                    state_path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+                except Exception:
+                    pass
+
+            time.sleep(IB_INTERVAL_S)
+        except KeyboardInterrupt:
+            log.info("Interrupted — closing.")
+            break
+        except Exception as e:
+            log.error(f"live loop error: {e}", exc_info=True)
+            time.sleep(60)
 
 
 # ---------------------------------------------------------------------------
