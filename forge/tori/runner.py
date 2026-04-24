@@ -757,15 +757,146 @@ def run_loop(datasets: dict[str, pd.DataFrame]):
 
 
 def run_live():
-    """IBKR execution placeholder."""
-    print("\n  Tori Trades -- LIVE MODE")
-    print("  Contracts:")
-    print("    PL (Platinum):  NYMEX -- client ID 104")
-    print("    CL (Crude Oil): NYMEX -- client ID 105")
-    print("    GC (Gold):      COMEX -- client ID 106")
-    print("    YM (Dow):       CBOT  -- client ID 107")
-    print("  Or micro variants: MPL, MCL, MGC, MYM")
-    print("\n  [PLACEHOLDER -- not yet connected to IBKR]\n")
+    """Live IBKR paper execution. Re-runs the scan logic on a 4hr cycle, captures
+    BREAK signals with structured data, submits brackets via signal_executor.
+
+    2026-04-24: replaces the placeholder. Trades MYM (micro Dow) and similar
+    micros on IBKR paper, client_id=115. ATR-based bracket: 1× stop, 2× target
+    (Tori conservative R:R from validated scope_down).
+    """
+    from forge.tori.trendlines import (
+        find_swing_highs, find_swing_lows,
+        fit_ascending_trendline, fit_descending_trendline,
+        score_trendline_quality, _trendline_value_at,
+        check_bounce, check_break,
+        _deduplicate_trendlines,
+    )
+    from helio import ibkr_execution as ibkr
+    from helio import signal_executor as sx
+    from helio.fleet_sizing import compute_risk_usd, max_notional_usd
+
+    IBKR_CLIENT_ID = 115
+    LOOP_S = 4 * 3600  # 4hr cycle (matches tori's tf)
+
+    state_path = LOG_DIR / "live_state.json"
+    state = {"open_trades": {}, "trade_count": 0}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    log.info(f"tori LIVE mode starting (client_id={IBKR_CLIENT_ID})")
+
+    while True:
+        try:
+            ib = None
+            try:
+                ib = ibkr.connect(IBKR_CLIENT_ID)
+            except Exception as exc:
+                log.warning("IBKR connect failed: %s", exc)
+
+            try:
+                # 1. Manage open positions
+                if ib is not None and state.get("open_trades"):
+                    closed = sx.check_open_positions(state, ib)
+                    for c in closed:
+                        log.info(f"CLOSED {c['symbol']} ({c['reason']}) @ {c['fill_price']:.2f} pnl=${c['pnl_usd']:.2f}")
+                        state["trade_count"] = state.get("trade_count", 0) + 1
+
+                # 2. Scan for new setups
+                if ib is not None:
+                    for ticker in TICKERS:
+                        try:
+                            df = download_data(ticker, period="3mo", interval="1h")
+                            df = resample_to_4h(df)
+                            df = compute_atr(df)
+                            if df.empty or df["ATR"].isna().all():
+                                continue
+                            last_bar = len(df) - 1
+                            atr = float(df["ATR"].iloc[last_bar])
+                            close = float(df["Close"].iloc[last_bar])
+
+                            swing_highs = find_swing_highs(df)
+                            swing_lows = find_swing_lows(df)
+
+                            trendlines = []
+                            for chunk_size in [6, 10, 15]:
+                                for start in range(0, max(len(swing_lows) - chunk_size + 1, 1),
+                                                    max(chunk_size // 2, 1)):
+                                    chunk = swing_lows[start: start + chunk_size]
+                                    tl = fit_ascending_trendline(chunk)
+                                    if tl and tl["touches"] >= 2:
+                                        trendlines.append(tl)
+                                for start in range(0, max(len(swing_highs) - chunk_size + 1, 1),
+                                                    max(chunk_size // 2, 1)):
+                                    chunk = swing_highs[start: start + chunk_size]
+                                    tl = fit_descending_trendline(chunk)
+                                    if tl and tl["touches"] >= 2:
+                                        trendlines.append(tl)
+
+                            trendlines = _deduplicate_trendlines(trendlines, df)
+
+                            for tl in trendlines:
+                                quality = score_trendline_quality(tl, df)
+                                if not quality["valid"] or quality["grade"] not in ("A+", "A"):
+                                    continue
+                                tl_val = _trendline_value_at(tl, last_bar)
+                                dist = abs(close - tl_val)
+                                if dist > 3.0 * atr:
+                                    continue
+
+                                # Validated subset: BREAK signals only (per scope_down)
+                                brk = check_break(df, tl, last_bar, atr)
+                                if not brk:
+                                    continue
+
+                                direction = brk["direction"]
+                                entry = close
+                                if direction == "long":
+                                    stop_px = entry - atr
+                                    target_px = entry + 2.0 * atr
+                                else:
+                                    stop_px = entry + atr
+                                    target_px = entry - 2.0 * atr
+
+                                # Sizing: micro contract for the underlying
+                                from forge.tori.sizing import POINT_VALUES, TICKER_TO_MICRO
+                                micro = TICKER_TO_MICRO.get(ticker, ticker)
+                                pt_usd = POINT_VALUES.get(micro, 0.50)
+                                risk_budget = compute_risk_usd(strategy_label="forge_tori")
+                                stop_dist = abs(entry - stop_px)
+                                contracts = max(1, int(risk_budget / max(stop_dist * pt_usd, 1e-6)))
+                                cap = max_notional_usd("micro_future")
+                                if cap > 0 and entry * pt_usd * contracts > cap:
+                                    contracts = max(1, int(cap / max(entry * pt_usd, 1e-6)))
+
+                                sig = sx.SignalEntry(
+                                    symbol=micro, direction=direction, size=contracts,
+                                    stop_px=stop_px, target_px=target_px,
+                                    instrument_type="micro_future", price_decimals=0,
+                                    max_hold_bars=8,  # 32 hours at 4hr bars
+                                )
+                                if sx.submit_signal(state, ib, sig):
+                                    log.info(f"LIVE {direction} {micro} entry={entry:.0f} stop={stop_px:.0f} target={target_px:.0f}")
+                        except Exception as e:
+                            log.error(f"tori live scan error {ticker}: {e}")
+            finally:
+                if ib is not None:
+                    ibkr.disconnect(ib)
+                try:
+                    state_path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+                except Exception:
+                    pass
+
+            log.info("tori live cycle complete; sleeping %ds", LOOP_S)
+            time.sleep(LOOP_S)
+        except KeyboardInterrupt:
+            log.info("tori live stopped")
+            break
+        except Exception as e:
+            log.error(f"live loop error: {e}", exc_info=True)
+            time.sleep(60)
 
 
 # ---------------------------------------------------------------------------

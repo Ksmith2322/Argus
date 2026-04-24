@@ -897,21 +897,137 @@ def run_loop():
 # ---------------------------------------------------------------------------
 
 def run_live():
-    """IBKR live trading placeholder — MYM (Micro Dow), client ID 108."""
-    log.info("CUE BANKS LIVE MODE — IBKR placeholder")
-    print("\n" + "=" * 70)
-    print("CUE BANKS LIVE MODE — NOT YET IMPLEMENTED")
-    print("=" * 70)
-    print(f"  Contract:  MYM (Micro Dow Futures)")
-    print(f"  Exchange:  CBOT")
-    print(f"  Client ID: {IBKR_CLIENT_ID}")
-    print(f"  Strategy:  Multi-TF Confluence (Daily/H4 bias, M5 entry)")
-    print(f"  Min Score: 3+ confluence factors")
-    print(f"  R:R Target: 1:5 to 1:8")
-    print(f"  Max Trades: {MAX_TRADES_PER_DAY}/day")
-    print(f"\n  To implement: connect via ib_insync, subscribe to MYM bars,")
-    print(f"  run confluence scoring in real-time, execute on signal.")
-    print()
+    """Live IBKR paper execution — MYM (Micro Dow). Uses the same confluence
+    scan as run_loop, but submits real bracket orders via signal_executor.
+
+    2026-04-24: replaces placeholder. Client_id=116 (forge range).
+    """
+    from helio import ibkr_execution as ibkr
+    from helio import signal_executor as sx
+    from helio.fleet_sizing import compute_risk_usd, max_notional_usd
+
+    LIVE_CLIENT_ID = 116  # distinct from old placeholder client_id=108
+    LOOP_S = 300  # 5 min
+    log.info(f"CUE BANKS LIVE mode starting (client_id={LIVE_CLIENT_ID})")
+    heartbeat_path = LOG_DIR / "heartbeat.json"
+    signal_csv = LOG_DIR / "cuebanks_signals.csv"
+    state_path = LOG_DIR / "live_state.json"
+
+    state = {"open_trades": {}, "trade_count": 0}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    while True:
+        try:
+            now = datetime.now()
+            h, m = now.hour, now.minute
+            t = h * 60 + m
+            ny_start = NY_OPEN_HOUR * 60 + NY_OPEN_MIN
+            ny_end = NY_CLOSE_HOUR * 60 + NY_CLOSE_MIN
+            in_ny = ny_start <= t <= ny_end
+
+            ib = None
+            try:
+                ib = ibkr.connect(LIVE_CLIENT_ID)
+            except Exception as exc:
+                log.warning("IBKR connect failed: %s", exc)
+
+            try:
+                # 1. Manage open positions
+                if ib is not None and state.get("open_trades"):
+                    closed = sx.check_open_positions(state, ib)
+                    for c in closed:
+                        log.info(f"CLOSED {c['symbol']} ({c['reason']}) @ {c['fill_price']:.2f} pnl=${c['pnl_usd']:.2f}")
+                        state["trade_count"] = state.get("trade_count", 0) + 1
+
+                heartbeat_path.write_text(json.dumps({
+                    "system": "cuebanks",
+                    "timestamp": now.isoformat(),
+                    "status": "scanning_live" if in_ny else "waiting",
+                    "mode": "ibkr_paper", "run_phase": "live",
+                    "open_trade_count": len(state.get("open_trades", {})),
+                }, indent=2))
+
+                # 2. Scan + submit
+                if in_ny and ib is not None:
+                    try:
+                        df_5m = download_data(TICKER, period="5d", interval="5m")
+                        df_h4 = resample_to_tf(df_5m, "4h")
+                        current_price = float(df_5m["Close"].iloc[-1])
+                        h4_sr = find_horizontal_sr(df_h4)
+                        h4_structure = detect_structure(df_h4)
+                        swing_highs, swing_lows = find_swing_points(df_h4, left=6, right=3)
+                        fib_levels = {}
+                        if swing_highs and swing_lows:
+                            rh = max(swing_highs[-3:], key=lambda x: x["price"])["price"]
+                            rl = min(swing_lows[-3:], key=lambda x: x["price"])["price"]
+                            if rh > rl:
+                                fib_levels = compute_fib_levels(rh, rl)
+                        exhaustion = detect_exhaustion(df_5m, len(df_5m) - 1)
+                        consol = detect_consolidation_break(df_5m, len(df_5m) - 1)
+
+                        result = score_confluence(
+                            price=current_price, sr_levels=h4_sr, fib_levels=fib_levels,
+                            structure=h4_structure, exhaustion=exhaustion,
+                            trendline_break=False, consolidation_break=consol, gap=None,
+                        )
+
+                        if result["tradeable"]:
+                            log.info(f"LIVE SIGNAL {result['direction']} score={result['score']}")
+                            entry = float(result["entry_price"])
+                            stop_px = float(result["stop_price"])
+                            target_px = float(result["tp1"])
+
+                            risk_budget = compute_risk_usd(strategy_label="forge_cuebanks")
+                            stop_dist = abs(entry - stop_px)
+                            contracts = max(1, int(risk_budget / max(stop_dist * POINT_VALUE_MYM, 1e-6)))
+                            cap = max_notional_usd("micro_future")
+                            if cap > 0 and entry * POINT_VALUE_MYM * contracts > cap:
+                                contracts = max(1, int(cap / max(entry * POINT_VALUE_MYM, 1e-6)))
+
+                            sig = sx.SignalEntry(
+                                symbol="MYM", direction=result["direction"], size=contracts,
+                                stop_px=stop_px, target_px=target_px,
+                                instrument_type="micro_future", price_decimals=0,
+                                max_hold_bars=24,  # 2 hours at 5min
+                            )
+                            if sx.submit_signal(state, ib, sig):
+                                log.info(f"LIVE {result['direction']} MYM entry={entry:.0f} stop={stop_px:.0f} target={target_px:.0f}")
+                                # Append to signal CSV (existing format)
+                                row = {
+                                    "timestamp": now.isoformat(),
+                                    "price": current_price,
+                                    "score": result["score"],
+                                    "direction": result["direction"],
+                                    "factors": " | ".join(result["factors"]),
+                                    "entry": entry, "stop": stop_px, "tp1": target_px,
+                                }
+                                file_exists = signal_csv.exists()
+                                with open(signal_csv, "a", newline="") as f:
+                                    writer = csv.DictWriter(f, fieldnames=row.keys())
+                                    if not file_exists:
+                                        writer.writeheader()
+                                    writer.writerow(row)
+                    except Exception as e:
+                        log.error(f"cuebanks live scan error: {e}", exc_info=True)
+            finally:
+                if ib is not None:
+                    ibkr.disconnect(ib)
+                try:
+                    state_path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+                except Exception:
+                    pass
+
+            time.sleep(LOOP_S)
+        except KeyboardInterrupt:
+            log.info("cuebanks live stopped")
+            break
+        except Exception as e:
+            log.error(f"live loop error: {e}", exc_info=True)
+            time.sleep(60)
 
 
 # ---------------------------------------------------------------------------
