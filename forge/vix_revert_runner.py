@@ -70,6 +70,14 @@ log.addHandler(_file_handler)
 VIX_ENTRY = 30.0
 VIX_EXIT = 20.0
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+sys.path.insert(0, str(_FORGE.parent))
+from helio import ibkr_execution as ibkr  # noqa: E402
+IBKR_CLIENT_ID = 113
+_SIGNAL_ONLY_MODE = False
+# Event-driven sizing: VIX > 30 is a panic event. Use 50% anchor for the SPY long.
+NOTIONAL_FRACTION = 0.5
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -178,32 +186,103 @@ def evaluate_once() -> str:
 
     action = "NO_SIGNAL"
 
-    if not state["in_position"]:
-        if vix >= VIX_ENTRY:
-            action = "BUY"
-            state["in_position"] = True
-            state["entry_date"] = datetime.now(tz=timezone.utc).isoformat()
-            state["entry_vix"] = round(vix, 2)
-            _append_signal("BUY", vix, f"VIX {vix:.1f} >= {VIX_ENTRY} — buy the panic")
-            log.info(f"BUY SPY — VIX={vix:.2f} >= {VIX_ENTRY}")
-        else:
-            log.info(f"No signal — VIX={vix:.2f} < {VIX_ENTRY}")
-    else:
-        if vix < VIX_EXIT:
-            action = "EXIT"
-            _append_signal("EXIT", vix, f"VIX {vix:.1f} < {VIX_EXIT} — mean reverted")
-            log.info(f"EXIT SPY — VIX={vix:.2f} < {VIX_EXIT}")
-            state["in_position"] = False
-            state["entry_date"] = None
-            state["entry_vix"] = None
-        else:
-            action = "HOLD"
-            log.info(f"HOLD — in position, VIX={vix:.2f} (exit below {VIX_EXIT})")
+    # IBKR connection (per-cycle, brief)
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+        except Exception as exc:
+            log.warning("IBKR connect failed, signal-only fallback: %s", exc)
+            ib = None
 
-    _save_state(state)
-    _write_heartbeat("ok", {"vix": round(vix, 2), "action": action,
-                            "in_position": state["in_position"]})
-    return action
+    try:
+        if not state["in_position"]:
+            if vix >= VIX_ENTRY:
+                # Submit BUY SPY (no bracket — exit triggered by VIX < 20)
+                entry_px = None
+                shares = 0
+                execution_venue = "signal_only"
+                if ib is not None:
+                    contract = ibkr.make_contract("SPY", "etf")
+                    try:
+                        ib.qualifyContracts(contract)
+                        existing = ibkr.query_position(ib, contract)
+                        if existing != 0:
+                            log.warning("BROKER_HAS_POSITION: SPY qty=%s, skipping vix_revert entry", existing)
+                            return "SKIP_HAS_POS"
+                        try:
+                            from helio.fleet_sizing import get_sizing_anchor_usd, max_notional_usd
+                            anchor = float(get_sizing_anchor_usd())
+                        except Exception:
+                            anchor = 10000.0
+                        target_notional = min(anchor * NOTIONAL_FRACTION, max_notional_usd("etf"))
+                        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr="1 D",
+                                                      barSizeSetting="1 hour", whatToShow="TRADES", useRTH=True)
+                        plan_entry = float(bars[-1].close) if bars else 500.0
+                        shares = max(1, int(target_notional / max(plan_entry, 1e-6)))
+                        from ib_insync import MarketOrder
+                        order = MarketOrder("BUY", shares)
+                        trade = ib.placeOrder(contract, order)
+                        fill = ibkr._wait_for_fill(ib, trade, timeout_s=15.0)
+                        if fill.filled:
+                            entry_px = fill.fill_price
+                            execution_venue = "ibkr_paper"
+                            log.info(f"VIX_REVERT ENTRY FILLED: BUY {shares} SPY @ {entry_px:.2f}")
+                        else:
+                            log.error("VIX_REVERT ENTRY FAILED: %s", fill.reject_reason)
+                    except Exception as exc:
+                        log.error("VIX_REVERT ENTRY EXCEPTION: %s", exc, exc_info=True)
+                action = "BUY"
+                state["in_position"] = True
+                state["entry_date"] = datetime.now(tz=timezone.utc).isoformat()
+                state["entry_vix"] = round(vix, 2)
+                state["entry_px"] = entry_px
+                state["position_size"] = shares
+                state["execution_venue"] = execution_venue
+                _append_signal("BUY", vix, f"VIX {vix:.1f} >= {VIX_ENTRY} — buy the panic ({execution_venue} {shares} sh @ {entry_px})")
+                log.info(f"BUY SPY — VIX={vix:.2f} >= {VIX_ENTRY}")
+            else:
+                log.info(f"No signal — VIX={vix:.2f} < {VIX_ENTRY}")
+        else:
+            if vix < VIX_EXIT:
+                exit_px = None
+                pnl_usd = None
+                if ib is not None and state.get("execution_venue") == "ibkr_paper":
+                    contract = ibkr.make_contract("SPY", "etf")
+                    try:
+                        ib.qualifyContracts(contract)
+                        broker_qty = ibkr.query_position(ib, contract)
+                    except Exception:
+                        broker_qty = 0
+                    if broker_qty > 0:
+                        fill = ibkr.close_position_market(
+                            ib, contract, direction="long", size=broker_qty,
+                        )
+                        if fill.filled:
+                            exit_px = fill.fill_price
+                            entry_px = state.get("entry_px") or exit_px
+                            pnl_usd = (exit_px - entry_px) * broker_qty
+                            log.info(f"VIX_REVERT EXIT FILLED @ {exit_px:.2f}, pnl=${pnl_usd:.2f}")
+                action = "EXIT"
+                _append_signal("EXIT", vix, f"VIX {vix:.1f} < {VIX_EXIT} — mean reverted (exit_px={exit_px} pnl=${pnl_usd})")
+                log.info(f"EXIT SPY — VIX={vix:.2f} < {VIX_EXIT}")
+                state["in_position"] = False
+                state["entry_date"] = None
+                state["entry_vix"] = None
+                state["entry_px"] = None
+                state["position_size"] = 0
+                state["execution_venue"] = None
+            else:
+                action = "HOLD"
+                log.info(f"HOLD — in position, VIX={vix:.2f} (exit below {VIX_EXIT})")
+
+        _save_state(state)
+        _write_heartbeat("ok", {"vix": round(vix, 2), "action": action,
+                                "in_position": state["in_position"]})
+        return action
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
 def show_status() -> None:
@@ -246,7 +325,13 @@ def main() -> None:
     group.add_argument("--loop", action="store_true", help="Continuous loop (hourly)")
     group.add_argument("--check", action="store_true", help="One-shot evaluation")
     group.add_argument("--status", action="store_true", help="Show current state")
+    parser.add_argument("--signal-only", action="store_true",
+                        help="Skip IBKR submission — log signals only")
     args = parser.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
 
     if args.status:
         show_status()
