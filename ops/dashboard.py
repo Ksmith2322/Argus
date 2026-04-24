@@ -4065,6 +4065,10 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
         "current_cumulative_pnl_usd": round(cumulative, 2),
         "current_cumulative_pnl_pct": round((cumulative / anchor) * 100.0 if anchor else 0.0, 4),
         "contribution_by_strategy": {k: round(v, 2) for k, v in sorted(by_strategy.items(), key=lambda x: -x[1])},
+        # Full list of tracked strategies (even zero-trade) so the per-strategy
+        # overlay can render every series. Labels match the `strategy` field on points.
+        "tracked_strategies": [label for (label, _, _, _, _) in specs],
+        "server_now_iso": datetime.now(timezone.utc).isoformat(),
         "points": points,
     })
 
@@ -6007,8 +6011,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div style="display:flex; justify-content:space-between; align-items:center;">
-  <h1>HELIO FLEET DASHBOARD</h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <h1 style="margin:0;">HELIO FLEET DASHBOARD</h1>
+    <a href="/brain" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">HELIO NEURAL CORE</a>
+    <a href="/fleet" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">FLEET OPS</a>
+  </div>
   <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR STAGED</span>
+</div>
+
+<!-- Governance health bar moved to top 2026-04-23 (was inside #ibkr-page section) -->
+<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin:10px 0;" id="governance-health-bar">
+  <span style="color:#7b8ab8;font-size:0.7em;">Loading governance health...</span>
 </div>
 
 <!-- FLEET STATUS panel removed 2026-04-22: redundant with fleet_health tiles + Strategy Performance table. -->
@@ -6018,10 +6031,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div id="stale-data-banner" style="margin-bottom:10px;"></div>
 <div id="silent-block-banner" style="margin-bottom:10px;"></div>
 <div id="maturity-summary-banner" style="margin-bottom:10px;"></div>
-<div id="risk-exposure-banner" style="margin-bottom:10px;"></div>
+<!-- risk-exposure-banner removed 2026-04-23 — same numbers visible in Open Positions panel. -->
 <div id="open-positions-panel" style="margin-bottom:10px;"></div>
-<div id="promotion-ladder-panel" style="margin-bottom:10px;"></div>
-<div id="exit-reasons-panel" style="margin-bottom:10px;"></div>
+<!-- promotion-ladder-panel removed 2026-04-23: promotion progress now inline in Strategy Performance table as 0-100% bar. -->
+<!-- exit-reasons-panel removed 2026-04-23: redundant with Exit Distribution column in Strategy Performance table. -->
 <script>
 // ─── OPEN POSITIONS + RISK EXPOSURE ───────────────────────────────
 function loadPositionsAndRisk() {
@@ -6092,55 +6105,8 @@ function loadPositionsAndRisk() {
 loadPositionsAndRisk();
 setInterval(loadPositionsAndRisk, 30000);
 
-// ─── PROMOTION LADDER ─────────────────────────────────────────────
-function loadPromotionLadder() {
-  fetch('/api/promotion_ladder').then(r=>r.json()).then(data=>{
-    const el = document.getElementById('promotion-ladder-panel');
-    if (!el) return;
-    if (data.error || !data.strategies) { el.innerHTML = ''; return; }
-    // Only show strategies with at least 1 live trade OR within 5 of starting
-    const activeOnly = data.strategies.filter(s => s.live_trades > 0);
-    if (activeOnly.length === 0) { el.innerHTML = ''; return; }
-    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
-      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:8px;">PROMOTION LADDER</div>'
-      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;">';
-    for (const s of activeOnly) {
-      const pfStr = s.live_pf === null ? '—' : Number(s.live_pf).toFixed(2);
-      const verdictColor = s.verdict === 'VALIDATED' ? '#00ff88' : s.verdict === 'DEGRADED' ? '#ff4444' : s.verdict === 'EMERGING' ? '#ffc107' : '#7b8ab8';
-      const pct = s.progress_pct;
-      const barColor = pct >= 75 ? '#00ff88' : pct >= 50 ? '#ffc107' : '#7b8ab8';
-      html += '<div style="background:#0d1117;border:1px solid #1e2a42;border-radius:4px;padding:8px 10px;">'
-        + '<div style="display:flex;justify-content:space-between;font-size:0.78em;margin-bottom:4px;">'
-        + '<span style="color:#e0e0e0;font-weight:bold;">' + s.strategy + '</span>'
-        + '<span style="color:' + verdictColor + ';font-weight:bold;font-size:0.9em;">' + s.verdict + '</span>'
-        + '</div>'
-        + '<div style="font-size:0.7em;color:#9da8c7;margin-bottom:4px;">'
-        + 'tier: <span style="color:#00d4ff;">' + s.current_tier + ' (' + (s.current_risk_pct*100).toFixed(2) + '%)</span>';
-      if (s.next_tier) {
-        html += ' → ' + s.next_tier + ' (' + (s.next_tier_risk_pct*100).toFixed(2) + '%)</div>'
-          + '<div style="background:#1a1f2e;border-radius:3px;height:6px;overflow:hidden;">'
-          + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div></div>'
-          + '<div style="font-size:0.65em;color:#7b8ab8;margin-top:4px;">'
-          + s.live_trades + ' trades · need ' + s.trades_needed + ' more'
-          + (s.pf_gap != null && s.pf_gap > 0 ? ' · PF gap ' + s.pf_gap.toFixed(2) : '')
-          + ' · live PF ' + pfStr
-          + '</div>'
-          + '<div style="font-size:0.6em;color:#7b8ab8;margin-top:2px;">'
-          + 'trades ' + (s.trade_progress_pct != null ? s.trade_progress_pct.toFixed(0) + '%' : '—')
-          + ' · PF ' + (s.pf_progress_pct != null ? s.pf_progress_pct.toFixed(0) + '%' : '—')
-          + ' <span style="color:#5a6585;">(overall = min)</span>'
-          + '</div>';
-      } else {
-        html += '</div><div style="color:#00ff88;font-size:0.7em;">At max tier (exceptional)</div>';
-      }
-      html += '</div>';
-    }
-    html += '</div></div>';
-    el.innerHTML = html;
-  }).catch(()=>{});
-}
-loadPromotionLadder();
-setInterval(loadPromotionLadder, 120000);
+// Promotion ladder panel removed 2026-04-23 — progress now inline in
+// Strategy Performance table. /api/promotion_ladder still powers that column.
 
 // ─── EXIT REASON DISTRIBUTION ─────────────────────────────────────
 function loadExitReasons() {
@@ -6448,18 +6414,16 @@ function renderEquityCurve(points, width, height, anchor) {
   const x = (ts) => pad.left + ((new Date(ts).getTime() - t0) / tSpan) * innerW;
   const y = (v) => pad.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
 
-  // Path + area
-  let linePath = '';
+  // Path (smoothed cubic bezier) + area under curve
+  // Falls back to straight lines if smoothPath helper isn't defined yet (script load order safety).
+  const linePath = (typeof smoothPath === 'function')
+    ? smoothPath(points, x, y)
+    : points.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.ts).toFixed(1) + ',' + y(p.cumulative_pnl_usd).toFixed(1)).join(' ');
   let areaPath = '';
-  points.forEach((p, i) => {
-    const px = x(p.ts), py = y(p.cumulative_pnl_usd);
-    linePath += (i === 0 ? 'M' : 'L') + px.toFixed(1) + ',' + py.toFixed(1) + ' ';
-  });
   if (points.length) {
     const x0 = x(points[0].ts), x1 = x(points[points.length-1].ts), yZero = y(0);
-    areaPath = 'M' + x0.toFixed(1) + ',' + yZero.toFixed(1) + ' '
-      + points.map(p => 'L' + x(p.ts).toFixed(1) + ',' + y(p.cumulative_pnl_usd).toFixed(1)).join(' ')
-      + ' L' + x1.toFixed(1) + ',' + yZero.toFixed(1) + ' Z';
+    // Area = smoothed top edge + vertical drop to baseline + close back to start
+    areaPath = linePath + ' L' + x1.toFixed(1) + ',' + yZero.toFixed(1) + ' L' + x0.toFixed(1) + ',' + yZero.toFixed(1) + ' Z';
   }
 
   const finalVal = vals[vals.length-1];
@@ -6540,57 +6504,164 @@ function loadFleetEquityCurve() {
 loadFleetEquityCurve();
 setInterval(loadFleetEquityCurve, 60000);
 
-// Per-strategy small-multiples equity curves — reuses renderEquityCurve
+// Monotone cubic (Fritsch-Carlson) smoother — same algorithm as D3's
+// curveMonotoneX. Passes through every data point exactly AND guarantees no
+// overshoot/loops between them. Equity curves read as smooth continuous lines
+// instead of swirling around trade clusters like Catmull-Rom does.
+function smoothPath(pts, xFn, yFn) {
+  if (!pts || pts.length === 0) return '';
+  const n = pts.length;
+  if (n === 1) return 'M' + xFn(pts[0].ts).toFixed(1) + ',' + yFn(pts[0].cumulative_pnl_usd).toFixed(1);
+  const xs = pts.map(p => xFn(p.ts));
+  const ys = pts.map(p => yFn(p.cumulative_pnl_usd));
+
+  // Secant slopes between consecutive points
+  const dx = new Array(n - 1), dy = new Array(n - 1), sec = new Array(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    dx[i] = xs[i+1] - xs[i];
+    dy[i] = ys[i+1] - ys[i];
+    sec[i] = dx[i] === 0 ? 0 : dy[i] / dx[i];
+  }
+
+  // Tangent at each point, then Fritsch-Carlson clamp
+  const m = new Array(n);
+  m[0] = sec[0];
+  for (let i = 1; i < n - 1; i++) {
+    if (sec[i-1] * sec[i] <= 0) m[i] = 0;
+    else m[i] = (sec[i-1] + sec[i]) / 2;
+  }
+  m[n-1] = sec[n-2];
+  for (let i = 0; i < n - 1; i++) {
+    if (sec[i] === 0) { m[i] = 0; m[i+1] = 0; continue; }
+    const a = m[i] / sec[i], b = m[i+1] / sec[i];
+    const s = a*a + b*b;
+    if (s > 9) {
+      const t = 3 / Math.sqrt(s);
+      m[i]   = t * a * sec[i];
+      m[i+1] = t * b * sec[i];
+    }
+  }
+
+  // Convert Hermite tangents to cubic-bezier control points (1/3 of dx out)
+  let d = 'M' + xs[0].toFixed(1) + ',' + ys[0].toFixed(1);
+  for (let i = 0; i < n - 1; i++) {
+    const cp1x = xs[i]   + dx[i] / 3;
+    const cp1y = ys[i]   + m[i]   * dx[i] / 3;
+    const cp2x = xs[i+1] - dx[i] / 3;
+    const cp2y = ys[i+1] - m[i+1] * dx[i] / 3;
+    d += ' C' + cp1x.toFixed(1) + ',' + cp1y.toFixed(1)
+       + ' ' + cp2x.toFixed(1) + ',' + cp2y.toFixed(1)
+       + ' ' + xs[i+1].toFixed(1) + ',' + ys[i+1].toFixed(1);
+  }
+  return d;
+}
+
+// Combined per-strategy overlay — every strategy on one chart, each its own color + legend.
+const _stratPalette = ['#00d4ff','#ff9800','#00ff88','#e91e63','#ffc107','#9c27b0','#8bc34a','#ff5722','#03a9f4','#ffeb3b','#009688','#f06292','#cddc39','#ba68c8'];
 function loadPerStrategyEquity() {
   fetch('/api/fleet_equity_curve?window_days=90&include_backfill=false').then(r=>r.json()).then(data=>{
     const el = document.getElementById('per-strategy-equity-panel');
     if (!el) return;
-    const anchor = data.anchor_capital_usd || 10000;
     const points = data.points || [];
+    const tracked = data.tracked_strategies || [];
+    const serverNow = data.server_now_iso ? new Date(data.server_now_iso).getTime() : Date.now();
 
-    // Group by strategy and compute per-strategy cumulative
+    // Group raw events by strategy
     const byStrat = new Map();
     for (const p of points) {
       const s = p.strategy || 'unknown';
       if (!byStrat.has(s)) byStrat.set(s, []);
       byStrat.get(s).push(p);
     }
-    const cards = [];
-    for (const [label, rows] of byStrat.entries()) {
-      rows.sort((a,b) => new Date(a.ts) - new Date(b.ts));
+
+    // t0 = earliest event across all strategies (or now if no trades yet)
+    const tsList = points.map(p => new Date(p.ts).getTime()).filter(x => isFinite(x));
+    const tEarliest = tsList.length ? Math.min(...tsList) : serverNow;
+    const t0ms = tEarliest;
+    const t1ms = serverNow;
+    const t0iso = new Date(t0ms).toISOString();
+    const t1iso = new Date(t1ms).toISOString();
+
+    // Build a series for EVERY tracked strategy (not just ones with trades).
+    // Each series starts at (t0, $0) and ends at (t1, final_cum) so all lines
+    // share the same left edge and extend to now. Zero-trade strategies render
+    // as a flat line at $0 from t0 → t1.
+    const series = [];
+    const allLabels = new Set([...tracked, ...byStrat.keys()]);
+    for (const label of allLabels) {
+      const rows = (byStrat.get(label) || []).slice().sort((a,b) => new Date(a.ts) - new Date(b.ts));
       let cum = 0;
-      const pts = rows.map(r => {
+      const core = rows.map(r => {
         cum += (r.trade_pnl_usd || 0);
         return { ts: r.ts, cumulative_pnl_usd: Math.round(cum*100)/100 };
       });
-      const finalPnl = pts.length ? pts[pts.length-1].cumulative_pnl_usd : 0;
-      const color = finalPnl > 0 ? '#00ff88' : (finalPnl < 0 ? '#ff4444' : '#7b8ab8');
-      cards.push({ label, pts, finalPnl, color, trades: rows.length });
+      const pts = [{ ts: t0iso, cumulative_pnl_usd: 0 }, ...core, { ts: t1iso, cumulative_pnl_usd: Math.round(cum*100)/100 }];
+      series.push({ label, pts, finalPnl: Math.round(cum*100)/100, trades: rows.length });
     }
-    // Sort by absolute PnL impact so biggest movers render first
-    cards.sort((a,b) => Math.abs(b.finalPnl) - Math.abs(a.finalPnl));
+    // Active (traded) strategies get palette colors + render on top; zero-trade
+    // strategies get a muted grey and render first so the active ones overlay.
+    const traded = series.filter(s => s.trades > 0).sort((a,b) => Math.abs(b.finalPnl) - Math.abs(a.finalPnl));
+    const untraded = series.filter(s => s.trades === 0).sort((a,b) => a.label.localeCompare(b.label));
+    traded.forEach((s, i) => { s.color = _stratPalette[i % _stratPalette.length]; s.active = true; });
+    untraded.forEach(s => { s.color = '#3a4560'; s.active = false; });
+    const drawOrder = [...untraded, ...traded]; // untraded first (underneath), traded on top
 
     let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">'
       + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">PER-STRATEGY EQUITY CURVES</div>'
-      + '<div style="font-size:0.7em;color:#7b8ab8;">live-only last ' + (data.window_days || 90) + 'd | ' + cards.length + ' strategies with trades</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;">live-only last ' + (data.window_days || 90) + 'd | ' + traded.length + '/' + series.length + ' strategies have traded</div>'
       + '</div>';
 
-    if (!cards.length) {
-      html += '<div style="color:#7b8ab8;font-size:0.75em;padding:10px;">No strategies with live trades in window.</div>';
-      el.innerHTML = html;
-      return;
+    // Shared axes across all series (use drawOrder so flat-$0 untraded strategies contribute too)
+    const allPts = drawOrder.flatMap(s => s.pts);
+    let vMin = Math.min(0, ...allPts.map(p => p.cumulative_pnl_usd));
+    let vMax = Math.max(0, ...allPts.map(p => p.cumulative_pnl_usd));
+    if (vMax === vMin) vMax = vMin + 1;
+    const pv = (vMax - vMin) * 0.08; vMin -= pv; vMax += pv;
+    const t0 = t0ms;
+    const t1 = t1ms;
+    const tSpan = Math.max(t1 - t0, 1);
+    const W = Math.max(el.clientWidth - 28, 600), H = 280;
+    const pad = {top: 10, right: 10, bottom: 22, left: 54};
+    const innerW = W - pad.left - pad.right, innerH = H - pad.top - pad.bottom;
+    const x = ts => pad.left + ((new Date(ts).getTime() - t0) / tSpan) * innerW;
+    const y = v => pad.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
+
+    // Axes: y ticks, zero line, x date labels
+    const yTicks = [vMin, (vMin+vMax)/2, vMax];
+    let svg = '';
+    for (const v of yTicks) {
+      const py = y(v);
+      svg += '<line x1="' + pad.left + '" y1="' + py.toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + py.toFixed(1) + '" stroke="#1e2a42" stroke-width="1" stroke-dasharray="2,3"/>'
+           + '<text x="' + (pad.left-6) + '" y="' + (py+3).toFixed(1) + '" fill="#7b8ab8" font-size="10" text-anchor="end">$' + v.toFixed(0) + '</text>';
+    }
+    if (vMin < 0 && vMax > 0) {
+      svg += '<line x1="' + pad.left + '" y1="' + y(0).toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + y(0).toFixed(1) + '" stroke="#334" stroke-width="1"/>';
+    }
+    const fmt = ts => { const d = new Date(ts); return (d.getMonth()+1) + '/' + d.getDate(); };
+    svg += '<text x="' + pad.left + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10">' + fmt(t0) + '</text>'
+         + '<text x="' + (W-pad.right) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="end">' + fmt(t1) + '</text>';
+
+    // Draw each series (single point = dot, multi point = smooth line)
+    for (const s of series) {
+      if (s.pts.length === 1) {
+        svg += '<circle cx="' + x(s.pts[0].ts).toFixed(1) + '" cy="' + y(s.pts[0].cumulative_pnl_usd).toFixed(1) + '" r="3" fill="' + s.color + '"/>';
+      } else {
+        svg += '<path d="' + smoothPath(s.pts, x, y) + '" fill="none" stroke="' + s.color + '" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>';
+      }
     }
 
-    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;">';
-    for (const c of cards) {
-      const sign = c.finalPnl >= 0 ? '+' : '';
-      html += '<div style="background:#0d1321;border:1px solid #1e2a42;border-left:3px solid ' + c.color + ';border-radius:4px;padding:8px;">'
-        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:6px;">'
-        + '<div style="color:#e0e0e0;font-size:0.75em;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + c.label + '</div>'
-        + '<div style="color:' + c.color + ';font-size:0.75em;font-weight:bold;white-space:nowrap;">' + sign + '$' + c.finalPnl.toFixed(2) + '</div>'
-        + '</div>'
-        + '<div style="color:#7b8ab8;font-size:0.65em;margin-bottom:4px;">' + c.trades + ' trades</div>'
-        + renderEquityCurve(c.pts, 260, 90, anchor)
+    html += '<svg width="' + W + '" height="' + H + '" style="display:block;">' + svg + '</svg>';
+
+    // Legend — color swatch + strategy + final PnL + trade count
+    html += '<div style="display:flex;flex-wrap:wrap;gap:10px 18px;margin-top:10px;font-size:0.72em;">';
+    for (const s of series) {
+      const sign = s.finalPnl >= 0 ? '+' : '';
+      const pnlColor = s.finalPnl >= 0 ? '#00ff88' : '#ff4444';
+      html += '<div style="display:flex;align-items:center;gap:6px;">'
+        + '<span style="display:inline-block;width:10px;height:10px;background:' + s.color + ';border-radius:2px;"></span>'
+        + '<span style="color:#e0e0e0;">' + s.label + '</span>'
+        + '<span style="color:' + pnlColor + ';font-weight:bold;">' + sign + '$' + s.finalPnl.toFixed(2) + '</span>'
+        + '<span style="color:#7b8ab8;">(' + s.trades + ')</span>'
         + '</div>';
     }
     html += '</div>';
@@ -6602,6 +6673,7 @@ function loadPerStrategyEquity() {
 }
 loadPerStrategyEquity();
 setInterval(loadPerStrategyEquity, 60000);
+window.addEventListener('resize', loadPerStrategyEquity);
 </script>
 <script>
 function loadFleetHealth() {
@@ -6644,22 +6716,89 @@ setInterval(loadFleetHealth, 30000);
 <div id="recent-trades-panel" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:14px;"></div>
 <script>
 function loadStrategyPerformance() {
-  // Fetch both endpoints in parallel, then merge tier/risk$ into each strategy row
+  // Fetch 4 endpoints in parallel: perf rows, tier/risk, exit-reason dist, promotion progress
   Promise.all([
     fetch('/api/strategy_performance').then(r=>r.json()),
-    fetch('/api/strategy_tiers').then(r=>r.json()).catch(()=>({strategies:[]}))
-  ]).then(([data, tiersData])=>{
+    fetch('/api/strategy_tiers').then(r=>r.json()).catch(()=>({strategies:[]})),
+    fetch('/api/exit_reasons').then(r=>r.json()).catch(()=>({strategies:{}})),
+    fetch('/api/promotion_ladder').then(r=>r.json()).catch(()=>({strategies:[]}))
+  ]).then(([data, tiersData, exitData, promData])=>{
     const el = document.getElementById('strategy-performance');
     if (!el) return;
     const strategies = data.strategies || [];
+    const norm = (x) => String(x || '').toLowerCase().replace(/[\s_.\-/]/g, '');
 
-    // Build lookup from tier endpoint, keyed by strategy name (case-insensitive, whitespace-normalized)
+    // Build tier lookup (accept full-name, stripped-prefix, and system synonyms)
     const tierMap = new Map();
     for (const t of (tiersData.strategies || [])) {
-      const key = String(t.strategy || '').toLowerCase().replace(/[\s_.-]/g, '');
-      tierMap.set(key, t);
+      const full = norm(t.strategy);
+      tierMap.set(full, t);
+      // Strip common prefixes so "spy_mean_rev" matches the "Spy Mean Rev" row
+      const stripped = full.replace(/^(forge|argus|apollo|hermes|titan|ares)/, '');
+      if (stripped && stripped !== full) tierMap.set(stripped, t);
     }
     const anchorUsd = Number(tiersData.anchor_usd || 0);
+
+    // Build exit-distribution lookup. Keys: full, stripped-prefix, and aggregated
+    // parent buckets (e.g. argus_usdjpy + argus_gbpusd + argus_cadjpy → "argus").
+    const exitMap = new Map();
+    const parentAgg = new Map(); // parent-name -> aggregated stats
+    const rawExits = (exitData && exitData.strategies) || {};
+    for (const key of Object.keys(rawExits)) {
+      const entry = rawExits[key];
+      const full = norm(key);
+      exitMap.set(full, entry);
+      const m = key.match(/^([a-z]+)_(.+)$/i);
+      if (m) {
+        const parent = m[1].toLowerCase();
+        const rest = norm(m[2]);
+        if (rest) exitMap.set(rest, entry);
+        // Aggregate into parent bucket (for rows like "Argus" that cover 3 pairs)
+        if (!parentAgg.has(parent)) {
+          parentAgg.set(parent, {total: 0, by_reason: {}});
+        }
+        const agg = parentAgg.get(parent);
+        agg.total += entry.total || 0;
+        for (const [r, c] of Object.entries(entry.by_reason || {})) {
+          agg.by_reason[r] = (agg.by_reason[r] || 0) + c;
+        }
+      }
+    }
+    // Promote aggregated buckets into the lookup (with pct recomputed)
+    for (const [parent, agg] of parentAgg.entries()) {
+      if (agg.total > 0 && !exitMap.has(parent)) {
+        const pct_by_reason = {};
+        for (const [r, c] of Object.entries(agg.by_reason)) {
+          pct_by_reason[r] = Math.round(c / agg.total * 1000) / 10;
+        }
+        exitMap.set(parent, {total: agg.total, by_reason: agg.by_reason, pct_by_reason});
+      }
+    }
+
+    // Build promotion-ladder lookup (same key strategy as tier/exit maps)
+    const promMap = new Map();
+    for (const p of (promData.strategies || [])) {
+      const full = norm(p.strategy);
+      promMap.set(full, p);
+      const stripped = full.replace(/^(forge|argus|apollo|hermes|titan|ares)/, '');
+      if (stripped && stripped !== full) promMap.set(stripped, p);
+    }
+
+    const renderExitBar = (entry) => {
+      if (!entry || !entry.total) return '<span style="color:#555;">—</span>';
+      const p = entry.pct_by_reason || {};
+      const stop = p.stop || 0, target = p.target || 0, time = p.time || 0;
+      const other = Math.max(0, 100 - stop - target - time);
+      const parts = [];
+      if (stop > 0)   parts.push('<div title="stop '+stop+'%" style="background:#ff4444;height:100%;width:'+stop+'%;"></div>');
+      if (target > 0) parts.push('<div title="target '+target+'%" style="background:#00ff88;height:100%;width:'+target+'%;"></div>');
+      if (time > 0)   parts.push('<div title="time '+time+'%" style="background:#ffc107;height:100%;width:'+time+'%;"></div>');
+      if (other > 0)  parts.push('<div title="other '+other.toFixed(0)+'%" style="background:#555;height:100%;width:'+other+'%;"></div>');
+      const tip = entry.total + ' trades · stop '+stop+'% · target '+target+'%' + (time ? ' · time '+time+'%' : '');
+      return '<div title="' + tip + '" style="display:flex;width:100%;min-width:100px;height:10px;border-radius:2px;overflow:hidden;background:#1e2a42;">'
+        + parts.join('') + '</div>'
+        + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;">' + entry.total + ' trades</div>';
+    };
 
     const fleetConfText = data.fleet_confidence !== null && data.fleet_confidence !== undefined
       ? data.fleet_confidence + '%'
@@ -6684,9 +6823,9 @@ function loadStrategyPerformance() {
     html += '<thead><tr style="background:#0d1321;color:#7b8ab8;text-align:left;">'
       + '<th style="padding:8px;">System</th>'
       + '<th style="padding:8px;">Strategy</th>'
-      + '<th style="padding:8px;">Tier</th>'
+      + '<th style="padding:8px;min-width:120px;">Exit Distribution</th>'
+      + '<th style="padding:8px;min-width:110px;">Promotion</th>'
       + '<th style="padding:8px;text-align:right;">Risk %</th>'
-      + '<th style="padding:8px;text-align:right;">Risk $</th>'
       + '<th style="padding:8px;text-align:right;">Backtest PF</th>'
       + '<th style="padding:8px;text-align:right;">BT Trades</th>'
       + '<th style="padding:8px;text-align:right;">BT WR</th>'
@@ -6705,16 +6844,48 @@ function loadStrategyPerformance() {
       const livePnlColor = s.live_pnl > 0 ? '#00ff88' : (s.live_pnl < 0 ? '#ff4444' : '#7b8ab8');
       const statusColor = s.status === 'BAKING' || s.status === 'SCANNING' || s.status === 'WAITING_ER' ? '#00d4ff' : '#7b8ab8';
 
-      // Tier lookup — try several name formats to match across endpoints
-      const candidates = [s.strategy, s.system + '_' + s.strategy, s.system, (s.system || '').toLowerCase() + '_' + (s.strategy || '').toLowerCase()].map(x => String(x || '').toLowerCase().replace(/[\s_.-]/g, ''));
+      // Name candidates for cross-endpoint lookups (tier map + exit map)
+      const candidates = [
+        s.strategy,
+        s.system + '_' + s.strategy,
+        s.system,
+        (s.system || '').toLowerCase() + '_' + (s.strategy || '').toLowerCase()
+      ].map(norm);
       let tierInfo = null;
       for (const k of candidates) {
         if (k && tierMap.has(k)) { tierInfo = tierMap.get(k); break; }
       }
-      const tier = tierInfo ? (tierInfo.tier || '—') : '—';
-      const tierColor = tier === 'unproven' ? '#7b8ab8' : tier === 'emerging' ? '#00d4ff' : tier === 'validated' ? '#00ff88' : tier === 'promoted' ? '#ffaa00' : tier === 'exceptional' ? '#ff9800' : '#555';
+      let exitInfo = null;
+      for (const k of candidates) {
+        if (k && exitMap.has(k)) { exitInfo = exitMap.get(k); break; }
+      }
+      let promInfo = null;
+      for (const k of candidates) {
+        if (k && promMap.has(k)) { promInfo = promMap.get(k); break; }
+      }
       const riskPctStr = tierInfo ? ((Number(tierInfo.risk_pct || 0) * 100).toFixed(2) + '%') : '—';
-      const riskUsdStr = tierInfo ? ('$' + Number(tierInfo.risk_usd_now || 0).toLocaleString(undefined,{maximumFractionDigits:0})) : '—';
+
+      // Render promotion progress as 0-100 bar + % label + verdict color
+      let promCell = '<span style="color:#555;">—</span>';
+      if (promInfo) {
+        const pct = Math.max(0, Math.min(100, Number(promInfo.progress_pct) || 0));
+        const verdict = promInfo.verdict || '';
+        const barColor = verdict === 'DEGRADED' ? '#ff4444'
+                       : pct >= 75 ? '#00ff88'
+                       : pct >= 50 ? '#ffc107'
+                       : '#7b8ab8';
+        const subtitle = promInfo.next_tier
+          ? ('→ ' + promInfo.next_tier + ' · need ' + (promInfo.trades_needed || 0) + ' trades'
+             + (promInfo.pf_gap > 0 ? ' · PF gap ' + Number(promInfo.pf_gap).toFixed(2) : ''))
+          : 'at max tier';
+        promCell = '<div style="display:flex;align-items:center;gap:6px;min-width:100px;">'
+          + '<div style="flex:1;background:#1e2a42;border-radius:3px;height:6px;overflow:hidden;">'
+          + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div>'
+          + '</div>'
+          + '<span style="color:' + barColor + ';font-weight:bold;font-size:0.95em;">' + pct.toFixed(0) + '%</span>'
+          + '</div>'
+          + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;" title="' + subtitle + '">' + subtitle + '</div>';
+      }
 
       // Confidence cell: number (or —) + source badge + sample warning tooltip
       const detail = s.confidence_detail || {};
@@ -6738,9 +6909,9 @@ function loadStrategyPerformance() {
       html += '<tr style="border-top:1px solid #1e2a42;">'
         + '<td style="padding:8px;font-weight:bold;color:#00d4ff;">' + s.system + '</td>'
         + '<td style="padding:8px;color:#e0e0e0;">' + s.strategy + '<br><span style="font-size:0.85em;color:#7b8ab8;">' + s.instruments + '</span></td>'
-        + '<td style="padding:8px;color:' + tierColor + ';font-weight:bold;">' + tier + '</td>'
+        + '<td style="padding:8px;vertical-align:middle;">' + renderExitBar(exitInfo) + '</td>'
+        + '<td style="padding:8px;vertical-align:middle;">' + promCell + '</td>'
         + '<td style="padding:8px;text-align:right;color:#00d4ff;">' + riskPctStr + '</td>'
-        + '<td style="padding:8px;text-align:right;color:#e0e0e0;">' + riskUsdStr + '</td>'
         + '<td style="padding:8px;text-align:right;color:#fff;">' + s.backtest_pf + '</td>'
         + '<td style="padding:8px;text-align:right;color:#7b8ab8;">' + s.backtest_trades + '</td>'
         + '<td style="padding:8px;text-align:right;color:#7b8ab8;">' + s.backtest_wr + '</td>'
@@ -6806,8 +6977,7 @@ function loadStrategyPerformance() {
       + '<td style="padding:10px 8px;color:#00d4ff;letter-spacing:1px;">FLEET TOTAL</td>'
       + '<td style="padding:10px 8px;color:#7b8ab8;font-weight:normal;font-size:0.85em;">(' + strategies.length + ' strategies)</td>'
       + '<td style="padding:10px 8px;color:#7b8ab8;">—</td>'
-      + '<td style="padding:10px 8px;text-align:right;color:#7b8ab8;">—</td>'
-      + '<td style="padding:10px 8px;text-align:right;color:#e0e0e0;">' + riskStr + '</td>'
+      + '<td style="padding:10px 8px;color:#7b8ab8;">—</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#7b8ab8;">—</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#fff;">' + btTradesTotal.toLocaleString() + '</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#9da8c7;">' + btWrAvg + '</td>'
@@ -6932,87 +7102,11 @@ function loadFleetOverview() {
 // loadFleetOverview() removed 2026-04-22 — panel deleted as redundant
 </script>
 
-<div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px 0;">
-  <h2 style="font-size:0.95em;color:#00e676;margin:0;letter-spacing:2px;">SYSTEM HEALTH</h2>
-  <span style="font-size:0.7em;color:#7b8ab8;">Runtime health, alert state, report freshness, and manual-action visibility.</span>
-</div>
+<!-- SYSTEM HEALTH + OPS VISIBILITY panel removed 2026-04-23 — runtime health
+     covered by gateway banner, stale-data banner, silent-block banner, and
+     fleet-health tiles. Alerts still fire via Discord + alert_history.json. -->
 
-<!-- SYSTEM HEALTH BAR -->
-<div id="health-bar" style="display:flex;gap:16px;align-items:center;padding:8px 14px;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;margin-bottom:8px;font-size:0.78em;">
-  <div>System: <span id="health-status" style="font-weight:bold;color:#00e676;">OK</span></div>
-  <div title="Best current paper-QA candidate toward promotion.">
-    Best Candidate:
-    <span id="health-valid" style="color:#00d4ff;font-weight:bold;">0</span> / <span id="health-target">60</span>
-    <span id="health-candidate" style="color:#7b8ab8;"></span>
-  </div>
-  <div style="flex:1;max-width:200px;">
-    <div style="background:#0d1321;border-radius:3px;height:8px;overflow:hidden;">
-      <div id="health-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#00d4ff,#00e676);border-radius:3px;transition:width 0.5s;"></div>
-    </div>
-  </div>
-  <div>Broker Truth: <span id="health-broker" style="font-weight:bold;color:#00e676;">--</span></div>
-  <div title="Signals blocked by guards in the last 24 hours. Total history is shown on hover.">Blocked 24h: <span id="health-blocked" style="color:#7b8ab8;">0</span></div>
-  <div>Issues: <span id="health-issues" style="color:#7b8ab8;">0</span></div>
-  <div>Manual: <span id="health-manual" style="color:#7b8ab8;">0</span></div>
-  <div>Stale Reports: <span id="health-stale" style="color:#7b8ab8;">0</span></div>
-  <div id="health-warnings" style="color:#ffc107;"></div>
-</div>
-
-<div id="ops-visibility" style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin-bottom:10px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-    <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">OPS VISIBILITY</h3>
-    <span id="ops-last-run" style="font-size:0.7em;color:#7b8ab8;">No alert state yet</span>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.7em;color:#7b8ab8;">Active Issues</div>
-      <div id="ops-active-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.7em;color:#7b8ab8;">Manual Actions</div>
-      <div id="ops-manual-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.7em;color:#7b8ab8;">Stale Reports</div>
-      <div id="ops-stale-count" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">0</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.7em;color:#7b8ab8;">Alert Severity</div>
-      <div id="ops-max-severity" style="font-size:1.3em;font-weight:bold;color:#e0e0e0;">OK</div>
-    </div>
-  </div>
-  <div style="display:grid;grid-template-columns:1.4fr 1.1fr 1.2fr 1.1fr;gap:10px;">
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">ACTIVE ISSUES</div>
-      <div id="ops-active-issues" style="font-size:0.72em;color:#e0e0e0;">No active issues.</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">MANUAL ACTIONS</div>
-      <div id="ops-manual-actions" style="font-size:0.72em;color:#e0e0e0;">No manual actions.</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">RECENT ALERT EVENTS</div>
-      <div id="ops-events" style="font-size:0.72em;color:#e0e0e0;">No alert events yet.</div>
-    </div>
-    <div style="background:#0d1117;border-radius:6px;padding:10px;">
-      <div style="font-size:0.72em;color:#7b8ab8;letter-spacing:1px;margin-bottom:6px;">REPORT FRESHNESS</div>
-      <div id="ops-report-freshness" style="font-size:0.72em;color:#e0e0e0;">Loading...</div>
-    </div>
-  </div>
-</div>
-
-<div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 6px 0;">
-  <h2 style="font-size:0.95em;color:#7b8ab8;margin:0;letter-spacing:2px;">CONFIG / SOURCE OF TRUTH</h2>
-  <span style="font-size:0.7em;color:#7b8ab8;">One control page. Broker truth stays separate from QA model truth.</span>
-</div>
-
-<!-- CONTROL STRIP -->
-<div id="control-strip" style="display:flex;gap:12px;align-items:center;padding:6px 12px;background:#0a0f1a;border:1px solid #1e2a42;border-radius:4px;margin-bottom:8px;font-size:0.72em;color:#7b8ab8;flex-wrap:wrap;">
-  <div>MODE: <span id="cs-mode" style="font-weight:bold;color:#00e676;">UNIFIED RUNNER</span></div>
-  <div>ACCOUNT: <span id="cs-account" style="color:#00d4ff;">Waiting for broker truth...</span></div>
-  <div>RUNNERS: <span id="cs-active-coins" style="color:#ffc107;">GBP/USD, EUR/USD, EUR/JPY (FX Cohort)</span></div>
-  <div>PHASE: <span id="cs-phase" style="color:#e040fb;">Cohort Validation</span></div>
-</div>
+<!-- CONFIG / SOURCE OF TRUTH header + control strip removed 2026-04-23 -->
 
 <!-- Single-page: IBKR Fleet Dashboard only -->
 
@@ -7020,11 +7114,8 @@ function loadFleetOverview() {
 
 
 <div id="ibkr-page">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-  <div style="display:flex;align-items:center;gap:16px;">
-    <h2 style="font-size:1.1em;color:#00d4ff;margin:0;letter-spacing:2px;">IBKR STAGED TRADING FLEET</h2>
-    <a href="/brain" style="color:#7b8ab8;text-decoration:none;font-size:0.7em;padding:3px 10px;border:1px solid #1e2a42;border-radius:4px;letter-spacing:1px;" onmouseover="this.style.background='#1e2a42';this.style.color='#00d4ff'" onmouseout="this.style.background='transparent';this.style.color='#7b8ab8'">HELIO NEURAL CORE</a>
-  </div>
+<!-- IBKR header + HELIO NEURAL CORE button moved to top of dashboard 2026-04-23 -->
+<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:12px;">
   <span id="ibkr-timestamp" style="color:#666;font-size:0.75em;"></span>
 </div>
 
@@ -7072,70 +7163,12 @@ function loadFleetOverview() {
   <div id="chart-recent-trades" class="chart-recent-list"></div>
 </div>
 
-<!-- Governance health bar -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin:12px 0;" id="governance-health-bar">
-  <span style="color:#7b8ab8;font-size:0.7em;">Loading governance health...</span>
-</div>
+<!-- Governance health bar moved to top of dashboard 2026-04-23 -->
 
-<!-- Stage transition history -->
-<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;margin:12px 0;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h3 style="font-size:0.8em;color:#00d4ff;margin:0;letter-spacing:1px;">STAGE TRANSITION HISTORY</h3>
-    <span style="font-size:0.65em;color:#7b8ab8;">Recent promotions, demotions, kills</span>
-  </div>
-  <div id="stage-history-timeline" style="max-height:200px;overflow-y:auto;">
-    <span style="color:#7b8ab8;font-size:0.7em;">Loading...</span>
-  </div>
-</div>
-
-<!-- Fleet-wide actions -->
-<div style="display:flex;gap:8px;margin:8px 0;justify-content:flex-end;">
-  <button onclick="stageAction('pause','FLEET')" style="background:#ffaa00;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.7em;font-weight:bold;">PAUSE ALL ENTRIES</button>
-  <button onclick="stageAction('unpause','FLEET')" style="background:#00e676;color:#000;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.7em;font-weight:bold;">RESUME ENTRIES</button>
-</div>
-
-<!-- Production section -->
-<div style="margin:16px 0 10px 0;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h2 style="font-size:0.95em;color:#00e676;margin:0;letter-spacing:2px;">PROD PAIRS</h2>
-    <span style="font-size:0.72em;color:#7b8ab8;">Real broker truth, real runner state, real journal rows.</span>
-  </div>
-
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">REAL MONEY RUNNERS</h3>
-    <span style="font-size:0.7em;color:#7b8ab8;">Production lane. Same runner surface as QA, but capital-backed.</span>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-bottom:12px;" id="ibkr-real-cards"></div>
-
-  <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-bottom:10px;">
-    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD EQUITY TRACE</h3>
-        <span id="prod-equity-chart-label" style="font-size:0.7em;color:#7b8ab8;"></span>
-      </div>
-      <canvas id="balance-history-chart" height="160" style="width:100%;display:block;"></canvas>
-    </div>
-    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <h3 style="font-size:0.8em;color:#00e676;margin:0;letter-spacing:1px;">PROD FLEET HISTORY</h3>
-        <span id="prod-fleet-history-label" style="font-size:0.7em;color:#7b8ab8;"></span>
-      </div>
-      <canvas id="prod-fleet-pnl-chart" height="150" style="width:100%;display:block;"></canvas>
-      <div id="prod-fleet-history-hover" style="margin-top:6px;font-size:0.72em;color:#7b8ab8;">Hover points for trade-close details.</div>
-    </div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;margin-bottom:14px;">
-    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-      <h3 style="font-size:0.8em;color:#00e676;margin:0 0 10px 0;letter-spacing:1px;">PROD TRADE JOURNAL</h3>
-      <div id="prod-trades-table" style="font-size:0.75em;max-height:380px;overflow:auto;padding-right:4px;"></div>
-    </div>
-    <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:14px;">
-      <h3 style="font-size:0.8em;color:#00e676;margin:0 0 10px 0;letter-spacing:1px;">PROD DAILY PERFORMANCE</h3>
-      <div id="prod-daily-perf-body" style="font-size:0.75em;color:#7b8ab8;max-height:380px;overflow:auto;padding-right:4px;">Loading...</div>
-    </div>
-  </div>
-</div>
+<!-- Stage transition history, PAUSE/RESUME buttons, and entire PROD PAIRS
+     section removed 2026-04-23 — paper-only focus, no live capital. Backtest
+     equity trace + per-strategy breakdown covered by FLEET EQUITY CURVE +
+     PER-STRATEGY EQUITY CURVES panels above. -->
 
 <!-- QA section — HIDDEN (moved to /fleet page) -->
 <div style="margin:16px 0 10px 0;display:none !important;">
