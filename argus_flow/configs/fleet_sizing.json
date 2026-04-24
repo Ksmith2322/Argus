@@ -22,12 +22,12 @@
   "strategy_live_cutoffs": {},
 
   "notional_caps_by_asset_class": {
-    "stock": 2.0,
-    "etf":   2.0,
+    "stock": 1.0,
+    "etf":   1.0,
     "fx":    20.0,
     "micro_future": 5.0
   },
-  "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK.",
+  "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK. 2026-04-24: stock+etf tightened 2.0→1.0 per user feedback — $10K account shouldn't hold $23K positions. FX stays at 20.0 (pip-stops make leveraged FX safe); micro_future stays at 5.0 (futures margin is ~10% notional).",
 
-  "version": "2026-04-23.v5"
+  "version": "2026-04-24.v6"
 }

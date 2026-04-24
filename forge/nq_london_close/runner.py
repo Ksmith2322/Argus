@@ -50,6 +50,11 @@ RESEARCH_ONLY = True  # 2026-04-21: 60d backtest PF 0.90 / 4.6 trades/wk — neg
 # this is more than research. Runner still produces paper trades; flag the artifact.
 # Re-enable for production by flipping to False after PF > 1.2 on a 90d+ backtest.
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+from helio import ibkr_execution as ibkr
+IBKR_CLIENT_ID = 107
+_SIGNAL_ONLY_MODE = False
+
 PARAMS = {
     "version": "v1",
     "ticker": "NQ=F",
@@ -199,11 +204,11 @@ def signal_check(df: pd.DataFrame) -> tuple[bool, dict]:
     return True, {"rsi": r, "overshoot": overshoot, "atr": a, "entry": close}
 
 
-def _open(state: dict, df: pd.DataFrame, ctx: dict) -> None:
-    entry = ctx["entry"]
+def _open(state: dict, df: pd.DataFrame, ctx: dict, ib=None) -> None:
+    plan_entry = ctx["entry"]
     a = ctx["atr"]
-    target = entry - PARAMS["target_atr_mult"] * a
-    stop = entry + PARAMS["stop_atr_mult"] * a
+    target = plan_entry - PARAMS["target_atr_mult"] * a
+    stop = plan_entry + PARAMS["stop_atr_mult"] * a
 
     try:
         from helio.fleet_sizing import compute_risk_usd, max_notional_usd
@@ -211,31 +216,67 @@ def _open(state: dict, df: pd.DataFrame, ctx: dict) -> None:
     except Exception:
         risk_budget_usd = 1000.0 * PARAMS["risk_pct_default"] * 1000
 
-    stop_pts = abs(stop - entry)
+    stop_pts = abs(stop - plan_entry)
     pt_usd = PARAMS["point_value_usd"]
     raw_contracts = risk_budget_usd / max(stop_pts * pt_usd, 1e-6)
     pos_size = max(1, int(round(raw_contracts)))
 
     try:
         cap_usd = max_notional_usd("micro_future")
-        notional = entry * pt_usd * pos_size
+        notional = plan_entry * pt_usd * pos_size
         if cap_usd > 0 and notional > cap_usd:
-            pos_size = max(1, int(cap_usd / max(entry * pt_usd, 1e-6)))
+            pos_size = max(1, int(cap_usd / max(plan_entry * pt_usd, 1e-6)))
     except Exception:
         pass
+    if pos_size <= 0:
+        log.warning("SIZE_ZERO: skipping entry")
+        return
 
-    risk_usd = stop_pts * pt_usd * pos_size
+    entry_px = plan_entry
+    stop_order_id = None
+    target_order_id = None
+    execution_venue = "signal_only"
+
+    if ib is not None and not _SIGNAL_ONLY_MODE:
+        contract = ibkr.make_contract("MNQ", "micro_future")
+        try:
+            ib.qualifyContracts(contract)
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION: MNQ qty=%s, skipping", existing)
+                return
+            result = ibkr.submit_bracket(
+                ib, contract, direction="short", size=pos_size,
+                stop_px=stop, target_px=target, price_decimals=2,
+            )
+            if not result.entry.filled:
+                log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
+                return
+            entry_px = float(result.entry.fill_price)
+            stop_order_id = result.stop_order_id
+            target_order_id = result.target_order_id
+            target = entry_px - PARAMS["target_atr_mult"] * a
+            stop = entry_px + PARAMS["stop_atr_mult"] * a
+            execution_venue = "ibkr_paper"
+        except Exception as exc:
+            log.error("REAL_ENTRY EXCEPTION: %s", exc, exc_info=True)
+            return
+
+    risk_usd = abs(stop - entry_px) * pt_usd * pos_size
 
     state["open_trade"] = {
         "entry_ts": str(df.index[-1]),
-        "entry_px": entry, "stop_px": stop, "target_px": target,
+        "entry_px": entry_px, "stop_px": stop, "target_px": target,
         "atr_entry": a, "position_size": pos_size, "risk_usd": risk_usd,
         "bars_held": 0,
         "config_hash": _config_hash(), "git_sha": _git_sha(),
         "session_id": state["session_id"],
+        "execution_venue": execution_venue,
+        "stop_order_id": stop_order_id,
+        "target_order_id": target_order_id,
     }
-    log.info("PAPER SHORT @ %.2f target %.2f stop %.2f atr %.3f contracts %d risk $%.0f",
-             entry, target, stop, a, pos_size, risk_usd)
+    log.info("%s SHORT MNQ @ %.2f target %.2f stop %.2f atr %.3f contracts %d risk $%.0f",
+             execution_venue.upper(), entry_px, target, stop, a, pos_size, risk_usd)
 
 
 def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
@@ -286,34 +327,80 @@ def evaluate_once() -> None:
     df = fetch_history()
     state = _load_state()
 
-    # Manage open trade
-    if state.get("open_trade"):
-        ot = state["open_trade"]
-        entry_ts = pd.to_datetime(ot["entry_ts"], utc=True)
-        forward = df[df.index > entry_ts]
-        for ts, row in forward.iterrows():
-            ot["bars_held"] = ot.get("bars_held", 0) + 1
-            if row["High"] >= ot["stop_px"]:
-                _close(state, ts, ot["stop_px"], "stop"); break
-            if row["Low"] <= ot["target_px"]:
-                _close(state, ts, ot["target_px"], "target"); break
-            if ot["bars_held"] >= PARAMS["hold_bars"]:
-                _close(state, ts, float(row["Close"]), "time"); break
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+        except Exception as exc:
+            log.warning("IBKR connect failed, signal-only fallback: %s", exc)
+            ib = None
 
-    # New entry
-    last_ts = df.index[-1]
-    if state.get("open_trade") is None:
-        should, ctx = signal_check(df)
-        if should:
-            _open(state, df, ctx)
-            _append_signal(last_ts, "ENTRY_SHORT",
-                           ctx.get("rsi", 0), ctx.get("overshoot", 0), ctx.get("atr", 0))
-        else:
-            _append_signal(last_ts, f"NO_TRIGGER_{ctx.get('reason','?')}",
-                           ctx.get("rsi", 0), ctx.get("overshoot", 0), ctx.get("atr", 0))
+    try:
+        # Manage open trade
+        if state.get("open_trade"):
+            ot = state["open_trade"]
+            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+                contract = ibkr.make_contract("MNQ", "micro_future")
+                try:
+                    ib.qualifyContracts(contract)
+                    outcome = ibkr.check_bracket_filled(
+                        ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                    )
+                except Exception as exc:
+                    log.error("bracket check failed: %s", exc)
+                    outcome = None
+                if outcome is not None:
+                    _close(state, outcome["fill_ts"], outcome["fill_price"], outcome["reason"])
+                else:
+                    entry_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                    forward = df[df.index > entry_ts]
+                    ot["bars_held"] = len(forward)
+                    if ot["bars_held"] >= PARAMS["hold_bars"]:
+                        try:
+                            broker_qty = ibkr.query_position(ib, contract)
+                        except Exception:
+                            broker_qty = 0
+                        if broker_qty != 0:
+                            fill = ibkr.close_position_market(
+                                ib, contract, direction="short", size=abs(broker_qty),
+                                stop_order_id=ot.get("stop_order_id"),
+                                target_order_id=ot.get("target_order_id"),
+                            )
+                            if fill.filled:
+                                _close(state, fill.fill_ts, fill.fill_price, "time")
+                            else:
+                                log.error("TIME_STOP close failed: %s", fill.reject_reason)
+                        else:
+                            _close(state, df.index[-1], float(df.iloc[-1]["Close"]), "reconcile_flat")
+            else:
+                entry_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                forward = df[df.index > entry_ts]
+                for ts, row in forward.iterrows():
+                    ot["bars_held"] = ot.get("bars_held", 0) + 1
+                    if row["High"] >= ot["stop_px"]:
+                        _close(state, ts, ot["stop_px"], "stop"); break
+                    if row["Low"] <= ot["target_px"]:
+                        _close(state, ts, ot["target_px"], "target"); break
+                    if ot["bars_held"] >= PARAMS["hold_bars"]:
+                        _close(state, ts, float(row["Close"]), "time"); break
 
-    _save_state(state)
-    _write_heartbeat(state, str(last_ts))
+        # New entry
+        last_ts = df.index[-1]
+        if state.get("open_trade") is None:
+            should, ctx = signal_check(df)
+            if should:
+                _open(state, df, ctx, ib=ib)
+                _append_signal(last_ts, "ENTRY_SHORT",
+                               ctx.get("rsi", 0), ctx.get("overshoot", 0), ctx.get("atr", 0))
+            else:
+                _append_signal(last_ts, f"NO_TRIGGER_{ctx.get('reason','?')}",
+                               ctx.get("rsi", 0), ctx.get("overshoot", 0), ctx.get("atr", 0))
+
+        _save_state(state)
+        _write_heartbeat(state, str(last_ts))
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
 def loop_mode() -> None:
@@ -401,7 +488,13 @@ def main() -> int:
     g.add_argument("--scan", action="store_true")
     g.add_argument("--backtest", action="store_true")
     ap.add_argument("--period", default="30d")
+    ap.add_argument("--signal-only", action="store_true",
+                    help="Skip IBKR submission — keep the yfinance-replay simulation path")
     args = ap.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
     if args.evaluate: evaluate_once()
     elif args.loop: loop_mode()
     elif args.scan: scan()
