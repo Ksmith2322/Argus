@@ -39,6 +39,13 @@ STATE_JSON = LOG_DIR / "state.json"
 CHECK_HOUR_ET = 9  # 9:00 AM ET
 LOOP_INTERVAL_S = 300  # check every 5 min whether it's time for daily scan
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+sys.path.insert(0, str(_FORGE.parent))
+from helio import ibkr_execution as ibkr  # noqa: E402
+IBKR_CLIENT_ID = 117
+_SIGNAL_ONLY_MODE = False
+HOLD_DAYS = 5  # event-driven: hold each addition for 5 trading days post-buy
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -126,12 +133,16 @@ def _scan_active_windows() -> list[dict]:
 
 
 def evaluate_once() -> list[dict]:
-    """Run a single rebalance scan. Returns list of signals generated."""
+    """Run a single rebalance scan. Returns list of signals generated.
+
+    2026-04-24: extended to submit real IBKR orders for new BUY signals
+    and exit positions held >= HOLD_DAYS trading days."""
     state = _load_state()
     signals = _scan_active_windows()
     today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
     new_signals = []
+    state.setdefault("active_positions", [])
 
     # Track which tickers we've already signaled (avoid duplicates)
     already_signaled = set()
@@ -144,26 +155,113 @@ def evaluate_once() -> list[dict]:
                         already_signaled.add(row.get("ticker", ""))
         except Exception:
             pass
+    # Plus tickers we currently hold
+    for pos in state.get("active_positions", []):
+        already_signaled.add(pos.get("ticker", ""))
 
-    for sig in signals:
-        ticker = sig["ticker"]
-        action_type = sig["action"]     # ADD or DELETE
-        direction = sig["direction"]    # LONG or SHORT
-        status = sig["status"]          # ACTIVE or POST-EFFECTIVE
+    # IBKR connection
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+        except Exception as exc:
+            log.warning("IBKR connect failed: %s", exc)
+            ib = None
 
-        # Only signal additions (BUY) in ACTIVE window, not post-effective
-        if action_type == "ADD" and status == "ACTIVE":
-            if ticker not in already_signaled:
-                detail = (
-                    f"S&P500 ADD — announce={sig['announce_date']} "
-                    f"effective={sig['effective_date']} "
-                    f"window={sig['window_pct_elapsed']:.0f}% elapsed"
-                )
+    try:
+        # 1. Exit positions held >= HOLD_DAYS days
+        from datetime import datetime as _dt
+        now = datetime.now(tz=timezone.utc)
+        keep_positions = []
+        for pos in state.get("active_positions", []):
+            try:
+                entry_dt = _dt.fromisoformat(pos["entry_ts"])
+                days_held = (now - entry_dt).days
+            except Exception:
+                days_held = 0
+            if days_held >= HOLD_DAYS:
+                ticker = pos["ticker"]
+                exit_px = None
+                pnl_usd = None
+                if ib is not None and pos.get("execution_venue") == "ibkr_paper":
+                    contract = ibkr.make_contract(ticker, "stock")
+                    try:
+                        ib.qualifyContracts(contract)
+                        broker_qty = ibkr.query_position(ib, contract)
+                    except Exception:
+                        broker_qty = 0
+                    if broker_qty > 0:
+                        fill = ibkr.close_position_market(
+                            ib, contract, direction="long", size=broker_qty,
+                        )
+                        if fill.filled:
+                            exit_px = fill.fill_price
+                            pnl_usd = (exit_px - pos.get("entry_px", exit_px)) * broker_qty
+                            log.info(f"REBALANCE EXIT {ticker} @ {exit_px:.2f} pnl=${pnl_usd:.2f} (held {days_held}d)")
+                _append_signal("EXIT", ticker, f"hold {days_held}d complete (pnl=${pnl_usd})")
+            else:
+                keep_positions.append(pos)
+        state["active_positions"] = keep_positions
+
+        # 2. Submit new entries
+        for sig in signals:
+            ticker = sig["ticker"]
+            action_type = sig["action"]
+            status = sig["status"]
+            if action_type == "ADD" and status == "ACTIVE" and ticker not in already_signaled:
+                # Compute size: ~25% of anchor / N expected positions, capped at etf cap
+                entry_px = None
+                shares = 0
+                execution_venue = "signal_only"
+                if ib is not None:
+                    contract = ibkr.make_contract(ticker, "stock")
+                    try:
+                        ib.qualifyContracts(contract)
+                        existing = ibkr.query_position(ib, contract)
+                        if existing != 0:
+                            log.warning(f"BROKER_HAS_POSITION: {ticker} qty={existing}, skipping")
+                            continue
+                        try:
+                            from helio.fleet_sizing import get_sizing_anchor_usd, max_notional_usd
+                            anchor = float(get_sizing_anchor_usd())
+                        except Exception:
+                            anchor = 10000.0
+                        # 25% anchor per addition (rebalance bursts can have multiple adds)
+                        target_notional = min(anchor * 0.25, max_notional_usd("stock"))
+                        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr="1 D",
+                                                      barSizeSetting="1 hour", whatToShow="TRADES", useRTH=True)
+                        plan_entry = float(bars[-1].close) if bars else 100.0
+                        shares = max(1, int(target_notional / max(plan_entry, 1e-6)))
+                        from ib_insync import MarketOrder
+                        order = MarketOrder("BUY", shares)
+                        trade = ib.placeOrder(contract, order)
+                        fill = ibkr._wait_for_fill(ib, trade, timeout_s=15.0)
+                        if fill.filled:
+                            entry_px = fill.fill_price
+                            execution_venue = "ibkr_paper"
+                            log.info(f"REBALANCE ENTRY: BUY {shares} {ticker} @ {entry_px:.2f}")
+                        else:
+                            log.error(f"REBALANCE ENTRY FAILED {ticker}: {fill.reject_reason}")
+                            continue
+                    except Exception as exc:
+                        log.error(f"REBALANCE ENTRY EXCEPTION {ticker}: {exc}", exc_info=True)
+                        continue
+                detail = (f"S&P500 ADD — announce={sig['announce_date']} "
+                          f"effective={sig['effective_date']} "
+                          f"window={sig['window_pct_elapsed']:.0f}% elapsed "
+                          f"({execution_venue} {shares} sh @ {entry_px})")
                 _append_signal("BUY", ticker, detail)
                 new_signals.append(sig)
-                log.info(f"BUY {ticker} — index rebalance addition")
-            else:
-                log.debug(f"Already signaled {ticker} — skipping")
+                state["active_positions"].append({
+                    "ticker": ticker,
+                    "entry_ts": now.isoformat(),
+                    "entry_px": entry_px,
+                    "position_size": shares,
+                    "execution_venue": execution_venue,
+                })
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
     state["last_scan_date"] = today_str
     state["active_windows"] = len(signals)
@@ -172,13 +270,14 @@ def evaluate_once() -> list[dict]:
     _write_heartbeat("ok", {
         "active_windows": len(signals),
         "new_signals": len(new_signals),
+        "open_positions": len(state.get("active_positions", [])),
         "last_scan": today_str,
     })
 
     if not signals:
         log.info("No active rebalance windows found")
     else:
-        log.info(f"Found {len(signals)} active windows, {len(new_signals)} new signals")
+        log.info(f"Found {len(signals)} active windows, {len(new_signals)} new entries, {len(state.get('active_positions', []))} held")
 
     return new_signals
 
@@ -225,7 +324,13 @@ def main() -> None:
     group.add_argument("--loop", action="store_true", help="Continuous loop (daily at 9 AM ET)")
     group.add_argument("--check", action="store_true", help="One-shot scan")
     group.add_argument("--status", action="store_true", help="Show current state")
+    parser.add_argument("--signal-only", action="store_true",
+                        help="Skip IBKR submission — log signals only")
     args = parser.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
 
     if args.status:
         show_status()
