@@ -37,6 +37,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 log = setup_logging("wick_gbpusd")
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+from helio import ibkr_execution as ibkr  # noqa: E402
+IBKR_CLIENT_ID = 112
+_SIGNAL_ONLY_MODE = False
+
 # Strategy parameters (frozen — change requires version bump in STRATEGY_SPEC.md)
 # Loaded via registry with hardcoded fallback (Phase 2 pattern — see
 # forge/gld_pm_long/runner.py for the template).
@@ -255,12 +260,12 @@ def _check_exit(open_trade: dict, today_bar: dict, today_idx: int, entry_idx: in
     return None
 
 
-def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal_idx: int) -> None:
-    """Signal fired at bar `signal_idx`. Open paper position at NEXT bar's open
-    (which doesn't exist yet — we'll use today's close as a placeholder for the
-    fill price to be reconciled tomorrow). Mark trade as pending-fill."""
+def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal_idx: int, ib=None) -> None:
+    """Signal fired at bar `signal_idx`. With real IBKR execution: submit market
+    BUY immediately + bracket. Without (signal-only fallback): mark as pending-fill
+    and settle next cycle (legacy behavior)."""
     a = float(feats["atr"].iloc[signal_idx])
-    entry_anchor = float(df["Close"].iloc[signal_idx])  # placeholder
+    entry_anchor = float(df["Close"].iloc[signal_idx])  # planned entry
     target = entry_anchor + PARAMS["target_atr"] * a
     stop = entry_anchor - PARAMS["stop_atr"] * a
     risk_budget_usd = compute_risk_usd(strategy_label="forge_wick_gbpusd")
@@ -272,36 +277,69 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
     if cap_units > 0 and pos_size > cap_units:
         log.warning("NOTIONAL_CAP: GBPUSD units %d > cap %d", pos_size, cap_units)
         pos_size = cap_units
-    risk_usd = stop_distance_pips * pip_value * (pos_size / 100_000)
-    # Store entry_ts (TIMESTAMP) not entry_idx. Previously this was stored as
-    # an integer position in the df, but the df window shifts on each run
-    # (yfinance returns a rolling window), causing entry_idx to drift from
-    # the actual entry bar — the "phantom close" bug that led to 0 trades
-    # in 5 months. Post-fix 2026-04-23: resolve ts → idx fresh each run.
-    entry_ts = None
-    if signal_idx + 1 < len(df):
-        entry_ts = str(df.index[signal_idx + 1])  # next bar's timestamp
+    if pos_size <= 0:
+        log.warning("SIZE_ZERO: skipping entry")
+        return
+
+    entry_px = entry_anchor
+    stop_order_id = None
+    target_order_id = None
+    execution_venue = "signal_only"
+    pending_fill = True  # legacy default for signal-only path
+
+    if ib is not None and not _SIGNAL_ONLY_MODE:
+        contract = ibkr.make_contract("GBPUSD", "fx")
+        try:
+            ib.qualifyContracts(contract)
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION: GBPUSD qty=%s, skipping", existing)
+                return
+            result = ibkr.submit_bracket(
+                ib, contract, direction="long", size=pos_size,
+                stop_px=stop, target_px=target, price_decimals=5,
+            )
+            if not result.entry.filled:
+                log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
+                return
+            entry_px = float(result.entry.fill_price)
+            stop_order_id = result.stop_order_id
+            target_order_id = result.target_order_id
+            target = entry_px + PARAMS["target_atr"] * a
+            stop = entry_px - PARAMS["stop_atr"] * a
+            execution_venue = "ibkr_paper"
+            pending_fill = False  # real fill landed, no need to settle next cycle
+        except Exception as exc:
+            log.error("REAL_ENTRY EXCEPTION: %s", exc, exc_info=True)
+            return
+
+    # entry_ts: for real, set now; for legacy signal-only, point at next bar
+    if execution_venue == "ibkr_paper":
+        entry_ts = str(df.index[signal_idx])
     else:
-        # Signal fired on the last loaded bar — entry happens on a future bar.
-        # Mark as None for now; _settle_pending_fill resolves once next bar arrives.
-        entry_ts = None
+        entry_ts = str(df.index[signal_idx + 1]) if signal_idx + 1 < len(df) else None
+
     state["open_trade"] = {
         "signal_ts": str(df.index[signal_idx]),
         "signal_close": entry_anchor,
         "entry_anchor": entry_anchor,
+        "entry_px": entry_px if not pending_fill else None,
         "target_px": target,
         "stop_px": stop,
         "atr_entry": a,
-        "entry_ts": entry_ts,  # canonical timestamp (was: "entry_idx" integer — buggy)
+        "entry_ts": entry_ts,
         "position_size": pos_size,
-        "risk_usd": risk_usd,
+        "risk_usd": stop_distance_pips * pip_value * (pos_size / 100_000),
         "session_id": state["session_id"],
         "config_hash": _config_hash(),
         "git_sha": _git_sha(),
-        "pending_fill": True,
+        "pending_fill": pending_fill,
+        "execution_venue": execution_venue,
+        "stop_order_id": stop_order_id,
+        "target_order_id": target_order_id,
     }
-    log.info("PAPER LONG opened — signal at %s, entry next open, target %.5f stop %.5f atr %.5f size %d",
-             df.index[signal_idx], target, stop, a, pos_size)
+    log.info("%s LONG opened — signal at %s, entry %.5f, target %.5f stop %.5f atr %.5f size %d",
+             execution_venue.upper(), df.index[signal_idx], entry_px, target, stop, a, pos_size)
 
 
 def _resolve_idx_from_ts(df: pd.DataFrame, ts_str: str | None) -> int | None:
@@ -418,56 +456,91 @@ def evaluate_once() -> None:
     feats = compute_features(df)
     state = _load_state()
     today_idx = len(df) - 1
-    today_bar = df.iloc[today_idx].to_dict()
     today_ts = df.index[today_idx]
 
-    # Settle any pending fill from yesterday's signal
-    _settle_pending_fill(state, df)
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+        except Exception as exc:
+            log.warning("IBKR connect failed, signal-only fallback: %s", exc)
+            ib = None
 
-    # Manage open position
-    if state.get("open_trade") and not state["open_trade"].get("pending_fill"):
-        ot = state["open_trade"]
-        # Resolve entry idx fresh from timestamp (phantom-close-bug fix 2026-04-23).
-        # Previously used stored entry_idx integer which drifted when df shifted.
-        entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts"))
-        if entry_idx is None:
-            entry_idx = ot.get("entry_idx")  # legacy back-compat
-        # Replay every bar between entry and today to check for exit
-        exit_event = None
-        if entry_idx is not None and entry_idx < len(df):
-            for j in range(entry_idx, today_idx + 1):
-                bar = df.iloc[j].to_dict()
-                ev = _check_exit(ot, bar, j, entry_idx=entry_idx)
-                if ev:
-                    exit_event = (j, ev[0], ev[1])
-                    break
-        if exit_event:
-            j, reason, exit_px = exit_event
-            _close_paper_trade(state, df, j, exit_px, reason)
+    try:
+        # Settle any pending fill from yesterday's signal (legacy signal-only path)
+        _settle_pending_fill(state, df)
 
-    # New signal evaluation only if flat
-    last_signal_ts = None
-    today_evaluated = True
-    if state.get("open_trade") is None:
-        sig = signal_long(df, feats)
-        if bool(sig.iloc[today_idx]):
-            log.info("SIGNAL fired today (%s)", today_ts)
-            _open_paper_trade(state, df, feats, today_idx)
-            last_signal_ts = str(today_ts)
-            _append_signal(today_ts, "ENTRY_LONG", feats.iloc[today_idx].to_dict())
-        else:
-            _append_signal(today_ts, "NO_TRIGGER", feats.iloc[today_idx].to_dict())
-            log.info("No signal today (%s) — uw=%.2f cp=%.2f bb_q=%s chop_q=%s",
-                     today_ts,
-                     feats.iloc[today_idx]["upper_wick_pct"] or 0,
-                     feats.iloc[today_idx]["close_pos_in_range"] or 0,
-                     "?" if pd.isna(feats.iloc[today_idx]["bb_width_q33"]) else f"{feats.iloc[today_idx]['bb_width_pct']:.4f} vs {feats.iloc[today_idx]['bb_width_q33']:.4f}",
-                     "?" if pd.isna(feats.iloc[today_idx]["chop_q67"]) else f"{feats.iloc[today_idx]['choppiness_14']:.1f} vs {feats.iloc[today_idx]['chop_q67']:.1f}")
+        # Manage open position
+        if state.get("open_trade") and not state["open_trade"].get("pending_fill"):
+            ot = state["open_trade"]
+            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+                contract = ibkr.make_contract("GBPUSD", "fx")
+                try:
+                    ib.qualifyContracts(contract)
+                    outcome = ibkr.check_bracket_filled(
+                        ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                    )
+                except Exception as exc:
+                    log.error("bracket check failed: %s", exc)
+                    outcome = None
+                if outcome is not None:
+                    # Bracket filled — record closure (need a bar idx for compatibility)
+                    _close_paper_trade(state, df, today_idx, outcome["fill_price"], outcome["reason"])
+                else:
+                    # Still open — check time stop via legacy entry_idx logic
+                    entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts"))
+                    if entry_idx is not None and (today_idx - entry_idx) >= PARAMS.get("hold_days", 5):
+                        try:
+                            broker_qty = ibkr.query_position(ib, contract)
+                        except Exception:
+                            broker_qty = 0
+                        if broker_qty > 0:
+                            fill = ibkr.close_position_market(
+                                ib, contract, direction="long", size=broker_qty,
+                                stop_order_id=ot.get("stop_order_id"),
+                                target_order_id=ot.get("target_order_id"),
+                            )
+                            if fill.filled:
+                                _close_paper_trade(state, df, today_idx, fill.fill_price, "time")
+                            else:
+                                log.error("TIME close failed: %s", fill.reject_reason)
+            else:
+                # Signal-only fallback: legacy bar replay
+                entry_idx = _resolve_idx_from_ts(df, ot.get("entry_ts"))
+                if entry_idx is None:
+                    entry_idx = ot.get("entry_idx")
+                exit_event = None
+                if entry_idx is not None and entry_idx < len(df):
+                    for j in range(entry_idx, today_idx + 1):
+                        bar = df.iloc[j].to_dict()
+                        ev = _check_exit(ot, bar, j, entry_idx=entry_idx)
+                        if ev:
+                            exit_event = (j, ev[0], ev[1])
+                            break
+                if exit_event:
+                    j, reason, exit_px = exit_event
+                    _close_paper_trade(state, df, j, exit_px, reason)
 
-    _save_state(state)
-    _write_heartbeat(state, last_signal_ts, today_evaluated)
-    log.info("Cycle complete. open=%s trades_total=%d",
-             "yes" if state.get("open_trade") else "no", state.get("trade_count", 0))
+        # New signal evaluation only if flat
+        last_signal_ts = None
+        today_evaluated = True
+        if state.get("open_trade") is None:
+            sig = signal_long(df, feats)
+            if bool(sig.iloc[today_idx]):
+                log.info("SIGNAL fired today (%s)", today_ts)
+                _open_paper_trade(state, df, feats, today_idx, ib=ib)
+                last_signal_ts = str(today_ts)
+                _append_signal(today_ts, "ENTRY_LONG", feats.iloc[today_idx].to_dict())
+            else:
+                _append_signal(today_ts, "NO_TRIGGER", feats.iloc[today_idx].to_dict())
+
+        _save_state(state)
+        _write_heartbeat(state, last_signal_ts, today_evaluated)
+        log.info("Cycle complete. open=%s trades_total=%d",
+                 "yes" if state.get("open_trade") else "no", state.get("trade_count", 0))
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
 def scan() -> None:
@@ -551,7 +624,13 @@ def main():
     g.add_argument("--backtest", action="store_true", help="Run backtest on cached/recent data")
     g.add_argument("--loop", action="store_true", help="Continuous daemon: re-evaluate every hour")
     p.add_argument("--period", default="5y", help="Backtest period (default 5y)")
+    p.add_argument("--signal-only", action="store_true",
+                   help="Skip IBKR submission — keep legacy pending_fill simulation path")
     args = p.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
     if args.evaluate:
         evaluate_once()
     elif args.scan:
