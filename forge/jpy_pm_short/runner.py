@@ -31,6 +31,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 log = setup_logging("jpy_pm_short")
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+from helio import ibkr_execution as ibkr
+IBKR_CLIENT_ID = 103
+_SIGNAL_ONLY_MODE = False
+
 PAIRS = {"USDJPY": "USDJPY=X", "CADJPY": "CADJPY=X"}
 
 PARAMS = {
@@ -150,71 +155,158 @@ def evaluate_once() -> None:
     state = _load_state()
     last_ts_overall = None
 
-    for sym, ticker in PAIRS.items():
+    # Single IBKR connection for the whole cycle — both pairs share it
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
         try:
-            df = fetch_history(ticker)
-        except Exception as e:
-            log.error("Failed to fetch %s: %s", sym, e)
-            continue
-        a_series = atr(df, PARAMS["atr_period"])
-        last_idx = len(df) - 1
-        last_ts = df.index[last_idx]
-        last_ts_overall = last_ts
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+            log.info("IBKR connected")
+        except Exception as exc:
+            log.warning("IBKR connect failed, falling back to signal-only: %s", exc)
+            ib = None
 
-        # Manage existing position for this pair
-        if sym in state["open_trades"]:
-            ot = state["open_trades"][sym]
-            entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
-            forward = df[df.index > entry_idx_ts]
-            bars_held = 0
-            for ts, row in forward.iterrows():
-                bars_held += 1
-                # SHORT: stop is ABOVE, target is BELOW
-                if row["High"] >= ot["stop_px"]:
-                    _close(state, sym, ts, ot["stop_px"], "stop")
-                    break
-                if row["Low"] <= ot["target_px"]:
-                    _close(state, sym, ts, ot["target_px"], "target")
-                    break
-                if bars_held >= PARAMS["hold_bars"]:
-                    _close(state, sym, ts, row["Close"], "time")
-                    break
+    try:
+        for sym, ticker in PAIRS.items():
+            try:
+                df = fetch_history(ticker)
+            except Exception as e:
+                log.error("Failed to fetch %s: %s", sym, e)
+                continue
+            a_series = atr(df, PARAMS["atr_period"])
+            last_idx = len(df) - 1
+            last_ts = df.index[last_idx]
+            last_ts_overall = last_ts
 
-        # Signal evaluation
-        sig_action = "NO_TRIGGER"
-        if sym not in state["open_trades"] and last_ts.hour == PARAMS["signal_hour_utc"]:
-            a = float(a_series.iloc[last_idx])
-            if np.isfinite(a) and a > 0:
-                _open(state, sym, df, last_idx, a)
-                sig_action = "ENTRY_SHORT"
-        _append_signal(last_ts, sym, sig_action,
-                       float(a_series.iloc[last_idx]) if np.isfinite(a_series.iloc[last_idx]) else 0)
+            # --- Manage existing position for this pair -------------------
+            if sym in state["open_trades"]:
+                ot = state["open_trades"][sym]
 
-    _save_state(state)
-    _write_heartbeat(state, str(last_ts_overall) if last_ts_overall else "")
-    log.info("Cycle done. open=%s trades_total=%d",
-             list(state.get("open_trades", {}).keys()),
-             state.get("trade_count", 0))
+                if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+                    contract = ibkr.make_contract(sym, "fx")
+                    try:
+                        ib.qualifyContracts(contract)
+                        outcome = ibkr.check_bracket_filled(
+                            ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                        )
+                    except Exception as exc:
+                        log.error("bracket check failed %s: %s", sym, exc)
+                        outcome = None
+
+                    if outcome is not None:
+                        _close(state, sym, outcome["fill_ts"], outcome["fill_price"], outcome["reason"])
+                    else:
+                        entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                        forward = df[df.index > entry_idx_ts]
+                        bars_held = len(forward)
+                        ot["bars_held"] = bars_held
+                        if bars_held >= PARAMS["hold_bars"]:
+                            log.info("TIME_STOP %s: %d bars held, closing at market", sym, bars_held)
+                            try:
+                                broker_qty = ibkr.query_position(ib, contract)
+                            except Exception:
+                                broker_qty = 0
+                            if broker_qty < 0:  # SHORT means negative broker qty
+                                fill = ibkr.close_position_market(
+                                    ib, contract, direction="short", size=abs(broker_qty),
+                                    stop_order_id=ot.get("stop_order_id"),
+                                    target_order_id=ot.get("target_order_id"),
+                                )
+                                if fill.filled:
+                                    _close(state, sym, fill.fill_ts, fill.fill_price, "time")
+                                else:
+                                    log.error("TIME_STOP close failed %s: %s", sym, fill.reject_reason)
+                            else:
+                                last_row = df.iloc[last_idx]
+                                _close(state, sym, df.index[last_idx], float(last_row["Close"]), "reconcile_flat")
+                else:
+                    # Signal-only fallback: yfinance replay like before
+                    entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                    forward = df[df.index > entry_idx_ts]
+                    bars_held = 0
+                    for ts, row in forward.iterrows():
+                        bars_held += 1
+                        if row["High"] >= ot["stop_px"]:
+                            _close(state, sym, ts, ot["stop_px"], "stop")
+                            break
+                        if row["Low"] <= ot["target_px"]:
+                            _close(state, sym, ts, ot["target_px"], "target")
+                            break
+                        if bars_held >= PARAMS["hold_bars"]:
+                            _close(state, sym, ts, row["Close"], "time")
+                            break
+
+            # --- Signal evaluation ----------------------------------------
+            sig_action = "NO_TRIGGER"
+            if sym not in state["open_trades"] and last_ts.hour == PARAMS["signal_hour_utc"]:
+                a = float(a_series.iloc[last_idx])
+                if np.isfinite(a) and a > 0:
+                    _open(state, sym, df, last_idx, a, ib=ib)
+                    sig_action = "ENTRY_SHORT" if sym in state["open_trades"] else "ENTRY_REJECTED"
+            _append_signal(last_ts, sym, sig_action,
+                           float(a_series.iloc[last_idx]) if np.isfinite(a_series.iloc[last_idx]) else 0)
+
+        _save_state(state)
+        _write_heartbeat(state, str(last_ts_overall) if last_ts_overall else "")
+        log.info("Cycle done. open=%s trades_total=%d",
+                 list(state.get("open_trades", {}).keys()),
+                 state.get("trade_count", 0))
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
-def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float) -> None:
-    entry = float(df["Close"].iloc[idx])
-    target = entry - PARAMS["target_atr"] * a  # SHORT: target below
-    stop = entry + PARAMS["stop_atr"] * a       # SHORT: stop above
+def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
+    plan_entry = float(df["Close"].iloc[idx])
+    target = plan_entry - PARAMS["target_atr"] * a  # SHORT: target below
+    stop = plan_entry + PARAMS["stop_atr"] * a       # SHORT: stop above
     risk_budget_usd = compute_risk_usd(strategy_label="forge_jpy_pm_short")
-    stop_pips = (stop - entry) * (100 if "JPY" in sym else 10000)
+    stop_pips = (stop - plan_entry) * (100 if "JPY" in sym else 10000)
     pip_value = 10.0 if "JPY" in sym else 10.0  # both 100K lot ~$10/pip
     pos_size = max(1, int(risk_budget_usd / max(stop_pips * pip_value / 100000, 0.001)))
-    usd_jpy_ref = entry if sym == "USDJPY" else None
-    notional_per_unit = fx_notional_per_unit_usd(sym, quote_price=entry, usd_jpy_price=usd_jpy_ref)
+    usd_jpy_ref = plan_entry if sym == "USDJPY" else None
+    notional_per_unit = fx_notional_per_unit_usd(sym, quote_price=plan_entry, usd_jpy_price=usd_jpy_ref)
     cap_units = int(max_notional_usd("fx") / max(notional_per_unit, 1e-9))
     if cap_units > 0 and pos_size > cap_units:
         log.warning("NOTIONAL_CAP: %s units %d > cap %d", sym, pos_size, cap_units)
         pos_size = cap_units
-    risk_usd = stop_pips * pip_value * (pos_size / 100_000)
+    if pos_size <= 0:
+        log.warning("SIZE_ZERO: %s computed size <= 0, skipping entry", sym)
+        return
+
+    entry_px = plan_entry
+    stop_order_id = None
+    target_order_id = None
+    execution_venue = "signal_only"
+
+    if ib is not None and not _SIGNAL_ONLY_MODE:
+        contract = ibkr.make_contract(sym, "fx")
+        try:
+            ib.qualifyContracts(contract)
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION: %s qty=%s, skipping to avoid doubling", sym, existing)
+                return
+            result = ibkr.submit_bracket(
+                ib, contract, direction="short", size=pos_size,
+                stop_px=stop, target_px=target, price_decimals=5,
+            )
+            if not result.entry.filled:
+                log.error("REAL_ENTRY FAILED %s: %s", sym, result.entry.reject_reason)
+                return
+            entry_px = float(result.entry.fill_price)
+            stop_order_id = result.stop_order_id
+            target_order_id = result.target_order_id
+            target = entry_px - PARAMS["target_atr"] * a
+            stop = entry_px + PARAMS["stop_atr"] * a
+            execution_venue = "ibkr_paper"
+        except Exception as exc:
+            log.error("REAL_ENTRY EXCEPTION %s: %s", sym, exc, exc_info=True)
+            return
+
+    risk_usd = abs(stop - entry_px) * (100 if "JPY" in sym else 10000) * pip_value * (pos_size / 100_000)
     state["open_trades"][sym] = {
         "entry_ts": str(df.index[idx]),
-        "entry_px": entry,
+        "entry_px": entry_px,
         "target_px": target,
         "stop_px": stop,
         "atr_entry": a,
@@ -223,9 +315,13 @@ def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float) -> None:
         "session_id": state["session_id"],
         "config_hash": _config_hash(),
         "git_sha": _git_sha(),
+        "execution_venue": execution_venue,
+        "stop_order_id": stop_order_id,
+        "target_order_id": target_order_id,
+        "bars_held": 0,
     }
-    log.info("PAPER SHORT %s @ %.5f target %.5f stop %.5f atr %.5f size %d",
-             sym, entry, target, stop, a, pos_size)
+    log.info("%s SHORT %s @ %.5f target %.5f stop %.5f atr %.5f size %d",
+             execution_venue.upper(), sym, entry_px, target, stop, a, pos_size)
 
 
 def _close(state: dict, sym: str, exit_ts, exit_px: float, reason: str) -> None:
@@ -383,7 +479,13 @@ def main():
     g.add_argument("--backtest", action="store_true")
     g.add_argument("--loop", action="store_true")
     p.add_argument("--period", default="2y")
+    p.add_argument("--signal-only", action="store_true",
+                   help="Skip IBKR submission — keep the yfinance-replay simulation path")
     args = p.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
     if args.evaluate:
         evaluate_once()
     elif args.scan:
