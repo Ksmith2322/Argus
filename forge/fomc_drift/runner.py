@@ -48,6 +48,15 @@ _FOMC_DATES_SET = frozenset(datetime.strptime(d, "%Y-%m-%d").date() for d in FOM
 LOOP_INTERVAL_S = 3600  # check once per hour (cheap; only acts at specific hours)
 RISK_PCT = 0.005  # unproven tier — conservative first-pass
 
+# 2026-04-24: IBKR execution. Unique client_id in the forge range 100-199.
+from helio import ibkr_execution as ibkr  # noqa: E402
+IBKR_CLIENT_ID = 110
+_SIGNAL_ONLY_MODE = False
+# Event-driven sizing (no stops): use risk_pct × 100 as fraction of anchor.
+# 0.005 × 100 = 0.5 → 50% of anchor in SPY for the 24hr FOMC hold.
+# Capped at etf notional cap (1.0× anchor).
+NOTIONAL_FRACTION_MULTIPLIER = 100
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] fomc_drift | %(message)s",
@@ -159,63 +168,156 @@ def check_and_act(verbose: bool = False) -> dict:
     open_trade = state.get("open_trade")
     is_fomc_today = today in _FOMC_DATES_SET
 
-    if open_trade:
-        # We have an open position — exit on FOMC announcement day.
-        if is_fomc_today:
-            # Exit — we log a signal; actual fill would happen via live execution layer
-            result["action"] = "EXIT"
-            result["reason"] = f"FOMC announcement day {today.isoformat()}, 2pm ET exit"
-            exit_px_placeholder = None  # wire to broker later; for now just log signal
-            _append_signal("EXIT", result["reason"], extra={
-                "entry_ts": open_trade.get("entry_ts"),
-                "entry_px": open_trade.get("entry_px"),
-                "fomc_date": today.isoformat(),
-            })
-            # Clear state — real implementation would fetch exit fill + compute PnL
-            state["open_trade"] = None
-            state["trade_count"] = state.get("trade_count", 0) + 1
-            _save_state(state)
-            _write_heartbeat("live_signal_only", "FLAT", None)
-        else:
-            result["action"] = "HOLD"
-            result["reason"] = f"open trade from {open_trade.get('entry_ts')}, waiting for FOMC {open_trade.get('fomc_date')}"
-            _write_heartbeat("live_signal_only", "LONG_SPY", open_trade)
-        return result
+    # IBKR connection (per-cycle, brief). Falls through to signal-only on failure.
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+        except Exception as exc:
+            log.warning("IBKR connect failed, signal-only fallback: %s", exc)
+            ib = None
 
-    # No open trade — check if today is T-1 to FOMC (entry condition)
-    t_minus_1, fomc_date = _is_day_before_fomc(today)
-    if t_minus_1 and is_pre_close_hour(now):
-        anchor = _broker_anchor()
-        if anchor is None:
-            result["action"] = "SKIP"
-            result["reason"] = "broker equity unavailable"
-            _write_heartbeat("live_signal_only", "FLAT", None)
+    try:
+        if open_trade:
+            # We have an open position — exit on FOMC announcement day.
+            if is_fomc_today:
+                result["action"] = "EXIT"
+                result["reason"] = f"FOMC announcement day {today.isoformat()}, 2pm ET exit"
+
+                exit_px = None
+                pnl_usd = None
+                if ib is not None and open_trade.get("execution_venue") == "ibkr_paper":
+                    contract = ibkr.make_contract("SPY", "etf")
+                    try:
+                        ib.qualifyContracts(contract)
+                        broker_qty = ibkr.query_position(ib, contract)
+                    except Exception:
+                        broker_qty = 0
+                    if broker_qty > 0:
+                        fill = ibkr.close_position_market(
+                            ib, contract, direction="long", size=broker_qty,
+                        )
+                        if fill.filled:
+                            exit_px = fill.fill_price
+                            entry_px = open_trade.get("entry_px") or exit_px
+                            pnl_usd = (exit_px - entry_px) * broker_qty
+                            log.info("FOMC EXIT FILLED @ %.2f, pnl=$%.2f", exit_px, pnl_usd)
+                _append_signal("EXIT", result["reason"], extra={
+                    "entry_ts": open_trade.get("entry_ts"),
+                    "entry_px": open_trade.get("entry_px"),
+                    "exit_px": exit_px,
+                    "pnl_usd": pnl_usd,
+                    "fomc_date": today.isoformat(),
+                })
+                if exit_px is not None:
+                    _append_trade({
+                        "entry_ts": open_trade.get("entry_ts"),
+                        "exit_ts": now.isoformat(),
+                        "entry_px": open_trade.get("entry_px"),
+                        "exit_px": exit_px,
+                        "return_pct": ((exit_px / open_trade.get("entry_px", exit_px)) - 1) * 100 if open_trade.get("entry_px") else 0,
+                        "pnl_usd": pnl_usd or 0,
+                        "position_size": open_trade.get("position_size"),
+                        "risk_usd": open_trade.get("risk_usd_at_entry"),
+                        "fomc_date": today.isoformat(),
+                    })
+                state["open_trade"] = None
+                state["trade_count"] = state.get("trade_count", 0) + 1
+                _save_state(state)
+                _write_heartbeat("ibkr_paper", "FLAT", None)
+            else:
+                result["action"] = "HOLD"
+                result["reason"] = f"open trade from {open_trade.get('entry_ts')}, waiting for FOMC {open_trade.get('fomc_date')}"
+                _write_heartbeat("ibkr_paper", "LONG_SPY", open_trade)
             return result
-        risk_usd = anchor * RISK_PCT
-        result["action"] = "ENTRY_LONG_SPY"
-        result["reason"] = f"T-1 to FOMC {fomc_date}, entering SPY long at pre-close (anchor=${anchor:.0f}, risk=${risk_usd:.2f})"
-        _append_signal("ENTRY_LONG_SPY", result["reason"], extra={
-            "fomc_date": fomc_date,
-            "anchor_usd": anchor,
-            "risk_usd": risk_usd,
-        })
-        # Record open trade — actual fill would come from broker; using None placeholder
-        state["open_trade"] = {
-            "entry_ts": now.isoformat(),
-            "entry_px": None,  # live broker fills fill this
-            "fomc_date": fomc_date,
-            "anchor_usd_at_entry": anchor,
-            "risk_usd_at_entry": risk_usd,
-        }
-        _save_state(state)
-        _write_heartbeat("live_signal_only", "LONG_SPY", state["open_trade"])
-    else:
-        next_fomc = _next_fomc_from(today)
-        result["action"] = "WAITING"
-        result["reason"] = f"next FOMC: {next_fomc or 'none scheduled'}"
-        _write_heartbeat("live_signal_only", "FLAT", None)
 
-    return result
+        # No open trade — check if today is T-1 to FOMC (entry condition)
+        t_minus_1, fomc_date = _is_day_before_fomc(today)
+        if t_minus_1 and is_pre_close_hour(now):
+            anchor = _broker_anchor()
+            if anchor is None:
+                result["action"] = "SKIP"
+                result["reason"] = "broker equity unavailable"
+                _write_heartbeat("ibkr_paper", "FLAT", None)
+                return result
+            risk_usd = anchor * RISK_PCT
+            # Event-driven sizing: 50% of anchor in SPY (capped at etf cap).
+            target_notional = anchor * RISK_PCT * NOTIONAL_FRACTION_MULTIPLIER
+
+            entry_px = None
+            position_size = 0
+            execution_venue = "signal_only"
+            if ib is not None:
+                contract = ibkr.make_contract("SPY", "etf")
+                try:
+                    ib.qualifyContracts(contract)
+                    existing = ibkr.query_position(ib, contract)
+                    if existing != 0:
+                        log.warning("BROKER_HAS_POSITION: SPY qty=%s, skipping fomc entry", existing)
+                        return {"ts": now.isoformat(), "action": "SKIP", "reason": "broker has SPY"}
+                    # Get a quote-ish price by reading historical
+                    bars = ib.reqHistoricalData(contract, endDateTime="", durationStr="1 D",
+                                                  barSizeSetting="1 hour", whatToShow="TRADES", useRTH=True)
+                    if bars:
+                        plan_entry = float(bars[-1].close)
+                    else:
+                        plan_entry = 500.0  # rough fallback; SPY ≈ $5xx
+                    try:
+                        from helio.fleet_sizing import max_notional_usd
+                        cap = max_notional_usd("etf")
+                        target_notional = min(target_notional, cap)
+                    except Exception:
+                        pass
+                    shares = max(1, int(target_notional / max(plan_entry, 1e-6)))
+                    # Submit market BUY (no bracket — this strategy holds for ~24hrs and
+                    # exits on calendar event, not stop/target)
+                    from ib_insync import MarketOrder
+                    order = MarketOrder("BUY", shares)
+                    trade = ib.placeOrder(contract, order)
+                    fill = ibkr._wait_for_fill(ib, trade, timeout_s=15.0)
+                    if fill.filled:
+                        entry_px = fill.fill_price
+                        position_size = shares
+                        execution_venue = "ibkr_paper"
+                        log.info("FOMC ENTRY FILLED: BUY %d SPY @ %.2f", shares, entry_px)
+                    else:
+                        log.error("FOMC ENTRY FAILED: %s", fill.reject_reason)
+                except Exception as exc:
+                    log.error("FOMC ENTRY EXCEPTION: %s", exc, exc_info=True)
+
+            result["action"] = "ENTRY_LONG_SPY"
+            result["reason"] = (f"T-1 to FOMC {fomc_date}, "
+                                f"{execution_venue} entry @ {entry_px} ({position_size} sh, "
+                                f"target notional ${target_notional:.0f})")
+            _append_signal("ENTRY_LONG_SPY", result["reason"], extra={
+                "fomc_date": fomc_date,
+                "anchor_usd": anchor,
+                "risk_usd": risk_usd,
+                "entry_px": entry_px,
+                "position_size": position_size,
+                "execution_venue": execution_venue,
+            })
+            state["open_trade"] = {
+                "entry_ts": now.isoformat(),
+                "entry_px": entry_px,
+                "position_size": position_size,
+                "fomc_date": fomc_date,
+                "anchor_usd_at_entry": anchor,
+                "risk_usd_at_entry": risk_usd,
+                "execution_venue": execution_venue,
+            }
+            _save_state(state)
+            _write_heartbeat(execution_venue, "LONG_SPY", state["open_trade"])
+        else:
+            next_fomc = _next_fomc_from(today)
+            result["action"] = "WAITING"
+            result["reason"] = f"next FOMC: {next_fomc or 'none scheduled'}"
+            _write_heartbeat("ibkr_paper", "FLAT", None)
+
+        return result
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
 def is_pre_close_hour(now: datetime) -> bool:
@@ -243,7 +345,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--loop", action="store_true", help="Run continuous daily-check daemon")
     parser.add_argument("--check", action="store_true", help="One-shot evaluation")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--signal-only", action="store_true",
+                        help="Skip IBKR submission — log signals only")
     args = parser.parse_args(argv)
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
 
     if args.loop:
         return main_loop()
