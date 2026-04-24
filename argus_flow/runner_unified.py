@@ -2681,9 +2681,12 @@ class InstrumentRunner:
             if vol > 0:
                 self.current_bar["volume"] = self.current_bar.get("volume", 0) + vol  # accumulate, not overwrite
 
-        # ── Order timeout check (real execution only) ────────
+        # ── Order timeout check (any real-order venue: paper-account or live) ────────
+        # 2026-04-24: "paper" stage now submits real orders to the IBKR paper
+        # account, so order lifecycle (timeouts, bracket health, pending gating)
+        # must run for paper too. Previously gated only on execution_mode=="real".
         s = self.state
-        if self.execution_mode == "real":
+        if self.execution_mode in ("real", "paper"):
             self._check_order_timeouts(now)
             # Check if bracket orders (stop/target) are still alive
             if s.position != "FLAT" and not s.exit_pending:
@@ -2725,7 +2728,7 @@ class InstrumentRunner:
             if s.position != "FLAT" and not exit_reason:
                 self._check_trailing_stop(mid)
 
-            if exit_reason and self.execution_mode == "real" and not s.exit_pending:
+            if exit_reason and self.execution_mode in ("real", "paper") and not s.exit_pending:
                 # Market-hours guard: don't submit orders into closed FX market
                 if self.instrument_type == "forex" and not _fx_market_open(now):
                     if not getattr(self, '_market_closed_warned', False):
@@ -3223,8 +3226,11 @@ class InstrumentRunner:
             stop_px = entry_plan["stop_px"]
             target_px = entry_plan["target_px"]
 
-            if self.execution_mode == "real":
-                # Real execution: submit order, wait for fill callback
+            if self.execution_mode in ("real", "paper"):
+                # 2026-04-24: "paper" stage now also submits real orders (to the
+                # IBKR paper account, port 7497). Previously "paper" fell through
+                # to the immediate-fill simulation below — which never hit the
+                # broker, leaving the real account balance flat.
                 if s.entry_pending:
                     self._log.warning("Entry already pending — skipping duplicate")
                     return
@@ -3248,7 +3254,8 @@ class InstrumentRunner:
                 )
                 return
 
-            # Paper execution: immediate fill
+            # Simulation fallback — retained for execution_mode="observe" (watcher stage)
+            # or any future mode that should track locally without hitting a broker.
             s.position = direction.upper()
             s.entry_price = entry_px
             s.avg_entry_price = entry_px
@@ -4368,7 +4375,7 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                                     f"(mid={mid}, reason={reason})"
                                 )
                                 inst._friday_close_logged = True
-                            if inst.execution_mode == "real" and mid:
+                            if inst.execution_mode in ("real", "paper") and mid:
                                 inst._submit_real_exit(reason, mid)
                             elif mid:
                                 pnl, pnl_usd = inst._log_trade(mid, reason, now)
@@ -4425,16 +4432,10 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         local_pos = inst.state.position
                         broker_flat = (bp == 0)
                         local_flat = (local_pos == "FLAT")
-                        # Paper mode: positions are simulated locally, broker is
-                        # always flat for that pair — a local-SHORT vs broker-0
-                        # is expected, not drift. Clear any stale block and skip.
-                        if getattr(inst, "execution_mode", "") == "paper":
-                            if getattr(inst, "_recon_blocked", False):
-                                log.info(f"RECON_DRIFT CLEARED: {inst.symbol} (paper mode — drift check skipped)")
-                            inst._recon_blocked = False
-                            inst._recon_block_reason = ""
-                            _sync_entry_block_state(inst)
-                            continue
+                        # 2026-04-24: paper stage now submits real orders to the
+                        # IBKR paper account, so broker positions should match
+                        # local state. Old paper-skip branch removed — drift
+                        # check now runs for paper too.
                         if broker_flat != local_flat:
                             log.warning(
                                 f"RECON_DRIFT: {inst.symbol} local={local_pos} "
@@ -4497,12 +4498,9 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                     if not broker_ok:
                         inst._reconciliation = ReconcileResult.BROKER_UNAVAILABLE
                         inst._reconciliation_detail = broker_error or "Could not query broker positions"
-                    elif getattr(inst, "execution_mode", "") == "paper":
-                        # Paper mode: local position is simulation-only, broker
-                        # is always flat. Label as paper-sim rather than drift
-                        # so dashboards and incident logs don't pollute.
-                        inst._reconciliation = ReconcileResult.CLEAN_FLAT if local_pos == "FLAT" else ReconcileResult.CLEAN_OPEN_MATCHED
-                        inst._reconciliation_detail = f"paper-sim: local={local_pos} (broker not queried for paper)"
+                    # 2026-04-24: paper mode now hits the broker (IBKR paper
+                    # account), so its reconciliation falls through to the
+                    # normal comparison below — same truth check as real mode.
                     elif local_pos == "FLAT" and broker_dir == "FLAT":
                         inst._reconciliation = ReconcileResult.CLEAN_FLAT
                         inst._reconciliation_detail = "Both local and broker flat"

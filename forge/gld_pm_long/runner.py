@@ -30,6 +30,14 @@ import yfinance as yf
 
 from forge.logging_setup import setup_logging
 from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
+from helio import ibkr_execution as ibkr
+
+# 2026-04-24: unique client ID in the forge range (100-199). Must not collide
+# with other forge runners (gdx_gld=101).
+IBKR_CLIENT_ID = 102
+# Set to True via --signal-only CLI flag to skip real-order submission and
+# fall back to yfinance-based simulation (for testing/debugging).
+_SIGNAL_ONLY_MODE = False
 
 REPO = Path(__file__).resolve().parents[2]
 LOG_DIR = REPO / "forge" / "logs" / "gld_pm_long"
@@ -203,59 +211,160 @@ def evaluate_once() -> None:
     a_series = atr(df, PARAMS["atr_period"])
     state = _load_state()
     last_idx = len(df) - 1
-    last_bar = df.iloc[last_idx]
     last_ts = df.index[last_idx]
 
-    # Manage open position — replay every bar since entry
-    if state.get("open_trade"):
-        ot = state["open_trade"]
-        entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
-        # Find bars after entry
-        forward = df[df.index > entry_idx_ts]
-        bars_held = 0
-        for ts, row in forward.iterrows():
-            bars_held += 1
-            if row["Low"] <= ot["stop_px"]:
-                _close(state, ts, ot["stop_px"], "stop")
-                break
-            if row["High"] >= ot["target_px"]:
-                _close(state, ts, ot["target_px"], "target")
-                break
-            if bars_held >= PARAMS["hold_bars"]:
-                _close(state, ts, row["Close"], "time")
-                break
+    # Open an IBKR connection for this cycle. If it fails (TWS down etc.), we
+    # fall through to signal-only mode — still evaluate signals, still update
+    # state/ledger via the yfinance replay path, but don't submit real orders.
+    ib = None
+    if not _SIGNAL_ONLY_MODE:
+        try:
+            ib = ibkr.connect(IBKR_CLIENT_ID)
+            log.info("IBKR connected")
+        except Exception as exc:
+            log.warning("IBKR connect failed, falling back to signal-only: %s", exc)
+            ib = None
 
-    # Signal evaluation: only at top of designated hours, only if flat
-    sig_action = "NO_TRIGGER"
-    if state.get("open_trade") is None:
-        if last_ts.hour in PARAMS["signal_hours_utc"]:
-            a = float(a_series.iloc[last_idx])
-            if np.isfinite(a) and a > 0:
-                _open(state, df, last_idx, a)
-                sig_action = "ENTRY_LONG"
-        _append_signal(last_ts, sig_action, last_ts.hour, float(a_series.iloc[last_idx]) if np.isfinite(a_series.iloc[last_idx]) else 0)
+    try:
+        # --- Manage open position -----------------------------------------
+        if state.get("open_trade"):
+            ot = state["open_trade"]
 
-    _save_state(state)
-    _write_heartbeat(state, str(last_ts))
-    log.info("Cycle done. open=%s trades_total=%d hour=%d action=%s",
-             "yes" if state.get("open_trade") else "no",
-             state.get("trade_count", 0), last_ts.hour, sig_action)
+            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+                # Real-order path: ask IBKR whether bracket stop/target filled
+                # between cycles, or whether we're still open.
+                contract = ibkr.make_contract("GLD", "etf")
+                try:
+                    ib.qualifyContracts(contract)
+                    outcome = ibkr.check_bracket_filled(
+                        ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                    )
+                except Exception as exc:
+                    log.error("bracket check failed: %s", exc)
+                    outcome = None
+
+                if outcome is not None:
+                    # Stop or target hit while we were asleep — record closure
+                    _close(state, outcome["fill_ts"], outcome["fill_price"], outcome["reason"])
+                else:
+                    # Still open — count bars and enforce time-stop
+                    entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                    forward = df[df.index > entry_idx_ts]
+                    bars_held = len(forward)
+                    ot["bars_held"] = bars_held
+                    if bars_held >= PARAMS["hold_bars"]:
+                        log.info("TIME_STOP: %d bars held, closing at market", bars_held)
+                        try:
+                            broker_qty = ibkr.query_position(ib, contract)
+                        except Exception:
+                            broker_qty = 0
+                        if broker_qty > 0:
+                            fill = ibkr.close_position_market(
+                                ib, contract, direction="long", size=broker_qty,
+                                stop_order_id=ot.get("stop_order_id"),
+                                target_order_id=ot.get("target_order_id"),
+                            )
+                            if fill.filled:
+                                _close(state, fill.fill_ts, fill.fill_price, "time")
+                            else:
+                                log.error("TIME_STOP close failed: %s", fill.reject_reason)
+                        else:
+                            # Broker shows flat but we thought we were open —
+                            # bracket likely filled but status check missed it.
+                            # Record closure at last bar close as best-effort.
+                            last_row = df.iloc[last_idx]
+                            _close(state, df.index[last_idx], float(last_row["Close"]), "reconcile_flat")
+            else:
+                # Signal-only fallback: replay yfinance bars like before
+                entry_idx_ts = pd.to_datetime(ot["entry_ts"], utc=True)
+                forward = df[df.index > entry_idx_ts]
+                bars_held = 0
+                for ts, row in forward.iterrows():
+                    bars_held += 1
+                    if row["Low"] <= ot["stop_px"]:
+                        _close(state, ts, ot["stop_px"], "stop")
+                        break
+                    if row["High"] >= ot["target_px"]:
+                        _close(state, ts, ot["target_px"], "target")
+                        break
+                    if bars_held >= PARAMS["hold_bars"]:
+                        _close(state, ts, row["Close"], "time")
+                        break
+
+        # --- Signal evaluation --------------------------------------------
+        sig_action = "NO_TRIGGER"
+        if state.get("open_trade") is None:
+            if last_ts.hour in PARAMS["signal_hours_utc"]:
+                a = float(a_series.iloc[last_idx])
+                if np.isfinite(a) and a > 0:
+                    _open(state, df, last_idx, a, ib=ib)
+                    sig_action = "ENTRY_LONG" if state.get("open_trade") else "ENTRY_REJECTED"
+            _append_signal(last_ts, sig_action, last_ts.hour,
+                           float(a_series.iloc[last_idx]) if np.isfinite(a_series.iloc[last_idx]) else 0)
+
+        _save_state(state)
+        _write_heartbeat(state, str(last_ts))
+        log.info("Cycle done. open=%s trades_total=%d hour=%d action=%s",
+                 "yes" if state.get("open_trade") else "no",
+                 state.get("trade_count", 0), last_ts.hour, sig_action)
+    finally:
+        if ib is not None:
+            ibkr.disconnect(ib)
 
 
-def _open(state: dict, df: pd.DataFrame, idx: int, a: float) -> None:
-    entry = float(df["Close"].iloc[idx])  # fill at hour close (paper)
-    target = entry + PARAMS["target_atr"] * a
-    stop = entry - PARAMS["stop_atr"] * a
+def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
+    """Open a LONG position. If `ib` is provided, submits real orders to IBKR;
+    otherwise records a signal-only entry using the bar close price."""
+    plan_entry = float(df["Close"].iloc[idx])  # planned entry for sizing (refined to real fill below)
+    target = plan_entry + PARAMS["target_atr"] * a
+    stop = plan_entry - PARAMS["stop_atr"] * a
     risk_budget_usd = compute_risk_usd(strategy_label="forge_gld_pm_long")
-    pos_size = int(risk_budget_usd / max(entry - stop, 0.01))
-    cap_shares = int(max_notional_usd("etf") / entry) if entry > 0 else pos_size
+    pos_size = int(risk_budget_usd / max(plan_entry - stop, 0.01))
+    cap_shares = int(max_notional_usd("etf") / plan_entry) if plan_entry > 0 else pos_size
     if cap_shares > 0 and pos_size > cap_shares:
         log.warning("NOTIONAL_CAP: GLD shares %d > cap %d", pos_size, cap_shares)
         pos_size = cap_shares
-    risk_usd = pos_size * max(entry - stop, 0.0)
+    if pos_size <= 0:
+        log.warning("SIZE_ZERO: computed size <= 0, skipping entry")
+        return
+
+    entry_px = plan_entry
+    stop_order_id = None
+    target_order_id = None
+    execution_venue = "signal_only"
+
+    if ib is not None and not _SIGNAL_ONLY_MODE:
+        # Real execution: market entry + protective stop + target limit
+        contract = ibkr.make_contract("GLD", "etf")
+        try:
+            ib.qualifyContracts(contract)
+            # Guard: don't double up if broker already shows a position
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION: GLD qty=%s, skipping entry to avoid doubling", existing)
+                return
+            result = ibkr.submit_bracket(
+                ib, contract, direction="long", size=pos_size,
+                stop_px=stop, target_px=target, price_decimals=2,
+            )
+            if not result.entry.filled:
+                log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
+                return
+            entry_px = float(result.entry.fill_price)
+            stop_order_id = result.stop_order_id
+            target_order_id = result.target_order_id
+            # Recompute stop/target relative to the REAL fill price, not the plan
+            target = entry_px + PARAMS["target_atr"] * a
+            stop = entry_px - PARAMS["stop_atr"] * a
+            execution_venue = "ibkr_paper"
+        except Exception as exc:
+            log.error("REAL_ENTRY EXCEPTION: %s", exc, exc_info=True)
+            return
+
+    risk_usd = pos_size * max(entry_px - stop, 0.0)
     state["open_trade"] = {
         "entry_ts": str(df.index[idx]),
-        "entry_px": entry,
+        "entry_px": entry_px,
         "target_px": target,
         "stop_px": stop,
         "atr_entry": a,
@@ -265,12 +374,19 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float) -> None:
         "config_hash": _config_hash(),
         "git_sha": _git_sha(),
         "signal_hour_utc": int(df.index[idx].hour),
+        "execution_venue": execution_venue,
+        "stop_order_id": stop_order_id,
+        "target_order_id": target_order_id,
+        "bars_held": 0,
     }
-    log.info("PAPER LONG opened @ %.2f target %.2f stop %.2f atr %.4f size %d hour %d UTC",
-             entry, target, stop, a, pos_size, df.index[idx].hour)
+    log.info("%s LONG opened @ %.2f target %.2f stop %.2f atr %.4f size %d hour %d UTC",
+             execution_venue.upper(), entry_px, target, stop, a, pos_size, df.index[idx].hour)
 
 
 def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
+    """Record a closed trade. exit_px should be the REAL IBKR fill when available
+    (bracket hit, market close fill) — caller is responsible for passing the
+    actual fill price rather than an inferred yfinance OHLC value."""
     ot = state["open_trade"]
     pnl_pts = exit_px - ot["entry_px"]
     pnl_usd = pnl_pts * ot["position_size"]
@@ -438,7 +554,13 @@ def main():
     g.add_argument("--backtest", action="store_true")
     g.add_argument("--loop", action="store_true", help="Continuous: wake at top of signal hours")
     p.add_argument("--period", default="2y")
+    p.add_argument("--signal-only", action="store_true",
+                   help="Skip IBKR submission — keep the old yfinance-replay simulation path")
     args = p.parse_args()
+    if args.signal_only:
+        global _SIGNAL_ONLY_MODE
+        _SIGNAL_ONLY_MODE = True
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
     if args.evaluate:
         evaluate_once()
     elif args.scan:
