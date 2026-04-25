@@ -4,6 +4,19 @@ description: One-page digest of the last 24h — trades executed, signals blocke
 allowed-tools: Bash
 ---
 
+## Pre-loaded snapshot
+
+**Broker state right now:**
+!`curl -s http://localhost:8080/api/gateway_status 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); print(f'  equity=\${d[\"broker_equity_usd\"]:,.2f}  healthy={d[\"all_healthy\"]}  oversight_age={d.get(\"risk_oversight_age_s\",\"?\")}s')"`
+
+**Trades closed in last 24h (count + net):**
+!`C:/Argus/.venv/Scripts/python.exe -c "import json; from datetime import datetime,timezone,timedelta; cutoff=datetime.now(timezone.utc)-timedelta(hours=24); trades=[]; f=open('C:/Argus/repo/argus_flow/logs/canonical_fills.jsonl');\
+[trades.append(r) for line in f for r in [json.loads(line)] if r.get('source')!='backfill_from_trade_csv' and (lambda ts: ts>=cutoff if ts else False)(__import__('datetime').datetime.fromisoformat(str(r.get('exit_ts') or r.get('ts') or '').replace('Z','+00:00')) if (r.get('exit_ts') or r.get('ts')) else None)]; total=sum(float(t.get('pnl_usd') or 0) for t in trades); wins=sum(1 for t in trades if float(t.get('pnl_usd') or 0)>0); print(f'  {len(trades)} trades  {wins} wins  net=\${total:+.2f}')" 2>/dev/null`
+
+---
+
+Use the snapshot above as the headline. The full digest below adds the per-trade detail.
+
 Produce a clean 24-hour operator digest.
 
 1. **Broker state right now**:

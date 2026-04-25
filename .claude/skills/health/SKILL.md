@@ -4,7 +4,20 @@ description: Check system health across all Argus + Greek family strategies. Sho
 allowed-tools: Bash Read
 ---
 
-Check the health of the entire Argus multiverse:
+## Live snapshot (pre-loaded at skill invocation)
+
+**Gateway + broker truth:**
+!`curl -s http://localhost:8080/api/gateway_status 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); print(f'broker_equity=\${d[\"broker_equity_usd\"]:,.2f} healthy={d[\"all_healthy\"]} oversight_age={d.get(\"risk_oversight_age_s\",\"?\")}s')" 2>/dev/null`
+
+**Fleet status (sys → status):**
+!`curl -s http://localhost:8080/api/fleet_health 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); ok=sum(1 for s in d['systems'].values() if s['status']=='OK'); n=len(d['systems']); print(f'  {ok}/{n} OK'); [print(f'  BAD: {k}={v[\"status\"]} (age={v.get(\"max_age_s\",\"?\")}s)') for k,v in d['systems'].items() if v['status']!='OK']"`
+
+**Open positions + risk:**
+!`curl -s http://localhost:8080/api/positions_open 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); print(f'  open={d[\"count\"]}  risk=\${d[\"total_risk_usd\"]}  budget_used={d[\"pct_of_budget_used\"]}%')"`
+
+---
+
+Use the snapshot above as the primary state. Drill deeper only if something looks off:
 
 1. **Check all Python runner processes**:
    ```bash

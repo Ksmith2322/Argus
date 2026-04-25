@@ -4,6 +4,16 @@ description: Comprehensive fleet sanity check — processes, locks, config drift
 allowed-tools: Bash Read
 ---
 
+## Pre-loaded headline state
+
+**Gateway + per-pair:**
+!`curl -s http://localhost:8080/api/gateway_status 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); print(f'  broker=\${d[\"broker_equity_usd\"]:,.2f}  healthy={d[\"all_healthy\"]}  pause={d[\"pause_entries_present\"]}'); [print(f'    {k}: pos={v.get(\"position\",\"?\")} age={v.get(\"age_s\",\"?\")}s blocked={v.get(\"entries_blocked\",\"?\")}') for k,v in d['per_pair'].items()]"`
+
+**Fleet anomalies (any not OK):**
+!`curl -s http://localhost:8080/api/fleet_health 2>/dev/null | C:/Argus/.venv/Scripts/python.exe -c "import sys,json; d=json.load(sys.stdin); bad=[(k,v) for k,v in d['systems'].items() if v['status']!='OK']; print(f'  {len(bad)} systems not OK' if bad else '  all systems OK'); [print(f'    {k}={v[\"status\"]} age={v.get(\"max_age_s\",\"?\")}s proc_alive={v.get(\"process_alive\",\"?\")}') for k,v in bad]"`
+
+---
+
 Run a full operational audit across the fleet. Find problems before they bite.
 
 ## 1. Running processes
