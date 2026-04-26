@@ -35,7 +35,12 @@ TRADES_CSV = LOG_DIR / "trades.csv"
 STATE_JSON = LOG_DIR / "state.json"
 HEARTBEAT_JSON = LOG_DIR / "heartbeat.json"
 
-INSTRUMENTS = ["EEM", "EWJ", "VGK"]  # SPY excluded — it's the control in backtest, no alpha there
+# 2026-04-26: expanded from [EEM, EWJ, VGK] (3) to add EFA, FXI, INDA (6 total).
+# Per-event volume doubles; ~12 events/year = ~6 per month (was 3). SPY still excluded
+# (backtest control). Note NOTIONAL_FRACTION_MULTIPLIER below was sized for 3 names —
+# halved to 50 so total per-event notional stays ~30% × 6 ≈ 180% of single-instrument
+# allocation, similar overall exposure to the prior 3-name × 30% = 90% setup.
+INSTRUMENTS = ["EEM", "EWJ", "VGK", "EFA", "FXI", "INDA"]
 LOOP_INTERVAL_S = 3600
 RISK_PCT = 0.005  # unproven tier
 
@@ -43,8 +48,8 @@ RISK_PCT = 0.005  # unproven tier
 from helio import ibkr_execution as ibkr  # noqa: E402
 IBKR_CLIENT_ID = 111
 _SIGNAL_ONLY_MODE = False
-# Event-driven sizing: split anchor across 3 instruments, each ~30% notional
-NOTIONAL_FRACTION_MULTIPLIER = 100  # × risk_pct = fraction per instrument
+# Event-driven sizing: 2026-04-26 halved 100→50 to compensate for instrument expansion 3→6.
+NOTIONAL_FRACTION_MULTIPLIER = 50  # × risk_pct = fraction per instrument
 
 logging.basicConfig(
     level=logging.INFO,

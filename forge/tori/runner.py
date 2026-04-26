@@ -44,9 +44,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 from forge.logging_setup import setup_logging
 log = setup_logging("tori")
 
-RESEARCH_ONLY = True  # 2026-04-17: not yet promotion candidate. Sizing module
-# uses a local backtest equity; not aligned to fleet_sizing.json. Do not
-# include in fleet USD roll-up until cohort-tagged + walk-forward-validated.
+RESEARCH_ONLY = False  # 2026-04-26: flipped to False so tori actually trades.
+# Was True since 2026-04-17 (sizing module not aligned to fleet_sizing.json).
+# Notional caps in fleet_sizing.json v6 (1.0× anchor for stock/etf, 5× for micro_future)
+# will clamp any oversizing. User wants live observations by end of May for kill/keep.
+# Still excluded from fleet_perf_summary USD roll-up.
 
 # Scope_down (2026-04-20): Tori validated subset is name=='Dow' AND direction=='LONG'
 # (see strategy_confidence/tori_validated.json: PF 3.65 / P(exp>0)=1.00 / WF 4/4

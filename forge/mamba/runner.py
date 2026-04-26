@@ -965,8 +965,10 @@ def run_scan():
 # Signal loop
 # ---------------------------------------------------------------------------
 
-RESEARCH_ONLY = True  # 2026-04-17: 4-iteration audit showed no edge in current
-# impl. Excluded from fleet_perf_summary USD roll-up until promotion candidate.
+RESEARCH_ONLY = False  # 2026-04-26: flipped to False to let it fire and accumulate
+# real-money paper data. Was True since 2026-04-17 (4-iteration audit showed no edge);
+# user wants live observations across the silent fleet by end of May to make kill/keep
+# decisions. Still excluded from fleet_perf_summary USD roll-up until walk-forward+kill rules.
 
 
 def write_heartbeat(status: str = "running", extra: dict | None = None):

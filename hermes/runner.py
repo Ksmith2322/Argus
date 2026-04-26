@@ -481,8 +481,11 @@ def main():
         print(f"HERMES Gap Scanner -- {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
         print(f"{'=' * 60}")
 
-        # Connect IBKR if live
-        if args.live and _IBKR_AVAILABLE:
+        # Connect IBKR if live OR execute (cohort_report passes --execute, not --live).
+        # 2026-04-26: was `if args.live` only; --execute flag was parsed at line 456
+        # but never used here, so cohort_report's `hermes --execute` ran scan-only.
+        # Result: hermes generated entries but never submitted them.
+        if (args.live or args.execute) and _IBKR_AVAILABLE:
             executor = IBKRExecutor(
                 client_id=CLIENT_IDS["hermes"],
                 system="hermes",

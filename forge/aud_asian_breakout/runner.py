@@ -61,7 +61,9 @@ PARAMS = {
     "atr_period": 14,
     "target_atr_mult": 1.0,
     "stop_atr_mult": 0.5,
-    "min_range_pips": 15,          # skip narrow ranges (noise)
+    # 2026-04-26: was 15/120; persistent NO_TRIGGER range_pips_outside_band over
+    # 90 days. Lowered floor to 8 to allow tighter Asian-session ranges through.
+    "min_range_pips": 8,           # skip narrow ranges (noise)
     "max_range_pips": 120,         # skip fat ranges (overnight news)
     "risk_pct_default": 0.005,
 }

@@ -9,10 +9,11 @@
   "eval_timeframe": "5m",
   "strategy_variant": "tight_stop_breakeven",
   "trigger": {
-    "range_pct_min": 0.0008,
+    "_2026-04-26_change": "range_pct_min 0.0008 -> 0.0005 + session_end 17 -> 20: 90d 0 signals at 0.0008 vs 18.9/day expected. Loosening to capture some signals; revisit after 30d.",
+    "range_pct_min": 0.0005,
     "range_accel_min": 0.0,
     "session_start_utc": 7,
-    "session_end_utc": 17,
+    "session_end_utc": 20,
     "blocked_hours_utc": [
       [
         15,

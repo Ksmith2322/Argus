@@ -60,9 +60,10 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 from forge.logging_setup import setup_logging
 log = setup_logging("cuebanks")
 
-RESEARCH_ONLY = True  # 2026-04-17: rulebook exists, production readiness not
-# validated. Local sizing module not aligned to fleet_sizing.json. Keep out
-# of fleet USD roll-up until promotion candidate.
+RESEARCH_ONLY = False  # 2026-04-26: flipped to False so cuebanks actually trades
+# the Confluence rulebook. Was True since 2026-04-17. fleet_sizing.json v6 caps
+# (1.0× anchor for stock/etf, 5× for micro_future) clamp any oversizing. User wants
+# live observations by end of May for kill/keep. Still excluded from USD roll-up.
 
 # Instrument
 TICKER = "YM=F"
