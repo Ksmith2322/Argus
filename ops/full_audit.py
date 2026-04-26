@@ -290,12 +290,23 @@ def lens_data_integrity() -> dict:
     out["per_strategy"] = per_strat
     out["divergent_strategies"] = [k for k, v in per_strat.items() if v["status"] == "DIVERGENT"]
 
-    # Reconciliation report
+    # Reconciliation report — read fresh artifact, but if older than 24h fall
+    # back to the in-memory check we just did (per_strategy above). The cached
+    # artifact gets stale when the cohort chain doesn't run, and shows phantom
+    # DRIFT against fill counts that have since reconciled.
     recon = _load_json(LOGS_DIR / "reconciliation_report.json") or {}
-    out["reconciliation_all_reconciled"] = recon.get("all_reconciled")
-    out["reconciliation_drift_strategies"] = [
-        s.get("strategy") for s in (recon.get("strategies") or []) if s.get("status") == "DRIFT"
-    ]
+    recon_path = LOGS_DIR / "reconciliation_report.json"
+    recon_age_h = (_file_age_seconds(recon_path) / 3600) if recon_path.exists() else None
+    if recon_age_h is not None and recon_age_h > 24:
+        out["reconciliation_all_reconciled"] = (len(out["divergent_strategies"]) == 0)
+        out["reconciliation_drift_strategies"] = list(out["divergent_strategies"])
+        out["reconciliation_source"] = f"in_memory (artifact {recon_age_h:.1f}h stale)"
+    else:
+        out["reconciliation_all_reconciled"] = recon.get("all_reconciled")
+        out["reconciliation_drift_strategies"] = [
+            s.get("strategy") for s in (recon.get("strategies") or []) if s.get("status") == "DRIFT"
+        ]
+        out["reconciliation_source"] = f"artifact ({recon_age_h:.1f}h old)" if recon_age_h is not None else "artifact"
 
     # Apollo forward_returns freshness
     fr_path = REPO / "apollo" / "logs" / "forward_returns.jsonl"
@@ -417,8 +428,11 @@ def lens_signal_conversion() -> dict:
 
 def lens_scheduled_tasks() -> dict:
     out: dict = {"lens": "scheduled_tasks", "ts": _now().isoformat()}
+    # 2026-04-25: dropped ArgusMetaWatchdog — was in the expected list but never
+    # registered. ArgusWatchdog already supervises the fleet, no second-tier
+    # watchdog warranted. Re-add if a meta-supervisor is created.
     tasks = ["ArgusCohortReport", "ArgusWatchdog", "ArgusGldPmLoop",
-             "ArgusNqLondonCloseLoop", "ArgusAudOrbLoop", "ArgusMetaWatchdog"]
+             "ArgusNqLondonCloseLoop", "ArgusAudOrbLoop"]
     results = {}
     for t in tasks:
         raw = _ps(["schtasks", "/query", "/TN", t, "/FO", "LIST", "/V"], timeout=10)
@@ -471,15 +485,44 @@ def lens_code_hygiene() -> dict:
         out["errors_24h_count"] = len(errors)
         out["errors_24h_sample"] = errors[:5]
 
-    # Stale locks
+    # Stale locks — a .lock is only "stale" if its companion .json's pid is dead
+    # OR no companion exists. The .lock file mtime is set at first acquisition
+    # and doesn't refresh, so age alone is misleading for long-running runners.
+    def _pid_alive(pid: int) -> bool:
+        if sys.platform == "win32":
+            try:
+                r = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return str(pid) in (r.stdout or "")
+            except Exception:
+                return True  # if check fails, assume alive (don't false-positive stale)
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
     stale = []
     locks_dir = LOGS_DIR / "_locks"
     if locks_dir.exists():
         now = time.time()
         for lock in locks_dir.glob("*.lock"):
             age_h = (now - os.path.getmtime(lock)) / 3600
-            if age_h > 48:
-                stale.append({"name": lock.name, "age_hours": round(age_h, 1)})
+            if age_h <= 48:
+                continue
+            companion = lock.with_suffix(".json")
+            owner_alive = False
+            owner_pid = None
+            if companion.exists():
+                meta = _load_json(companion) or {}
+                owner_pid = meta.get("pid")
+                if isinstance(owner_pid, int):
+                    owner_alive = _pid_alive(owner_pid)
+            if not owner_alive:
+                stale.append({"name": lock.name, "age_hours": round(age_h, 1),
+                              "owner_pid": owner_pid, "reason": "owner_dead_or_missing"})
     out["stale_locks"] = stale
 
     # Git status

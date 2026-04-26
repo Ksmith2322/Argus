@@ -294,7 +294,14 @@ def evaluate_once() -> None:
         # --- Signal evaluation --------------------------------------------
         sig_action = "NO_TRIGGER"
         if state.get("open_trade") is None:
-            if last_ts.hour in PARAMS["signal_hours_utc"]:
+            now_utc = datetime.now(timezone.utc)
+            # Don't open new positions when US equity market is closed (weekends).
+            # Without this guard, --loop wakes hourly and submits orders that IBKR
+            # parks as PreSubmitted/Inactive, which the runner then logs as failures.
+            is_weekend = now_utc.weekday() >= 5
+            if is_weekend:
+                sig_action = "WEEKEND_SKIP"
+            elif last_ts.hour in PARAMS["signal_hours_utc"]:
                 a = float(a_series.iloc[last_idx])
                 if np.isfinite(a) and a > 0:
                     _open(state, df, last_idx, a, ib=ib)

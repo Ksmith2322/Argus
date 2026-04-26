@@ -88,6 +88,13 @@ def fetch_congress_trades() -> list[dict]:
             print("[themis] Rate limited (429) — waiting 60s...")
             time.sleep(60)
             continue
+        if resp.status_code == 401:
+            # 2026-04-25: QuiverQuant's public endpoint started 401-ing without a key.
+            # Don't crash the loop — return empty list and let the runner sleep till
+            # next cycle. Set QUIVER_API_KEY env var to restore live data. Themis is
+            # informational-only so missing data is non-fatal.
+            print("[themis] 401 Unauthorized — set QUIVER_API_KEY env var to enable")
+            return []
         resp.raise_for_status()
         data = resp.json()
         break

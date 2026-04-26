@@ -75,7 +75,10 @@ NY_CLOSE_HOUR, NY_CLOSE_MIN = 16, 0
 MAX_TRADES_PER_DAY = 2
 MIN_RR = 5.0  # Conservative (rulebook says 1:7-1:8)
 
-IBKR_CLIENT_ID = 108
+# 2026-04-25: was 108 which collided with aud_asian_breakout. Realigned to
+# memory-documented forge range (cuebanks=116). cuebanks is RESEARCH_ONLY=True
+# today so the collision was latent, but a flip would have caused a TWS clash.
+IBKR_CLIENT_ID = 116
 
 # Starting equity for backtest
 BACKTEST_EQUITY = 10_000.0

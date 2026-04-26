@@ -11,8 +11,13 @@ try {
             Add-Content -Path $logFile -Value "[$timestamp] refresh_managed_truth: $line"
         }
     }
+    # 2026-04-25: was `throw "exit code $LASTEXITCODE"` which aborted the entire
+    # cohort chain whenever the managed_truth_loop daemon held the lock at 04:00 UTC.
+    # Result: 4 nights in a row of "WITH FAILURES" with apollo/hermes/titan/ares/gdx_gld
+    # never running. The daemon refreshes managed_truth every 3 min anyway, so a
+    # contended-lock failure here is non-fatal — just record and continue.
     if ($LASTEXITCODE -ne 0) {
-        throw "exit code $LASTEXITCODE"
+        Add-Content -Path $logFile -Value "[$timestamp] refresh_managed_truth WARNING: exit code $LASTEXITCODE (non-fatal — daemon keeps managed_truth fresh on 3-min cycle)"
     }
     Write-Host "Running drift detector..."
     $driftOutput = & $python -m helio.drift_detector 2>&1

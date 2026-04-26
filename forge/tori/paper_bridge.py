@@ -134,6 +134,21 @@ def evaluate_once() -> dict:
         log.info("backtest produced 0 trades in rolling window")
         return {"status": "no_trades", "new_trades": 0}
 
+    # 2026-04-25: run_backtest now returns a list of (ticker, list[dict]) tuples
+    # in some configurations. Flatten + drop non-dict elements to make this
+    # resilient to either shape (was crashing with `'list' object has no
+    # attribute 'get'` on YM=F runs since 2026-04-22).
+    if all_trades and not isinstance(all_trades[0], dict):
+        flat: list[dict] = []
+        for item in all_trades:
+            if isinstance(item, dict):
+                flat.append(item)
+            elif isinstance(item, (list, tuple)):
+                for sub in item:
+                    if isinstance(sub, dict):
+                        flat.append(sub)
+        all_trades = flat
+
     state = _load_state()
     cutoff = state.get("last_processed_entry_date", "")
 
