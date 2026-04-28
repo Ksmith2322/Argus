@@ -8394,7 +8394,7 @@ function loadCapitalSafetyBar() {
     let integritySeg = '';
     if (integ && integ.headline_status && integ.headline_status !== 'ok' && integ.headline_status !== 'unknown') {
       const iColor = integ.headline_status === 'fail' ? '#ff4444' : '#ffaa00';
-      const issueList = (integ.issues || []).map(i => '• ' + i.message).join('\n');
+      const issueList = (integ.issues || []).map(i => '• ' + i.message).join(' | ');
       integritySeg = '<span style="color:#1e2a42;">|</span>'
         + '<span style="color:#9da8c7;" title="' + issueList.replace(/"/g, '&quot;') + '">Integrity: '
         + '<b style="color:' + iColor + ';">⚠ ' + integ.checks_failed + ' issue' + (integ.checks_failed > 1 ? 's' : '') + '</b>'
