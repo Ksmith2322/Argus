@@ -153,7 +153,7 @@ def main() -> int:
                 pass
         # FLATTEN_EOD is NEVER auto-cleared — requires manual review
 
-    # Track tier transitions
+    # Track tier transitions + Discord alert
     if tier != prev_tier:
         state["tier_history"].append({
             "ts": now_utc,
@@ -164,6 +164,28 @@ def main() -> int:
         })
         # Keep only last 20 transitions
         state["tier_history"] = state["tier_history"][-20:]
+
+        # Fire Discord alert on tier transitions (with cooldown via dedicated state file)
+        try:
+            sys.path.insert(0, str(REPO))
+            from ops._alert_helper import post_discord, load_cooldown_state, should_alert, mark_alerted, save_cooldown_state
+            COOLDOWN_KEY = f"circuit_breaker_{tier}"
+            COOLDOWN_MIN = 60  # don't re-alert same tier within 1h
+            cd_state = load_cooldown_state("circuit_breaker_cooldown")
+            if should_alert(cd_state, COOLDOWN_KEY, COOLDOWN_MIN):
+                colors = {"WARN": 0xFFC107, "PAUSE": 0xFF8800, "FLATTEN": 0xFF4444, "OK": 0x00FF88}
+                color = colors.get(tier, 0x9DA8C7)
+                title = f"CIRCUIT BREAKER: {prev_tier} -> {tier}"
+                desc = (
+                    f"Daily PnL: **{pnl_pct:+.2f}%**\n"
+                    f"Equity: ${equity:,.2f} (day open ${open_eq:,.2f})\n"
+                    f"Actions: {', '.join(actions) if actions else 'none'}"
+                )
+                if post_discord(title, desc, color=color):
+                    mark_alerted(cd_state, COOLDOWN_KEY, reason=f"tier {prev_tier}->{tier}")
+                    save_cooldown_state("circuit_breaker_cooldown", cd_state)
+        except Exception as e:
+            print(f"  warn: Discord alert failed (non-fatal): {e}", file=sys.stderr)
 
     state["last_actions"] = actions
     _save_state(state)

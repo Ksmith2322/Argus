@@ -3685,6 +3685,311 @@ async def api_market_clock():
     return JSONResponse(_market_clock_snapshot())
 
 
+@app.get("/api/strategy_dimensions")
+async def api_strategy_dimensions():
+    """Per-strategy multi-dimensional health (replaces single 'OK' catch-all)
+    AND fleet-level confidence sub-scores (replaces single Fleet Confidence X%).
+
+    Five OK dimensions per strategy:
+       PROC_OK      - process running, heartbeat fresh
+       EDGE_OK      - drift not DECLINING, action not KILL
+       EXEC_OK      - no chronic REAL_ENTRY FAILED / no execution bugs
+       RISK_OK      - not over cluster cap; sizing within bounds
+       PROMOTION_OK - decision action allows scaling (not KILL/REDUCE)
+
+    Five fleet sub-scores (0-100):
+       operational - % of strategies PROC_OK
+       evidence    - % of strategies with n>=10 valid trades
+       execution   - 100 - (% of recent entries that hit REAL_ENTRY FAILED)
+       risk        - 100 if no cluster > 80% else lower
+       attribution - top-1 alpha contributor's % of fleet PnL (concentration metric)
+    """
+    # Pull source data
+    try:
+        actions_resp = await api_strategy_actions(window_days=30)
+        actions_data = json.loads(actions_resp.body)
+        action_by = {r["strategy"]: r for r in actions_data.get("strategies", [])}
+    except Exception:
+        action_by = {}
+
+    try:
+        drift_resp = await api_strategy_drift()
+        drift_data = json.loads(drift_resp.body)
+        drift_by = {r["strategy"]: r for r in drift_data.get("strategies", [])}
+    except Exception:
+        drift_by = {}
+
+    try:
+        eff_resp = await api_strategy_efficiency(window_days=30)
+        eff_data = json.loads(eff_resp.body)
+        eff_by = {r["strategy"]: r for r in eff_data.get("strategies", [])}
+    except Exception:
+        eff_by = {}
+
+    try:
+        blocked_resp = await api_blocked_entries_today()
+        blocked_data = json.loads(blocked_resp.body)
+        blocked_by_strat = blocked_data.get("by_strategy") or {}
+    except Exception:
+        blocked_by_strat = {}
+
+    try:
+        cluster_resp = await api_cluster_exposure()
+        cluster_data = json.loads(cluster_resp.body)
+    except Exception:
+        cluster_data = {"clusters": []}
+
+    try:
+        alpha_resp = await api_alpha_attribution(window_days=30)
+        alpha_data = json.loads(alpha_resp.body)
+    except Exception:
+        alpha_data = {"concentration": {}}
+
+    # Read fleet_health for runtime
+    try:
+        fh_path = REPO / "argus_flow" / "logs" / "fleet_status.json"
+        if fh_path.exists():
+            fh = json.loads(fh_path.read_text(encoding="utf-8"))
+            systems = fh.get("systems") or {}
+        else:
+            systems = {}
+    except Exception:
+        systems = {}
+
+    # Per-strategy dimensions
+    all_strategies = set(action_by.keys()) | set(eff_by.keys())
+    rows = []
+    for strat in sorted(all_strategies):
+        a = action_by.get(strat, {})
+        e = eff_by.get(strat, {})
+        d = drift_by.get(strat, {})
+        # Map canonical strategy label -> fleet_health system key (rough mapping)
+        sys_key = strat
+        runtime_status = systems.get(sys_key, {}).get("status", "UNKNOWN")
+        # Try forge_X variant
+        if runtime_status == "UNKNOWN" and not strat.startswith("forge_"):
+            runtime_status = systems.get("forge_" + strat, {}).get("status", "UNKNOWN")
+
+        # blocked entries lookup uses dir name (strip forge_)
+        blocked_key = strat.replace("forge_", "")
+        blocked = blocked_by_strat.get(blocked_key, {})
+
+        n = a.get("n_total", 0)
+        pnl = a.get("pnl_usd", 0)
+        action = a.get("action", "UNKNOWN")
+        drift = d.get("drift_verdict", "INSUFFICIENT")
+
+        # 5 dimensions (each True/False)
+        proc_ok = runtime_status not in ("DOWN", "DEGRADED", "UNKNOWN")
+        edge_ok = (drift != "DECLINING") and (n < 10 or pnl >= -100)  # not yet bleeding hard
+        # Exec: no chronic real_entry_failed (>10 in 24h is concerning; market_closed and broker_has_position are normal)
+        exec_failed = blocked.get("real_entry_failed", 0)
+        exec_ok = exec_failed < 20  # threshold; tune later
+        # Risk: not in cluster over 80%
+        risk_ok = all(c.get("pct_used", 0) < 80 for c in cluster_data.get("clusters", []))
+        # Promotion: action not KILL, drift not DECLINING
+        promotion_ok = action not in ("KILL",) and drift != "DECLINING"
+
+        rows.append({
+            "strategy": strat,
+            "runtime": runtime_status,
+            "proc_ok":      proc_ok,
+            "edge_ok":      edge_ok,
+            "exec_ok":      exec_ok,
+            "risk_ok":      risk_ok,
+            "promotion_ok": promotion_ok,
+            "decision": action,
+        })
+
+    # Fleet-level sub-scores (0-100)
+    n_total = len(rows) or 1
+    operational_pct = round(sum(1 for r in rows if r["proc_ok"]) / n_total * 100, 1)
+    evidence_pct = round(sum(1 for s, e in eff_by.items() if e.get("trade_count", 0) >= 10) / n_total * 100, 1)
+    # Execution: 100 - (failures / total entry attempts) * 100
+    total_failures = sum(b.get("real_entry_failed", 0) for b in blocked_by_strat.values())
+    total_attempts = total_failures + sum(e.get("trade_count", 0) for e in eff_by.values())
+    execution_pct = round(max(0, 100 - (total_failures / total_attempts * 100 if total_attempts else 0)), 1)
+    # Risk: penalize if any cluster over 80%
+    max_cluster_pct = max([c.get("pct_used", 0) for c in cluster_data.get("clusters", [])] + [0])
+    risk_pct_score = round(max(0, 100 - max(0, max_cluster_pct - 50)), 1)
+    # Attribution: top-1 alpha share (lower = more diversified)
+    top1 = alpha_data.get("concentration", {}).get("top_1_pct_of_abs", 0)
+    attribution_pct = round(max(0, 100 - top1), 1)  # 100 = perfectly diversified
+
+    overall = round((operational_pct + evidence_pct + execution_pct + risk_pct_score + attribution_pct) / 5, 1)
+
+    return JSONResponse({
+        "overall": overall,
+        "subscores": {
+            "operational": operational_pct,
+            "evidence":    evidence_pct,
+            "execution":   execution_pct,
+            "risk":        risk_pct_score,
+            "attribution": attribution_pct,
+        },
+        "strategies": rows,
+    })
+
+
+@app.get("/api/strategy_states")
+async def api_strategy_states():
+    """Per-strategy three-dimensional state composition:
+       Runtime  - UP / STALE / DOWN / DEGRADED / BLOCKED (from fleet_health)
+       Trading  - FLAT / IN_TRADE / WAITING / NO_TRIGGER (from positions + recent signals)
+       Decision - SCALE_UP / HOLD / REDUCE / KILL / IGNORE (from strategy_actions engine)
+
+    Per project_dashboard_upgrades_capital_safety.md - single 'OK' tile hides
+    decision-state degradation when runtime is fine. Three-dimensional view
+    catches that.
+    """
+    rows = []
+    # Runtime: from fleet_health
+    try:
+        import urllib.request, urllib.parse
+        # Reuse internal logic by reading the json files directly
+        fh_path = REPO / "argus_flow" / "logs" / "fleet_status.json"
+        if fh_path.exists():
+            fh = json.loads(fh_path.read_text(encoding="utf-8"))
+            systems = fh.get("systems") or {}
+        else:
+            systems = {}
+    except Exception:
+        systems = {}
+
+    # Trading: open_trades + recent signal action
+    open_strategies = set()
+    try:
+        # Reuse the positions_open scan (same source)
+        for hb_root in (REPO / "argus_flow" / "logs", REPO / "forge" / "logs"):
+            if not hb_root.exists(): continue
+            for hb_path in list(hb_root.glob("*/heartbeat.json")) + list(hb_root.glob("heartbeat.json")):
+                try:
+                    hb = json.loads(hb_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                strategy = hb.get("system") or hb_path.parent.name
+                if hb.get("open_trade"):
+                    open_strategies.add(strategy)
+                ots = hb.get("open_trades")
+                if ots and isinstance(ots, dict) and ots:
+                    open_strategies.add(strategy)
+    except Exception:
+        pass
+
+    # Decision: from strategy_actions endpoint output (re-run logic)
+    try:
+        actions_resp = await api_strategy_actions(window_days=30)
+        actions_data = json.loads(actions_resp.body)
+        action_by = {r["strategy"]: r for r in actions_data.get("strategies", [])}
+    except Exception:
+        action_by = {}
+
+    # Combine. Iterate over all strategy names known
+    all_names = set(systems.keys()) | set(open_strategies) | set(action_by.keys())
+    # Filter out non-runner system names (like 'dashboard', 'argus' which is multi-pair)
+    non_strategy = {"dashboard", "ares"}
+    # Map fleet_health name -> canonical strategy label used by actions (if differs)
+    NAME_MAP = {
+        "forge_multi_orb":         "forge_multi_orb",
+        "forge_spy_mean_rev":      "forge_spy_mean_rev",
+        "forge_vix_intraday":      "forge_vix_intraday",
+        "forge_jpy_pm_short":      "forge_jpy_pm_short",
+        "forge_nq_overnight":      "forge_nq_overnight",
+        "forge_nq_london_close":   "forge_nq_london_close",
+        "forge_aud_asian_breakout":"forge_aud_asian_breakout",
+        "forge_gld_pm_long":       "forge_gld_pm_long",
+        "forge_wick_gbpusd":       "forge_wick_gbpusd",
+        "forge_multi_orb":         "forge_multi_orb",
+    }
+    for name in sorted(all_names):
+        if name in non_strategy: continue
+        sys_info = systems.get(name, {})
+        runtime = sys_info.get("status", "UNKNOWN")
+        # Trading
+        if name in open_strategies:
+            trading = "IN_TRADE"
+        else:
+            trading = "FLAT"
+        # Decision: try multiple key variants
+        canonical = NAME_MAP.get(name, name)
+        a = action_by.get(canonical) or action_by.get(name) or action_by.get("forge_" + name.replace("forge_","")) or {}
+        decision = a.get("action", "UNKNOWN")
+        rows.append({
+            "strategy": name,
+            "runtime": runtime,
+            "trading": trading,
+            "decision": decision,
+            "decision_reason": a.get("reason", ""),
+            "decision_confidence_pct": a.get("confidence_pct", 0),
+        })
+    return JSONResponse({"strategies": rows})
+
+
+@app.get("/api/broker_drift_status")
+async def api_broker_drift_status():
+    """Read broker_drift_state.json (written by ops/broker_drift_aggregator)."""
+    fp = REPO / "argus_flow" / "logs" / "_risk" / "broker_drift_state.json"
+    if not fp.exists():
+        return JSONResponse({"status": "unknown", "reason": "broker_drift_state.json not yet written"})
+    try:
+        return JSONResponse(json.loads(fp.read_text(encoding="utf-8")))
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)})
+
+
+@app.get("/api/margin_status")
+async def api_margin_status():
+    """Margin used estimate sourced from runner_unified's broker snapshot.
+
+    Reads argus_flow/logs/_broker/broker_snapshot.json (refreshed every loop tick
+    by the active runner). Returns init/maint margin used + headroom + percent
+    bands, plus age. Used by the Capital Safety Bar margin segment and any
+    future margin-pressure alerting.
+
+    Bands (init_margin / net_liq):
+       OK     <40%
+       WARN   40-65%
+       HOT    >=65%
+    """
+    fp = REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json"
+    if not fp.exists():
+        return JSONResponse({"status": "unknown", "reason": "broker_snapshot.json not yet written"})
+    try:
+        snap = json.loads(fp.read_text(encoding="utf-8"))
+        acct = snap.get("account") or {}
+        net_liq = float(acct.get("net_liquidation_usd") or 0)
+        init_m = float(acct.get("init_margin_req_usd") or 0)
+        maint_m = float(acct.get("maint_margin_req_usd") or 0)
+        avail = float(acct.get("available_funds_usd") or 0)
+        bp = float(acct.get("buying_power_usd") or 0)
+        margin_used_pct = (init_m / net_liq * 100) if net_liq > 0 else 0
+        maint_used_pct = (maint_m / net_liq * 100) if net_liq > 0 else 0
+        headroom_pct = (avail / net_liq * 100) if net_liq > 0 else 0
+        if margin_used_pct >= 65:
+            band = "HOT"
+        elif margin_used_pct >= 40:
+            band = "WARN"
+        else:
+            band = "OK"
+        age_s = int(time.time() - fp.stat().st_mtime)
+        return JSONResponse({
+            "status": "ok",
+            "band": band,
+            "net_liq_usd": round(net_liq, 2),
+            "init_margin_used_usd": round(init_m, 2),
+            "maint_margin_used_usd": round(maint_m, 2),
+            "available_funds_usd": round(avail, 2),
+            "buying_power_usd": round(bp, 2),
+            "margin_used_pct": round(margin_used_pct, 2),
+            "maint_used_pct": round(maint_used_pct, 2),
+            "headroom_pct": round(headroom_pct, 2),
+            "age_s": age_s,
+            "stale": age_s > 600,
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)})
+
+
 @app.get("/api/circuit_breaker_status")
 async def api_circuit_breaker_status():
     """Read circuit_breaker_state.json (written by ops/daily_loss_circuit_breaker).
@@ -7303,8 +7608,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-volatile { background: #3d1a0d; color: #ff9800; border: 1px solid #ff9800; }
   .coin-summary { padding: 14px; }
 </style>
+<!-- VIEW_CSS_PLACEHOLDER (substituted by _render_view) -->
 </head>
-<body>
+<body class="VIEW_BODY_CLASS_PLACEHOLDER">
+
+<!-- View-nav strip: 5-page split (#9). Always present; default view = "all". -->
+<div id="view-nav-strip" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;font-size:0.7em;letter-spacing:1px;">
+  <span style="color:#5a6a8a;">VIEW:</span>
+  <a href="/"          style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="all">ALL</a>
+  <a href="/noc"       style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="noc">NOC</a>
+  <a href="/ops"       style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="ops">FLEET OPS</a>
+  <a href="/pipeline"  style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="pipeline">PIPELINE</a>
+  <a href="/risk-view" style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="risk">RISK</a>
+  <a href="/research"  style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;" data-view="research">RESEARCH</a>
+</div>
+<script>
+  (function(){
+    var bc = document.body.className || '';
+    var m = bc.match(/view-([a-z]+)/);
+    var v = m ? m[1] : 'all';
+    document.querySelectorAll('#view-nav-strip a[data-view]').forEach(function(a){
+      if (a.dataset.view === v) {
+        a.style.background = '#1e2a42';
+        a.style.color = '#00d4ff';
+        a.style.fontWeight = 'bold';
+      }
+    });
+  })();
+</script>
+
 <!-- TWS health banner — appears only when TWS is degraded/unreachable -->
 <div id="tws-health-banner" style="display:none;margin-bottom:10px;"></div>
 
@@ -7344,6 +7676,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- MFE CAPTURE — true MFE/realized ratio with bar lookback -->
 <div id="mfe-capture-panel" style="margin-bottom:14px;"></div>
+
+<!-- CLUSTER EXPOSURE — per-cluster bar chart (used vs cap) -->
+<div id="cluster-exposure-panel" style="margin-bottom:14px;"></div>
+
+<!-- THREE-STATE PER-STRATEGY VIEW (Runtime / Trading / Decision) -->
+<div id="three-state-panel" style="margin-bottom:14px;"></div>
+
+<!-- FLEET CONFIDENCE SUB-SCORES + per-strategy 5-OK status (#6 + #8 combined) -->
+<div id="dimensions-panel" style="margin-bottom:14px;"></div>
 
 <!-- ALPHA ATTRIBUTION — who's actually carrying the fleet PnL -->
 <div id="alpha-attribution-panel" style="margin-bottom:14px;"></div>
@@ -7520,8 +7861,9 @@ function loadMfeCapture() {
     for (const s of rows) {
       const meanColor = s.mean_capture > 0.5 ? '#00ff88' : (s.mean_capture > 0 ? '#ffc107' : '#ff4444');
       const mfeMaeColor = s.mean_mfe_to_mae > 2.0 ? '#00ff88' : (s.mean_mfe_to_mae > 1.0 ? '#ffc107' : '#ff4444');
-      html += '<tr style="border-top:1px solid #1e2a42;">'
-        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+      const safeId = s.strategy.replace(/[^a-z0-9]/gi, '_');
+      html += '<tr style="border-top:1px solid #1e2a42;cursor:pointer;" onclick="toggleMfeDrill(\'' + safeId + '\')" title="Click to expand last 20 trades">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;"><span id="mfe-arrow-' + safeId + '" style="color:#7b8ab8;font-size:0.85em;">▶</span> ' + s.strategy + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.n + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + meanColor + ';font-weight:bold;">' + s.mean_capture.toFixed(2) + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.median_capture.toFixed(2) + '</td>'
@@ -7531,15 +7873,208 @@ function loadMfeCapture() {
         + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">' + s.adverse_pct.toFixed(0) + '%</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + mfeMaeColor + ';">' + s.mean_mfe_to_mae.toFixed(2) + '</td>'
         + '</tr>';
+      // Hidden drill-down row with per-trade detail
+      const trades = s.trades || [];
+      if (trades.length > 0) {
+        html += '<tr id="mfe-drill-' + safeId + '" style="display:none;">'
+          + '<td colspan="9" style="padding:6px 14px;background:#0a1224;">'
+          + '<div style="font-size:0.72em;color:#7b8ab8;margin-bottom:4px;">Last ' + Math.min(trades.length, 20) + ' trades for ' + s.strategy + ':</div>'
+          + '<table style="width:100%;border-collapse:collapse;font-size:0.72em;">'
+          + '<thead><tr style="color:#7b8ab8;"><th style="text-align:left;padding:3px 6px;">Entry</th><th style="text-align:left;padding:3px 6px;">Symbol</th><th style="text-align:center;padding:3px 6px;">Dir</th><th style="text-align:right;padding:3px 6px;">MFE</th><th style="text-align:right;padding:3px 6px;">MAE</th><th style="text-align:right;padding:3px 6px;">Realized</th><th style="text-align:right;padding:3px 6px;">Capture</th><th style="text-align:center;padding:3px 6px;">Bar</th></tr></thead><tbody>';
+        for (const t of trades.slice(-20).reverse()) {
+          const cc = t.capture_ratio > 0.5 ? '#00ff88' : (t.capture_ratio > 0 ? '#ffc107' : '#ff4444');
+          // Mini bar showing capture as percentage of MFE
+          const barW = Math.max(2, Math.min(40, Math.abs(t.capture_ratio) * 40));
+          const barColor = t.capture_ratio >= 0 ? '#00ff88' : '#ff4444';
+          html += '<tr style="border-top:1px solid #1e2a42;">'
+            + '<td style="padding:3px 6px;color:#9da8c7;">' + t.entry_ts.slice(5,16) + '</td>'
+            + '<td style="padding:3px 6px;color:#e0e0e0;">' + t.symbol + '</td>'
+            + '<td style="padding:3px 6px;text-align:center;color:#9da8c7;">' + t.direction.slice(0,1).toUpperCase() + '</td>'
+            + '<td style="padding:3px 6px;text-align:right;color:#00ff88;">+' + t.mfe_distance.toFixed(4) + '</td>'
+            + '<td style="padding:3px 6px;text-align:right;color:#ff4444;">-' + t.mae_distance.toFixed(4) + '</td>'
+            + '<td style="padding:3px 6px;text-align:right;color:' + cc + ';">' + (t.realized_distance >= 0 ? '+' : '') + t.realized_distance.toFixed(4) + '</td>'
+            + '<td style="padding:3px 6px;text-align:right;color:' + cc + ';font-weight:bold;">' + t.capture_ratio.toFixed(2) + '</td>'
+            + '<td style="padding:3px 6px;text-align:center;"><div style="display:inline-block;width:40px;height:8px;background:#1e2a42;border-radius:1px;position:relative;"><div style="position:absolute;left:0;top:0;height:100%;width:' + barW + 'px;background:' + barColor + ';"></div></div></td>'
+            + '</tr>';
+        }
+        html += '</tbody></table></td></tr>';
+      }
     }
     html += '</tbody></table>'
-      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:6px;">Excellent: capture &ge; 80% of MFE. Adverse: stopped past entry. MFE/MAE &gt; 2 = trade goes favorable before going adverse (good signal).</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:6px;">Excellent: capture &ge; 80% of MFE. Adverse: stopped past entry. MFE/MAE &gt; 2 = trade goes favorable before going adverse (good signal). Click strategy row to drill in.</div>'
       + '</div>';
     el.innerHTML = html;
   }).catch(()=>{});
 }
+function toggleMfeDrill(safeId) {
+  const row = document.getElementById('mfe-drill-' + safeId);
+  const arrow = document.getElementById('mfe-arrow-' + safeId);
+  if (!row) return;
+  const expanded = row.style.display !== 'none';
+  row.style.display = expanded ? 'none' : 'table-row';
+  if (arrow) arrow.textContent = expanded ? '▶' : '▼';
+}
 loadMfeCapture();
 setInterval(loadMfeCapture, 300000);  // refresh every 5min (data computed by managed_truth_loop)
+
+// ─── CLUSTER EXPOSURE PANEL ────────────────────────────────────────
+// Per-cluster horizontal bar chart (used vs cap). Auto-hides when fleet flat.
+function loadClusterExposurePanel() {
+  fetch('/api/cluster_exposure').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('cluster-exposure-panel');
+    if (!el) return;
+    const clusters = (data.clusters || []).filter(c => c.pct_used > 0);
+    if (clusters.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">'
+      + '<span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">CLUSTER EXPOSURE</span>'
+      + '<span style="color:#7b8ab8;font-size:0.78em;">total $' + (data.total_notional_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ' / $' + (data.total_cap_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ' (' + (data.total_pct_used||0).toFixed(1) + '%)</span></div>'
+      + '<div style="display:flex;flex-direction:column;gap:6px;">';
+    for (const c of clusters) {
+      const barColor = c.pct_used >= 90 ? '#ff4444' : (c.pct_used >= 70 ? '#ff8800' : (c.pct_used >= 40 ? '#ffaa00' : '#00d4ff'));
+      const barW = Math.min(100, c.pct_used).toFixed(1);
+      html += '<div style="display:flex;align-items:center;gap:10px;font-size:0.78em;">'
+        + '<div style="min-width:160px;color:#e0e0e0;">' + c.cluster + '</div>'
+        + '<div style="flex:1;background:#0a1224;border:1px solid #1e2a42;border-radius:3px;height:14px;position:relative;overflow:hidden;">'
+        + '<div style="background:' + barColor + ';height:100%;width:' + barW + '%;"></div>'
+        + '<div style="position:absolute;top:0;left:0;right:0;text-align:center;line-height:14px;color:#fff;font-size:0.78em;font-weight:bold;text-shadow:0 0 2px #000;">' + c.pct_used.toFixed(1) + '%</div>'
+        + '</div>'
+        + '<div style="min-width:160px;text-align:right;color:#9da8c7;">$' + c.used_usd.toLocaleString(undefined,{maximumFractionDigits:0}) + ' / $' + c.cap_usd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</div>'
+        + '</div>';
+    }
+    html += '</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:6px;">Per-instrument cap: ' + (data.single_instrument_cap_x||0.6) + 'x equity. Cluster cap pre-trade check rejects entries with cluster_cap_breach.</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadClusterExposurePanel();
+setInterval(loadClusterExposurePanel, 30000);
+
+// ─── THREE-STATE DIMENSION DISPLAY ─────────────────────────────────
+// Runtime / Trading / Decision per strategy. Catches the degradation that
+// a single 'OK' tile hides (process up, decision=KILL_CANDIDATE).
+const RUNTIME_COLORS = {OK:'#00e676', STALE:'#ffaa00', DOWN:'#ff4444', DEGRADED:'#ff8800', BLOCKED:'#ff4444', UNKNOWN:'#7b8ab8'};
+const TRADING_COLORS = {FLAT:'#7b8ab8', IN_TRADE:'#00d4ff', WAITING:'#9da8c7'};
+const DECISION_COLORS = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', IGNORE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
+function loadThreeState() {
+  fetch('/api/strategy_states').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('three-state-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">THREE-STATE DIMENSIONS'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">runtime, trading, decision - one OK tile hides too much</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Runtime</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Trading</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Decision</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Conf</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Reason</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const rc = RUNTIME_COLORS[s.runtime] || '#7b8ab8';
+      const tc = TRADING_COLORS[s.trading] || '#7b8ab8';
+      const dc = DECISION_COLORS[s.decision] || '#7b8ab8';
+      const flagDanger = (s.runtime === 'OK' && (s.decision === 'KILL' || s.decision === 'REDUCE'));
+      const rowBg = flagDanger ? 'background:#2a1010;' : '';
+      html += '<tr style="border-top:1px solid #1e2a42;' + rowBg + '">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + (flagDanger ? ' <span title="Runtime OK but decision recommends action" style="color:#ffaa00;">!</span>' : '') + '</td>'
+        + '<td style="padding:5px 6px;text-align:center;color:' + rc + ';font-weight:bold;">' + s.runtime + '</td>'
+        + '<td style="padding:5px 6px;text-align:center;color:' + tc + ';">' + s.trading + '</td>'
+        + '<td style="padding:5px 6px;text-align:center;color:' + dc + ';font-weight:bold;">' + s.decision + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + (s.decision_confidence_pct||0) + '%</td>'
+        + '<td style="padding:5px 6px;color:#7b8ab8;font-size:0.92em;">' + (s.decision_reason || '-') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:4px;">Red row = runtime OK but decision recommends action. The hidden-degradation case the memo flagged.</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadThreeState();
+setInterval(loadThreeState, 60000);
+
+// ─── FLEET DIMENSIONS PANEL (#6 + #8) ──────────────────────────────
+// Top: 5 fleet sub-scores (operational / evidence / execution / risk / attribution)
+// Bottom: per-strategy 5-OK status as colored dots (PROC/EDGE/EXEC/RISK/PROMOTION)
+function loadDimensions() {
+  fetch('/api/strategy_dimensions').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('dimensions-panel');
+    if (!el) return;
+    const sub = data.subscores || {};
+    const overall = data.overall || 0;
+    const overallColor = overall >= 80 ? '#00ff88' : (overall >= 60 ? '#ffc107' : '#ff4444');
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">'
+      + '<span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">FLEET DIMENSIONS</span>'
+      + '<span style="font-size:0.78em;color:' + overallColor + ';font-weight:bold;">overall ' + overall + '%</span>'
+      + '</div>';
+    // Sub-score bars
+    const subDefs = [
+      ['operational', 'Operational', '% of strategies with healthy process'],
+      ['evidence',    'Evidence',    '% of strategies with n>=10 valid trades'],
+      ['execution',   'Execution',   '100 minus failure rate of entry attempts'],
+      ['risk',        'Risk',        'penalized when any cluster cap > 50% used'],
+      ['attribution', 'Attribution', '100 minus top-1 alpha share (more diversified = higher)'],
+    ];
+    html += '<div style="display:flex;flex-direction:column;gap:5px;margin-bottom:10px;">';
+    for (const [key, label, tip] of subDefs) {
+      const v = sub[key] || 0;
+      const c = v >= 80 ? '#00ff88' : (v >= 60 ? '#ffc107' : '#ff4444');
+      html += '<div style="display:flex;align-items:center;gap:10px;font-size:0.78em;" title="' + tip + '">'
+        + '<div style="min-width:120px;color:#9da8c7;">' + label + '</div>'
+        + '<div style="flex:1;background:#0a1224;border:1px solid #1e2a42;border-radius:3px;height:12px;position:relative;overflow:hidden;">'
+        + '<div style="background:' + c + ';height:100%;width:' + Math.min(100,v) + '%;"></div>'
+        + '</div>'
+        + '<div style="min-width:50px;text-align:right;color:' + c + ';font-weight:bold;">' + v + '%</div>'
+        + '</div>';
+    }
+    html += '</div>';
+
+    // Per-strategy 5-OK dots
+    const rows = data.strategies || [];
+    if (rows.length > 0) {
+      html += '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+        + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+        + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+        + '<th style="text-align:center;padding:5px 6px;" title="process up + heartbeat fresh">Proc</th>'
+        + '<th style="text-align:center;padding:5px 6px;" title="not in DECLINING drift, not bleeding heavily">Edge</th>'
+        + '<th style="text-align:center;padding:5px 6px;" title="no chronic execution failures">Exec</th>'
+        + '<th style="text-align:center;padding:5px 6px;" title="no cluster cap > 80%">Risk</th>'
+        + '<th style="text-align:center;padding:5px 6px;" title="action allows scaling (not KILL)">Promo</th>'
+        + '<th style="text-align:right;padding:5px 6px;">Decision</th>'
+        + '</tr></thead><tbody>';
+      const dot = (ok, key) => {
+        const c = ok ? '#00ff88' : '#ff4444';
+        const sym = ok ? '✓' : '✗';
+        return '<span style="color:' + c + ';font-weight:bold;font-size:1.1em;" title="' + key + '=' + (ok?'OK':'FAIL') + '">' + sym + '</span>';
+      };
+      const decisionColors = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', IGNORE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
+      for (const s of rows) {
+        const dc = decisionColors[s.decision] || '#7b8ab8';
+        html += '<tr style="border-top:1px solid #1e2a42;">'
+          + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+          + '<td style="padding:5px 6px;text-align:center;">' + dot(s.proc_ok, 'PROC_OK') + '</td>'
+          + '<td style="padding:5px 6px;text-align:center;">' + dot(s.edge_ok, 'EDGE_OK') + '</td>'
+          + '<td style="padding:5px 6px;text-align:center;">' + dot(s.exec_ok, 'EXEC_OK') + '</td>'
+          + '<td style="padding:5px 6px;text-align:center;">' + dot(s.risk_ok, 'RISK_OK') + '</td>'
+          + '<td style="padding:5px 6px;text-align:center;">' + dot(s.promotion_ok, 'PROMOTION_OK') + '</td>'
+          + '<td style="padding:5px 6px;text-align:right;color:' + dc + ';font-weight:bold;">' + s.decision + '</td>'
+          + '</tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadDimensions();
+setInterval(loadDimensions, 60000);
 
 // ─── CAPITAL SAFETY BAR ────────────────────────────────────────────
 // Single-line top-of-page summary. Combines positions_open (risk $) +
@@ -7549,7 +8084,8 @@ function loadCapitalSafetyBar() {
   Promise.all([
     fetch('/api/positions_open').then(r=>r.json()),
     fetch('/api/cluster_exposure').then(r=>r.json()),
-  ]).then(([pos, clu])=>{
+    fetch('/api/margin_status').then(r=>r.json()).catch(()=>({status:'error'})),
+  ]).then(([pos, clu, mar])=>{
     const el = document.getElementById('capital-safety-bar');
     if (!el) return;
     const anchor = pos.anchor_usd || 0;
@@ -7568,6 +8104,17 @@ function loadCapitalSafetyBar() {
     const totalColor = totalCapPct >= 80 ? '#ff4444' : totalCapPct >= 50 ? '#ffaa00' : '#00d4ff';
     const fleetState = openCount === 0 ? 'FLAT' : (riskPct >= 80 ? 'HOT' : 'ACTIVE');
     const stateColor = fleetState === 'FLAT' ? '#00e676' : (fleetState === 'HOT' ? '#ff4444' : '#00d4ff');
+    // Margin segment (only show when status=ok and not stale)
+    let marginSeg = '';
+    if (mar && mar.status === 'ok' && !mar.stale) {
+      const marColor = mar.band === 'HOT' ? '#ff4444' : mar.band === 'WARN' ? '#ffaa00' : '#00d4ff';
+      marginSeg = '<span style="color:#1e2a42;">|</span>'
+        + '<span style="color:#9da8c7;">Margin: <b style="color:' + marColor + ';">' + mar.margin_used_pct.toFixed(1) + '%</b>'
+        + ' used · headroom <b style="color:#fff;">$' + mar.available_funds_usd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b></span>';
+    } else if (mar && mar.status === 'ok' && mar.stale) {
+      marginSeg = '<span style="color:#1e2a42;">|</span>'
+        + '<span style="color:#7b8ab8;">Margin: <i>stale (' + mar.age_s + 's)</i></span>';
+    }
     el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
       + '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;">'
       + '<span style="color:#7b8ab8;letter-spacing:2px;">CAPITAL SAFETY</span>'
@@ -7578,6 +8125,7 @@ function loadCapitalSafetyBar() {
       + '<span style="color:#9da8c7;">Gross notional: <b style="color:' + grossColor + ';">$' + grossUsd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b> (' + grossPct.toFixed(0) + '% of equity)</span>'
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
+      + marginSeg
       + (topCluster ? '<span style="color:#1e2a42;">|</span><span style="color:#9da8c7;">Top cluster: <b style="color:#fff;">' + topCluster.cluster + '</b> ' + topCluster.pct_used.toFixed(1) + '%</span>' : '')
       + '</div>'
       + '<span style="color:#7b8ab8;font-size:0.92em;">anchor $' + anchor.toLocaleString(undefined,{maximumFractionDigits:0}) + '</span>'
@@ -7627,6 +8175,25 @@ function loadBlockedEntries() {
 }
 loadBlockedEntries();
 setInterval(loadBlockedEntries, 60000);  // refresh every 60s
+
+// Apply Decision-Engine recommendation to allocation_factors via POST.
+// One-click closes the loop on the Layer 3 -> Layer 4 path.
+function applyAllocFactor(strategy, factor) {
+  const verbose = factor === 0 ? 'KILL (set 0x)' : (factor > 1 ? 'SCALE UP (set ' + factor + 'x)' : (factor < 1 ? 'REDUCE (set ' + factor + 'x)' : 'set ' + factor + 'x'));
+  if (!confirm('Apply ' + verbose + ' for ' + strategy + '? Effective on next eval cycle (' + (strategy.includes('argus') ? 'minutes' : '5-15 min depending on strategy') + '). Existing positions unaffected.')) return;
+  fetch('/api/allocation_factors', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({strategy: strategy, factor: factor}),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      // Refresh the panel
+      loadDecisionEngine();
+    } else {
+      alert('Failed: ' + (d.error || 'unknown'));
+    }
+  }).catch(e => alert('Network error: ' + e));
+}
 
 // ─── DECISION ENGINE PANEL ─────────────────────────────────────────
 // Layer 3 of the metrics->scoring->decision->allocation stack.
@@ -7703,6 +8270,7 @@ function loadDecisionEngine() {
       + '<th style="text-align:left;padding:6px 8px;">Reason</th>'
       + '<th style="text-align:left;padding:6px 8px;">Suggested</th>'
       + '<th style="text-align:right;padding:6px 8px;">Active ×</th>'
+      + '<th style="text-align:center;padding:6px 8px;">Apply</th>'
       + '</tr></thead><tbody>';
     for (const s of data.strategies || []) {
       const c = ACTION_COLORS[s.action] || ACTION_COLORS.HOLD;
@@ -7721,7 +8289,6 @@ function loadDecisionEngine() {
         + '<td style="padding:6px 8px;color:#7b8ab8;font-size:0.92em;">' + s.reason + '</td>'
         + '<td style="padding:6px 8px;color:' + c.fg + ';font-size:0.92em;">' + s.allocation_hint + '</td>'
         + '<td style="padding:6px 8px;text-align:right;">' + (function(){
-            // Try multiple label variants when looking up
             const tries = [s.strategy, s.strategy.replace('forge_',''), 'forge_' + s.strategy];
             let f = 1.0;
             let found = false;
@@ -7729,6 +8296,18 @@ function loadDecisionEngine() {
             const factorColor = !found ? '#7b8ab8' : (f === 0 ? '#ff4444' : (f > 1.2 ? '#00ff88' : (f < 0.8 ? '#ffc107' : '#9da8c7')));
             const fontWeight = found ? 'bold' : 'normal';
             return '<span style="color:' + factorColor + ';font-weight:' + fontWeight + ';">' + f.toFixed(2) + (found ? '' : '<span style="color:#555;font-size:0.85em;"> (default)</span>') + '</span>';
+          })()
+        + '</td>'
+        + '<td style="padding:6px 8px;text-align:center;">' + (function(){
+            // Map ACTION -> recommended factor; show Apply button only if different from current
+            const recMap = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, KILL:0.0, IGNORE:1.0};
+            const rec = recMap[s.action];
+            if (rec == null) return '<span style="color:#555;">-</span>';
+            const tries = [s.strategy, s.strategy.replace('forge_',''), 'forge_' + s.strategy];
+            let cur = 1.0;
+            for (const k of tries) { if (k in factors) { cur = factors[k]; break; } }
+            if (Math.abs(cur - rec) < 0.01) return '<span style="color:#00e676;font-size:0.85em;" title="current matches recommendation">applied</span>';
+            return '<button onclick="applyAllocFactor(\'' + s.strategy + '\',' + rec + ')" style="background:#1e2a42;border:1px solid #00d4ff;color:#00d4ff;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:0.85em;letter-spacing:1px;font-weight:bold;" title="Set ' + s.strategy + ' allocation to ' + rec + 'x">apply ' + rec + 'x</button>';
           })()
         + '</td>'
         + '</tr>';
@@ -14102,9 +14681,125 @@ window.addEventListener('load', function() {
 </html>"""
 
 
+# ---------------------------------------------------------------------------
+# 5-page split (#9 hack version): each view serves DASHBOARD_HTML with a
+# CSS injection that hides panels not in that view's whitelist. The default
+# `/` route shows everything.
+#
+# View whitelists below are the panel-ids (top-level) each view keeps visible.
+# Anything in PANEL_IDS_ALL but NOT in the view's allowlist gets hidden.
+# Easier to maintain than a per-view "hide" list — adding a new panel that
+# stays in only ALL costs nothing.
+# ---------------------------------------------------------------------------
+
+PANEL_IDS_ALL = [
+    # Top-of-page bars / banners
+    "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
+    "halt-banner", "market-clock-bar", "blocked-entries-bar",
+    "gateway-status-banner", "stale-data-banner", "silent-block-banner",
+    "maturity-summary-banner",
+    # Decision / fleet panels
+    "decision-engine-panel", "efficiency-panel", "opportunity-panel",
+    "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
+    "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
+    "alpha-attribution-panel", "correlation-map-panel", "trade-validity-panel",
+    # Live / state
+    "open-positions-panel", "fleet-health", "fleet-equity-panel",
+    "per-strategy-equity-panel", "strategy-performance", "recent-trades-panel",
+    # Live chart card
+    "live-strategy-chart-card", "ibkr-page",
+]
+
+VIEW_ALLOWLISTS = {
+    # NOC = "is the bot alive and safe right now"
+    "noc": {
+        "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
+        "halt-banner", "market-clock-bar", "blocked-entries-bar",
+        "gateway-status-banner", "stale-data-banner", "silent-block-banner",
+        "maturity-summary-banner", "fleet-health", "open-positions-panel",
+    },
+    # Fleet Ops = decision-layer view
+    "ops": {
+        "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
+        "market-clock-bar", "blocked-entries-bar",
+        "decision-engine-panel", "three-state-panel", "dimensions-panel",
+        "efficiency-panel", "fleet-health", "open-positions-panel",
+    },
+    # Pipeline = signal flow / capture
+    "pipeline": {
+        "capital-safety-bar", "market-clock-bar",
+        "opportunity-panel", "target-capture-panel", "mfe-capture-panel",
+        "capital-deployment-panel", "fleet-health",
+    },
+    # Risk = supervisor view
+    "risk": {
+        "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
+        "halt-banner", "blocked-entries-bar", "cluster-exposure-panel",
+        "correlation-map-panel", "trade-validity-panel", "open-positions-panel",
+    },
+    # Research = analyst lens
+    "research": {
+        "capital-safety-bar",
+        "efficiency-panel", "opportunity-panel", "mfe-capture-panel",
+        "alpha-attribution-panel", "correlation-map-panel", "trade-validity-panel",
+        "dimensions-panel", "fleet-equity-panel", "per-strategy-equity-panel",
+        "strategy-performance", "recent-trades-panel",
+    },
+}
+
+
+def _render_view(view: str | None) -> str:
+    """Substitute view placeholders in DASHBOARD_HTML.
+
+    view=None or 'all' -> show everything (default).
+    Otherwise inject CSS that hides panels not in the view's allowlist.
+    """
+    body_class = ""
+    css_block = ""
+    if view and view in VIEW_ALLOWLISTS:
+        body_class = f"view-{view}"
+        allow = VIEW_ALLOWLISTS[view]
+        hide_ids = [pid for pid in PANEL_IDS_ALL if pid not in allow]
+        if hide_ids:
+            selector = ", ".join(f"body.view-{view} #{pid}" for pid in hide_ids)
+            css_block = f"<style id=\"view-css\">{selector} {{ display: none !important; }}</style>"
+    html = DASHBOARD_HTML.replace(
+        "<!-- VIEW_CSS_PLACEHOLDER (substituted by _render_view) -->", css_block
+    ).replace(
+        'class="VIEW_BODY_CLASS_PLACEHOLDER"',
+        f'class="{body_class}"' if body_class else "",
+    )
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return DASHBOARD_HTML
+    return _render_view(None)
+
+
+@app.get("/noc", response_class=HTMLResponse)
+async def view_noc():
+    return _render_view("noc")
+
+
+@app.get("/ops", response_class=HTMLResponse)
+async def view_ops():
+    return _render_view("ops")
+
+
+@app.get("/pipeline", response_class=HTMLResponse)
+async def view_pipeline():
+    return _render_view("pipeline")
+
+
+@app.get("/risk-view", response_class=HTMLResponse)
+async def view_risk():
+    return _render_view("risk")
+
+
+@app.get("/research", response_class=HTMLResponse)
+async def view_research():
+    return _render_view("research")
 
 
 def _load_gate_decisions(log_dir: Path) -> dict:

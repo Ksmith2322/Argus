@@ -55,6 +55,7 @@ _TWS_HEALTH_SCRIPT = _REPO / "ops" / "tws_health_probe.py"
 _CIRCUIT_BREAKER_SCRIPT = _REPO / "ops" / "daily_loss_circuit_breaker.py"
 _FLATTEN_EXECUTOR_SCRIPT = _REPO / "ops" / "flatten_eod_executor.py"
 _COMPUTE_MFE_SCRIPT = _REPO / "ops" / "compute_mfe.py"
+_BROKER_DRIFT_SCRIPT = _REPO / "ops" / "broker_drift_aggregator.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -150,7 +151,8 @@ def main() -> int:
                                      ("canonical_reconcile", _RECONCILE_SCRIPT),
                                      ("cohort_failure_check", _COHORT_FAILURE_SCRIPT),
                                      ("tws_health_probe", _TWS_HEALTH_SCRIPT),
-                                     ("compute_mfe", _COMPUTE_MFE_SCRIPT)):
+                                     ("compute_mfe", _COMPUTE_MFE_SCRIPT),
+                                     ("broker_drift_aggregator", _BROKER_DRIFT_SCRIPT)):
                     if script.exists():
                         try:
                             subprocess.run(

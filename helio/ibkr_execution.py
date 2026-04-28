@@ -44,6 +44,27 @@ def is_fleet_halted() -> tuple[bool, str]:
         reason = "(unable to read flag file)"
     return True, reason or "no reason provided"
 
+
+# FLATTEN_EOD flag — when present, runners should:
+#   - Refuse all new entries (handled by submit_bracket halt check too)
+#   - Force-close any existing positions at next eval boundary (close_position_market
+#     allows close even if market closed — this is an emergency-flatten scenario)
+# Set by ops/daily_loss_circuit_breaker (auto on -4% loss) OR manually.
+# NEVER auto-clears - requires manual review per project_capital_allocator_policy.md.
+FLATTEN_FLAG_PATH = Path(__file__).resolve().parents[1] / "argus_flow" / "logs" / "FLATTEN_EOD.flag"
+
+
+def is_flatten_active() -> tuple[bool, str]:
+    """Returns (active, reason). Strategy runners should close any open position
+    on next eval cycle when this returns True."""
+    if not FLATTEN_FLAG_PATH.exists():
+        return False, ""
+    try:
+        reason = FLATTEN_FLAG_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        reason = "(unable to read flag file)"
+    return True, reason or "no reason provided"
+
 from ib_insync import (
     IB,
     Contract,
@@ -282,6 +303,15 @@ def submit_bracket(
         )
         return BracketResult(entry=FillResult(filled=False, reject_reason=f"fleet_halted:{halt_reason[:64]}"))
 
+    # FLATTEN_EOD also blocks new entries (it implies emergency state)
+    flatten_active, flatten_reason = is_flatten_active()
+    if flatten_active:
+        log.warning(
+            f"FLATTEN_EOD active: refusing entry {direction} {size} {contract.symbol}. "
+            f"Reason: {flatten_reason}"
+        )
+        return BracketResult(entry=FillResult(filled=False, reject_reason=f"flatten_eod:{flatten_reason[:64]}"))
+
     if not is_market_open(contract):
         log.warning(
             f"MARKET_CLOSED: refusing entry {direction} {size} {contract.symbol} "
@@ -414,10 +444,14 @@ def close_position_market(
     direction: the direction of the OPEN position ("long" → submit SELL to close).
     Safe to call even if brackets already got filled — cancel fails silently.
 
-    Refuses to submit if market is closed for this contract. Caller should
-    retry on the next eval cycle once market is open.
+    Refuses to submit if market is closed for this contract — UNLESS
+    FLATTEN_EOD is active (which is an emergency-close scenario where we want
+    to flatten regardless of market hours; the flatten_eod_executor uses
+    outsideRth LMTs to handle FX OOH but for this caller path we just allow
+    the submit and let IBKR queue or reject as it sees fit).
     """
-    if not is_market_open(contract):
+    flatten_active, _ = is_flatten_active()
+    if not flatten_active and not is_market_open(contract):
         log.warning(
             f"MARKET_CLOSED: refusing close {direction} {size} {contract.symbol} "
             f"({getattr(contract, 'secType', '?')}) — outside trading hours"

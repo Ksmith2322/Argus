@@ -248,6 +248,8 @@ def main(window_days: int = 30) -> int:
             "scratch_pct":   round(scratch / n * 100, 1),
             "adverse_pct":   round(adverse / n * 100, 1),
             "mean_mfe_to_mae": round(mfe_mae_avg, 3),
+            # Per-trade detail for drill-down (capped at 100 trades to keep file size sane)
+            "trades": trades[-100:],
         })
     rows.sort(key=lambda x: -x["mean_capture"])
 
