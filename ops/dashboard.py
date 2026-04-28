@@ -8085,7 +8085,8 @@ function loadCapitalSafetyBar() {
     fetch('/api/positions_open').then(r=>r.json()),
     fetch('/api/cluster_exposure').then(r=>r.json()),
     fetch('/api/margin_status').then(r=>r.json()).catch(()=>({status:'error'})),
-  ]).then(([pos, clu, mar])=>{
+    fetch('/api/broker_drift_status').then(r=>r.json()).catch(()=>({status:'error'})),
+  ]).then(([pos, clu, mar, drift])=>{
     const el = document.getElementById('capital-safety-bar');
     if (!el) return;
     const anchor = pos.anchor_usd || 0;
@@ -8115,6 +8116,25 @@ function loadCapitalSafetyBar() {
       marginSeg = '<span style="color:#1e2a42;">|</span>'
         + '<span style="color:#7b8ab8;">Margin: <i>stale (' + mar.age_s + 's)</i></span>';
     }
+    // Broker drift segment — only show when state is known + non-zero or breached.
+    // 'unknown'/'error' or pristine zero-divergence stay hidden to avoid noise.
+    let driftSeg = '';
+    if (drift && drift.divergence_pct !== undefined) {
+      const dpct = drift.divergence_pct;
+      const sustained = drift.sustained_minutes || 0;
+      const tripped = drift.tripped === true;
+      const breach = Math.abs(dpct) > (drift.tolerance_pct || 1.0);
+      // Render only if interesting (breach, tripped, or non-trivial divergence)
+      if (tripped || breach || Math.abs(dpct) >= 0.25) {
+        const dColor = tripped ? '#ff4444' : breach ? '#ffaa00' : '#7b8ab8';
+        const label = tripped ? 'TRIPPED' : breach ? 'BREACH' : 'OK';
+        driftSeg = '<span style="color:#1e2a42;">|</span>'
+          + '<span style="color:#9da8c7;">Drift: <b style="color:' + dColor + ';">'
+          + (dpct >= 0 ? '+' : '') + dpct.toFixed(2) + '%</b>'
+          + (sustained > 0 ? ' (' + sustained.toFixed(0) + 'min ' + label + ')' : '')
+          + '</span>';
+      }
+    }
     el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
       + '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;">'
       + '<span style="color:#7b8ab8;letter-spacing:2px;">CAPITAL SAFETY</span>'
@@ -8126,6 +8146,7 @@ function loadCapitalSafetyBar() {
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
       + marginSeg
+      + driftSeg
       + (topCluster ? '<span style="color:#1e2a42;">|</span><span style="color:#9da8c7;">Top cluster: <b style="color:#fff;">' + topCluster.cluster + '</b> ' + topCluster.pct_used.toFixed(1) + '%</span>' : '')
       + '</div>'
       + '<span style="color:#7b8ab8;font-size:0.92em;">anchor $' + anchor.toLocaleString(undefined,{maximumFractionDigits:0}) + '</span>'
@@ -15249,6 +15270,18 @@ canvas { display: block; position: fixed; top: 0; left: 0; z-index: 0; }
 </style>
 </head>
 <body>
+<!-- View-nav strip (#9 5-page split) -->
+<div id="view-nav-strip" style="position:fixed;top:6px;right:8px;z-index:1000;display:flex;gap:4px;flex-wrap:wrap;align-items:center;font-size:0.6em;letter-spacing:1px;background:rgba(10,18,36,0.85);padding:4px 8px;border-radius:4px;border:1px solid #1e2a42;">
+  <span style="color:#5a6a8a;">VIEW:</span>
+  <a href="/"          style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">ALL</a>
+  <a href="/noc"       style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">NOC</a>
+  <a href="/ops"       style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">OPS</a>
+  <a href="/pipeline"  style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">PIPE</a>
+  <a href="/risk-view" style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">RISK</a>
+  <a href="/research"  style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">RES</a>
+  <a href="/brain"     style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">BRAIN</a>
+  <a href="/fleet"     style="color:#7b8ab8;text-decoration:none;padding:2px 6px;border:1px solid #1e2a42;border-radius:3px;">FLEET</a>
+</div>
 <div id="hud">
   <h1>Helio Neural Core</h1>
   <div class="sub" id="status-line">Initializing neural network...</div>
@@ -16327,6 +16360,18 @@ td { padding:6px 8px; border-bottom:1px solid #0d1420; }
 </style>
 </head>
 <body>
+
+<!-- View-nav strip (#9 5-page split) -->
+<div id="view-nav-strip" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 8px 10px;font-size:0.7em;letter-spacing:1px;">
+  <span style="color:#5a6a8a;">VIEW:</span>
+  <a href="/"          style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">ALL</a>
+  <a href="/noc"       style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">NOC</a>
+  <a href="/ops"       style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">FLEET OPS</a>
+  <a href="/pipeline"  style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">PIPELINE</a>
+  <a href="/risk-view" style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">RISK</a>
+  <a href="/research"  style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">RESEARCH</a>
+  <a href="/brain"     style="color:#7b8ab8;text-decoration:none;padding:3px 9px;border:1px solid #1e2a42;border-radius:4px;">BRAIN</a>
+</div>
 
 <div class="header">
   <div class="header-left">
