@@ -3730,6 +3730,681 @@ async def api_resume_fleet():
     return JSONResponse({"halted": False, "message": "no HALT.flag to remove (fleet was not halted)"})
 
 
+def _read_canonical_fills(window_days: int = 30) -> list[dict]:
+    """Load canonical_fills.jsonl, filter to closed trades within window, exclude
+    invalid trades (experiment_valid=false). Returns parsed dicts."""
+    fp = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+    if not fp.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    out = []
+    try:
+        with fp.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                # We only count EXITs (closed trades)
+                if r.get("side") != "EXIT":
+                    continue
+                # Try to parse exit_ts
+                try:
+                    ets = r.get("exit_ts") or r.get("ts") or ""
+                    ts = datetime.fromisoformat(str(ets).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+                # Skip if backfilled-from-csv (lower trust) or marked invalid
+                if r.get("source") == "backfill_from_trade_csv":
+                    continue
+                r["_exit_dt"] = ts
+                out.append(r)
+    except Exception:
+        return []
+    return out
+
+
+def _per_strategy_invalid_set() -> dict[str, set]:
+    """For each strategy, return the set of (entry_ts) values flagged
+    experiment_valid=false in the per-strategy trades.csv. Used to filter
+    out canonical_fills entries that correspond to invalid trades."""
+    invalid: dict[str, set] = {}
+    for csv_path in (REPO / "forge" / "logs").glob("*/trades.csv"):
+        strategy_dir = csv_path.parent.name
+        # Map dir name to canonical strategy label
+        label = f"forge_{strategy_dir}" if not strategy_dir.startswith(("argus_", "apollo", "hermes", "titan")) else strategy_dir
+        try:
+            with csv_path.open(encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if str(r.get("experiment_valid", "true")).lower() == "false":
+                        ets = r.get("ts") or r.get("entry_ts") or ""
+                        invalid.setdefault(label, set()).add(ets)
+        except Exception:
+            continue
+    return invalid
+
+
+@app.get("/api/strategy_efficiency")
+async def api_strategy_efficiency(window_days: int = 30):
+    """Per-strategy capital efficiency: time-in-market, PnL per minute deployed,
+    PnL per trade, average position notional. Drives the dashboard's efficiency
+    table — answers 'is this strategy actually using its capital well?' instead
+    of just 'did it make money?'.
+
+    A strategy that holds positions 80% of the time and makes $10 is much worse
+    than one that holds 2% of the time and makes $5 — same dollars, very different
+    capital efficiency. This view surfaces that distinction.
+
+    Excludes trades flagged experiment_valid=false in their per-strategy CSV.
+    """
+    fills = _read_canonical_fills(window_days)
+    invalid_map = _per_strategy_invalid_set()
+    period_seconds = window_days * 86400
+
+    by_strategy: dict[str, dict] = {}
+    for r in fills:
+        strat = r.get("strategy") or "unknown"
+        invalid_set = invalid_map.get(strat, set())
+        if (r.get("entry_ts") or "") in invalid_set:
+            continue
+        try:
+            entry_ts = datetime.fromisoformat(str(r.get("entry_ts", "")).replace("Z", "+00:00"))
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+            exit_ts = r["_exit_dt"]
+            duration_s = max(0, (exit_ts - entry_ts).total_seconds())
+        except Exception:
+            duration_s = 0
+        try:
+            pnl = float(r.get("pnl_usd") or 0)
+        except Exception:
+            pnl = 0
+        try:
+            entry_px = float(r.get("entry_px") or 0)
+            size = float(r.get("size") or 0)
+            notional = abs(entry_px * size)
+        except Exception:
+            notional = 0
+
+        d = by_strategy.setdefault(strat, {
+            "trade_count": 0, "total_pnl_usd": 0.0, "total_duration_s": 0.0,
+            "wins": 0, "losses": 0, "notionals": [],
+        })
+        d["trade_count"] += 1
+        d["total_pnl_usd"] += pnl
+        d["total_duration_s"] += duration_s
+        if pnl > 0: d["wins"] += 1
+        elif pnl < 0: d["losses"] += 1
+        if notional > 0: d["notionals"].append(notional)
+
+    rows = []
+    for strat, d in by_strategy.items():
+        n = d["trade_count"]
+        pnl = d["total_pnl_usd"]
+        time_in_min = d["total_duration_s"] / 60.0
+        time_in_pct = (d["total_duration_s"] / period_seconds * 100.0) if period_seconds else 0
+        avg_notional = sum(d["notionals"]) / len(d["notionals"]) if d["notionals"] else 0
+        rows.append({
+            "strategy": strat,
+            "trade_count": n,
+            "total_pnl_usd": round(pnl, 2),
+            "wins": d["wins"],
+            "losses": d["losses"],
+            "win_rate_pct": round(d["wins"] / n * 100, 1) if n else 0,
+            "time_in_market_min": round(time_in_min, 1),
+            "time_in_market_pct": round(time_in_pct, 3),
+            "pnl_per_trade_usd": round(pnl / n, 2) if n else 0,
+            "pnl_per_min_in_market_usd": round(pnl / time_in_min, 4) if time_in_min > 0 else 0,
+            "avg_notional_usd": round(avg_notional, 0),
+            # Composite "efficiency score": dollars per (% capital × % time deployed).
+            # Higher = more bang per buck of capital + time. Lets you sort.
+            "efficiency_score": round(
+                pnl / (max(time_in_pct, 0.01) * max(avg_notional, 1)) * 1_000_000, 2
+            ) if n > 0 else 0,
+        })
+    rows.sort(key=lambda x: -x["efficiency_score"])
+    return JSONResponse({
+        "window_days": window_days,
+        "period_start_utc": (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat(),
+        "strategies": rows,
+    })
+
+
+@app.get("/api/strategy_drift")
+async def api_strategy_drift():
+    """Per-strategy rolling expectancy + drift direction. Compares the last 30
+    valid trades against the prior 30. Answers 'is the edge alive or decaying?'.
+
+    Expectancy = (avg_win * win_rate) - (avg_loss * loss_rate). When
+    expectancy_recent > expectancy_prior + threshold, edge is improving;
+    if recent < prior - threshold, edge is degrading. Below 10 trades = no signal.
+    """
+    invalid_map = _per_strategy_invalid_set()
+    by_strategy: dict[str, list] = {}
+
+    fp = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+    if not fp.exists():
+        return JSONResponse({"strategies": []})
+    try:
+        with fp.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("side") != "EXIT" or r.get("source") == "backfill_from_trade_csv":
+                    continue
+                strat = r.get("strategy") or "unknown"
+                if (r.get("entry_ts") or "") in invalid_map.get(strat, set()):
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(r.get("exit_ts") or r.get("ts") or "").replace("Z", "+00:00"))
+                    pnl = float(r.get("pnl_usd") or 0)
+                except Exception:
+                    continue
+                by_strategy.setdefault(strat, []).append((ts, pnl))
+    except Exception:
+        return JSONResponse({"strategies": []})
+
+    def expectancy(trades: list) -> tuple[float, float]:
+        """Returns (expectancy_usd, win_rate)."""
+        if not trades: return (0.0, 0.0)
+        wins = [p for _, p in trades if p > 0]
+        losses = [p for _, p in trades if p < 0]
+        n = len(trades)
+        wr = len(wins) / n if n else 0
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = abs(sum(losses) / len(losses)) if losses else 0
+        exp = (avg_win * wr) - (avg_loss * (1 - wr))
+        return (exp, wr * 100)
+
+    rows = []
+    for strat, trades in by_strategy.items():
+        trades.sort(key=lambda x: x[0])  # oldest first
+        n = len(trades)
+        if n == 0:
+            continue
+        recent = trades[-30:]                          # last 30
+        prior = trades[-60:-30] if n >= 60 else []     # prior 30 (only if we have enough)
+        all_window = trades[-90:]                      # last 90 for context
+
+        exp_recent, wr_recent = expectancy(recent)
+        exp_prior, wr_prior = expectancy(prior)
+        exp_all, wr_all = expectancy(all_window)
+
+        # Drift verdict
+        verdict = "INSUFFICIENT"
+        delta_pct = 0.0
+        if n < 10:
+            verdict = "INSUFFICIENT"
+        elif n < 30:
+            verdict = "EARLY"  # have data, not enough for trend
+        elif n < 60:
+            verdict = "STABILIZING"  # have one window but can't compare
+        else:
+            # Compare recent to prior
+            if abs(exp_prior) < 0.01:
+                verdict = "PRIOR_FLAT"  # divide-by-zero guard
+                delta_pct = 0.0
+            else:
+                delta_pct = (exp_recent - exp_prior) / abs(exp_prior) * 100
+                # Threshold: ±20% change = meaningful, smaller = flat
+                if delta_pct > 20:
+                    verdict = "RISING"
+                elif delta_pct < -20:
+                    verdict = "DECLINING"
+                else:
+                    verdict = "FLAT"
+
+        rows.append({
+            "strategy": strat,
+            "n_total": n,
+            "n_recent": len(recent),
+            "n_prior": len(prior),
+            "expectancy_recent_usd": round(exp_recent, 2),
+            "expectancy_prior_usd": round(exp_prior, 2),
+            "expectancy_90d_usd": round(exp_all, 2),
+            "wr_recent_pct": round(wr_recent, 1),
+            "wr_prior_pct": round(wr_prior, 1),
+            "delta_pct": round(delta_pct, 1),
+            "drift_verdict": verdict,
+        })
+    rows.sort(key=lambda x: x["strategy"])
+    return JSONResponse({"strategies": rows})
+
+
+@app.get("/api/opportunity_vs_taken")
+async def api_opportunity_vs_taken(window_days: int = 7):
+    """Per-strategy signals_generated vs signals_taken (from per-strategy
+    signals.csv files). Surfaces 'are filters helping or killing edge?'.
+
+    A strategy that fires 100 signals/day and takes 1 may have a too-strict
+    filter; one that fires 5 and takes 5 may need a filter. Block-reason
+    counts show WHICH gate is rejecting most signals.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    rows = []
+
+    for csv_path in (REPO / "forge" / "logs").glob("*/signals.csv"):
+        strategy_dir = csv_path.parent.name
+        try:
+            with csv_path.open(encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                generated = 0
+                taken = 0
+                blocked_by_reason: dict[str, int] = {}
+                for r in reader:
+                    ts_raw = r.get("ts") or ""
+                    try:
+                        ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    if ts < cutoff:
+                        continue
+                    generated += 1
+                    action = (r.get("action") or "").upper()
+                    if action.startswith("ENTRY_"):
+                        taken += 1
+                    elif action.startswith("NO_TRIGGER_"):
+                        # Reason is the part after NO_TRIGGER_
+                        reason = action[len("NO_TRIGGER_"):].lower() or "unknown"
+                        blocked_by_reason[reason] = blocked_by_reason.get(reason, 0) + 1
+                    else:
+                        # Other action (BLOCKED_*, SKIP_*, etc.) — bucket as misc
+                        blocked_by_reason["misc"] = blocked_by_reason.get("misc", 0) + 1
+        except Exception:
+            continue
+
+        if generated == 0:
+            continue
+        # Top 3 block reasons
+        top_blocks = sorted(blocked_by_reason.items(), key=lambda x: -x[1])[:3]
+        take_rate = (taken / generated * 100) if generated else 0
+        rows.append({
+            "strategy": strategy_dir,
+            "signals_evaluated": generated,
+            "signals_taken": taken,
+            "signals_blocked": generated - taken,
+            "take_rate_pct": round(take_rate, 1),
+            "top_block_reasons": [{"reason": k, "count": v} for k, v in top_blocks],
+        })
+    rows.sort(key=lambda x: -x["signals_evaluated"])
+    return JSONResponse({"window_days": window_days, "strategies": rows})
+
+
+@app.get("/api/strategy_actions")
+async def api_strategy_actions(window_days: int = 30):
+    """The decision-engine output. Combines efficiency + drift + sample-size
+    confidence into a single ACTION per strategy.
+
+    Architecture (Layer 3 of the metrics->scoring->decision->allocation stack):
+      - Inputs:  efficiency, drift, sample size
+      - Scoring: confidence-weighted (low n = low confidence = HOLD by default)
+      - Output:  one of {SCALE_UP, HOLD, REDUCE, KILL, IGNORE}
+
+    Rules (intentionally simple — discretionary override not allowed without
+    rewriting these):
+
+      n < 10                      -> IGNORE  (insufficient sample, no signal)
+      drift=DECLINING, eff < 0    -> KILL    (losing money + getting worse)
+      drift=DECLINING, eff >= 0   -> REDUCE  (profitable but degrading; throttle, watch)
+      drift=RISING, eff > 5       -> SCALE_UP (improving + meaningfully positive)
+      drift=RISING, eff <= 5      -> HOLD    (improving but not yet meaningful)
+      drift=FLAT/STABILIZING, eff>0 -> HOLD  (working, keep going)
+      drift=FLAT, eff < 0         -> REDUCE  (consistently negative, no change in trajectory)
+      anything else               -> HOLD
+    """
+    # Reuse the two existing endpoints' logic by calling them
+    # (avoids duplicating the math)
+    eff_data = json.loads((await api_strategy_efficiency(window_days=window_days)).body)
+    drift_data = json.loads((await api_strategy_drift()).body)
+
+    # Index by strategy
+    eff_by = {r["strategy"]: r for r in eff_data.get("strategies", [])}
+    drift_by = {r["strategy"]: r for r in drift_data.get("strategies", [])}
+
+    # Union of strategies seen
+    all_strategies = set(eff_by.keys()) | set(drift_by.keys())
+
+    rows = []
+    for strat in sorted(all_strategies):
+        e = eff_by.get(strat, {})
+        d = drift_by.get(strat, {})
+
+        n = d.get("n_total", e.get("trade_count", 0))
+        eff_score = e.get("efficiency_score", 0)
+        pnl = e.get("total_pnl_usd", 0)
+        drift_verdict = d.get("drift_verdict", "INSUFFICIENT")
+
+        # ── Confidence weighting (0-100) ──
+        # Sample size is the primary driver. 30+ trades = full confidence.
+        if n >= 30: conf = 100
+        elif n >= 10: conf = int((n / 30) * 100)
+        elif n >= 5: conf = 30  # some signal, not enough to act on alone
+        else: conf = 10
+
+        # ── Decision rules ──
+        # When confidence is low we're conservative.
+        if n < 10:
+            action, reason = "IGNORE", f"insufficient sample (n={n})"
+        elif drift_verdict == "DECLINING":
+            if pnl < 0:
+                action, reason = "KILL", f"losing money + edge degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%)"
+            else:
+                action, reason = "REDUCE", f"profitable but degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%) — throttle and watch"
+        elif drift_verdict == "RISING":
+            if eff_score > 5:
+                action, reason = "SCALE_UP", f"improving + efficient (eff={eff_score:.1f}, drift {d.get('delta_pct',0):+.0f}%)"
+            else:
+                action, reason = "HOLD", f"improving but small magnitude (eff={eff_score:.1f}) — wait for evidence"
+        elif drift_verdict in ("FLAT", "STABILIZING"):
+            if pnl > 0:
+                action, reason = "HOLD", f"working, no change in trajectory (pnl=${pnl:.0f}, eff={eff_score:.1f})"
+            elif pnl < 0:
+                action, reason = "REDUCE", f"consistently negative, flat trend (pnl=${pnl:.0f})"
+            else:
+                action, reason = "HOLD", "neutral — wait for more data"
+        elif drift_verdict == "EARLY":
+            action, reason = "HOLD", f"have data (n={n}) but not enough for trend"
+        else:
+            action, reason = "HOLD", f"no clear signal (drift={drift_verdict})"
+
+        rows.append({
+            "strategy": strat,
+            "action": action,
+            "reason": reason,
+            "confidence_pct": conf,
+            "n_total": n,
+            "pnl_usd": pnl,
+            "efficiency_score": eff_score,
+            "drift_verdict": drift_verdict,
+            "drift_delta_pct": d.get("delta_pct", 0),
+            # Suggested allocation tier (Layer 4 hint, not enforced)
+            "allocation_hint": {
+                "SCALE_UP": "20-30% (top tier)",
+                "HOLD":     "5-10% (standard)",
+                "REDUCE":   "0-5% (throttled)",
+                "KILL":     "0% (stop)",
+                "IGNORE":   "0% (no decision)",
+            }.get(action, "0%"),
+        })
+
+    # Sort: SCALE_UP first, then HOLD, REDUCE, KILL, IGNORE
+    action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "KILL": 3, "IGNORE": 4}
+    rows.sort(key=lambda r: (action_order.get(r["action"], 5), -r["pnl_usd"]))
+    return JSONResponse({
+        "window_days": window_days,
+        "rules_version": "v1_2026-04-27",
+        "strategies": rows,
+        "summary": {
+            "scale_up": sum(1 for r in rows if r["action"] == "SCALE_UP"),
+            "hold":     sum(1 for r in rows if r["action"] == "HOLD"),
+            "reduce":   sum(1 for r in rows if r["action"] == "REDUCE"),
+            "kill":     sum(1 for r in rows if r["action"] == "KILL"),
+            "ignore":   sum(1 for r in rows if r["action"] == "IGNORE"),
+        },
+    })
+
+
+@app.get("/api/capital_deployment_timeline")
+async def api_capital_deployment_timeline(window_days: int = 7, bucket_hours: int = 1):
+    """Time-series of % capital deployed over the last N days, bucketed hourly.
+
+    Walks all entry/exit events from canonical_fills, maintains a running set of
+    open positions at each timestamp, and snapshots total_deployed_notional at
+    each hour boundary. Distinguishes 'flat' (no exposure) from 'stable
+    performance' — your equity curve flat sections are mostly the former.
+
+    Output: list of {ts, deployed_usd, deployed_pct_of_anchor} samples.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    fp = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+    if not fp.exists():
+        return JSONResponse({"samples": [], "anchor_usd": 0})
+
+    # Build event list: each fill record gives us an entry_ts AND exit_ts (for EXIT side).
+    events = []  # (ts, sign, notional, strategy)  sign=+1 open, -1 close
+    try:
+        with fp.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("side") != "EXIT" or r.get("source") == "backfill_from_trade_csv":
+                    continue
+                try:
+                    entry_ts = datetime.fromisoformat(str(r.get("entry_ts","")).replace("Z","+00:00"))
+                    exit_ts = datetime.fromisoformat(str(r.get("exit_ts","")).replace("Z","+00:00"))
+                    if entry_ts.tzinfo is None: entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                    if exit_ts.tzinfo is None: exit_ts = exit_ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if exit_ts < cutoff:
+                    continue
+                try:
+                    notional = abs(float(r.get("entry_px") or 0) * float(r.get("size") or 0))
+                except Exception:
+                    notional = 0
+                if notional <= 0: continue
+                strat = r.get("strategy") or "unknown"
+                events.append((entry_ts, +1, notional, strat))
+                events.append((exit_ts, -1, notional, strat))
+    except Exception:
+        return JSONResponse({"samples": [], "anchor_usd": 0})
+
+    events.sort(key=lambda e: e[0])
+
+    # Walk hourly buckets between cutoff and now, maintaining current_deployed
+    try:
+        from helio.fleet_sizing import get_sizing_anchor_usd
+        anchor = float(get_sizing_anchor_usd())
+    except Exception:
+        anchor = 30000.0  # fallback; only affects pct math
+
+    bucket_seconds = bucket_hours * 3600
+    now = datetime.now(timezone.utc)
+    samples = []
+    current = 0.0
+    ev_idx = 0
+    n_events = len(events)
+
+    bucket_start = cutoff.replace(minute=0, second=0, microsecond=0)
+    while bucket_start <= now:
+        bucket_end = bucket_start + timedelta(seconds=bucket_seconds)
+        # Apply all events that occurred in this bucket
+        while ev_idx < n_events and events[ev_idx][0] < bucket_end:
+            current += events[ev_idx][1] * events[ev_idx][2]
+            ev_idx += 1
+        # Floor at 0 (defensive — if exit_ts comes before entry_ts somehow)
+        deployed = max(0, current)
+        samples.append({
+            "ts": bucket_start.isoformat(),
+            "deployed_usd": round(deployed, 0),
+            "deployed_pct_of_anchor": round((deployed / anchor * 100) if anchor else 0, 1),
+        })
+        bucket_start = bucket_end
+
+    # Trim trailing zero-suffix only if the entire period is flat (cosmetic)
+    return JSONResponse({
+        "window_days": window_days,
+        "bucket_hours": bucket_hours,
+        "anchor_usd": round(anchor, 2),
+        "n_events": n_events,
+        "samples": samples,
+    })
+
+
+@app.get("/api/target_capture")
+async def api_target_capture(window_days: int = 30):
+    """Per-strategy realized vs planned capture ratio. For each closed trade:
+    capture = (exit_px - entry_px) / (target_px - entry_px) for longs;
+    inverted for shorts.
+
+    capture > 1.0  : exited beyond target (rare; can happen on slippage favorable)
+    capture = 1.0  : exact target hit
+    0 < capture < 1: partial — exited mid-move
+    capture <= 0   : reversed against entry / stopped out
+
+    Mean capture ratio per strategy is a proxy for 'are exits efficient or
+    leaving money on the table?' — answers your 'death by weak follow-through'
+    question without needing per-trade bar data (full MFE comes later).
+
+    Excludes invalid trades (experiment_valid=false).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    by_strategy: dict[str, list] = {}
+
+    for csv_path in (REPO / "forge" / "logs").glob("*/trades.csv"):
+        strategy_dir = csv_path.parent.name
+        try:
+            with csv_path.open(encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if str(r.get("experiment_valid", "true")).lower() == "false":
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(str(r.get("ts","")).replace("Z","+00:00"))
+                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    if ts < cutoff: continue
+                    try:
+                        entry_px = float(r["entry_px"])
+                        exit_px  = float(r["exit_px"])
+                        target_px = float(r.get("target_px") or 0)
+                    except Exception:
+                        continue
+                    if target_px == 0: continue
+                    direction = (r.get("direction") or "long").lower()
+                    if direction == "long":
+                        planned = target_px - entry_px
+                        realized = exit_px - entry_px
+                    else:
+                        planned = entry_px - target_px
+                        realized = entry_px - exit_px
+                    if abs(planned) < 1e-9: continue
+                    ratio = realized / planned
+                    by_strategy.setdefault(strategy_dir, []).append({
+                        "ratio": ratio,
+                        "exit_reason": r.get("exit_reason", ""),
+                    })
+        except Exception:
+            continue
+
+    rows = []
+    for strat, trades in by_strategy.items():
+        if not trades: continue
+        ratios = [t["ratio"] for t in trades]
+        n = len(ratios)
+        ratios_sorted = sorted(ratios)
+        # Simple distribution buckets
+        full_capture = sum(1 for r in ratios if r >= 0.95)        # ~hit target
+        partial      = sum(1 for r in ratios if 0 < r < 0.95)     # mid-move exit
+        breakeven    = sum(1 for r in ratios if -0.05 <= r <= 0)  # ~scratch
+        adverse      = sum(1 for r in ratios if r < -0.05)        # stopped out
+        # Mean & median
+        mean_r = sum(ratios) / n
+        median_r = ratios_sorted[n // 2]
+        rows.append({
+            "strategy": strat,
+            "n": n,
+            "mean_capture": round(mean_r, 3),
+            "median_capture": round(median_r, 3),
+            "full_capture_pct": round(full_capture / n * 100, 1),
+            "partial_pct": round(partial / n * 100, 1),
+            "breakeven_pct": round(breakeven / n * 100, 1),
+            "adverse_pct": round(adverse / n * 100, 1),
+        })
+    rows.sort(key=lambda x: -x["mean_capture"])
+    return JSONResponse({"window_days": window_days, "strategies": rows})
+
+
+@app.get("/api/blocked_entries_today")
+async def api_blocked_entries_today():
+    """Count entries blocked by each guard in the last 24h. Scans runner logs
+    for the warning patterns emitted by helio/ibkr_execution.py and helio/
+    ibkr_executor.py guards. Used by the dashboard guard-fires widget.
+
+    Useful operator signal: high counts of cluster_cap_breach or
+    fx_below_idealpro_min indicate a strategy is over-sized for current caps.
+    Persistent market_closed counts indicate a strategy is firing outside its
+    intended session (gate misconfig). High fleet_halted counts mean the
+    HALT.flag is engaged.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    by_strategy: dict[str, dict] = {}
+    log_roots = [
+        REPO / "argus_flow" / "logs" / "runner_unified.log",
+        REPO / "apollo" / "logs" / "runner.log",
+        REPO / "hermes" / "logs" / "runner.log",
+        REPO / "titan" / "logs" / "runner.log",
+    ]
+    log_roots.extend((REPO / "forge" / "logs").glob("*/runner.log"))
+
+    def classify(line: str):
+        """Each log line maps to ONE bucket. Order matters — most specific first."""
+        # REAL_ENTRY FAILED with named reason takes priority over generic
+        if "REAL_ENTRY FAILED" in line:
+            if "market_closed" in line: return "market_closed"
+            if "cluster_cap_breach" in line: return "cluster_cap_breach"
+            if "fx_below_idealpro_min" in line: return "fx_below_idealpro_min"
+            if "fleet_halted" in line: return "fleet_halted"
+            return "real_entry_failed"  # generic catchall (broker rejects, IB errors, etc)
+        # Direct helio-level log lines (uppercase markers from helio/ibkr_execution.py)
+        if "FLEET_HALTED:" in line: return "fleet_halted"
+        if "MARKET_CLOSED:" in line: return "market_closed"
+        if "FX_BELOW_IDEALPRO_MIN" in line: return "fx_below_idealpro_min"
+        if "CLUSTER_CAP_BREACH" in line: return "cluster_cap_breach"
+        if "BROKER_HAS_POSITION" in line: return "broker_has_position"
+        if "NOTIONAL_CAP" in line: return "notional_cap_clamp"
+        if "SIZE_ZERO" in line: return "size_zero_skip"
+        return None
+
+    for log_path in log_roots:
+        if not log_path.exists():
+            continue
+        strategy = log_path.parent.name
+        if strategy == "logs":  # argus_flow/logs/runner_unified.log
+            strategy = "argus"
+
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        for line in text.splitlines():
+            if len(line) < 20:
+                continue
+            ts_str = line[:19]
+            try:
+                ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if ts < cutoff:
+                continue
+            bucket = classify(line)
+            if bucket is None:
+                continue
+            by_strategy.setdefault(strategy, {})[bucket] = by_strategy.get(strategy, {}).get(bucket, 0) + 1
+
+    # Aggregate totals across all strategies
+    totals: dict[str, int] = {}
+    for s, b in by_strategy.items():
+        for bucket, n in b.items():
+            totals[bucket] = totals.get(bucket, 0) + n
+
+    return JSONResponse({
+        "window_hours": 24,
+        "totals": totals,
+        "by_strategy": by_strategy,
+    })
+
+
 @app.get("/api/cluster_exposure")
 async def api_cluster_exposure():
     """Current fleet exposure by macro cluster (FX_USD_LONG, EQUITY_BETA, etc.) +
@@ -6292,6 +6967,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span style="color:#7b8ab8;">Loading market clock...</span>
 </div>
 
+<!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
+<div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
+
+<!-- DECISION ENGINE — primary decision view, top of strategy area -->
+<div id="decision-engine-panel" style="margin-bottom:14px;"></div>
+
+<!-- EFFICIENCY TABLE — capital efficiency view (the metric backing the decision engine) -->
+<div id="efficiency-panel" style="margin-bottom:14px;"></div>
+
+<!-- OPPORTUNITY VS TAKEN — signals fired vs taken per strategy -->
+<div id="opportunity-panel" style="margin-bottom:14px;"></div>
+
+<!-- CAPITAL DEPLOYMENT TIMELINE — sparkline showing % capital deployed over time -->
+<div id="capital-deployment-panel" style="margin-bottom:14px;"></div>
+
+<!-- TARGET CAPTURE RATIO — exit efficiency proxy (until full MFE lookback exists) -->
+<div id="target-capture-panel" style="margin-bottom:14px;"></div>
+
 <div style="display:flex; justify-content:space-between; align-items:center;">
   <div style="display:flex;align-items:center;gap:16px;">
     <h1 style="margin:0;">HELIO FLEET DASHBOARD</h1>
@@ -6371,6 +7064,286 @@ function resumeFleet() {
 }
 loadHaltStatus();
 setInterval(loadHaltStatus, 10000);  // re-check every 10s
+
+// ─── BLOCKED ENTRIES (LAST 24h) ────────────────────────────────────
+// Compact one-line counter of guard fires. Hides when totals are all zero.
+// Buckets, in priority order: cluster_cap_breach (interesting), fx_below_idealpro_min
+// (sizing too small), fleet_halted (kill-switch), market_closed (RTH guard working),
+// real_entry_failed / broker_has_position / notional_cap_clamp / size_zero_skip.
+const BUCKET_LABELS = {
+  cluster_cap_breach:    {label:'Cluster cap',    color:'#ffaa00'},
+  fx_below_idealpro_min: {label:'FX < $25K min',  color:'#ffaa00'},
+  fleet_halted:          {label:'Fleet halted',   color:'#ff4444'},
+  market_closed:         {label:'Market closed',  color:'#7b8ab8'},
+  real_entry_failed:     {label:'Entry failed',   color:'#ff4444'},
+  broker_has_position:   {label:'Broker has pos', color:'#7b8ab8'},
+  notional_cap_clamp:    {label:'Notional clamp', color:'#9da8c7'},
+  size_zero_skip:        {label:'Size=0 skip',    color:'#7b8ab8'},
+};
+function loadBlockedEntries() {
+  fetch('/api/blocked_entries_today').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('blocked-entries-bar');
+    if (!el) return;
+    const totals = data.totals || {};
+    const total = Object.values(totals).reduce((a,b)=>a+b, 0);
+    if (total === 0) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    const blocks = [];
+    for (const [bucket, meta] of Object.entries(BUCKET_LABELS)) {
+      const n = totals[bucket] || 0;
+      if (n === 0) continue;
+      blocks.push('<span style="white-space:nowrap;color:'+meta.color+';">'+meta.label+': <b>'+n+'</b></span>');
+    }
+    el.innerHTML = '<div style="background:#0d1321;border:1px solid #1e2a42;border-radius:6px;padding:6px 14px;font-size:0.74em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
+      + '<div style="display:flex;gap:14px;flex-wrap:wrap;">'
+      + '<span style="color:#7b8ab8;letter-spacing:1px;">GUARDS (24h)</span>'
+      + blocks.join('<span style="color:#1e2a42;">|</span>')
+      + '</div>'
+      + '<span style="color:#7b8ab8;font-size:0.92em;" title="Click for per-strategy breakdown">total ' + total + '</span>'
+      + '</div>';
+  }).catch(()=>{});
+}
+loadBlockedEntries();
+setInterval(loadBlockedEntries, 60000);  // refresh every 60s
+
+// ─── DECISION ENGINE PANEL ─────────────────────────────────────────
+// Layer 3 of the metrics->scoring->decision->allocation stack.
+// Primary "what do I do?" view. Sorted by action priority (SCALE_UP first).
+const ACTION_COLORS = {
+  SCALE_UP: {bg:'#0d1c11', border:'#00ff88', fg:'#00ff88'},
+  HOLD:     {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'},
+  REDUCE:   {bg:'#2a2010', border:'#ffaa00', fg:'#ffaa00'},
+  KILL:     {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
+  IGNORE:   {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
+};
+function loadDecisionEngine() {
+  fetch('/api/strategy_actions?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('decision-engine-panel');
+    if (!el) return;
+    const summary = data.summary || {};
+    const total = (summary.scale_up||0) + (summary.hold||0) + (summary.reduce||0) + (summary.kill||0) + (summary.ignore||0);
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">DECISION ENGINE</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">rules ' + (data.rules_version||'') + ' · 30d window</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">'
+      + '<span style="color:' + ACTION_COLORS.SCALE_UP.fg + ';">SCALE_UP ' + (summary.scale_up||0) + '</span> · '
+      + '<span style="color:' + ACTION_COLORS.HOLD.fg + ';">HOLD ' + (summary.hold||0) + '</span> · '
+      + '<span style="color:' + ACTION_COLORS.REDUCE.fg + ';">REDUCE ' + (summary.reduce||0) + '</span> · '
+      + '<span style="color:' + ACTION_COLORS.KILL.fg + ';">KILL ' + (summary.kill||0) + '</span> · '
+      + '<span style="color:' + ACTION_COLORS.IGNORE.fg + ';">IGNORE ' + (summary.ignore||0) + '</span>'
+      + '</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:6px 8px;">Strategy</th>'
+      + '<th style="text-align:center;padding:6px 8px;">Action</th>'
+      + '<th style="text-align:right;padding:6px 8px;">Conf</th>'
+      + '<th style="text-align:right;padding:6px 8px;">N</th>'
+      + '<th style="text-align:right;padding:6px 8px;">PnL 30d</th>'
+      + '<th style="text-align:right;padding:6px 8px;">Eff</th>'
+      + '<th style="text-align:left;padding:6px 8px;">Drift</th>'
+      + '<th style="text-align:left;padding:6px 8px;">Reason</th>'
+      + '<th style="text-align:left;padding:6px 8px;">Suggested alloc</th>'
+      + '</tr></thead><tbody>';
+    for (const s of data.strategies || []) {
+      const c = ACTION_COLORS[s.action] || ACTION_COLORS.HOLD;
+      const pnlColor = s.pnl_usd > 0 ? '#00ff88' : (s.pnl_usd < 0 ? '#ff4444' : '#7b8ab8');
+      const driftColor = s.drift_verdict === 'RISING' ? '#00ff88' : (s.drift_verdict === 'DECLINING' ? '#ff4444' : '#9da8c7');
+      const driftText = s.drift_verdict + (s.drift_delta_pct ? ' ' + (s.drift_delta_pct >= 0 ? '+' : '') + s.drift_delta_pct.toFixed(0) + '%' : '');
+      html += '<tr style="border-top:1px solid #1e2a42;background:' + c.bg + ';">'
+        + '<td style="padding:6px 8px;font-weight:bold;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:6px 8px;text-align:center;"><span style="background:' + c.border + ';color:#000;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + s.action + '</span></td>'
+        + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.confidence_pct + '%</td>'
+        + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.n_total + '</td>'
+        + '<td style="padding:6px 8px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (s.pnl_usd >= 0 ? '+' : '') + '$' + s.pnl_usd.toFixed(2) + '</td>'
+        + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.efficiency_score.toFixed(1) + '</td>'
+        + '<td style="padding:6px 8px;color:' + driftColor + ';">' + driftText + '</td>'
+        + '<td style="padding:6px 8px;color:#7b8ab8;font-size:0.92em;">' + s.reason + '</td>'
+        + '<td style="padding:6px 8px;color:' + c.fg + ';font-size:0.92em;">' + s.allocation_hint + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:8px;font-size:0.72em;color:#7b8ab8;">Rules: n&lt;10→IGNORE · declining+losing→KILL · declining+winning→REDUCE · rising+eff&gt;5→SCALE_UP · flat+positive→HOLD · flat+losing→REDUCE</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('decision engine error:', e);});
+}
+loadDecisionEngine();
+setInterval(loadDecisionEngine, 60000);
+
+// ─── EFFICIENCY PANEL ──────────────────────────────────────────────
+// Backing metric for the decision engine. Sorted by efficiency_score.
+function loadEfficiency() {
+  fetch('/api/strategy_efficiency?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('efficiency-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) {
+      el.innerHTML = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;font-size:0.78em;color:#7b8ab8;">CAPITAL EFFICIENCY (30d): no closed trades in window</div>';
+      return;
+    }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">CAPITAL EFFICIENCY (30d)'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">PnL per (% time-in-market × avg notional). Higher = more bang per buck of deployed capital.</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL</th>'
+      + '<th style="text-align:right;padding:5px 6px;">WR</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL/trade</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Time-in-market</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL/min deployed</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Avg notional</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Eff score</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const pnlColor = s.total_pnl_usd > 0 ? '#00ff88' : (s.total_pnl_usd < 0 ? '#ff4444' : '#7b8ab8');
+      const effColor = s.efficiency_score > 100 ? '#00ff88' : (s.efficiency_score > 0 ? '#ffc107' : (s.efficiency_score < 0 ? '#ff4444' : '#7b8ab8'));
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.trade_count + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (s.total_pnl_usd >= 0 ? '+' : '') + '$' + s.total_pnl_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.win_rate_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + pnlColor + ';">' + (s.pnl_per_trade_usd >= 0 ? '+' : '') + '$' + s.pnl_per_trade_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.time_in_market_pct.toFixed(2) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + s.pnl_per_min_in_market_usd.toFixed(4) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + s.avg_notional_usd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + effColor + ';font-weight:bold;">' + s.efficiency_score.toFixed(1) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('efficiency error:', e);});
+}
+loadEfficiency();
+setInterval(loadEfficiency, 60000);
+
+// ─── OPPORTUNITY VS TAKEN ─────────────────────────────────────────
+// Are filters helping or killing edge? Strategies that fire 1000 signals
+// and take 5 may be too restrictive; strategies that take everything may
+// need a filter.
+function loadOpportunity() {
+  fetch('/api/opportunity_vs_taken?window_days=7').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('opportunity-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">OPPORTUNITY vs TAKEN (7d)'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">low take-rate + high block count → filters may be too tight</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Evaluated</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Taken</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Take rate</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Top block reasons</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const takeColor = s.take_rate_pct >= 5 ? '#00ff88' : (s.take_rate_pct >= 1 ? '#ffc107' : '#ff4444');
+      const blocks = (s.top_block_reasons || []).map(b => b.reason + '×' + b.count).join(' · ') || '—';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.signals_evaluated + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#fff;font-weight:bold;">' + s.signals_taken + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + takeColor + ';font-weight:bold;">' + s.take_rate_pct.toFixed(2) + '%</td>'
+        + '<td style="padding:5px 6px;color:#7b8ab8;font-size:0.92em;">' + blocks + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('opportunity error:', e);});
+}
+loadOpportunity();
+setInterval(loadOpportunity, 120000);  // signals.csv changes slowly; refresh every 2min
+
+// ─── CAPITAL DEPLOYMENT TIMELINE ───────────────────────────────────
+// Inline SVG sparkline. Distinguishes 'flat = no exposure' from 'flat = stable
+// performance'. The original equity curve flat sections are mostly the former.
+function loadCapitalDeployment() {
+  fetch('/api/capital_deployment_timeline?window_days=7&bucket_hours=1').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('capital-deployment-panel');
+    if (!el) return;
+    const samples = data.samples || [];
+    if (samples.length === 0) { el.innerHTML = ''; return; }
+    const maxPct = Math.max(...samples.map(s=>s.deployed_pct_of_anchor), 5);  // floor at 5% so tiny exposures still show
+    const peakPct = Math.max(...samples.map(s=>s.deployed_pct_of_anchor));
+    const meanPct = samples.reduce((a,s)=>a+s.deployed_pct_of_anchor,0) / samples.length;
+    const flatHours = samples.filter(s => s.deployed_pct_of_anchor < 1).length;
+    const flatPct = (flatHours / samples.length * 100);
+    // Build inline SVG bars
+    const barWidth = Math.max(1, Math.floor(800 / samples.length));
+    const svgWidth = barWidth * samples.length;
+    const svgHeight = 80;
+    let bars = '';
+    samples.forEach((s, i) => {
+      const h = (s.deployed_pct_of_anchor / maxPct) * svgHeight;
+      const x = i * barWidth;
+      const y = svgHeight - h;
+      const color = s.deployed_pct_of_anchor < 1 ? '#1e2a42' : (s.deployed_pct_of_anchor > 50 ? '#ff4444' : (s.deployed_pct_of_anchor > 20 ? '#ffc107' : '#00d4ff'));
+      bars += `<rect x="${x}" y="${y}" width="${barWidth}" height="${h}" fill="${color}"/>`;
+    });
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">CAPITAL DEPLOYMENT (7d hourly)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">distinguishes inactive capital from stable performance</span></div>'
+      + '<div style="font-size:0.75em;color:#9da8c7;">'
+      + 'peak <b style="color:#fff;">' + peakPct.toFixed(1) + '%</b> · mean <b>' + meanPct.toFixed(1) + '%</b> · flat <b>' + flatPct.toFixed(0) + '%</b> of hours'
+      + '</div></div>'
+      + '<svg width="' + svgWidth + '" height="' + svgHeight + '" style="display:block;background:#0a1224;border-radius:3px;">' + bars + '</svg>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:4px;">' + samples[0].ts.slice(0,16) + ' (oldest, left) → ' + samples[samples.length-1].ts.slice(0,16) + ' (now, right). Each bar = 1h. Gray = flat (no exposure).</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('capital deployment error:', e);});
+}
+loadCapitalDeployment();
+setInterval(loadCapitalDeployment, 300000);  // 5min refresh
+
+// ─── TARGET CAPTURE RATIO ──────────────────────────────────────────
+// Proxy for MFE/realized capture: ratio of how much of the planned move
+// (entry → target) the strategy actually realized. Shows exit quality.
+// Strategies with low capture but positive PnL are 'winning small' — leaving
+// money on the table. Full MFE with bar lookback is a future build.
+function loadTargetCapture() {
+  fetch('/api/target_capture?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('target-capture-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">TARGET CAPTURE (30d, MFE proxy)'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">capture = realized PnL / planned move (entry→target). 1.0 = full target hit, &lt; 0 = stopped out.</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Mean cap.</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Median</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Full hit</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Partial</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Scratch</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Stopped</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const meanColor = s.mean_capture > 0.5 ? '#00ff88' : (s.mean_capture > 0 ? '#ffc107' : '#ff4444');
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.n + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + meanColor + ';font-weight:bold;">' + s.mean_capture.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.median_capture.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#00ff88;">' + s.full_capture_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ffc107;">' + s.partial_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#7b8ab8;">' + s.breakeven_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">' + s.adverse_pct.toFixed(0) + '%</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('target capture error:', e);});
+}
+loadTargetCapture();
+setInterval(loadTargetCapture, 120000);
 </script>
 
 <!-- Governance health bar moved to top 2026-04-23 (was inside #ibkr-page section) -->
