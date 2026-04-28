@@ -3685,6 +3685,35 @@ async def api_market_clock():
     return JSONResponse(_market_clock_snapshot())
 
 
+@app.get("/api/tws_health")
+async def api_tws_health():
+    """Read tws_health.json (written by ops/tws_health_probe.py).
+
+    Status meanings:
+      healthy     - TWS connected, data farms alive, NetLiq > 0 (normal)
+      unreachable - TWS API not responding (TWS down or wrong port)
+      degraded    - TWS connected but data farms dead (overnight-reset state)
+      error       - probe couldn't run (rare)
+
+    Used by the dashboard top-of-page TWS health banner — only renders
+    when status != "healthy".
+    """
+    fp = REPO / "argus_flow" / "logs" / "tws_health.json"
+    if not fp.exists():
+        return JSONResponse({"status": "unknown", "reason": "tws_health.json not yet written (probe hasn't run)"})
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        # Compute age of probe result
+        try:
+            ts = datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00"))
+            data["age_seconds"] = int((datetime.now(timezone.utc) - ts).total_seconds())
+        except Exception:
+            data["age_seconds"] = None
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"status": "error", "reason": f"failed to read tws_health.json: {e}"})
+
+
 @app.get("/api/halt_status")
 async def api_halt_status():
     """Returns whether the fleet kill-switch is engaged and the stated reason."""
@@ -4124,6 +4153,9 @@ async def api_strategy_actions(window_days: int = 30):
             "efficiency_score": eff_score,
             "drift_verdict": drift_verdict,
             "drift_delta_pct": d.get("delta_pct", 0),
+            # Pass through the underlying expectancy values for the sparkline
+            "expectancy_recent_usd": d.get("expectancy_recent_usd", 0),
+            "expectancy_prior_usd":  d.get("expectancy_prior_usd", 0),
             # Suggested allocation tier (Layer 4 hint, not enforced)
             "allocation_hint": {
                 "SCALE_UP": "20-30% (top tier)",
@@ -7192,6 +7224,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+<!-- TWS health banner — appears only when TWS is degraded/unreachable -->
+<div id="tws-health-banner" style="display:none;margin-bottom:10px;"></div>
+
+<!-- Capital Safety Bar — single-line top-of-page summary of fleet safety state -->
+<div id="capital-safety-bar" style="margin-bottom:10px;">
+  <div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#7b8ab8;">Loading capital safety...</div>
+</div>
+
 <!-- Halt-status banner — appears only when fleet is halted, top-of-page -->
 <div id="halt-banner" style="display:none;margin-bottom:10px;"></div>
 
@@ -7307,6 +7347,81 @@ function resumeFleet() {
 loadHaltStatus();
 setInterval(loadHaltStatus, 10000);  // re-check every 10s
 
+// ─── TWS HEALTH BANNER ─────────────────────────────────────────────
+// Surfaces the overnight-reset failure mode (TCP connected but data farms dead).
+// Only renders when status != "healthy" (no clutter when normal).
+function loadTwsHealth() {
+  fetch('/api/tws_health').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('tws-health-banner');
+    if (!el) return;
+    if (d.status === 'healthy' || d.status === 'unknown') { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    const config = {
+      degraded:    {bg:'#3a0a0a', border:'#ff4444', icon:'⚠', title:'TWS DEGRADED', subtitle:'connected but data farms dead — re-login to TWS'},
+      unreachable: {bg:'#3a0a0a', border:'#ff4444', icon:'✕', title:'TWS UNREACHABLE', subtitle:'TWS not responding on the API port'},
+      error:       {bg:'#2a2010', border:'#ffaa00', icon:'?', title:'TWS PROBE ERROR', subtitle:'probe failed unexpectedly'},
+    }[d.status] || {bg:'#2a2010', border:'#ffaa00', icon:'?', title:'TWS UNKNOWN', subtitle:''};
+    const ageStr = d.age_seconds != null ? Math.floor(d.age_seconds/60) + 'm ago' : 'unknown';
+    el.innerHTML = '<div style="background:' + config.bg + ';border:2px solid ' + config.border + ';border-radius:6px;padding:12px 18px;color:#ffe;font-size:0.9em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
+      + '<div><span style="color:' + config.border + ';font-weight:bold;letter-spacing:2px;font-size:1.05em;">' + config.icon + ' ' + config.title + '</span>'
+      + ' <span style="color:#ffaaaa;margin-left:12px;">' + config.subtitle + '</span></div>'
+      + '<div style="color:#ffaaaa;font-size:0.85em;">last probe: ' + ageStr + '</div>'
+      + '</div>'
+      + '<div style="margin-top:6px;color:#ffe;"><b>Reason:</b> ' + (d.reason || '(none)') + '</div>'
+      + '<div style="margin-top:4px;color:#ffaaaa;font-size:0.85em;">Fix: re-login to TWS (paper account DUP472829), then run <code>start_all_runners.ps1 -RestartAll</code> to re-establish runner sessions. See failure mode #10 in reference_failure_modes.md.</div>'
+      + '</div>';
+  }).catch(()=>{});
+}
+loadTwsHealth();
+setInterval(loadTwsHealth, 30000);  // re-check every 30s
+
+// ─── CAPITAL SAFETY BAR ────────────────────────────────────────────
+// Single-line top-of-page summary. Combines positions_open (risk $) +
+// cluster_exposure (gross notional + top cluster). Color-codes each
+// segment so degraded states pop visually before you scroll.
+function loadCapitalSafetyBar() {
+  Promise.all([
+    fetch('/api/positions_open').then(r=>r.json()),
+    fetch('/api/cluster_exposure').then(r=>r.json()),
+  ]).then(([pos, clu])=>{
+    const el = document.getElementById('capital-safety-bar');
+    if (!el) return;
+    const anchor = pos.anchor_usd || 0;
+    const openCount = pos.count || 0;
+    const openRisk = pos.total_risk_usd || 0;
+    const riskPct = pos.pct_of_budget_used || 0;
+    const grossUsd = clu.total_notional_usd || 0;
+    const grossPct = anchor ? (grossUsd / anchor * 100) : 0;
+    const totalCapPct = clu.total_pct_used || 0;
+    // Top-cluster from clu.clusters
+    const clusters = clu.clusters || [];
+    const topCluster = clusters.find(c => c.pct_used > 0);
+    // Color thresholds (consistent with risk-banner pattern)
+    const riskColor = riskPct >= 80 ? '#ff4444' : riskPct >= 50 ? '#ffaa00' : '#00d4ff';
+    const grossColor = grossPct >= 250 ? '#ff4444' : grossPct >= 150 ? '#ffaa00' : '#00d4ff';
+    const totalColor = totalCapPct >= 80 ? '#ff4444' : totalCapPct >= 50 ? '#ffaa00' : '#00d4ff';
+    const fleetState = openCount === 0 ? 'FLAT' : (riskPct >= 80 ? 'HOT' : 'ACTIVE');
+    const stateColor = fleetState === 'FLAT' ? '#00e676' : (fleetState === 'HOT' ? '#ff4444' : '#00d4ff');
+    el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
+      + '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;">'
+      + '<span style="color:#7b8ab8;letter-spacing:2px;">CAPITAL SAFETY</span>'
+      + '<span style="color:' + stateColor + ';font-weight:bold;letter-spacing:1px;">' + fleetState + '</span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Open: <b style="color:#fff;">' + openCount + ' pos</b> · risk <b style="color:' + riskColor + ';">$' + openRisk.toFixed(2) + '</b> / $' + (pos.fleet_budget_usd||0).toFixed(0) + ' (' + riskPct.toFixed(1) + '%)</span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Gross notional: <b style="color:' + grossColor + ';">$' + grossUsd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b> (' + grossPct.toFixed(0) + '% of equity)</span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
+      + (topCluster ? '<span style="color:#1e2a42;">|</span><span style="color:#9da8c7;">Top cluster: <b style="color:#fff;">' + topCluster.cluster + '</b> ' + topCluster.pct_used.toFixed(1) + '%</span>' : '')
+      + '</div>'
+      + '<span style="color:#7b8ab8;font-size:0.92em;">anchor $' + anchor.toLocaleString(undefined,{maximumFractionDigits:0}) + '</span>'
+      + '</div>';
+  }).catch(()=>{});
+}
+loadCapitalSafetyBar();
+setInterval(loadCapitalSafetyBar, 15000);  // every 15s during market hours
+
 // ─── BLOCKED ENTRIES (LAST 24h) ────────────────────────────────────
 // Compact one-line counter of guard fires. Hides when totals are all zero.
 // Buckets, in priority order: cluster_cap_breach (interesting), fx_below_idealpro_min
@@ -7351,6 +7466,37 @@ setInterval(loadBlockedEntries, 60000);  // refresh every 60s
 // ─── DECISION ENGINE PANEL ─────────────────────────────────────────
 // Layer 3 of the metrics->scoring->decision->allocation stack.
 // Primary "what do I do?" view. Sorted by action priority (SCALE_UP first).
+//
+// Tiny inline SVG sparkline: 2 vertical bars side-by-side. Left = prior 30
+// trades' expectancy, right = recent 30. Bar height proportional to absolute
+// expectancy. Fill color: positive=green, negative=red. Provides at-a-glance
+// "is the edge growing or shrinking?" without needing to read delta_pct.
+function renderExpectancySpark(priorExp, recentExp) {
+  if ((priorExp == null || priorExp === 0) && (recentExp == null || recentExp === 0)) {
+    return '<span style="color:#555;font-size:0.85em;">—</span>';
+  }
+  const p = priorExp || 0;
+  const r = recentExp || 0;
+  const maxAbs = Math.max(Math.abs(p), Math.abs(r), 1);  // floor at 1 to avoid div-by-zero
+  const w = 8, gap = 3, maxH = 16;
+  const pH = Math.abs(p) / maxAbs * maxH;
+  const rH = Math.abs(r) / maxAbs * maxH;
+  const pColor = p > 0 ? '#00ff88' : (p < 0 ? '#ff4444' : '#555');
+  const rColor = r > 0 ? '#00ff88' : (r < 0 ? '#ff4444' : '#555');
+  // Bars hang from a midline (positive = up, negative = down)
+  const mid = maxH;  // total svg height = 2*maxH
+  const pY = p >= 0 ? (mid - pH) : mid;
+  const rY = r >= 0 ? (mid - rH) : mid;
+  const svgH = 2 * maxH + 2;
+  const svgW = w + gap + w;
+  const tooltip = 'prior 30: $' + p.toFixed(2) + ' / recent 30: $' + r.toFixed(2);
+  return '<svg width="' + svgW + '" height="' + svgH + '" style="vertical-align:middle;" title="' + tooltip + '">'
+    + '<line x1="0" y1="' + mid + '" x2="' + svgW + '" y2="' + mid + '" stroke="#1e2a42" stroke-width="1"/>'
+    + '<rect x="0" y="' + pY + '" width="' + w + '" height="' + Math.max(1, pH) + '" fill="' + pColor + '" opacity="0.5"/>'
+    + '<rect x="' + (w + gap) + '" y="' + rY + '" width="' + w + '" height="' + Math.max(1, rH) + '" fill="' + rColor + '"/>'
+    + '</svg>';
+}
+
 const ACTION_COLORS = {
   SCALE_UP: {bg:'#0d1c11', border:'#00ff88', fg:'#00ff88'},
   HOLD:     {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'},
@@ -7384,6 +7530,7 @@ function loadDecisionEngine() {
       + '<th style="text-align:right;padding:6px 8px;">PnL 30d</th>'
       + '<th style="text-align:right;padding:6px 8px;">Eff</th>'
       + '<th style="text-align:left;padding:6px 8px;">Drift</th>'
+      + '<th style="text-align:center;padding:6px 8px;">Trend</th>'
       + '<th style="text-align:left;padding:6px 8px;">Reason</th>'
       + '<th style="text-align:left;padding:6px 8px;">Suggested alloc</th>'
       + '</tr></thead><tbody>';
@@ -7400,6 +7547,7 @@ function loadDecisionEngine() {
         + '<td style="padding:6px 8px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (s.pnl_usd >= 0 ? '+' : '') + '$' + s.pnl_usd.toFixed(2) + '</td>'
         + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.efficiency_score.toFixed(1) + '</td>'
         + '<td style="padding:6px 8px;color:' + driftColor + ';">' + driftText + '</td>'
+        + '<td style="padding:6px 8px;text-align:center;">' + renderExpectancySpark(s.expectancy_prior_usd, s.expectancy_recent_usd) + '</td>'
         + '<td style="padding:6px 8px;color:#7b8ab8;font-size:0.92em;">' + s.reason + '</td>'
         + '<td style="padding:6px 8px;color:' + c.fg + ';font-size:0.92em;">' + s.allocation_hint + '</td>'
         + '</tr>';

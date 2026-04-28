@@ -51,6 +51,7 @@ _SCHEMA_SCRIPT = _REPO / "ops" / "schema_validator.py"
 _RECONCILE_SCRIPT = _REPO / "ops" / "canonical_reconcile.py"
 _BROKER_DISCONNECT_SCRIPT = _REPO / "ops" / "broker_disconnect_check.py"
 _COHORT_FAILURE_SCRIPT = _REPO / "ops" / "cohort_failure_check.py"
+_TWS_HEALTH_SCRIPT = _REPO / "ops" / "tws_health_probe.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -113,7 +114,8 @@ def main() -> int:
             if now_epoch - _last_hourly_epoch >= HOURLY_CHECKS_INTERVAL_S:
                 for name, script in (("schema_validator", _SCHEMA_SCRIPT),
                                      ("canonical_reconcile", _RECONCILE_SCRIPT),
-                                     ("cohort_failure_check", _COHORT_FAILURE_SCRIPT)):
+                                     ("cohort_failure_check", _COHORT_FAILURE_SCRIPT),
+                                     ("tws_health_probe", _TWS_HEALTH_SCRIPT)):
                     if script.exists():
                         try:
                             subprocess.run(
