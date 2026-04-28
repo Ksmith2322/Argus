@@ -4324,6 +4324,239 @@ async def api_target_capture(window_days: int = 30):
     return JSONResponse({"window_days": window_days, "strategies": rows})
 
 
+@app.get("/api/alpha_attribution")
+async def api_alpha_attribution(window_days: int = 30):
+    """Per-strategy contribution to fleet PnL. Answers reviewer's question:
+    'who actually made the money?'. Ranked by absolute contribution.
+
+    Concentration metrics expose the typical fleet truth: 1-2 strategies are
+    likely doing 80% of the work. That has direct allocation implications.
+
+    Excludes invalid trades (experiment_valid=false).
+    """
+    fills = _read_canonical_fills(window_days)
+    invalid_map = _per_strategy_invalid_set()
+    by_strategy: dict[str, dict] = {}
+    for r in fills:
+        strat = r.get("strategy") or "unknown"
+        if (r.get("entry_ts") or "") in invalid_map.get(strat, set()):
+            continue
+        try:
+            pnl = float(r.get("pnl_usd") or 0)
+        except Exception:
+            continue
+        d = by_strategy.setdefault(strat, {
+            "pnl_usd": 0.0, "n": 0, "wins": 0, "losses": 0,
+            "wins_pnl": 0.0, "losses_pnl": 0.0,
+        })
+        d["pnl_usd"] += pnl
+        d["n"] += 1
+        if pnl > 0:
+            d["wins"] += 1
+            d["wins_pnl"] += pnl
+        elif pnl < 0:
+            d["losses"] += 1
+            d["losses_pnl"] += pnl
+
+    total_pnl = sum(d["pnl_usd"] for d in by_strategy.values())
+    abs_total = sum(abs(d["pnl_usd"]) for d in by_strategy.values())
+
+    rows = []
+    for strat, d in by_strategy.items():
+        # Two attribution metrics — both useful:
+        #   net_pct: contribution to net fleet PnL (signed; can exceed 100% if
+        #            other strategies are negative)
+        #   abs_pct: share of TOTAL absolute movement (always 0-100, shows
+        #            who's actually doing the work, win or lose)
+        net_pct = (d["pnl_usd"] / total_pnl * 100) if total_pnl else 0
+        abs_pct = (abs(d["pnl_usd"]) / abs_total * 100) if abs_total else 0
+        rows.append({
+            "strategy": strat,
+            "pnl_usd": round(d["pnl_usd"], 2),
+            "trade_count": d["n"],
+            "wins": d["wins"],
+            "losses": d["losses"],
+            "wins_pnl_usd": round(d["wins_pnl"], 2),
+            "losses_pnl_usd": round(d["losses_pnl"], 2),
+            "pct_of_net_pnl": round(net_pct, 1),
+            "pct_of_abs_pnl": round(abs_pct, 1),
+        })
+    # Rank by absolute share of activity (so loss-makers also surface)
+    rows.sort(key=lambda x: -x["pct_of_abs_pnl"])
+
+    # Cumulative concentration
+    cum = 0.0
+    for r in rows:
+        cum += r["pct_of_abs_pnl"]
+        r["cumulative_abs_pct"] = round(cum, 1)
+
+    # Concentration headline
+    top1 = rows[0]["pct_of_abs_pnl"] if rows else 0
+    top3 = sum(r["pct_of_abs_pnl"] for r in rows[:3])
+    return JSONResponse({
+        "window_days": window_days,
+        "total_net_pnl_usd": round(total_pnl, 2),
+        "total_abs_pnl_usd": round(abs_total, 2),
+        "n_strategies": len(rows),
+        "concentration": {
+            "top_1_pct_of_abs": round(top1, 1),
+            "top_3_pct_of_abs": round(top3, 1),
+        },
+        "strategies": rows,
+    })
+
+
+@app.get("/api/correlation_map")
+async def api_correlation_map(window_days: int = 30):
+    """Pairwise correlation of strategy daily PnL + time-in-market overlap.
+
+    Validates the cluster cap is doing its job AND shows where the fleet is
+    secretly stacking the same bet. Two strategies with high corr + high time
+    overlap = redundant; cull one or accept lower aggregate position sizing.
+
+    Excludes invalid trades.
+    """
+    fills = _read_canonical_fills(window_days)
+    invalid_map = _per_strategy_invalid_set()
+    daily_pnl: dict[str, dict[str, float]] = {}
+    open_intervals: dict[str, list] = {}
+
+    for r in fills:
+        strat = r.get("strategy") or "unknown"
+        if (r.get("entry_ts") or "") in invalid_map.get(strat, set()):
+            continue
+        try:
+            pnl = float(r.get("pnl_usd") or 0)
+            entry_ts = datetime.fromisoformat(str(r.get("entry_ts","")).replace("Z","+00:00"))
+            if entry_ts.tzinfo is None: entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+            exit_ts = r["_exit_dt"]
+        except Exception:
+            continue
+        date_key = exit_ts.date().isoformat()
+        daily_pnl.setdefault(strat, {})[date_key] = daily_pnl.get(strat, {}).get(date_key, 0) + pnl
+        open_intervals.setdefault(strat, []).append((entry_ts, exit_ts))
+
+    strategies = sorted(daily_pnl.keys())
+    all_dates = sorted({d for s in strategies for d in daily_pnl[s].keys()})
+
+    import math
+    def pearson(xs: list, ys: list):
+        n = len(xs)
+        if n < 3: return None
+        mx, my = sum(xs)/n, sum(ys)/n
+        num = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+        dx = math.sqrt(sum((x-mx)**2 for x in xs))
+        dy = math.sqrt(sum((y-my)**2 for y in ys))
+        if dx*dy == 0: return None
+        return num/(dx*dy)
+
+    def overlap_seconds(intervals_a: list, intervals_b: list) -> float:
+        total = 0.0
+        for a_start, a_end in intervals_a:
+            for b_start, b_end in intervals_b:
+                start = max(a_start, b_start)
+                end = min(a_end, b_end)
+                if end > start:
+                    total += (end - start).total_seconds()
+        return total
+
+    pairs = []
+    for i, s1 in enumerate(strategies):
+        for j, s2 in enumerate(strategies):
+            if j <= i:
+                continue
+            xs = [daily_pnl[s1].get(d, 0.0) for d in all_dates]
+            ys = [daily_pnl[s2].get(d, 0.0) for d in all_dates]
+            corr = pearson(xs, ys)
+
+            ov_s = overlap_seconds(open_intervals[s1], open_intervals[s2])
+            total_a = sum((e-s).total_seconds() for s, e in open_intervals[s1])
+            total_b = sum((e-s).total_seconds() for s, e in open_intervals[s2])
+            # Cap component pct at 100 — strategies that hold multiple concurrent
+            # positions (multi_orb runs 4) can produce raw ratios > 1 because
+            # each position interval is counted separately. The cap turns it back
+            # into the intuitive "fraction of time both were active" metric.
+            ov_pct_a = min(100.0, (ov_s / total_a * 100)) if total_a > 0 else 0
+            ov_pct_b = min(100.0, (ov_s / total_b * 100)) if total_b > 0 else 0
+            ov_pct = (ov_pct_a + ov_pct_b) / 2
+
+            # Redundancy verdict — actionable summary
+            redundant = False
+            if corr is not None and corr > 0.6 and ov_pct > 30:
+                redundant = True
+            pairs.append({
+                "strategy_a": s1,
+                "strategy_b": s2,
+                "correlation": round(corr, 3) if corr is not None else None,
+                "time_overlap_pct": round(ov_pct, 1),
+                "redundant": redundant,
+            })
+    # Most-correlated pairs first (by absolute correlation)
+    pairs.sort(key=lambda x: -abs(x["correlation"] or 0))
+
+    return JSONResponse({
+        "window_days": window_days,
+        "n_strategies": len(strategies),
+        "n_dates": len(all_dates),
+        "n_pairs": len(pairs),
+        "n_redundant": sum(1 for p in pairs if p["redundant"]),
+        "pairs": pairs,
+    })
+
+
+@app.get("/api/trade_validity_counts")
+async def api_trade_validity_counts():
+    """Per-strategy valid/invalid trade counts. Invalid = experiment_valid=false
+    in trades.csv (set when a trade is contaminated — e.g. wrong-priced
+    reconcile_flat, simulated exit during account reset, OCO double-fire artifact).
+
+    Surfaces data hygiene issues that would silently corrupt validation
+    analysis. Today's incident left 6 invalid trades; without this view they'd
+    visually compete with real trades on the dashboard.
+    """
+    rows = []
+    for csv_path in (REPO / "forge" / "logs").glob("*/trades.csv"):
+        strategy = csv_path.parent.name
+        valid = 0
+        invalid = 0
+        invalid_reasons: dict[str, int] = {}
+        try:
+            with csv_path.open(encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if str(r.get("experiment_valid", "true")).lower() == "false":
+                        invalid += 1
+                        reason = (r.get("invalid_reason") or "unknown").strip()[:90]
+                        invalid_reasons[reason] = invalid_reasons.get(reason, 0) + 1
+                    else:
+                        valid += 1
+        except Exception:
+            continue
+        total = valid + invalid
+        if total == 0:
+            continue
+        rows.append({
+            "strategy": strategy,
+            "valid": valid,
+            "invalid": invalid,
+            "total": total,
+            "invalid_pct": round(invalid / total * 100, 1),
+            "top_invalid_reasons": [
+                {"reason": k, "count": v}
+                for k, v in sorted(invalid_reasons.items(), key=lambda x: -x[1])[:3]
+            ],
+        })
+    rows.sort(key=lambda x: -x["invalid_pct"])
+    fleet_total_valid = sum(r["valid"] for r in rows)
+    fleet_total_invalid = sum(r["invalid"] for r in rows)
+    fleet_total = fleet_total_valid + fleet_total_invalid
+    return JSONResponse({
+        "fleet_valid": fleet_total_valid,
+        "fleet_invalid": fleet_total_invalid,
+        "fleet_invalid_pct": round(fleet_total_invalid / fleet_total * 100, 2) if fleet_total else 0,
+        "strategies": rows,
+    })
+
+
 @app.get("/api/blocked_entries_today")
 async def api_blocked_entries_today():
     """Count entries blocked by each guard in the last 24h. Scans runner logs
@@ -6985,6 +7218,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- TARGET CAPTURE RATIO — exit efficiency proxy (until full MFE lookback exists) -->
 <div id="target-capture-panel" style="margin-bottom:14px;"></div>
 
+<!-- ALPHA ATTRIBUTION — who's actually carrying the fleet PnL -->
+<div id="alpha-attribution-panel" style="margin-bottom:14px;"></div>
+
+<!-- CORRELATION / REDUNDANCY MAP — pairwise correlation + time overlap -->
+<div id="correlation-map-panel" style="margin-bottom:14px;"></div>
+
+<!-- TRADE VALIDITY COUNTS — valid/invalid per strategy (data hygiene surface) -->
+<div id="trade-validity-panel" style="margin-bottom:14px;"></div>
+
 <div style="display:flex; justify-content:space-between; align-items:center;">
   <div style="display:flex;align-items:center;gap:16px;">
     <h1 style="margin:0;">HELIO FLEET DASHBOARD</h1>
@@ -7344,6 +7586,152 @@ function loadTargetCapture() {
 }
 loadTargetCapture();
 setInterval(loadTargetCapture, 120000);
+
+// ─── ALPHA ATTRIBUTION ─────────────────────────────────────────────
+// Who's actually carrying the fleet PnL? Sorted by absolute share.
+function loadAlphaAttribution() {
+  fetch('/api/alpha_attribution?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('alpha-attribution-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    const conc = data.concentration || {};
+    const headlineColor = conc.top_3_pct_of_abs > 80 ? '#ffaa00' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">ALPHA ATTRIBUTION (30d)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">who is actually carrying the fleet?</span></div>'
+      + '<div style="font-size:0.75em;color:' + headlineColor + ';">'
+      + 'Net fleet PnL: <b style="color:' + (data.total_net_pnl_usd >= 0 ? '#00ff88' : '#ff4444') + ';">' + (data.total_net_pnl_usd >= 0 ? '+' : '') + '$' + data.total_net_pnl_usd.toFixed(2) + '</b>'
+      + ' · top 1 = ' + conc.top_1_pct_of_abs + '% · top 3 = ' + conc.top_3_pct_of_abs + '% of activity</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL</th>'
+      + '<th style="text-align:right;padding:5px 6px;">% of net</th>'
+      + '<th style="text-align:right;padding:5px 6px;">% of activity</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Cumulative</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Wins / Losses</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const pnlColor = s.pnl_usd > 0 ? '#00ff88' : (s.pnl_usd < 0 ? '#ff4444' : '#7b8ab8');
+      const netColor = s.pct_of_net_pnl > 0 ? '#00ff88' : (s.pct_of_net_pnl < 0 ? '#ff4444' : '#7b8ab8');
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.trade_count + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (s.pnl_usd >= 0 ? '+' : '') + '$' + s.pnl_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + netColor + ';">' + (s.pct_of_net_pnl >= 0 ? '+' : '') + s.pct_of_net_pnl.toFixed(1) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.pct_of_abs_pnl.toFixed(1) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#7b8ab8;">' + s.cumulative_abs_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.wins + ' (+$' + s.wins_pnl_usd.toFixed(0) + ') / ' + s.losses + ' ($' + s.losses_pnl_usd.toFixed(0) + ')</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('alpha attribution error:', e);});
+}
+loadAlphaAttribution();
+setInterval(loadAlphaAttribution, 60000);
+
+// ─── CORRELATION / REDUNDANCY MAP ──────────────────────────────────
+// Pairwise correlation + time-overlap. Strategies with high corr + high
+// overlap are redundant — same bet by another name.
+function loadCorrelationMap() {
+  fetch('/api/correlation_map?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('correlation-map-panel');
+    if (!el) return;
+    const pairs = data.pairs || [];
+    if (pairs.length === 0) { el.innerHTML = ''; return; }
+    const redundantCount = data.n_redundant || 0;
+    const headlineColor = redundantCount > 0 ? '#ffaa00' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">CORRELATION / REDUNDANCY (30d)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">high corr + high time overlap = same bet by another name</span></div>'
+      + '<div style="font-size:0.75em;color:' + headlineColor + ';">'
+      + data.n_strategies + ' strategies · ' + data.n_pairs + ' pairs · '
+      + '<b>' + redundantCount + ' redundant</b> (corr&gt;0.6 + overlap&gt;30%)</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy A</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy B</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Correlation</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Time overlap</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Verdict</th>'
+      + '</tr></thead><tbody>';
+    // Show top 15 most-correlated pairs
+    for (const p of pairs.slice(0, 15)) {
+      const corr = p.correlation;
+      const corrColor = corr === null ? '#7b8ab8' : (Math.abs(corr) > 0.6 ? '#ff4444' : (Math.abs(corr) > 0.3 ? '#ffc107' : '#9da8c7'));
+      const ovColor = p.time_overlap_pct > 30 ? '#ff4444' : (p.time_overlap_pct > 10 ? '#ffc107' : '#9da8c7');
+      const verdict = p.redundant ? '<span style="background:#ff4444;color:#000;padding:1px 6px;border-radius:3px;font-weight:bold;">REDUNDANT</span>' : '<span style="color:#7b8ab8;">ok</span>';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + p.strategy_a + '</td>'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + p.strategy_b + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + corrColor + ';font-weight:bold;">' + (corr === null ? '—' : (corr >= 0 ? '+' : '') + corr.toFixed(2)) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + ovColor + ';">' + p.time_overlap_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:center;">' + verdict + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    if (pairs.length > 15) {
+      html += '<div style="font-size:0.7em;color:#7b8ab8;margin-top:4px;">Showing top 15 of ' + pairs.length + ' pairs (sorted by absolute correlation).</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('correlation map error:', e);});
+}
+loadCorrelationMap();
+setInterval(loadCorrelationMap, 300000);  // 5min refresh; correlations change slowly
+
+// ─── TRADE VALIDITY COUNTS ─────────────────────────────────────────
+// Surfaces strategies with high invalid-trade ratio. Today's incident left
+// 6 invalid trades; without this view they'd silently pollute validation.
+function loadTradeValidity() {
+  fetch('/api/trade_validity_counts').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('trade-validity-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    // Only show if there are ANY invalid trades anywhere
+    if (data.fleet_invalid === 0 || rows.length === 0) {
+      el.innerHTML = '<div style="background:#0d1c11;border:1px solid #143021;border-radius:4px;padding:6px 12px;font-size:0.7em;color:#00e676;">'
+        + '<span style="letter-spacing:1px;">TRADE VALIDITY</span>: ' + data.fleet_valid + ' valid trades, 0 invalid (clean)</div>';
+      return;
+    }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">TRADE VALIDITY</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">data hygiene surface — invalid trades excluded from edge analysis</span></div>'
+      + '<div style="font-size:0.75em;color:#9da8c7;">'
+      + 'Fleet: <b>' + data.fleet_valid + '</b> valid · <b style="color:#ffaa00;">' + data.fleet_invalid + '</b> invalid'
+      + ' (<b>' + data.fleet_invalid_pct.toFixed(1) + '%</b>)</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Valid</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Invalid</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Invalid %</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Top reasons</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      if (s.invalid === 0) continue;  // only show strategies with invalid trades
+      const invColor = s.invalid_pct > 20 ? '#ff4444' : (s.invalid_pct > 5 ? '#ffaa00' : '#ffc107');
+      const reasons = (s.top_invalid_reasons || []).map(r => r.reason + '×' + r.count).join(' · ');
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.valid + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + invColor + ';font-weight:bold;">' + s.invalid + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + invColor + ';">' + s.invalid_pct.toFixed(1) + '%</td>'
+        + '<td style="padding:5px 6px;color:#7b8ab8;font-size:0.92em;">' + reasons + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('trade validity error:', e);});
+}
+loadTradeValidity();
+setInterval(loadTradeValidity, 120000);
 </script>
 
 <!-- Governance health bar moved to top 2026-04-23 (was inside #ibkr-page section) -->
