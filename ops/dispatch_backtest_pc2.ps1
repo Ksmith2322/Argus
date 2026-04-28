@@ -29,7 +29,7 @@ ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus
 $pc1Hash = git rev-parse HEAD
 $pc2Hash = ssh $PC2 "powershell -NonInteractive -NoProfile -Command `"Set-Location C:/Argus/repo; git rev-parse HEAD`"" 2>$null
 if ($pc2Hash -and $pc2Hash.Trim() -ne $pc1Hash.Trim()) {
-    Write-Warning "PC2 commit ($($pc2Hash.Trim().Substring(0,7))) != PC1 ($($pc1Hash.Trim().Substring(0,7))) — pull may have failed"
+    Write-Warning "PC2 commit ($($pc2Hash.Trim().Substring(0,7))) != PC1 ($($pc1Hash.Trim().Substring(0,7))) - pull may have failed"
 } else {
     Write-Host "PC2 in sync: $($pc1Hash.Trim().Substring(0,7))" -ForegroundColor Green
 }

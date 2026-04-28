@@ -221,6 +221,7 @@ def _open(state, ticker, df, direction, ctx, ib=None):
             result = ibkr.submit_bracket(
                 ib, contract, direction=direction, size=shares,
                 stop_px=stop, target_px=target, price_decimals=2,
+                est_entry_px=plan_entry,
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED %s: %s", ticker, result.entry.reject_reason)
@@ -328,6 +329,10 @@ def evaluate_once():
                         ib.qualifyContracts(contract)
                         outcome = ibkr.check_bracket_filled(
                             ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                            entry_direction=ot.get("direction"),
+                            entry_size=ot.get("position_size") or ot.get("size"),
+                            stop_px=ot.get("stop_px"),
+                            target_px=ot.get("target_px"),
                         )
                     except Exception as exc:
                         log.error("bracket check failed %s: %s", ticker, exc)

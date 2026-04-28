@@ -23,7 +23,7 @@ $staleThresholdSeconds = 900  # 15 minutes
 $checkIntervalSeconds = 60
 $maxRestartsPerHour = 3
 
-# Active configs — MUST match the exact --configs list runner_unified is
+# Active configs - MUST match the exact --configs list runner_unified is
 # launched with. Previously tried dynamic discovery via deployment_pipeline
 # but that can drift from the actual launch (e.g. CADJPY at stage=watcher
 # is running but wouldn't show up in "paper"-only emit, and watcher-stage
@@ -204,13 +204,13 @@ while ($true) {
             Send-Discord "**CRITICAL: FX runner down, max restarts ($maxRestartsPerHour/hr) exhausted!** Manual intervention needed." "red"
         }
     } elseif ($wasDown["fx"]) {
-        # Was down, now back — send confirmation
+        # Was down, now back - send confirmation
         $wasDown["fx"] = $false
         Log "FX runner BACK ONLINE"
         Send-Discord "FX runner is **BACK ONLINE** and healthy." "green"
     }
 
-    # Futures runner check — skipped entirely when no futures configs are
+    # Futures runner check - skipped entirely when no futures configs are
     # active. Previously this alerted "Futures runner NOT FOUND!" every
     # cycle even though $futuresConfigs = @(), triggering spurious restarts
     # into a broken arg list ("Cannot bind argument to parameter 'Path'").
@@ -231,7 +231,7 @@ while ($true) {
         }
     }
 
-    # ── Gap Fix #1: API port check (detect TWS API disabled mid-session) ──
+    # -- Gap Fix #1: API port check (detect TWS API disabled mid-session) --
     $portListening = $false
     try {
         $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 7497 -WarningAction SilentlyContinue
@@ -250,7 +250,7 @@ while ($true) {
         $script:portWarnSent = $false
     }
 
-    # ── Gap Fix #4: Stale heartbeat detection (runners alive but no data) ──
+    # -- Gap Fix #4: Stale heartbeat detection (runners alive but no data) --
     $staleCount = 0
     $freshCount = 0
     # Check ALL active instruments, not just FX
@@ -272,7 +272,7 @@ while ($true) {
     $dayOfWeek = (Get-Date).DayOfWeek
     $marketExpected = -not (($dayOfWeek -eq "Saturday") -or ($dayOfWeek -eq "Sunday" -and $utcHour -lt 21) -or ($dayOfWeek -eq "Friday" -and $utcHour -ge 22))
 
-    # Stale alert — only during market hours
+    # Stale alert - only during market hours
     if ($marketExpected -and $fxAlive -and $freshCount -eq 0 -and $staleCount -gt 0) {
         if (-not $script:staleWarnSent) {
             Log "ALERT: All heartbeats STALE ($staleCount stale, $freshCount fresh) but runners alive!"
@@ -282,7 +282,7 @@ while ($true) {
         }
     }
 
-    # Recovery alert — fires anytime heartbeats come back after a stale warning, regardless of market hours
+    # Recovery alert - fires anytime heartbeats come back after a stale warning, regardless of market hours
     if ($freshCount -gt 0 -and $script:staleWarnSent) {
         $downMinutes = if ($script:staleWarnTime) { [int](($now - $script:staleWarnTime).TotalMinutes) } else { 0 }
         Log "Heartbeats RESTORED ($freshCount fresh, $staleCount stale) after ${downMinutes}min"
@@ -291,7 +291,7 @@ while ($true) {
         $script:staleWarnTime = $null
     }
 
-    # ── Gap Fix #2: Trade event notifications ──
+    # -- Gap Fix #2: Trade event notifications --
     # Check for new trades every 5 min
     if ($now.Minute % 5 -eq 0 -and $now.Second -lt 65) {
         foreach ($dir in $hbDirs) {
@@ -320,7 +320,7 @@ while ($true) {
         }
     }
 
-    # ── Gap Fix #3: Daily session summary (9 AM CT = 14:00 UTC) ──
+    # -- Gap Fix #3: Daily session summary (9 AM CT = 14:00 UTC) --
     if ($utcHour -eq 14 -and $now.Minute -ge 0 -and $now.Minute -lt 2 -and -not $script:dailySummarySent) {
         $totalTrades = 0
         $totalPnl = 0.0

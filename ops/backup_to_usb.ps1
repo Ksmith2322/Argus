@@ -6,7 +6,7 @@
 #   .\ops\backup_to_usb.ps1 -DryRun            # show what would be copied
 #
 # Backs up:
-#   - C:\Argus\repo (code, config, data — excludes __pycache__, .git/objects)
+#   - C:\Argus\repo (code, config, data - excludes __pycache__, .git/objects)
 #   - C:\Argus\repo\state (runtime state)
 #   - C:\Argus\repo\ops\logs (recent N days of artifacts)
 #
@@ -88,7 +88,7 @@ if ($DryRun) {
     exit 0
 }
 
-# Step 1: Backup repo (code, config, data) — exclude heavy/regenerable dirs
+# Step 1: Backup repo (code, config, data) - exclude heavy/regenerable dirs
 Write-BackupLog "Syncing repo..."
 $robocopyArgs = @(
     $repoRoot,

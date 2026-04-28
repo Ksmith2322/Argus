@@ -3533,6 +3533,280 @@ async def api_promotion_ladder():
     return JSONResponse({"strategies": strategies})
 
 
+def _next_weekday_at(now_et: datetime, weekday: int, hour: int, minute: int = 0) -> datetime:
+    """Next datetime in NY tz with the given weekday (Mon=0..Sun=6) at hour:minute,
+    strictly in the future relative to now_et."""
+    days_ahead = (weekday - now_et.weekday()) % 7
+    candidate = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if candidate <= now_et:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _next_at(now_et: datetime, hour: int, minute: int = 0) -> datetime:
+    """Next datetime in NY tz at hour:minute today or tomorrow if already passed."""
+    cand = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if cand <= now_et:
+        cand += timedelta(days=1)
+    return cand
+
+
+def _market_clock_snapshot() -> dict:
+    """Compute current status of the markets relevant to the fleet.
+
+    Hardcoded windows:
+      - US stocks (NYSE/NASDAQ): pre-market 04:00-09:30, RTH 09:30-16:00, after-hours 16:00-20:00 ET, weekdays.
+      - FX (IDEALPRO): 24/5, opens Sun 17:00 ET, closes Fri 17:00 ET.
+      - CME futures: opens Sun 18:00 ET, closes Fri 17:00 ET, daily 17:00-18:00 ET maintenance break.
+
+    Doesn't account for US holidays — fine for at-a-glance display; broker rejects on holidays.
+    """
+    from zoneinfo import ZoneInfo
+    NY = ZoneInfo("America/New_York")
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(NY)
+    weekday = now_et.weekday()  # Mon=0 ... Sun=6
+    minute_of_day = now_et.hour * 60 + now_et.minute
+
+    # ── US stocks ────────────────────────────────
+    us = {"label": "US Stocks", "now_et": now_et.strftime("%H:%M ET")}
+    if weekday >= 5:
+        us["status"] = "closed"
+        us["status_label"] = "Weekend"
+        us["status_color"] = "red"
+        next_open = _next_weekday_at(now_et, 0, 9, 30)  # Mon 09:30
+        us["next_event"] = {
+            "label": f"Pre-market opens {next_open.strftime('%a %H:%M ET')}",
+            "ts": next_open.isoformat(),
+            "seconds_until": int((next_open - now_et).total_seconds()),
+        }
+    elif minute_of_day < 4 * 60:
+        us["status"] = "closed"
+        us["status_label"] = "Closed"
+        us["status_color"] = "red"
+        nxt = _next_at(now_et, 4, 0)
+        us["next_event"] = {"label": "Pre-market opens 04:00 ET", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    elif minute_of_day < 9 * 60 + 30:
+        us["status"] = "pre_market"
+        us["status_label"] = "Pre-Market"
+        us["status_color"] = "yellow"
+        nxt = _next_at(now_et, 9, 30)
+        us["next_event"] = {"label": "RTH opens 09:30 ET", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    elif minute_of_day < 16 * 60:
+        us["status"] = "rth"
+        us["status_label"] = "Regular Hours"
+        us["status_color"] = "green"
+        nxt = _next_at(now_et, 16, 0)
+        us["next_event"] = {"label": "RTH closes 16:00 ET", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    elif minute_of_day < 20 * 60:
+        us["status"] = "after_hours"
+        us["status_label"] = "After-Hours"
+        us["status_color"] = "yellow"
+        # Next event = next RTH open (tomorrow weekday or Monday)
+        target_wd = 0 if weekday == 4 else (weekday + 1)  # Friday after-hours → Monday
+        nxt = _next_weekday_at(now_et, target_wd, 9, 30)
+        us["next_event"] = {"label": f"RTH opens {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    else:  # 20:00-24:00 weekday
+        us["status"] = "closed"
+        us["status_label"] = "Closed"
+        us["status_color"] = "red"
+        target_wd = 0 if weekday == 4 else (weekday + 1)
+        nxt = _next_weekday_at(now_et, target_wd, 4, 0)
+        us["next_event"] = {"label": f"Pre-market opens {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+
+    # ── FX (24/5) ────────────────────────────────
+    fx = {"label": "FX"}
+    fx_open = not (
+        (weekday == 4 and now_et.hour >= 17)  # Fri after 5pm ET
+        or weekday == 5
+        or (weekday == 6 and now_et.hour < 17)  # Sun before 5pm ET
+    )
+    if fx_open:
+        fx["status"] = "open"
+        fx["status_label"] = "Open"
+        fx["status_color"] = "green"
+        # Next close = Friday 17:00 ET
+        nxt = _next_weekday_at(now_et, 4, 17, 0)
+        fx["next_event"] = {"label": f"Closes {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    else:
+        fx["status"] = "closed"
+        fx["status_label"] = "Weekend Close"
+        fx["status_color"] = "red"
+        nxt = _next_weekday_at(now_et, 6, 17, 0)  # Next Sun 17:00
+        fx["next_event"] = {"label": f"Reopens {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+
+    # ── CME Futures ───────────────────────────────
+    fut = {"label": "CME Futures"}
+    fut_open = not (
+        (weekday == 4 and now_et.hour >= 17)  # Fri after 5pm
+        or weekday == 5
+        or (weekday == 6 and now_et.hour < 18)  # Sun before 6pm
+        or now_et.hour == 17  # Daily 5-6 PM maintenance break
+    )
+    if fut_open:
+        fut["status"] = "open"
+        fut["status_label"] = "Open"
+        fut["status_color"] = "green"
+        nxt = _next_at(now_et, 17, 0)  # Next 5pm break
+        fut["next_event"] = {"label": "Daily break 17:00-18:00 ET", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    elif weekday == 4 and now_et.hour >= 17:
+        fut["status"] = "closed"
+        fut["status_label"] = "Weekend Close"
+        fut["status_color"] = "red"
+        nxt = _next_weekday_at(now_et, 6, 18, 0)  # Sun 6pm
+        fut["next_event"] = {"label": f"Reopens {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    elif weekday == 5 or (weekday == 6 and now_et.hour < 18):
+        fut["status"] = "closed"
+        fut["status_label"] = "Weekend Close"
+        fut["status_color"] = "red"
+        nxt = _next_weekday_at(now_et, 6, 18, 0)
+        fut["next_event"] = {"label": f"Reopens {nxt.strftime('%a %H:%M ET')}", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+    else:  # 17:00-18:00 daily break
+        fut["status"] = "break"
+        fut["status_label"] = "Maintenance Break"
+        fut["status_color"] = "yellow"
+        nxt = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        fut["next_event"] = {"label": "Reopens 18:00 ET", "ts": nxt.isoformat(), "seconds_until": int((nxt - now_et).total_seconds())}
+
+    return {
+        "now_utc": now_utc.isoformat(),
+        "now_et": now_et.isoformat(),
+        "now_et_display": now_et.strftime("%a %Y-%m-%d %H:%M:%S ET"),
+        "us_stocks": us,
+        "fx": fx,
+        "futures": fut,
+    }
+
+
+@app.get("/api/market_clock")
+async def api_market_clock():
+    """Live market session status for US stocks, FX, and CME futures, with
+    next-event countdowns. Used by the dashboard top-of-page market clock widget."""
+    return JSONResponse(_market_clock_snapshot())
+
+
+@app.get("/api/halt_status")
+async def api_halt_status():
+    """Returns whether the fleet kill-switch is engaged and the stated reason."""
+    from helio.ibkr_execution import is_fleet_halted, HALT_FLAG_PATH
+    halted, reason = is_fleet_halted()
+    set_at = None
+    if halted and HALT_FLAG_PATH.exists():
+        try:
+            set_at = datetime.fromtimestamp(HALT_FLAG_PATH.stat().st_mtime, tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+    return JSONResponse({
+        "halted": halted,
+        "reason": reason,
+        "set_at": set_at,
+        "flag_path": str(HALT_FLAG_PATH),
+    })
+
+
+@app.post("/api/halt_fleet")
+async def api_halt_fleet(request: Request):
+    """Engage the fleet kill-switch. Writes HALT.flag with the supplied reason.
+    All forge runners refuse new entries while the flag exists; existing
+    positions can still exit normally. Resume via POST /api/resume_fleet."""
+    from helio.ibkr_execution import HALT_FLAG_PATH
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = (body.get("reason") if isinstance(body, dict) else None) or "halted via API (no reason given)"
+    HALT_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HALT_FLAG_PATH.write_text(reason, encoding="utf-8")
+    return JSONResponse({"halted": True, "reason": reason, "flag_path": str(HALT_FLAG_PATH)})
+
+
+@app.post("/api/resume_fleet")
+async def api_resume_fleet():
+    """Release the fleet kill-switch by deleting HALT.flag."""
+    from helio.ibkr_execution import HALT_FLAG_PATH
+    if HALT_FLAG_PATH.exists():
+        HALT_FLAG_PATH.unlink()
+        return JSONResponse({"halted": False, "message": "HALT.flag removed; runners may submit new entries on next eval cycle"})
+    return JSONResponse({"halted": False, "message": "no HALT.flag to remove (fleet was not halted)"})
+
+
+@app.get("/api/cluster_exposure")
+async def api_cluster_exposure():
+    """Current fleet exposure by macro cluster (FX_USD_LONG, EQUITY_BETA, etc.) +
+    per-symbol totals. Caps come from helio/cluster_exposure.py — pre-trade check
+    rejects entries that would breach. Use this endpoint to monitor cluster
+    utilization (each cluster shown vs its cap)."""
+    try:
+        from helio.cluster_exposure import (
+            compute_cluster_exposure,
+            CLUSTER_CAPS,
+            SINGLE_INSTRUMENT_CAP_X,
+            TOTAL_NOTIONAL_CAP_X,
+        )
+        from helio.fleet_sizing import get_sizing_anchor_usd
+        anchor = float(get_sizing_anchor_usd())
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "cluster_utilization": [], "anchor_usd": 0})
+
+    expo = compute_cluster_exposure()
+
+    # Build a per-cluster utilization table
+    clusters = []
+    for name, mult in CLUSTER_CAPS.items():
+        cap_usd = mult * anchor
+        used = expo["by_cluster"].get(name, 0.0)
+        pct = (used / cap_usd * 100.0) if cap_usd > 0 else 0
+        clusters.append({
+            "cluster": name,
+            "cap_x_anchor": mult,
+            "cap_usd": round(cap_usd, 2),
+            "used_usd": round(used, 2),
+            "pct_used": round(pct, 1),
+        })
+    clusters.sort(key=lambda x: -x["pct_used"])  # most-utilized first
+
+    # Per-symbol single-instrument cap
+    symbols = []
+    sym_cap_usd = SINGLE_INSTRUMENT_CAP_X * anchor
+    for sym, used in sorted(expo["by_symbol"].items(), key=lambda x: -x[1]):
+        symbols.append({
+            "symbol": sym,
+            "cap_usd": round(sym_cap_usd, 2),
+            "used_usd": round(used, 2),
+            "pct_used": round((used / sym_cap_usd * 100.0) if sym_cap_usd > 0 else 0, 1),
+        })
+
+    total_cap_usd = TOTAL_NOTIONAL_CAP_X * anchor
+    return JSONResponse({
+        "anchor_usd": round(anchor, 2),
+        "total_notional_usd": round(expo["total_notional"], 2),
+        "total_cap_usd": round(total_cap_usd, 2),
+        "total_pct_used": round((expo["total_notional"] / total_cap_usd * 100.0) if total_cap_usd > 0 else 0, 1),
+        "clusters": clusters,
+        "symbols": symbols,
+        "single_instrument_cap_x": SINGLE_INSTRUMENT_CAP_X,
+        "total_notional_cap_x": TOTAL_NOTIONAL_CAP_X,
+    })
+
+
+def _derive_direction(t: dict) -> str:
+    """Resolve trade direction. Some runners (e.g. jpy_pm_short) don't store
+    an explicit `direction` field — derive it from stop_px vs entry_px:
+    stop above entry => short, stop below => long. Fall back to 'long' only
+    if neither explicit field nor px relationship is available."""
+    explicit = t.get("direction") or t.get("side")
+    if explicit in ("long", "short"):
+        return explicit
+    entry_px = t.get("entry_px")
+    stop_px = t.get("stop_px")
+    try:
+        if entry_px is not None and stop_px is not None:
+            return "short" if float(stop_px) > float(entry_px) else "long"
+    except (TypeError, ValueError):
+        pass
+    return "long"
+
+
 @app.get("/api/positions_open")
 async def api_positions_open():
     """Scan all strategy heartbeat.json files for open_trade. Returns
@@ -3564,7 +3838,7 @@ async def api_positions_open():
                     "strategy": system,
                     "entry_ts": open_trade.get("entry_ts") or open_trade.get("signal_ts") or "",
                     "entry_px": open_trade.get("entry_px"),
-                    "direction": open_trade.get("direction") or open_trade.get("side") or "long",
+                    "direction": _derive_direction(open_trade),
                     "size": open_trade.get("position_size") or open_trade.get("size"),
                     "risk_usd": open_trade.get("risk_usd"),
                     "target_px": open_trade.get("target_px"),
@@ -3578,7 +3852,7 @@ async def api_positions_open():
                         "instrument": key,
                         "entry_ts": t.get("entry_ts") or "",
                         "entry_px": t.get("entry_px"),
-                        "direction": t.get("direction") or "long",
+                        "direction": _derive_direction(t),
                         "size": t.get("position_size") or t.get("size"),
                         "risk_usd": t.get("risk_usd"),
                         "target_px": t.get("target_px"),
@@ -6010,6 +6284,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+<!-- Halt-status banner — appears only when fleet is halted, top-of-page -->
+<div id="halt-banner" style="display:none;margin-bottom:10px;"></div>
+
+<!-- Market clock widget — top-of-page, 2026-04-27 -->
+<div id="market-clock-bar" style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;margin-bottom:10px;font-size:0.78em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+  <span style="color:#7b8ab8;">Loading market clock...</span>
+</div>
+
 <div style="display:flex; justify-content:space-between; align-items:center;">
   <div style="display:flex;align-items:center;gap:16px;">
     <h1 style="margin:0;">HELIO FLEET DASHBOARD</h1>
@@ -6018,6 +6300,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
   <span id="connection-status" style="color:#00ff88;font-size:0.7em;">IBKR STAGED</span>
 </div>
+
+<script>
+// ─── MARKET CLOCK ───────────────────────────────────────────────────
+// Refreshes from server every 60s; ticks the countdown locally every 1s.
+let _marketClockData = null;
+let _marketClockFetchedAt = 0;
+const COLOR_MAP = {green:'#00e676', yellow:'#ffaa00', red:'#ff4444'};
+function fmtCountdown(secs) {
+  if (secs == null || secs < 0) return '—';
+  if (secs < 60) return secs + 's';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h >= 24) return Math.floor(h/24) + 'd ' + (h%24) + 'h';
+  if (h > 0) return h + 'h ' + String(m).padStart(2,'0') + 'm';
+  return m + 'm ' + String(secs % 60).padStart(2,'0') + 's';
+}
+function renderMarketClock() {
+  const el = document.getElementById('market-clock-bar');
+  if (!el || !_marketClockData) return;
+  const elapsed = Math.floor((Date.now() - _marketClockFetchedAt) / 1000);
+  const m = _marketClockData;
+  const blocks = [];
+  for (const key of ['us_stocks','fx','futures']) {
+    const mk = m[key]; if (!mk) continue;
+    const dot = '<span style="color:'+COLOR_MAP[mk.status_color]+';font-weight:bold;">●</span>';
+    const remaining = mk.next_event ? Math.max(0, mk.next_event.seconds_until - elapsed) : null;
+    const event = mk.next_event ? '<span style="color:#7b8ab8;">→ '+mk.next_event.label+' (in '+fmtCountdown(remaining)+')</span>' : '';
+    blocks.push('<span style="white-space:nowrap;">'+dot+' <span style="color:#e0e0e0;font-weight:bold;">'+mk.label+':</span> <span style="color:'+COLOR_MAP[mk.status_color]+';">'+mk.status_label+'</span> '+event+'</span>');
+  }
+  el.innerHTML = blocks.join('<span style="color:#1e2a42;">|</span>')
+    + '<span style="color:#7b8ab8;font-size:0.85em;margin-left:auto;">'+m.now_et_display+'</span>';
+}
+function loadMarketClock() {
+  fetch('/api/market_clock').then(r=>r.json()).then(data=>{
+    _marketClockData = data;
+    _marketClockFetchedAt = Date.now();
+    renderMarketClock();
+  }).catch(()=>{});
+}
+loadMarketClock();
+setInterval(loadMarketClock, 60000);   // re-fetch every 60s
+setInterval(renderMarketClock, 1000);  // tick countdown every 1s (no network)
+
+// ─── HALT BANNER ───────────────────────────────────────────────────
+function loadHaltStatus() {
+  fetch('/api/halt_status').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('halt-banner');
+    if (!el) return;
+    if (!d.halted) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    const setAt = d.set_at ? new Date(d.set_at).toLocaleString() : 'unknown';
+    el.innerHTML = '<div style="background:#3a0a0a;border:2px solid #ff4444;border-radius:6px;padding:12px 18px;color:#ffe;font-size:0.9em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
+      + '<div><span style="color:#ff4444;font-weight:bold;letter-spacing:2px;font-size:1.05em;">⛔ FLEET HALTED</span>'
+      + ' <span style="color:#ffaaaa;margin-left:12px;">no new entries will be submitted</span></div>'
+      + '<button onclick="resumeFleet()" style="background:#1a3a1a;border:1px solid #00ff88;color:#00ff88;padding:6px 14px;border-radius:4px;cursor:pointer;font-weight:bold;letter-spacing:1px;font-size:0.85em;">RESUME FLEET</button>'
+      + '</div>'
+      + '<div style="margin-top:6px;color:#ffe;"><b>Reason:</b> ' + (d.reason || '(none)') + '</div>'
+      + '<div style="margin-top:2px;color:#ffaaaa;font-size:0.85em;">Engaged at: ' + setAt + '</div>'
+      + '</div>';
+  }).catch(()=>{});
+}
+function resumeFleet() {
+  if (!confirm('Resume fleet? Runners will be allowed to submit new entries on next eval cycle.')) return;
+  fetch('/api/resume_fleet', {method:'POST'}).then(r=>r.json()).then(d=>{
+    alert(d.message || 'Fleet resumed.');
+    loadHaltStatus();
+  });
+}
+loadHaltStatus();
+setInterval(loadHaltStatus, 10000);  // re-check every 10s
+</script>
 
 <!-- Governance health bar moved to top 2026-04-23 (was inside #ibkr-page section) -->
 <div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;margin:10px 0;" id="governance-health-bar">
@@ -6973,11 +7327,15 @@ function loadStrategyPerformance() {
     const pnlColorTotal = (livePnlByUnit['$'] || 0) + (livePnlByUnit['pips'] || 0) >= 0 ? '#00ff88' : '#ff4444';
     const riskStr = riskUsdTotal > 0 ? '$' + riskUsdTotal.toLocaleString(undefined,{maximumFractionDigits:0}) : '—';
 
+    // 13 cells must match the data rows above (system, strategy, exitBar, promCell,
+    // risk%, BT PF, BT Trades, BT WR, Live Trades, Live WR, Live PnL, Confidence, Status).
+    // Was missing the BT PF column → shifted every total one cell left of its header.
     html += '<tr style="border-top:2px solid #00d4ff;background:#0d1321;font-weight:bold;">'
       + '<td style="padding:10px 8px;color:#00d4ff;letter-spacing:1px;">FLEET TOTAL</td>'
       + '<td style="padding:10px 8px;color:#7b8ab8;font-weight:normal;font-size:0.85em;">(' + strategies.length + ' strategies)</td>'
       + '<td style="padding:10px 8px;color:#7b8ab8;">—</td>'
       + '<td style="padding:10px 8px;color:#7b8ab8;">—</td>'
+      + '<td style="padding:10px 8px;text-align:right;color:#7b8ab8;">—</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#7b8ab8;">—</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#fff;">' + btTradesTotal.toLocaleString() + '</td>'
       + '<td style="padding:10px 8px;text-align:right;color:#9da8c7;">' + btWrAvg + '</td>'

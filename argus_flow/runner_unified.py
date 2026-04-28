@@ -2228,12 +2228,60 @@ class InstrumentRunner:
 
     # ── Real execution helpers (gated behind execution_mode == "real") ──
     def _submit_real_entry(self, direction: str, size: float, stop_px: float, target_px: float) -> bool:
-        """Submit a market order for real entry. Returns True on success."""
+        """Submit a market order for real entry. Returns True on success.
+
+        Pre-trade guards (mirrors helio/ibkr_execution.py:submit_bracket):
+          1. Fleet kill-switch (HALT.flag)
+          2. FX IdealPro minimum ($25K USD-equivalent)
+          3. Cluster exposure cap (per-instrument + macro cluster + total notional)
+        """
         s = self.state
         ib = getattr(self, '_ib', None)
         if ib is None:
             self._log.error("REAL_ENTRY FAILED: no IB reference on runner")
             return False
+
+        # Guard 1: fleet halt
+        try:
+            from helio.ibkr_execution import is_fleet_halted
+            halted, halt_reason = is_fleet_halted()
+            if halted:
+                self._log.warning(f"FLEET_HALTED: refusing entry {direction} {size} {self.symbol}. Reason: {halt_reason}")
+                return False
+        except Exception:
+            pass
+
+        # Guard 2: FX IdealPro min — argus only trades FX, so always check
+        try:
+            from helio.ibkr_execution import _fx_usd_notional, IDEALPRO_MIN_USD
+            entry_px_est = float(stop_px)  # rough estimate; for FX, stop is within ~10 pips of entry
+            usd_notional = _fx_usd_notional(self.symbol, float(size), entry_px_est)
+            if 0 < usd_notional < IDEALPRO_MIN_USD:
+                self._log.warning(
+                    f"FX_BELOW_IDEALPRO_MIN: refusing {direction} {size} {self.symbol} "
+                    f"(~${usd_notional:,.0f} < ${IDEALPRO_MIN_USD:,} IdealPro min) — would route as odd-lot"
+                )
+                return False
+        except Exception as exc:
+            self._log.warning(f"FX min check failed (allowing trade): {exc}")
+
+        # Guard 3: cluster exposure cap
+        try:
+            from helio.cluster_exposure import would_breach_cluster_cap
+            entry_px_est = float(stop_px)
+            from helio.ibkr_execution import _fx_usd_notional as _est
+            est_notional = _est(self.symbol, float(size), entry_px_est)
+            if est_notional > 0:
+                breach = would_breach_cluster_cap(self.symbol, direction, est_notional)
+                if breach:
+                    self._log.warning(
+                        f"CLUSTER_CAP_BREACH: {breach} would exceed cap on "
+                        f"{direction} {size} {self.symbol} (~${est_notional:,.0f}). Refusing entry."
+                    )
+                    return False
+        except Exception as exc:
+            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+
         try:
             action = "BUY" if direction == "long" else "SELL"
             # ib_insync MarketOrder: totalQuantity must be positive
@@ -2270,21 +2318,31 @@ class InstrumentRunner:
             # Closing action is opposite of position
             close_action = "SELL" if s.position == "LONG" else "BUY"
 
-            # Stop order (protective)
+            # OCA group — when one bracket leg fills, the other auto-cancels.
+            # Mirrors the fix in helio/ibkr_execution.py (2026-04-27): without
+            # OCA, both stop AND target can fill on the same bar = unintended
+            # opposite-direction position.
+            oca_group = f"oca_{self.symbol}_{s.entry_order_id}_{int(time.time() * 1000) % 1_000_000}"
+
+            # Stop order (protective) — OCA leg A
             stop_order = StopOrder(close_action, abs(size), round(stop_px, 5))
+            stop_order.ocaGroup = oca_group
+            stop_order.ocaType = 1  # cancel all remaining orders with block
             stop_order.account = getattr(self, 'stage_account', '') or ''
             stop_trade = ib.placeOrder(self.contract, stop_order)
             s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
 
-            # Target limit order
+            # Target limit order — OCA leg B
             limit_order = LimitOrder(close_action, abs(size), round(target_px, 5))
+            limit_order.ocaGroup = oca_group
+            limit_order.ocaType = 1
             limit_order.account = getattr(self, 'stage_account', '') or ''
             target_trade = ib.placeOrder(self.contract, limit_order)
             s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
 
             s.save()
             self._log.info(
-                f"BRACKET SUBMITTED {self.symbol} "
+                f"BRACKET SUBMITTED {self.symbol} oca={oca_group} "
                 f"stop_orderId={s.stop_order_id} @ {stop_px:.5f} | "
                 f"target_orderId={s.target_order_id} @ {target_px:.5f}"
             )

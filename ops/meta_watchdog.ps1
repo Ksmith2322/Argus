@@ -1,4 +1,4 @@
-# ops/meta_watchdog.ps1 — supervisor for the supervisors.
+# ops/meta_watchdog.ps1 - supervisor for the supervisors.
 #
 # Purpose: the primary watchdog.ps1 and fleet_monitor.py can themselves die
 # (2026-03-31 incident: watchdog exited with Last Result 1 and stayed dead
@@ -32,7 +32,7 @@ Log "=== meta_watchdog check ==="
 
 # 1) Is watchdog.ps1 running?
 if (-not (IsProcessRunning 'watchdog\.ps1')) {
-    Log "watchdog.ps1 is NOT running — restarting"
+    Log "watchdog.ps1 is NOT running - restarting"
     Start-Process -FilePath "powershell.exe" -ArgumentList @(
         "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass",
         "-File", "C:\Argus\repo\ops\watchdog.ps1"
@@ -49,7 +49,7 @@ if (-not (IsProcessRunning 'watchdog\.ps1')) {
 
 # 2) Is fleet_monitor running?
 if (-not (IsProcessRunning 'helio\.fleet_monitor')) {
-    Log "helio.fleet_monitor is NOT running — restarting"
+    Log "helio.fleet_monitor is NOT running - restarting"
     Start-Process -FilePath "C:\Argus\.venv\Scripts\python.exe" -ArgumentList @(
         "-m", "helio.fleet_monitor", "--interval-s", "60", "--no-restart"
     ) -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
@@ -65,7 +65,7 @@ if (-not (IsProcessRunning 'helio\.fleet_monitor')) {
 
 # 3) Is the runner itself running? (last-resort defense if watchdog is wedged)
 if (-not (IsProcessRunning 'argus_flow\.runner_unified')) {
-    Log "runner_unified is NOT running — flagging only (watchdog should restart it)"
+    Log "runner_unified is NOT running - flagging only (watchdog should restart it)"
     # Don't restart here; let watchdog handle it. Just surface the fact.
 }
 

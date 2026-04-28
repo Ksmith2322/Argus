@@ -20,7 +20,7 @@ Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC" -ForegroundColor Gr
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ── PRE-FLIGHT CHECKS ──────────────────────────────────────
+# -- PRE-FLIGHT CHECKS --------------------------------------
 
 Write-Host "--- Pre-Flight Checks ---" -ForegroundColor Yellow
 
@@ -38,7 +38,7 @@ Write-Host "  [3/3] Correlation guard..." -ForegroundColor Gray
 
 Write-Host ""
 
-# ── LAUNCH RUNNERS ──────────────────────────────────────────
+# -- LAUNCH RUNNERS ------------------------------------------
 
 Write-Host "--- Launching Runners ---" -ForegroundColor Yellow
 Write-Host "  1. EUR/USD  (clientId=10) - T4 full stack" -ForegroundColor Green
@@ -59,7 +59,7 @@ Start-Sleep -Seconds 3
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$repoRoot'; `$Host.UI.RawUI.WindowTitle = 'IBKR-GBPUSD'; Write-Host 'GBP/USD Runner' -ForegroundColor Cyan; & '$pyExe' -m argus_flow.runner_gbpusd" -WindowStyle Normal
 Write-Host "  [OK] GBP/USD started" -ForegroundColor Green
 
-# ── POST-LAUNCH HEALTH CHECK ───────────────────────────────
+# -- POST-LAUNCH HEALTH CHECK -------------------------------
 
 Write-Host ""
 Write-Host "Waiting 30s for runners to initialize..." -ForegroundColor Gray
@@ -69,14 +69,14 @@ Write-Host ""
 Write-Host "--- Post-Launch Health Check ---" -ForegroundColor Yellow
 & $pyExe -m argus_flow.ops.heartbeat_monitor 2>&1 | ForEach-Object { Write-Host "  $_" }
 
-# ── DISCORD WATCHER ─────────────────────────────────────────
+# -- DISCORD WATCHER -----------------------------------------
 
 Write-Host ""
 Write-Host "Starting Discord trade watcher in background..." -ForegroundColor Gray
 Start-Process powershell -ArgumentList "-WindowStyle", "Hidden", "-Command", "Set-Location '$repoRoot'; & '$pyExe' -m argus_flow.ops.discord_alerts --watch" -WindowStyle Hidden
 Write-Host "  [OK] Discord watcher started" -ForegroundColor Green
 
-# ── SUMMARY ─────────────────────────────────────────────────
+# -- SUMMARY -------------------------------------------------
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan

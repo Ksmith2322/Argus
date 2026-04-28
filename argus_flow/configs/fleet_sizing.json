@@ -22,12 +22,12 @@
   "strategy_live_cutoffs": {},
 
   "notional_caps_by_asset_class": {
-    "stock": 1.0,
-    "etf":   1.0,
-    "fx":    20.0,
-    "micro_future": 5.0
+    "stock": 0.3,
+    "etf":   0.3,
+    "fx":    1.0,
+    "micro_future": 2.0
   },
-  "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Prevents sizing that would fail on a real funded account even if risk math says OK. 2026-04-24: stock+etf tightened 2.0→1.0 per user feedback — $10K account shouldn't hold $23K positions. FX stays at 20.0 (pip-stops make leveraged FX safe); micro_future stays at 5.0 (futures margin is ~10% notional).",
+  "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Hard ceiling expressed as % of equity for stock/etf/fx. Futures get higher multiplier because they're risk-managed by margin (~10% of notional), not raw notional — 1 MNQ contract is ~$54K notional but only ~$5.4K margin = 18% of $30K equity. v8 (2026-04-27): bumped micro_future 0.5→2.0 to allow 1 contract on $30K anchor; otherwise nq_overnight, nq_london_close, mamba/tori/cuebanks couldn't trade at all. Stock/etf 0.3× and fx 1.0× kept tight for survival-first.",
 
-  "version": "2026-04-24.v6"
+  "version": "2026-04-27.v8"
 }

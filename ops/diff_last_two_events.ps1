@@ -1,4 +1,4 @@
-﻿# ops/diff_last_two_events.ps1
+# ops/diff_last_two_events.ps1
 $ErrorActionPreference = "Stop"
 
 $logs = "C:\Argus\repo\ops\logs"

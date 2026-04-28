@@ -126,7 +126,37 @@ class IBKRExecutor:
         """Submit a bracket order: entry + stop loss + take profit.
 
         Returns the parent order ID on success, None on failure.
+
+        Pre-trade guards (mirrors helio/ibkr_execution.py:submit_bracket):
+          1. Fleet kill-switch (HALT.flag) — refuses entries when fleet is halted
+          2. Cluster exposure cap — refuses entries that would breach
+        OCO bracket structure is already correct (uses ib_insync.bracketOrder).
         """
+        # Guard 1: fleet halt
+        try:
+            from helio.ibkr_execution import is_fleet_halted
+            halted, halt_reason = is_fleet_halted()
+            if halted:
+                self._log.warning(f"FLEET_HALTED: refusing {direction} {quantity} {symbol}. Reason: {halt_reason}")
+                return None
+        except Exception:
+            pass
+
+        # Guard 2: cluster exposure cap
+        try:
+            from helio.cluster_exposure import would_breach_cluster_cap
+            est_notional = float(quantity) * float(entry_price)
+            if est_notional > 0:
+                breach = would_breach_cluster_cap(symbol, direction.lower(), est_notional)
+                if breach:
+                    self._log.warning(
+                        f"CLUSTER_CAP_BREACH: {breach} would exceed cap on "
+                        f"{direction} {quantity} {symbol} (~${est_notional:,.0f}). Refusing entry."
+                    )
+                    return None
+        except Exception as exc:
+            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+
         try:
             contract = Stock(symbol, "SMART", "USD")
             self._ib.qualifyContracts(contract)

@@ -90,11 +90,11 @@ function Invoke-QueueJob {
     try {
         Write-QueueLog "START: $label"
 
-        # Run backtest (always single-run for queue jobs — no determinism check needed)
+        # Run backtest (always single-run for queue jobs - no determinism check needed)
         Write-Host "  Running run_backtest.ps1 -SingleRun"
         & "$repoRoot\ops\run_backtest.ps1" -SingleRun
 
-        # Get the run ID from latest summary — must be newer than job start
+        # Get the run ID from latest summary - must be newer than job start
         $latestSummary = Get-ChildItem "$repoRoot\ops\logs" -Filter "bt_summary_bt_*.json" |
             Where-Object { $_.Name -notmatch "latest" -and $_.LastWriteTime -ge $startTime } |
             Sort-Object LastWriteTime -Descending |
@@ -103,7 +103,7 @@ function Invoke-QueueJob {
             $runId = $latestSummary.BaseName -replace "bt_summary_", ""
             $jobSuccess = $true
         } else {
-            # No new summary created — job failed silently
+            # No new summary created - job failed silently
             $jobSuccess = $false
             Write-Host "  WARNING: No new summary file created (backtest may have crashed)" -ForegroundColor Yellow
         }

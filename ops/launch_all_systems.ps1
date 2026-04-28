@@ -44,7 +44,7 @@ function Test-SystemRunning([string]$pattern) {
 
 Log "=== Helio Fleet Launch ($(if ($Live) {'LIVE'} else {'PAPER'})) ==="
 
-# 1. Argus (FX intraday) — already running, just check
+# 1. Argus (FX intraday) - already running, just check
 $argusRunning = Test-SystemRunning "runner_unified"
 if (-not $argusRunning) {
     Log "Argus not running, starting..."
@@ -87,7 +87,7 @@ if (-not (Test-SystemRunning "apollo\.runner")) {
     Log "Apollo already running, skipping"
 }
 
-# 5. Ares is monthly — runs via nightly cohort report, not as a daemon
+# 5. Ares is monthly - runs via nightly cohort report, not as a daemon
 Log "Ares: runs via nightly cohort report (monthly cadence, no daemon needed)"
 
 # 6. Fleet Monitor (watchdog + heartbeat checker + snapshot)

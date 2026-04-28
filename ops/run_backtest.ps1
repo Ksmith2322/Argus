@@ -1,4 +1,4 @@
-﻿# ops/run_backtest.ps1
+# ops/run_backtest.ps1
 param(
     [switch]$SingleRun   # skip Run 2 + determinism check (for comparison tests)
 )
@@ -150,7 +150,7 @@ function Assert-EquityArtifact {
     # line above: param(
     $p = Join-Path $logsDir ("equity_{0}.csv" -f $runId)
     if (!(Test-Path $p)) {
-        # BT_LITE_MODE skips equity CSV — not an error
+        # BT_LITE_MODE skips equity CSV - not an error
         # Check both process env and .env file (Python dotenv loads .env, PS doesn't)
         $liteMode = $env:BT_LITE_MODE
         if (-not $liteMode) {
@@ -216,7 +216,7 @@ function Normalize-TextForDeterminism {
     # Common timestamp patterns (best-effort): ISO-8601 Z stamps and +00:00 offset
     $t = [regex]::Replace($t, "\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})", "<TSZ>")
 
-    # Bare dates (YYYY-MM-DD) not already part of a timestamp — catches RISK_DAY_RESET wall-clock leak
+    # Bare dates (YYYY-MM-DD) not already part of a timestamp - catches RISK_DAY_RESET wall-clock leak
     $t = [regex]::Replace($t, "\b\d{4}-\d{2}-\d{2}\b", "<DATE>")
 
     # git_sha and config_hash can change if a commit lands between Run 1 and Run 2

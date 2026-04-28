@@ -244,6 +244,7 @@ def _open(state: dict, df: pd.DataFrame, direction: str, ctx: dict, ib=None) -> 
             result = ibkr.submit_bracket(
                 ib, contract, direction=direction, size=pos_size,
                 stop_px=stop, target_px=target, price_decimals=5,
+                est_entry_px=plan_entry,
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
@@ -350,6 +351,10 @@ def evaluate_once() -> None:
                     ib.qualifyContracts(contract)
                     outcome = ibkr.check_bracket_filled(
                         ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
+                        entry_direction=ot.get("direction"),
+                        entry_size=ot.get("position_size") or ot.get("size"),
+                        stop_px=ot.get("stop_px"),
+                        target_px=ot.get("target_px"),
                     )
                 except Exception as exc:
                     log.error("bracket check failed: %s", exc)

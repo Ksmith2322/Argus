@@ -75,7 +75,7 @@ try {
         exit 1
     }
 
-    # Step 2: Login with MD5(password + nonce) — matches gateway's hashpwd() JS
+    # Step 2: Login with MD5(password + nonce) - matches gateway's hashpwd() JS
     if ($nonce) {
         Write-Log "Computing hash and logging in..."
         $hashPassword = Get-MD5Hash -Text ($Password + $nonce)
@@ -93,10 +93,10 @@ try {
             -WebSession $session -UseBasicParsing -TimeoutSec 15
 
         if ($loginResult.Content -match 'wl80211on') {
-            Write-Log "Login successful — on config page"
+            Write-Log "Login successful - on config page"
             $configPage = $loginResult
         } elseif ($loginResult.Content -match 'Access Code Required') {
-            Write-Log "ERROR: Login failed — authentication rejected"
+            Write-Log "ERROR: Login failed - authentication rejected"
             exit 1
         } else {
             # Try fetching config page with session cookies
@@ -118,7 +118,7 @@ try {
         -WebSession $session -UseBasicParsing -TimeoutSec 15
 
     if ($result24.Content -match "Changes saved") {
-        Write-Log "2.4GHz radio: $WifiValue — Changes saved"
+        Write-Log "2.4GHz radio: $WifiValue - Changes saved"
     } elseif ($result24.Content -match 'wl80211on') {
         Write-Log "2.4GHz radio: submitted (checking state...)"
         # Verify the select value
@@ -138,7 +138,7 @@ try {
         -WebSession $session -UseBasicParsing -TimeoutSec 15
 
     if ($result5.Content -match "Changes saved") {
-        Write-Log "5GHz radio: $WifiValue — Changes saved"
+        Write-Log "5GHz radio: $WifiValue - Changes saved"
     } elseif ($result5.Content -match 'wl80211on_5') {
         Write-Log "5GHz radio: submitted"
     } else {

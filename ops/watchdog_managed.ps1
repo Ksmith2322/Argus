@@ -111,7 +111,7 @@ function Test-LockMetadataProcessAlive([string]$metaPath, [string]$expectedKind 
 
 function Get-AliveRunnerLocks() {
     $results = @()
-    # Only scan Argus runner locks — Helio family (helio_*, apollo_*, hermes_*) are managed separately
+    # Only scan Argus runner locks - Helio family (helio_*, apollo_*, hermes_*) are managed separately
     $lockFiles = Get-ChildItem "argus_flow/logs/_locks" -Filter "runner_*.json" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch "^(helio|apollo|hermes)_" }
     foreach ($file in $lockFiles) {
         try {
@@ -483,7 +483,7 @@ while ($true) {
         $script:maxRestartAlertSent = $false
     }
 
-    # ── Helio family supervision (Apollo, Hermes, Helio swing) ──────────
+    # -- Helio family supervision (Apollo, Hermes, Helio swing) ----------
     # Check every 5 minutes. Restart dead runners. Uses heartbeat staleness.
     $helioCheckInterval = 300
     if (((Get-Date) - $script:helioLastCheck).TotalSeconds -ge $helioCheckInterval) {
@@ -546,7 +546,7 @@ while ($true) {
         $script:portWarnSent = $false
     }
 
-    # IB Gateway / TWS process supervision — fail-closed on sustained outage
+    # IB Gateway / TWS process supervision - fail-closed on sustained outage
     $gatewayAlive = $false
     try {
         $twsProc = Get-Process -Name "tws" -ErrorAction SilentlyContinue
