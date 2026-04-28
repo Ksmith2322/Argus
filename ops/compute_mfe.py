@@ -207,6 +207,17 @@ def main(window_days: int = 30) -> int:
             mfe_safe = max(abs(mfe_distance), 1e-9)
             capture_ratio = realized_distance / mfe_safe   # 1.0 = exited at peak; <1 = left money on table; <0 = stopped
 
+            # MFE/MAE ratio: undefined when trade never went adverse (mae_distance <= 0)
+            # or when MAE is so tiny the ratio is meaningless. Cap at 20× to prevent
+            # near-zero MAE producing absurd values (the 10⁷ class of bug).
+            MAX_MFE_MAE = 20.0
+            MIN_MAE = 1e-6
+            if mae_distance <= MIN_MAE:
+                mfe_to_mae_ratio: float | None = None  # never went adverse
+            else:
+                raw = mfe_distance / mae_distance
+                mfe_to_mae_ratio = round(min(raw, MAX_MFE_MAE), 3) if raw > 0 else round(raw, 3)
+
             by_strategy.setdefault(strat, []).append({
                 "symbol": symbol,
                 "direction": direction,
@@ -216,7 +227,7 @@ def main(window_days: int = 30) -> int:
                 "mae_distance": round(mae_distance, 6),
                 "realized_distance": round(realized_distance, 6),
                 "capture_ratio": round(capture_ratio, 4),
-                "mfe_to_mae_ratio": round(mfe_distance / max(mae_distance, 1e-9), 3),
+                "mfe_to_mae_ratio": mfe_to_mae_ratio,
                 "n_bars": mfe["n_bars"],
             })
 
@@ -235,8 +246,10 @@ def main(window_days: int = 30) -> int:
         partial   = sum(1 for c in captures if 0 < c < 0.50)
         scratch   = sum(1 for c in captures if -0.10 <= c <= 0)
         adverse   = sum(1 for c in captures if c < -0.10)
-        # Average MFE-to-MAE ratio (how often did the trade go favorable BEFORE going adverse)
-        mfe_mae_avg = sum(t["mfe_to_mae_ratio"] for t in trades) / n
+        # Average MFE-to-MAE ratio over trades where MAE was defined (skip None)
+        mfe_mae_vals = [t["mfe_to_mae_ratio"] for t in trades if t["mfe_to_mae_ratio"] is not None]
+        n_mae_valid = len(mfe_mae_vals)
+        mfe_mae_avg = (sum(mfe_mae_vals) / n_mae_valid) if n_mae_valid else None
         rows.append({
             "strategy": strat,
             "n": n,
@@ -247,7 +260,9 @@ def main(window_days: int = 30) -> int:
             "partial_pct":   round(partial / n * 100, 1),
             "scratch_pct":   round(scratch / n * 100, 1),
             "adverse_pct":   round(adverse / n * 100, 1),
-            "mean_mfe_to_mae": round(mfe_mae_avg, 3),
+            "mean_mfe_to_mae": round(mfe_mae_avg, 3) if mfe_mae_avg is not None else None,
+            "n_mae_valid": n_mae_valid,
+            "n_mae_undefined": n - n_mae_valid,
             # Per-trade detail for drill-down (capped at 100 trades to keep file size sane)
             "trades": trades[-100:],
         })

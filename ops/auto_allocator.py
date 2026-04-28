@@ -45,7 +45,7 @@ RECOMMENDATION = {
     "HOLD":     1.0,    # auto-OK
     "REDUCE":   0.5,    # auto-OK (conservative)
     "KILL":     None,   # manual only — terminal action
-    "IGNORE":   None,   # no recommendation
+    "OBSERVE":  None,   # insufficient sample — observe, no recommendation
 }
 
 

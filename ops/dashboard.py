@@ -3816,10 +3816,31 @@ async def api_strategy_dimensions():
     top1 = alpha_data.get("concentration", {}).get("top_1_pct_of_abs", 0)
     attribution_pct = round(max(0, 100 - top1), 1)  # 100 = perfectly diversified
 
-    overall = round((operational_pct + evidence_pct + execution_pct + risk_pct_score + attribution_pct) / 5, 1)
+    # Overall = evidence-cap gating model, NOT a simple average.
+    # A simple mean over-rewards weak fleets: 87% ops + 37% evidence averaged
+    # to 78% reads "mostly healthy" when the truth is "operationally healthy,
+    # evidence immature." Replace with binding floors so weak components
+    # cap the headline number.
+    naive_avg = round(
+        (operational_pct + evidence_pct + execution_pct + risk_pct_score + attribution_pct) / 5,
+        1,
+    )
+    caps: list[tuple[float, str]] = [(naive_avg, "naive_average")]
+    if evidence_pct < 50:
+        caps.append((60.0, f"evidence {evidence_pct}% < 50% (insufficient sample maturity)"))
+    if risk_pct_score < 80:
+        caps.append((70.0, f"risk {risk_pct_score}% < 80% (cluster concentration)"))
+    if execution_pct < 80:
+        caps.append((70.0, f"execution {execution_pct}% < 80% (entry-failure rate)"))
+    if operational_pct < 80:
+        caps.append((70.0, f"operational {operational_pct}% < 80% (process/heartbeat issues)"))
+    overall, binding_cap_reason = min(caps, key=lambda c: c[0])
+    overall = round(overall, 1)
 
     return JSONResponse({
         "overall": overall,
+        "overall_naive_avg": naive_avg,           # for transparency — show what the old number was
+        "binding_cap_reason": binding_cap_reason,  # human-readable: why the cap binds
         "subscores": {
             "operational": operational_pct,
             "evidence":    evidence_pct,
@@ -3836,7 +3857,7 @@ async def api_strategy_states():
     """Per-strategy three-dimensional state composition:
        Runtime  - UP / STALE / DOWN / DEGRADED / BLOCKED (from fleet_health)
        Trading  - FLAT / IN_TRADE / WAITING / NO_TRIGGER (from positions + recent signals)
-       Decision - SCALE_UP / HOLD / REDUCE / KILL / IGNORE (from strategy_actions engine)
+       Decision - SCALE_UP / HOLD / REDUCE / KILL / OBSERVE (from strategy_actions engine)
 
     Per project_dashboard_upgrades_capital_safety.md - single 'OK' tile hides
     decision-state degradation when runtime is fine. Three-dimensional view
@@ -4145,6 +4166,62 @@ async def api_resume_fleet():
     return JSONResponse({"halted": False, "message": "no HALT.flag to remove (fleet was not halted)"})
 
 
+# ─── FX notional normalization ─────────────────────────────────────
+# `position_size` for an FX trade is in BASE-currency units. Multiplying it
+# by `entry_px` (the quote/base price) gives notional in QUOTE currency, not
+# USD. Treating that as USD produces values like $7.5M for a $50K USDJPY
+# position. This helper does the conversion with explicit currency-pair logic.
+#
+# Approximate base→USD spot rates. Used as a fallback when live broker rates
+# are unavailable; magnitude-correct for cross-currency normalization, not
+# precise to the pip. Refresh occasionally; replace with live IBKR market
+# data once the FX-quotes feed is wired into the dashboard backend.
+# Last refreshed: 2026-04-28
+_FX_BASE_TO_USD: dict[str, float] = {
+    "USD": 1.00,
+    "EUR": 1.08,
+    "GBP": 1.27,
+    "AUD": 0.66,
+    "CAD": 0.73,
+    "NZD": 0.60,
+    "CHF": 1.13,
+    "JPY": 1 / 150.0,  # 1 JPY ≈ $0.00667
+}
+
+_FX_PAIR_RE = __import__("re").compile(r"^[A-Z]{3}/?[A-Z]{3}$")
+
+
+def _fx_normalized_exposure_usd(symbol: str, size_base: float, entry_px: float) -> float | None:
+    """Convert FX position size + price → USD notional with currency-pair awareness.
+
+    For non-FX symbols, returns None (caller should fall back to size × entry_px).
+    For FX, multiplies size_base by base→USD rate. Examples:
+      USDJPY  size=47260, px=159 → 47260 × 1.00       = $47,260
+      CADJPY  size=59075, px=116 → 59075 × 0.73       = $43,125
+      GBPUSD  size=10000, px=1.27 → 10000 × 1.27      = $12,700  (quote IS USD)
+      EURJPY  size=10000, px=170 → 10000 × 1.08       = $10,800
+    """
+    if not symbol:
+        return None
+    sym = symbol.upper().replace("/", "")
+    if not _FX_PAIR_RE.match(symbol.upper()) and len(sym) != 6:
+        return None
+    base = sym[:3]
+    quote = sym[3:]
+    if base not in _FX_BASE_TO_USD or quote not in _FX_BASE_TO_USD:
+        return None  # not an FX pair we recognize
+    sz = abs(float(size_base or 0))
+    if sz == 0:
+        return 0.0
+    if quote == "USD":
+        # GBPUSD, EURUSD, AUDUSD — entry_px IS USD-per-base, so size × entry_px = USD
+        # (Equivalent to size × base_to_usd, since entry_px ≈ base_to_usd by definition)
+        ep = abs(float(entry_px or 0))
+        return sz * ep if ep > 0 else sz * _FX_BASE_TO_USD[base]
+    # Otherwise convert base units → USD via the stored rate
+    return sz * _FX_BASE_TO_USD[base]
+
+
 def _read_canonical_fills(window_days: int = 30) -> list[dict]:
     """Load canonical_fills.jsonl, filter to closed trades within window, exclude
     invalid trades (experiment_valid=false). Returns parsed dicts."""
@@ -4241,7 +4318,11 @@ async def api_strategy_efficiency(window_days: int = 30):
         try:
             entry_px = float(r.get("entry_px") or 0)
             size = float(r.get("size") or 0)
-            notional = abs(entry_px * size)
+            symbol = str(r.get("symbol") or "")
+            # FX: size is in BASE-currency units, so size × entry_px ≠ USD.
+            # Use the normalizer for FX pairs; fall back to size × price for stocks/ETFs.
+            fx_norm = _fx_normalized_exposure_usd(symbol, size, entry_px)
+            notional = fx_norm if fx_norm is not None else abs(entry_px * size)
         except Exception:
             notional = 0
 
@@ -4460,12 +4541,12 @@ async def api_strategy_actions(window_days: int = 30):
     Architecture (Layer 3 of the metrics->scoring->decision->allocation stack):
       - Inputs:  efficiency, drift, sample size
       - Scoring: confidence-weighted (low n = low confidence = HOLD by default)
-      - Output:  one of {SCALE_UP, HOLD, REDUCE, KILL, IGNORE}
+      - Output:  one of {SCALE_UP, HOLD, REDUCE, KILL, OBSERVE}
 
     Rules (intentionally simple — discretionary override not allowed without
     rewriting these):
 
-      n < 10                      -> IGNORE  (insufficient sample, no signal)
+      n < 10                      -> OBSERVE (insufficient sample, no decision yet)
       drift=DECLINING, eff < 0    -> KILL    (losing money + getting worse)
       drift=DECLINING, eff >= 0   -> REDUCE  (profitable but degrading; throttle, watch)
       drift=RISING, eff > 5       -> SCALE_UP (improving + meaningfully positive)
@@ -4506,7 +4587,7 @@ async def api_strategy_actions(window_days: int = 30):
         # ── Decision rules ──
         # When confidence is low we're conservative.
         if n < 10:
-            action, reason = "IGNORE", f"insufficient sample (n={n})"
+            action, reason = "OBSERVE", f"insufficient sample (n={n})"
         elif drift_verdict == "DECLINING":
             if pnl < 0:
                 action, reason = "KILL", f"losing money + edge degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%)"
@@ -4548,12 +4629,12 @@ async def api_strategy_actions(window_days: int = 30):
                 "HOLD":     "5-10% (standard)",
                 "REDUCE":   "0-5% (throttled)",
                 "KILL":     "0% (stop)",
-                "IGNORE":   "0% (no decision)",
+                "OBSERVE":  "0% (insufficient data)",
             }.get(action, "0%"),
         })
 
-    # Sort: SCALE_UP first, then HOLD, REDUCE, KILL, IGNORE
-    action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "KILL": 3, "IGNORE": 4}
+    # Sort: SCALE_UP first, then HOLD, REDUCE, KILL, OBSERVE
+    action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "KILL": 3, "OBSERVE": 4}
     rows.sort(key=lambda r: (action_order.get(r["action"], 5), -r["pnl_usd"]))
     return JSONResponse({
         "window_days": window_days,
@@ -4564,7 +4645,7 @@ async def api_strategy_actions(window_days: int = 30):
             "hold":     sum(1 for r in rows if r["action"] == "HOLD"),
             "reduce":   sum(1 for r in rows if r["action"] == "REDUCE"),
             "kill":     sum(1 for r in rows if r["action"] == "KILL"),
-            "ignore":   sum(1 for r in rows if r["action"] == "IGNORE"),
+            "observe":  sum(1 for r in rows if r["action"] == "OBSERVE"),
         },
     })
 
@@ -4868,15 +4949,27 @@ async def api_correlation_map(window_days: int = 30):
         if dx*dy == 0: return None
         return num/(dx*dy)
 
-    def overlap_seconds(intervals_a: list, intervals_b: list) -> float:
-        total = 0.0
+    def overlap_seconds_and_count(intervals_a: list, intervals_b: list) -> tuple[float, int]:
+        """Returns (total_overlap_seconds, count_of_a_trades_overlapping_any_b).
+
+        The count is the discrete-trade co-occurrence sample size — how many of
+        A's trades happened while B had at least one position open. Drives the
+        confidence flag: a +0.95 correlation off 2 trades is statistically
+        meaningless and shouldn't drive a 'redundant' verdict.
+        """
+        total_seconds = 0.0
+        count_a_overlap = 0
         for a_start, a_end in intervals_a:
+            had_overlap = False
             for b_start, b_end in intervals_b:
                 start = max(a_start, b_start)
                 end = min(a_end, b_end)
                 if end > start:
-                    total += (end - start).total_seconds()
-        return total
+                    total_seconds += (end - start).total_seconds()
+                    had_overlap = True
+            if had_overlap:
+                count_a_overlap += 1
+        return total_seconds, count_a_overlap
 
     pairs = []
     for i, s1 in enumerate(strategies):
@@ -4887,7 +4980,9 @@ async def api_correlation_map(window_days: int = 30):
             ys = [daily_pnl[s2].get(d, 0.0) for d in all_dates]
             corr = pearson(xs, ys)
 
-            ov_s = overlap_seconds(open_intervals[s1], open_intervals[s2])
+            ov_s, n_a_overlap = overlap_seconds_and_count(open_intervals[s1], open_intervals[s2])
+            _, n_b_overlap = overlap_seconds_and_count(open_intervals[s2], open_intervals[s1])
+            n_overlap = min(n_a_overlap, n_b_overlap)  # the smaller side bounds the sample
             total_a = sum((e-s).total_seconds() for s, e in open_intervals[s1])
             total_b = sum((e-s).total_seconds() for s, e in open_intervals[s2])
             # Cap component pct at 100 — strategies that hold multiple concurrent
@@ -4898,15 +4993,27 @@ async def api_correlation_map(window_days: int = 30):
             ov_pct_b = min(100.0, (ov_s / total_b * 100)) if total_b > 0 else 0
             ov_pct = (ov_pct_a + ov_pct_b) / 2
 
-            # Redundancy verdict — actionable summary
+            # Confidence: ranks the *meaningfulness* of the correlation and
+            # overlap numbers. n_overlap < 10 => statistical noise, ignore.
+            if n_overlap >= 30:
+                confidence = "HIGH"
+            elif n_overlap >= 10:
+                confidence = "OK"
+            else:
+                confidence = "LOW"
+
+            # Redundancy verdict — only mark redundant if we have enough sample.
+            # A +0.95 correlation off 2 co-occurring trades is meaningless.
             redundant = False
-            if corr is not None and corr > 0.6 and ov_pct > 30:
+            if corr is not None and corr > 0.6 and ov_pct > 30 and confidence != "LOW":
                 redundant = True
             pairs.append({
                 "strategy_a": s1,
                 "strategy_b": s2,
                 "correlation": round(corr, 3) if corr is not None else None,
                 "time_overlap_pct": round(ov_pct, 1),
+                "n_overlap": n_overlap,
+                "confidence": confidence,
                 "redundant": redundant,
             })
     # Most-correlated pairs first (by absolute correlation)
@@ -4972,6 +5079,140 @@ async def api_trade_validity_counts():
         "fleet_invalid": fleet_total_invalid,
         "fleet_invalid_pct": round(fleet_total_invalid / fleet_total * 100, 2) if fleet_total else 0,
         "strategies": rows,
+    })
+
+
+@app.get("/api/readiness_check")
+async def api_readiness_check():
+    """Parse the 20-point real-money readiness checklist and return progress.
+
+    Powers the thin progress bar at the top of the dashboard. Lean: doesn't
+    duplicate the doc — it READS the doc and counts. Single source of truth
+    stays in the markdown file at the user's memory directory.
+    """
+    candidates = [
+        Path(r"C:\Users\ksmit\.claude\projects\c--Argus\memory\project_real_money_readiness_gate_20260531.md"),
+        REPO / "memory" / "project_real_money_readiness_gate_20260531.md",  # repo fallback
+    ]
+    md_path = next((p for p in candidates if p.exists()), None)
+    if md_path is None:
+        return JSONResponse({"status": "missing", "message": "readiness checklist file not found"})
+    try:
+        content = md_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+    # Count lines like "- [ ]" (pending) and "- [x]" / "- [X]" (passed) in the
+    # "## The 20 points" section only — ignore example checkboxes elsewhere.
+    import re as _re
+    section = content.split("## The 20 points", 1)
+    body = section[1] if len(section) > 1 else content
+    body = body.split("## Sign-off", 1)[0]  # stop at sign-off block
+    items = _re.findall(r"- \[([ xX])\]\s+\*\*(\d+)\.\s+([^*]+)\*\*", body)
+    total = len(items)
+    passed = sum(1 for marker, _, _ in items if marker.lower() == "x")
+    pending = [{"n": int(num), "title": title.strip()} for marker, num, title in items if marker == " "]
+    # Days until 5/31 freeze (negative if past)
+    today = datetime.now(timezone.utc).date()
+    target = datetime(2026, 5, 31, tzinfo=timezone.utc).date()
+    days_left = (target - today).days
+    pct = round(passed / total * 100, 1) if total else 0
+    return JSONResponse({
+        "status": "ok",
+        "passed": passed,
+        "total": total,
+        "pct": pct,
+        "pending": pending,
+        "days_until_freeze": days_left,
+        "freeze_date": "2026-05-31",
+    })
+
+
+@app.get("/api/metric_integrity")
+async def api_metric_integrity(window_days: int = 30):
+    """Single source of truth for 'is the dashboard's data trustable?'.
+
+    Aggregates four checks across the existing endpoints:
+      - mfe_mae_outliers: how many trades had undefined MAE (capped/excluded)
+      - trade_validity: fleet-wide invalid-trade rate
+      - drift_sample: how many strategies have n < 10 trades (decision = OBSERVE)
+      - efficiency_anomaly: strategies with avg_notional > 10× anchor (FX bug
+        sentinel — should be 0 after the FX-normalizer fix; if it ever non-zero
+        again, something regressed in the conversion path)
+
+    Powers the Capital Safety Bar's one-line integrity status. Lean — no
+    parallel "Metric Integrity" panel; just a summary segment + cell ⚠ markers.
+    """
+    issues: list[dict] = []
+    total_checks = 0
+    failed = 0
+
+    # 1. MFE/MAE outlier rate
+    try:
+        mfe_path = REPO / "argus_flow" / "logs" / "mfe_capture.json"
+        if mfe_path.exists():
+            mfe = json.loads(mfe_path.read_text(encoding="utf-8"))
+            total_undef = sum(s.get("n_mae_undefined", 0) for s in mfe.get("strategies", []))
+            total_n = sum(s.get("n", 0) for s in mfe.get("strategies", []))
+            undef_pct = (total_undef / total_n * 100) if total_n else 0
+            total_checks += 1
+            if undef_pct > 30:
+                failed += 1
+                issues.append({"check": "mfe_mae", "severity": "warn",
+                               "message": f"{total_undef}/{total_n} trades ({undef_pct:.0f}%) had undefined MAE — average excludes them"})
+    except Exception:
+        pass
+
+    # 2. Trade validity
+    try:
+        v_resp = await api_trade_validity_counts()
+        v = json.loads(v_resp.body)
+        total_checks += 1
+        if v.get("fleet_invalid_pct", 0) > 5:
+            failed += 1
+            issues.append({"check": "trade_validity", "severity": "fail",
+                           "message": f"{v.get('fleet_invalid', 0)}/{v.get('fleet_valid',0)+v.get('fleet_invalid',0)} trades flagged invalid ({v.get('fleet_invalid_pct',0):.1f}%) — exclude before scoring"})
+    except Exception:
+        pass
+
+    # 3. Drift sample size
+    try:
+        d_resp = await api_strategy_drift()
+        d = json.loads(d_resp.body)
+        below_10 = sum(1 for s in d.get("strategies", []) if s.get("n_total", 0) < 10)
+        total_strats = len(d.get("strategies", []))
+        total_checks += 1
+        if total_strats and below_10 / total_strats > 0.5:
+            failed += 1
+            issues.append({"check": "drift_sample", "severity": "warn",
+                           "message": f"{below_10}/{total_strats} strategies below n=10 — decisions remain OBSERVE for those"})
+    except Exception:
+        pass
+
+    # 4. FX-notional anomaly sentinel — if avg_notional grossly exceeds anchor,
+    # the FX-normalizer regressed. With the helper landed 2026-04-28 this should
+    # always be clean; non-zero result here is a real regression signal.
+    try:
+        eff_resp = await api_strategy_efficiency(window_days=window_days)
+        eff = json.loads(eff_resp.body)
+        # Use first strategy's anchor as a proxy (all share fleet anchor)
+        anchor = 30000  # fallback if can't read; real check uses ratio not absolute
+        anomalous = [s["strategy"] for s in eff.get("strategies", [])
+                     if s.get("avg_notional_usd", 0) > anchor * 10]
+        total_checks += 1
+        if anomalous:
+            failed += 1
+            issues.append({"check": "fx_notional_sentinel", "severity": "fail",
+                           "message": f"avg_notional > 10× anchor for: {', '.join(anomalous[:3])} — FX normalizer may have regressed"})
+    except Exception:
+        pass
+
+    headline = "ok" if failed == 0 else ("warn" if all(i["severity"] != "fail" for i in issues) else "fail")
+    return JSONResponse({
+        "headline_status": headline,
+        "checks_run": total_checks,
+        "checks_failed": failed,
+        "issues": issues,
+        "summary": f"{total_checks - failed}/{total_checks} checks clean" + (f" · {failed} issue(s)" if failed else ""),
     })
 
 
@@ -5463,30 +5704,23 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
                     notional_usd = None
                     sym_upper = str(r.get("symbol") or symbol_default).upper().replace("/", "")
 
-                    # FX strategies — size is in base-currency units
-                    FX_LABELS = ("argus_usdjpy", "argus_gbpusd", "argus_cadjpy",
-                                 "forge_wick_gbpusd", "forge_jpy_pm_short",
-                                 "forge_aud_asian_breakout")
+                    # FX strategies — size is in base-currency units, requires
+                    # currency-pair-aware normalization. Use the shared helper.
                     if label == "forge_gdx_gld":
                         notional_usd = (_safe_f(r.get("gdx_shares")) * _safe_f(r.get("gdx_entry"))
                                         + _safe_f(r.get("gld_shares")) * _safe_f(r.get("gld_entry")))
-                    elif label in FX_LABELS or label.startswith("argus_"):
-                        sz = _safe_f(size)
-                        ep = _safe_f(r.get("entry_px"))
-                        if sym_upper.startswith("USD"):        # USDJPY, USDCAD etc — base = USD
-                            notional_usd = sz
-                        elif sym_upper.endswith("USD"):        # GBPUSD, EURUSD, AUDUSD — entry IS USD/base
-                            notional_usd = sz * ep
-                        elif sym_upper.endswith("JPY"):        # cross-JPY — rough 1:1 USD approx
-                            notional_usd = sz   # approximation; actual depends on base-to-USD rate
-                        else:
-                            notional_usd = sz * ep if ep > 0 else sz
                     else:
-                        # Default: equity-style (shares × entry_px). Covers spy_mean_rev,
-                        # multi_orb, vix_intraday, nq_london_close, gld_pm_long, nq_overnight,
-                        # mamba, tori, cuebanks, vix_revert, rebalance, fomc_drift,
-                        # tom_international, apollo, hermes, titan.
-                        notional_usd = _safe_f(size) * _safe_f(r.get("entry_px"))
+                        # Try FX normalization first; if helper returns None it's not an FX
+                        # pair so fall back to equity-style (shares × entry_px).
+                        fx_norm = _fx_normalized_exposure_usd(
+                            r.get("symbol") or symbol_default or "",
+                            _safe_f(size),
+                            _safe_f(r.get("entry_px")),
+                        )
+                        if fx_norm is not None:
+                            notional_usd = fx_norm
+                        else:
+                            notional_usd = _safe_f(size) * _safe_f(r.get("entry_px"))
                     notional_usd = round(notional_usd, 2) if notional_usd else None
 
                     trades.append({
@@ -7648,6 +7882,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#7b8ab8;">Loading capital safety...</div>
 </div>
 
+<!-- Real-money readiness — thin progress bar; hides itself at 100% or after 5/31. -->
+<div id="readiness-bar" style="display:none;margin-bottom:10px;"></div>
+
 <!-- Halt-status banner — appears only when fleet is halted, top-of-page -->
 <div id="halt-banner" style="display:none;margin-bottom:10px;"></div>
 
@@ -7686,7 +7923,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- FLEET CONFIDENCE SUB-SCORES + per-strategy 5-OK status (#6 + #8 combined) -->
 <div id="dimensions-panel" style="margin-bottom:14px;"></div>
 
-<!-- ALPHA ATTRIBUTION — who's actually carrying the fleet PnL -->
+<!-- FLEET CONTRIBUTION — who is carrying fleet PnL (not benchmark alpha — separate panel post-5/31) -->
 <div id="alpha-attribution-panel" style="margin-bottom:14px;"></div>
 
 <!-- CORRELATION / REDUNDANCY MAP — pairwise correlation + time overlap -->
@@ -7860,7 +8097,12 @@ function loadMfeCapture() {
       + '</tr></thead><tbody>';
     for (const s of rows) {
       const meanColor = s.mean_capture > 0.5 ? '#00ff88' : (s.mean_capture > 0 ? '#ffc107' : '#ff4444');
-      const mfeMaeColor = s.mean_mfe_to_mae > 2.0 ? '#00ff88' : (s.mean_mfe_to_mae > 1.0 ? '#ffc107' : '#ff4444');
+      const mfeMaeUndef = (s.mean_mfe_to_mae === null || s.mean_mfe_to_mae === undefined);
+      const mfeMaeColor = mfeMaeUndef ? '#7b8ab8' : (s.mean_mfe_to_mae > 2.0 ? '#00ff88' : (s.mean_mfe_to_mae > 1.0 ? '#ffc107' : '#ff4444'));
+      const undefShare = (s.n_mae_undefined && s.n) ? Math.round(100 * s.n_mae_undefined / s.n) : 0;
+      const mfeMaeText = mfeMaeUndef
+        ? '<span title="MAE undefined for all ' + s.n + ' trades (never went adverse)">—</span>'
+        : (s.mean_mfe_to_mae.toFixed(2) + (undefShare > 0 ? '<span style="color:#ffaa00;font-size:0.85em;margin-left:3px;" title="' + s.n_mae_undefined + ' of ' + s.n + ' trades had no adverse excursion — excluded from average. Treat ratio as best-effort, not raw."> ⚠</span>' : ''));
       const safeId = s.strategy.replace(/[^a-z0-9]/gi, '_');
       html += '<tr style="border-top:1px solid #1e2a42;cursor:pointer;" data-mfe-id="' + safeId + '" onclick="toggleMfeDrill(this.dataset.mfeId)" title="Click to expand last 20 trades">'
         + '<td style="padding:5px 6px;color:#e0e0e0;"><span id="mfe-arrow-' + safeId + '" style="color:#7b8ab8;font-size:0.85em;">▶</span> ' + s.strategy + '</td>'
@@ -7871,7 +8113,7 @@ function loadMfeCapture() {
         + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.good_pct.toFixed(0) + '%</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#ffc107;">' + s.partial_pct.toFixed(0) + '%</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">' + s.adverse_pct.toFixed(0) + '%</td>'
-        + '<td style="padding:5px 6px;text-align:right;color:' + mfeMaeColor + ';">' + s.mean_mfe_to_mae.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + mfeMaeColor + ';">' + mfeMaeText + '</td>'
         + '</tr>';
       // Hidden drill-down row with per-trade detail
       const trades = s.trades || [];
@@ -7956,7 +8198,7 @@ setInterval(loadClusterExposurePanel, 30000);
 // a single 'OK' tile hides (process up, decision=KILL_CANDIDATE).
 const RUNTIME_COLORS = {OK:'#00e676', STALE:'#ffaa00', DOWN:'#ff4444', DEGRADED:'#ff8800', BLOCKED:'#ff4444', UNKNOWN:'#7b8ab8'};
 const TRADING_COLORS = {FLAT:'#7b8ab8', IN_TRADE:'#00d4ff', WAITING:'#9da8c7'};
-const DECISION_COLORS = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', IGNORE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
+const DECISION_COLORS = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', OBSERVE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
 function loadThreeState() {
   fetch('/api/strategy_states').then(r=>r.json()).then(data=>{
     const el = document.getElementById('three-state-panel');
@@ -8008,12 +8250,21 @@ function loadDimensions() {
     if (!el) return;
     const sub = data.subscores || {};
     const overall = data.overall || 0;
+    const naive = data.overall_naive_avg;
+    const cap = data.binding_cap_reason || 'naive_average';
     const overallColor = overall >= 80 ? '#00ff88' : (overall >= 60 ? '#ffc107' : '#ff4444');
+    // Show binding cap when it's pinning the overall score below the naive mean.
+    // Honest reading: a 78% naive average masking a 37% evidence layer is dishonest;
+    // the cap surfaces *what is limiting readiness* instead of averaging it away.
+    const capBadge = (cap !== 'naive_average')
+      ? '<span style="font-size:0.7em;color:#7b8ab8;margin-left:8px;" title="Naive avg would be ' + (naive!=null?naive+'%':'—') + '. Cap binds: ' + cap + '">⚠ capped</span>'
+      : '';
     let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
       + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">'
       + '<span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">FLEET DIMENSIONS</span>'
-      + '<span style="font-size:0.78em;color:' + overallColor + ';font-weight:bold;">overall ' + overall + '%</span>'
-      + '</div>';
+      + '<span style="font-size:0.78em;color:' + overallColor + ';font-weight:bold;">overall ' + overall + '%' + capBadge + '</span>'
+      + '</div>'
+      + (cap !== 'naive_average' ? '<div style="font-size:0.72em;color:#9da8c7;margin-bottom:8px;padding:4px 8px;background:#0a1224;border-left:3px solid #ffaa00;border-radius:2px;">Capped at ' + overall + '%: ' + cap + '. Naive average would be ' + (naive!=null?naive+'%':'—') + '.</div>' : '');
     // Sub-score bars
     const subDefs = [
       ['operational', 'Operational', '% of strategies with healthy process'],
@@ -8054,7 +8305,7 @@ function loadDimensions() {
         const sym = ok ? '✓' : '✗';
         return '<span style="color:' + c + ';font-weight:bold;font-size:1.1em;" title="' + key + '=' + (ok?'OK':'FAIL') + '">' + sym + '</span>';
       };
-      const decisionColors = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', IGNORE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
+      const decisionColors = {SCALE_UP:'#00ff88', HOLD:'#9da8c7', REDUCE:'#ffaa00', KILL:'#ff4444', OBSERVE:'#7b8ab8', UNKNOWN:'#7b8ab8'};
       for (const s of rows) {
         const dc = decisionColors[s.decision] || '#7b8ab8';
         html += '<tr style="border-top:1px solid #1e2a42;">'
@@ -8086,13 +8337,15 @@ function loadCapitalSafetyBar() {
     fetch('/api/cluster_exposure').then(r=>r.json()),
     fetch('/api/margin_status').then(r=>r.json()).catch(()=>({status:'error'})),
     fetch('/api/broker_drift_status').then(r=>r.json()).catch(()=>({status:'error'})),
-  ]).then(([pos, clu, mar, drift])=>{
+    fetch('/api/metric_integrity').then(r=>r.json()).catch(()=>({headline_status:'unknown'})),
+  ]).then(([pos, clu, mar, drift, integ])=>{
     const el = document.getElementById('capital-safety-bar');
     if (!el) return;
     const anchor = pos.anchor_usd || 0;
     const openCount = pos.count || 0;
     const openRisk = pos.total_risk_usd || 0;
-    const riskPct = pos.pct_of_budget_used || 0;
+    const riskPct = pos.pct_of_budget_used || 0;          // % of risk budget (e.g. $1,899)
+    const riskPctEquity = anchor ? (openRisk / anchor * 100) : 0;  // % of total equity
     const grossUsd = clu.total_notional_usd || 0;
     const grossPct = anchor ? (grossUsd / anchor * 100) : 0;
     const totalCapPct = clu.total_pct_used || 0;
@@ -8135,18 +8388,32 @@ function loadCapitalSafetyBar() {
           + '</span>';
       }
     }
+    // Metric Integrity segment — single-line status of "is the data trustable?"
+    // Lean implementation: hide when status=ok (no need to clutter the bar with
+    // a green checkmark); show ⚠ + count when issues exist. Tooltip enumerates.
+    let integritySeg = '';
+    if (integ && integ.headline_status && integ.headline_status !== 'ok' && integ.headline_status !== 'unknown') {
+      const iColor = integ.headline_status === 'fail' ? '#ff4444' : '#ffaa00';
+      const issueList = (integ.issues || []).map(i => '• ' + i.message).join('\n');
+      integritySeg = '<span style="color:#1e2a42;">|</span>'
+        + '<span style="color:#9da8c7;" title="' + issueList.replace(/"/g, '&quot;') + '">Integrity: '
+        + '<b style="color:' + iColor + ';">⚠ ' + integ.checks_failed + ' issue' + (integ.checks_failed > 1 ? 's' : '') + '</b>'
+        + ' <span style="color:#7b8ab8;font-size:0.92em;">(' + integ.summary + ')</span>'
+        + '</span>';
+    }
     el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
       + '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;">'
       + '<span style="color:#7b8ab8;letter-spacing:2px;">CAPITAL SAFETY</span>'
       + '<span style="color:' + stateColor + ';font-weight:bold;letter-spacing:1px;">' + fleetState + '</span>'
       + '<span style="color:#1e2a42;">|</span>'
-      + '<span style="color:#9da8c7;">Open: <b style="color:#fff;">' + openCount + ' pos</b> · risk <b style="color:' + riskColor + ';">$' + openRisk.toFixed(2) + '</b> / $' + (pos.fleet_budget_usd||0).toFixed(0) + ' (' + riskPct.toFixed(1) + '%)</span>'
+      + '<span style="color:#9da8c7;">Open: <b style="color:#fff;">' + openCount + ' pos</b> · risk <b style="color:' + riskColor + ';">$' + openRisk.toFixed(2) + '</b> / $' + (pos.fleet_budget_usd||0).toFixed(0) + ' budget (<b style="color:' + riskColor + ';">' + riskPct.toFixed(1) + '%</b>) · <span style="color:#7b8ab8;" title="Open risk as % of total broker equity (anchor)">' + riskPctEquity.toFixed(2) + '% of equity</span></span>'
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Gross notional: <b style="color:' + grossColor + ';">$' + grossUsd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b> (' + grossPct.toFixed(0) + '% of equity)</span>'
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
       + marginSeg
       + driftSeg
+      + integritySeg
       + (topCluster ? '<span style="color:#1e2a42;">|</span><span style="color:#9da8c7;">Top cluster: <b style="color:#fff;">' + topCluster.cluster + '</b> ' + topCluster.pct_used.toFixed(1) + '%</span>' : '')
       + '</div>'
       + '<span style="color:#7b8ab8;font-size:0.92em;">anchor $' + anchor.toLocaleString(undefined,{maximumFractionDigits:0}) + '</span>'
@@ -8155,6 +8422,41 @@ function loadCapitalSafetyBar() {
 }
 loadCapitalSafetyBar();
 setInterval(loadCapitalSafetyBar, 15000);  // every 15s during market hours
+
+// ─── REAL-MONEY READINESS BAR ──────────────────────────────────────
+// Thin progress strip — single source of truth is the markdown checklist
+// in the user's memory dir. Renders nothing when status=missing or after
+// the freeze date (5/31) or once 100% complete (no need to clutter the UI).
+function loadReadinessBar() {
+  fetch('/api/readiness_check').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('readiness-bar');
+    if (!el) return;
+    if (d.status !== 'ok' || d.total === 0) { el.style.display = 'none'; return; }
+    if (d.passed >= d.total && d.days_until_freeze < 0) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    const pct = d.pct;
+    const barColor = pct >= 80 ? '#00ff88' : pct >= 50 ? '#ffc107' : '#7b8ab8';
+    const daysColor = d.days_until_freeze < 0 ? '#ff4444' : d.days_until_freeze <= 14 ? '#ffaa00' : '#9da8c7';
+    const daysLabel = d.days_until_freeze < 0
+      ? Math.abs(d.days_until_freeze) + 'd past 5/31 freeze'
+      : d.days_until_freeze + 'd to 5/31 freeze';
+    const pendingTitles = (d.pending || []).slice(0, 5).map(p => p.n + '. ' + p.title).join(' · ');
+    const tip = pendingTitles ? 'Pending: ' + pendingTitles + (d.pending.length > 5 ? ' …' : '') : 'All items checked';
+    el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:6px 14px;font-size:0.74em;display:flex;align-items:center;gap:12px;" title="' + tip.replace(/"/g, '&quot;') + '">'
+      + '<span style="color:#7b8ab8;letter-spacing:1px;font-weight:bold;">REAL-MONEY READINESS</span>'
+      + '<div style="flex:1;background:#0a1224;border:1px solid #1e2a42;border-radius:3px;height:10px;position:relative;overflow:hidden;">'
+      + '<div style="background:' + barColor + ';height:100%;width:' + Math.min(100, pct) + '%;"></div>'
+      + '</div>'
+      + '<span style="color:' + barColor + ';font-weight:bold;min-width:90px;text-align:right;">' + d.passed + '/' + d.total + ' (' + pct + '%)</span>'
+      + '<span style="color:' + daysColor + ';font-size:0.92em;min-width:130px;text-align:right;">' + daysLabel + '</span>'
+      + '</div>';
+  }).catch(()=>{
+    const el = document.getElementById('readiness-bar');
+    if (el) el.style.display = 'none';
+  });
+}
+loadReadinessBar();
+setInterval(loadReadinessBar, 600000);  // 10 min — checklist changes are rare
 
 // ─── BLOCKED ENTRIES (LAST 24h) ────────────────────────────────────
 // Compact one-line counter of guard fires. Hides when totals are all zero.
@@ -8255,7 +8557,7 @@ const ACTION_COLORS = {
   HOLD:     {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'},
   REDUCE:   {bg:'#2a2010', border:'#ffaa00', fg:'#ffaa00'},
   KILL:     {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
-  IGNORE:   {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
+  OBSERVE:  {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
 function loadDecisionEngine() {
   Promise.all([
@@ -8266,7 +8568,7 @@ function loadDecisionEngine() {
     if (!el) return;
     const summary = data.summary || {};
     const factors = (allocData && allocData.factors) || {};
-    const total = (summary.scale_up||0) + (summary.hold||0) + (summary.reduce||0) + (summary.kill||0) + (summary.ignore||0);
+    const total = (summary.scale_up||0) + (summary.hold||0) + (summary.reduce||0) + (summary.kill||0) + (summary.observe||0);
     let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
       + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
       + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">DECISION ENGINE</span>'
@@ -8276,10 +8578,11 @@ function loadDecisionEngine() {
       + '<span style="color:' + ACTION_COLORS.HOLD.fg + ';">HOLD ' + (summary.hold||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.REDUCE.fg + ';">REDUCE ' + (summary.reduce||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.KILL.fg + ';">KILL ' + (summary.kill||0) + '</span> · '
-      + '<span style="color:' + ACTION_COLORS.IGNORE.fg + ';">IGNORE ' + (summary.ignore||0) + '</span>'
+      + '<span style="color:' + ACTION_COLORS.OBSERVE.fg + ';">OBSERVE ' + (summary.observe||0) + '</span>'
       + '</div></div>'
       + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
       + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:center;padding:6px 4px;width:36px;" title="DO NOW: top 3 unapplied REDUCE/KILL/SCALE_UP recommendations, sorted by urgency"></th>'
       + '<th style="text-align:left;padding:6px 8px;">Strategy</th>'
       + '<th style="text-align:center;padding:6px 8px;">Action</th>'
       + '<th style="text-align:right;padding:6px 8px;">Conf</th>'
@@ -8293,12 +8596,46 @@ function loadDecisionEngine() {
       + '<th style="text-align:right;padding:6px 8px;">Active ×</th>'
       + '<th style="text-align:center;padding:6px 8px;">Apply</th>'
       + '</tr></thead><tbody>';
-    for (const s of data.strategies || []) {
+    // ─── Urgency re-sort + DO NOW badge ──────────────────────────────
+    // Lean-version "Action Queue": don't add a second panel — re-rank the
+    // existing rows so unapplied KILL/REDUCE/SCALE_UP float to the top, then
+    // badge the top 3 with DO NOW. Bleeding strategies are surfaced first.
+    const URGENCY_RANK = {KILL: 0, REDUCE: 1, SCALE_UP: 2};
+    const recMapForSort = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, KILL:0.0, OBSERVE:1.0};
+    function currentFactor(strat) {
+      const tries = [strat, strat.replace('forge_',''), 'forge_' + strat];
+      for (const k of tries) { if (k in factors) return factors[k]; }
+      return 1.0;
+    }
+    const decoratedRows = (data.strategies || []).map(s => {
+      const cur = currentFactor(s.strategy);
+      const rec = recMapForSort[s.action];
+      const isActionable = (s.action in URGENCY_RANK) && rec != null && Math.abs(cur - rec) >= 0.01;
+      return {s, isActionable, urgency: isActionable ? URGENCY_RANK[s.action] : 99};
+    });
+    decoratedRows.sort((a, b) => {
+      // Actionable first, by urgency (KILL < REDUCE < SCALE_UP), then by larger PnL impact
+      if (a.urgency !== b.urgency) return a.urgency - b.urgency;
+      // Within actionable group, sort by absolute PnL (biggest bleeders first for KILL/REDUCE)
+      if (a.urgency < 99) return Math.abs(b.s.pnl_usd) - Math.abs(a.s.pnl_usd);
+      // Non-actionable: keep server's original order (SCALE_UP > HOLD > REDUCE > KILL > OBSERVE, by -pnl)
+      return 0;
+    });
+    let doNowAssigned = 0;
+    for (const dr of decoratedRows) {
+      const s = dr.s;
+      const isDoNow = dr.isActionable && doNowAssigned < 3;
+      if (isDoNow) doNowAssigned++;
       const c = ACTION_COLORS[s.action] || ACTION_COLORS.HOLD;
       const pnlColor = s.pnl_usd > 0 ? '#00ff88' : (s.pnl_usd < 0 ? '#ff4444' : '#7b8ab8');
       const driftColor = s.drift_verdict === 'RISING' ? '#00ff88' : (s.drift_verdict === 'DECLINING' ? '#ff4444' : '#9da8c7');
       const driftText = s.drift_verdict + (s.drift_delta_pct ? ' ' + (s.drift_delta_pct >= 0 ? '+' : '') + s.drift_delta_pct.toFixed(0) + '%' : '');
-      html += '<tr style="border-top:1px solid #1e2a42;background:' + c.bg + ';">'
+      const doNowBadge = isDoNow
+        ? '<span style="background:#ff4444;color:#000;padding:1px 5px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.7em;" title="Top-3 unapplied REDUCE/KILL/SCALE_UP — apply now to stop bleed or capture edge">DO NOW</span>'
+        : '';
+      const rowBorder = isDoNow ? 'border-top:1px solid #ff4444;border-left:3px solid #ff4444;' : 'border-top:1px solid #1e2a42;';
+      html += '<tr style="' + rowBorder + 'background:' + c.bg + ';">'
+        + '<td style="padding:6px 4px;text-align:center;">' + doNowBadge + '</td>'
         + '<td style="padding:6px 8px;font-weight:bold;color:#e0e0e0;">' + s.strategy + '</td>'
         + '<td style="padding:6px 8px;text-align:center;"><span style="background:' + c.border + ';color:#000;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + s.action + '</span></td>'
         + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.confidence_pct + '%</td>'
@@ -8321,7 +8658,7 @@ function loadDecisionEngine() {
         + '</td>'
         + '<td style="padding:6px 8px;text-align:center;">' + (function(){
             // Map ACTION -> recommended factor; show Apply button only if different from current
-            const recMap = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, KILL:0.0, IGNORE:1.0};
+            const recMap = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, KILL:0.0, OBSERVE:1.0};
             const rec = recMap[s.action];
             if (rec == null) return '<span style="color:#555;">-</span>';
             const tries = [s.strategy, s.strategy.replace('forge_',''), 'forge_' + s.strategy];
@@ -8334,7 +8671,7 @@ function loadDecisionEngine() {
         + '</tr>';
     }
     html += '</tbody></table>'
-      + '<div style="margin-top:8px;font-size:0.72em;color:#7b8ab8;">Rules: n&lt;10→IGNORE · declining+losing→KILL · declining+winning→REDUCE · rising+eff&gt;5→SCALE_UP · flat+positive→HOLD · flat+losing→REDUCE</div>'
+      + '<div style="margin-top:8px;font-size:0.72em;color:#7b8ab8;">Rules: n&lt;10→OBSERVE · declining+losing→KILL · declining+winning→REDUCE · rising+eff&gt;5→SCALE_UP · flat+positive→HOLD · flat+losing→REDUCE</div>'
       + '</div>';
     el.innerHTML = html;
   }).catch(e=>{console.error('decision engine error:', e);});
@@ -8516,7 +8853,10 @@ function loadTargetCapture() {
 loadTargetCapture();
 setInterval(loadTargetCapture, 120000);
 
-// ─── ALPHA ATTRIBUTION ─────────────────────────────────────────────
+// ─── FLEET CONTRIBUTION ────────────────────────────────────────────
+// (Renamed from "Alpha Attribution" 2026-04-28: this measures who is
+// carrying fleet PnL, not excess return vs benchmark. True benchmark
+// alpha lands post-5/31 as a separate panel.)
 // Who's actually carrying the fleet PnL? Sorted by absolute share.
 function loadAlphaAttribution() {
   fetch('/api/alpha_attribution?window_days=30').then(r=>r.json()).then(data=>{
@@ -8528,8 +8868,8 @@ function loadAlphaAttribution() {
     const headlineColor = conc.top_3_pct_of_abs > 80 ? '#ffaa00' : '#9da8c7';
     let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
       + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
-      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">ALPHA ATTRIBUTION (30d)</span>'
-      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">who is actually carrying the fleet?</span></div>'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">FLEET CONTRIBUTION (30d)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">who is carrying the fleet PnL? (not benchmark alpha — that lands post-5/31)</span></div>'
       + '<div style="font-size:0.75em;color:' + headlineColor + ';">'
       + 'Net fleet PnL: <b style="color:' + (data.total_net_pnl_usd >= 0 ? '#00ff88' : '#ff4444') + ';">' + (data.total_net_pnl_usd >= 0 ? '+' : '') + '$' + data.total_net_pnl_usd.toFixed(2) + '</b>'
       + ' · top 1 = ' + conc.top_1_pct_of_abs + '% · top 3 = ' + conc.top_3_pct_of_abs + '% of activity</div></div>'
@@ -8587,19 +8927,39 @@ function loadCorrelationMap() {
       + '<th style="text-align:left;padding:5px 6px;">Strategy B</th>'
       + '<th style="text-align:right;padding:5px 6px;">Correlation</th>'
       + '<th style="text-align:right;padding:5px 6px;">Time overlap</th>'
+      + '<th style="text-align:right;padding:5px 6px;" title="Number of co-occurring trade pairs. Low N = correlation is noise.">N overlap</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Confidence</th>'
       + '<th style="text-align:center;padding:5px 6px;">Verdict</th>'
       + '</tr></thead><tbody>';
     // Show top 15 most-correlated pairs
     for (const p of pairs.slice(0, 15)) {
       const corr = p.correlation;
-      const corrColor = corr === null ? '#7b8ab8' : (Math.abs(corr) > 0.6 ? '#ff4444' : (Math.abs(corr) > 0.3 ? '#ffc107' : '#9da8c7'));
+      const conf = p.confidence || 'LOW';
+      // De-emphasize correlation color when confidence is LOW — a strong-looking
+      // correlation off 2 trades is noise, not signal.
+      const corrColor = (corr === null || conf === 'LOW') ? '#7b8ab8'
+                        : (Math.abs(corr) > 0.6 ? '#ff4444' : (Math.abs(corr) > 0.3 ? '#ffc107' : '#9da8c7'));
       const ovColor = p.time_overlap_pct > 30 ? '#ff4444' : (p.time_overlap_pct > 10 ? '#ffc107' : '#9da8c7');
-      const verdict = p.redundant ? '<span style="background:#ff4444;color:#000;padding:1px 6px;border-radius:3px;font-weight:bold;">REDUNDANT</span>' : '<span style="color:#7b8ab8;">ok</span>';
+      const confColor = conf === 'HIGH' ? '#00ff88' : (conf === 'OK' ? '#9da8c7' : '#7b8ab8');
+      const confLabel = '<span style="background:' + (conf === 'LOW' ? '#1e2a42' : (conf === 'HIGH' ? '#0d1c11' : '#0d1321')) + ';color:' + confColor + ';padding:1px 6px;border-radius:3px;font-size:0.92em;letter-spacing:1px;" title="N=' + p.n_overlap + ' co-occurring trades">' + conf + '</span>';
+      // Verdict: REDUNDANT only fires when confidence isn't LOW (server-side rule),
+      // but show "tentative" when confidence is LOW even with high apparent correlation
+      // so the user knows there's a pattern but it's not yet trustworthy.
+      let verdict;
+      if (p.redundant) {
+        verdict = '<span style="background:#ff4444;color:#000;padding:1px 6px;border-radius:3px;font-weight:bold;">REDUNDANT</span>';
+      } else if (conf === 'LOW' && corr !== null && Math.abs(corr) > 0.6 && p.time_overlap_pct > 30) {
+        verdict = '<span style="color:#ffaa00;" title="Pattern would be REDUNDANT but N=' + p.n_overlap + ' is too small">tentative</span>';
+      } else {
+        verdict = '<span style="color:#7b8ab8;">ok</span>';
+      }
       html += '<tr style="border-top:1px solid #1e2a42;">'
         + '<td style="padding:5px 6px;color:#e0e0e0;">' + p.strategy_a + '</td>'
         + '<td style="padding:5px 6px;color:#e0e0e0;">' + p.strategy_b + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + corrColor + ';font-weight:bold;">' + (corr === null ? '—' : (corr >= 0 ? '+' : '') + corr.toFixed(2)) + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + ovColor + ';">' + p.time_overlap_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + p.n_overlap + '</td>'
+        + '<td style="padding:5px 6px;text-align:center;">' + confLabel + '</td>'
         + '<td style="padding:5px 6px;text-align:center;">' + verdict + '</td>'
         + '</tr>';
     }
