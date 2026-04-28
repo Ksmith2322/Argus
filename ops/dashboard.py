@@ -3685,6 +3685,87 @@ async def api_market_clock():
     return JSONResponse(_market_clock_snapshot())
 
 
+@app.get("/api/circuit_breaker_status")
+async def api_circuit_breaker_status():
+    """Read circuit_breaker_state.json (written by ops/daily_loss_circuit_breaker).
+
+    Tier meanings:
+      OK       - daily PnL within tolerance
+      WARN     - daily loss at -1% (alert only, no action)
+      PAUSE    - daily loss at -2% (HALT.flag set automatically)
+      FLATTEN  - daily loss at -4% (HALT + FLATTEN_EOD set; positions force-closed)
+
+    Used by the dashboard banner."""
+    fp = REPO / "argus_flow" / "logs" / "_risk" / "circuit_breaker_state.json"
+    if not fp.exists():
+        return JSONResponse({"current_tier": "OK", "reason": "circuit_breaker_state.json not yet written"})
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"current_tier": "OK", "error": str(e)})
+
+
+@app.get("/api/allocation_factors")
+async def api_allocation_factors():
+    """Read per-strategy capital multipliers from allocation_factors.json.
+    Default 1.0 if not specified. Layer 4 of the decision-allocator stack."""
+    fp = REPO / "argus_flow" / "configs" / "allocation_factors.json"
+    if not fp.exists():
+        return JSONResponse({"factors": {}, "version": None})
+    try:
+        return JSONResponse(json.loads(fp.read_text(encoding="utf-8")))
+    except Exception as e:
+        return JSONResponse({"factors": {}, "error": str(e)})
+
+
+@app.post("/api/allocation_factors")
+async def api_allocation_factors_set(request: Request):
+    """Set ONE strategy's allocation factor. Body: {strategy: str, factor: float}.
+    Clamped to 0.0-2.0. Operator-driven write — Decision Engine surfaces a
+    'recommended' factor but apply requires explicit user click."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    strategy = body.get("strategy")
+    if not strategy:
+        return JSONResponse({"error": "missing 'strategy'"}, status_code=400)
+    try:
+        factor = float(body.get("factor", 1.0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "factor must be a number"}, status_code=400)
+    factor = max(0.0, min(2.0, factor))
+    fp = REPO / "argus_flow" / "configs" / "allocation_factors.json"
+    if fp.exists():
+        try: cfg = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception: cfg = {}
+    else:
+        cfg = {}
+    cfg.setdefault("factors", {})[strategy] = factor
+    cfg["last_updated"] = datetime.now(timezone.utc).isoformat()
+    cfg.setdefault("version", "v1_2026-04-28")
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return JSONResponse({"ok": True, "strategy": strategy, "factor": factor})
+
+
+@app.get("/api/mfe_capture")
+async def api_mfe_capture():
+    """Read mfe_capture.json (written by ops/compute_mfe.py).
+
+    True MFE-based capture ratio per strategy: realized_distance / mfe_distance.
+    Distinguishes 'win small' (good entries, premature exits) from 'lose big'
+    (bad entries) far better than target_capture proxy."""
+    fp = REPO / "argus_flow" / "logs" / "mfe_capture.json"
+    if not fp.exists():
+        return JSONResponse({"strategies": [], "reason": "mfe_capture.json not yet computed; run python -m ops.compute_mfe"})
+    try:
+        return JSONResponse(json.loads(fp.read_text(encoding="utf-8")))
+    except Exception as e:
+        return JSONResponse({"strategies": [], "error": str(e)})
+
+
 @app.get("/api/tws_health")
 async def api_tws_health():
     """Read tws_health.json (written by ops/tws_health_probe.py).
@@ -7227,6 +7308,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- TWS health banner — appears only when TWS is degraded/unreachable -->
 <div id="tws-health-banner" style="display:none;margin-bottom:10px;"></div>
 
+<!-- Circuit breaker banner — appears only when daily loss tier != OK -->
+<div id="circuit-breaker-banner" style="display:none;margin-bottom:10px;"></div>
+
 <!-- Capital Safety Bar — single-line top-of-page summary of fleet safety state -->
 <div id="capital-safety-bar" style="margin-bottom:10px;">
   <div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#7b8ab8;">Loading capital safety...</div>
@@ -7257,6 +7341,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <!-- TARGET CAPTURE RATIO — exit efficiency proxy (until full MFE lookback exists) -->
 <div id="target-capture-panel" style="margin-bottom:14px;"></div>
+
+<!-- MFE CAPTURE — true MFE/realized ratio with bar lookback -->
+<div id="mfe-capture-panel" style="margin-bottom:14px;"></div>
 
 <!-- ALPHA ATTRIBUTION — who's actually carrying the fleet PnL -->
 <div id="alpha-attribution-panel" style="margin-bottom:14px;"></div>
@@ -7375,6 +7462,84 @@ function loadTwsHealth() {
 }
 loadTwsHealth();
 setInterval(loadTwsHealth, 30000);  // re-check every 30s
+
+// ─── CIRCUIT BREAKER BANNER ────────────────────────────────────────
+// Daily loss tiers: OK / WARN (-1%) / PAUSE (-2%) / FLATTEN (-4%)
+function loadCircuitBreaker() {
+  fetch('/api/circuit_breaker_status').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('circuit-breaker-banner');
+    if (!el) return;
+    const tier = d.current_tier || 'OK';
+    if (tier === 'OK') { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    const config = {
+      WARN:    {bg:'#2a2010', border:'#ffaa00', icon:'⚠', title:'CIRCUIT BREAKER: WARN', subtitle:'daily loss at -1% (alert only, no action taken)'},
+      PAUSE:   {bg:'#3a2010', border:'#ff8800', icon:'⏸', title:'CIRCUIT BREAKER: PAUSE', subtitle:'daily loss at -2% — HALT.flag set automatically; existing positions exit normally'},
+      FLATTEN: {bg:'#3a0a0a', border:'#ff4444', icon:'✕', title:'CIRCUIT BREAKER: FLATTEN', subtitle:'daily loss at -4% — HALT + FLATTEN_EOD set; positions force-closed'},
+    }[tier] || {bg:'#0d1321', border:'#7b8ab8', icon:'?', title:'CIRCUIT BREAKER: ' + tier, subtitle:''};
+    const pnl = (d.latest_pnl_pct ?? 0).toFixed(2);
+    const eq = (d.latest_equity_usd ?? 0).toLocaleString(undefined,{maximumFractionDigits:0});
+    const open = (d.day_open_equity_usd ?? 0).toLocaleString(undefined,{maximumFractionDigits:0});
+    el.innerHTML = '<div style="background:' + config.bg + ';border:2px solid ' + config.border + ';border-radius:6px;padding:12px 18px;color:#ffe;font-size:0.9em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">'
+      + '<div><span style="color:' + config.border + ';font-weight:bold;letter-spacing:2px;font-size:1.05em;">' + config.icon + ' ' + config.title + '</span>'
+      + ' <span style="color:#ffaaaa;margin-left:12px;">' + config.subtitle + '</span></div>'
+      + '<div style="color:#ffaaaa;font-size:0.85em;">day open $' + open + ' → now $' + eq + ' (' + pnl + '%)</div>'
+      + '</div></div>';
+  }).catch(()=>{});
+}
+loadCircuitBreaker();
+setInterval(loadCircuitBreaker, 30000);
+
+// ─── MFE CAPTURE PANEL ─────────────────────────────────────────────
+// True MFE-based exit-quality with bar lookback (replaces target_capture
+// which was a proxy from existing data).
+function loadMfeCapture() {
+  fetch('/api/mfe_capture').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('mfe-capture-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">MFE CAPTURE (' + (data.window_days||30) + 'd, true bar-lookback)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">capture = realized / MFE. Low = exits leave money on table. mfe_to_mae shows risk shape.</span></div>'
+      + '<div style="color:#7b8ab8;font-size:0.75em;">' + (data.n_trades_processed||0) + '/' + (data.n_trades_total||0) + ' trades · skipped ' + (data.n_skipped_invalid||0) + ' invalid + ' + (data.n_skipped_no_bars||0) + ' no-bars</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Mean cap</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Median</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Excellent</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Good</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Partial</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Adverse</th>'
+      + '<th style="text-align:right;padding:5px 6px;">MFE/MAE</th>'
+      + '</tr></thead><tbody>';
+    for (const s of rows) {
+      const meanColor = s.mean_capture > 0.5 ? '#00ff88' : (s.mean_capture > 0 ? '#ffc107' : '#ff4444');
+      const mfeMaeColor = s.mean_mfe_to_mae > 2.0 ? '#00ff88' : (s.mean_mfe_to_mae > 1.0 ? '#ffc107' : '#ff4444');
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.n + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + meanColor + ';font-weight:bold;">' + s.mean_capture.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.median_capture.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#00ff88;">' + s.excellent_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.good_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ffc107;">' + s.partial_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">' + s.adverse_pct.toFixed(0) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + mfeMaeColor + ';">' + s.mean_mfe_to_mae.toFixed(2) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;margin-top:6px;">Excellent: capture &ge; 80% of MFE. Adverse: stopped past entry. MFE/MAE &gt; 2 = trade goes favorable before going adverse (good signal).</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{});
+}
+loadMfeCapture();
+setInterval(loadMfeCapture, 300000);  // refresh every 5min (data computed by managed_truth_loop)
 
 // ─── CAPITAL SAFETY BAR ────────────────────────────────────────────
 // Single-line top-of-page summary. Combines positions_open (risk $) +
@@ -7505,10 +7670,14 @@ const ACTION_COLORS = {
   IGNORE:   {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
 function loadDecisionEngine() {
-  fetch('/api/strategy_actions?window_days=30').then(r=>r.json()).then(data=>{
+  Promise.all([
+    fetch('/api/strategy_actions?window_days=30').then(r=>r.json()),
+    fetch('/api/allocation_factors').then(r=>r.json()),
+  ]).then(([data, allocData])=>{
     const el = document.getElementById('decision-engine-panel');
     if (!el) return;
     const summary = data.summary || {};
+    const factors = (allocData && allocData.factors) || {};
     const total = (summary.scale_up||0) + (summary.hold||0) + (summary.reduce||0) + (summary.kill||0) + (summary.ignore||0);
     let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
       + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
@@ -7532,7 +7701,8 @@ function loadDecisionEngine() {
       + '<th style="text-align:left;padding:6px 8px;">Drift</th>'
       + '<th style="text-align:center;padding:6px 8px;">Trend</th>'
       + '<th style="text-align:left;padding:6px 8px;">Reason</th>'
-      + '<th style="text-align:left;padding:6px 8px;">Suggested alloc</th>'
+      + '<th style="text-align:left;padding:6px 8px;">Suggested</th>'
+      + '<th style="text-align:right;padding:6px 8px;">Active ×</th>'
       + '</tr></thead><tbody>';
     for (const s of data.strategies || []) {
       const c = ACTION_COLORS[s.action] || ACTION_COLORS.HOLD;
@@ -7550,6 +7720,17 @@ function loadDecisionEngine() {
         + '<td style="padding:6px 8px;text-align:center;">' + renderExpectancySpark(s.expectancy_prior_usd, s.expectancy_recent_usd) + '</td>'
         + '<td style="padding:6px 8px;color:#7b8ab8;font-size:0.92em;">' + s.reason + '</td>'
         + '<td style="padding:6px 8px;color:' + c.fg + ';font-size:0.92em;">' + s.allocation_hint + '</td>'
+        + '<td style="padding:6px 8px;text-align:right;">' + (function(){
+            // Try multiple label variants when looking up
+            const tries = [s.strategy, s.strategy.replace('forge_',''), 'forge_' + s.strategy];
+            let f = 1.0;
+            let found = false;
+            for (const k of tries) { if (k in factors) { f = factors[k]; found = true; break; } }
+            const factorColor = !found ? '#7b8ab8' : (f === 0 ? '#ff4444' : (f > 1.2 ? '#00ff88' : (f < 0.8 ? '#ffc107' : '#9da8c7')));
+            const fontWeight = found ? 'bold' : 'normal';
+            return '<span style="color:' + factorColor + ';font-weight:' + fontWeight + ';">' + f.toFixed(2) + (found ? '' : '<span style="color:#555;font-size:0.85em;"> (default)</span>') + '</span>';
+          })()
+        + '</td>'
         + '</tr>';
     }
     html += '</tbody></table>'

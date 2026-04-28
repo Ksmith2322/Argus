@@ -52,6 +52,9 @@ _RECONCILE_SCRIPT = _REPO / "ops" / "canonical_reconcile.py"
 _BROKER_DISCONNECT_SCRIPT = _REPO / "ops" / "broker_disconnect_check.py"
 _COHORT_FAILURE_SCRIPT = _REPO / "ops" / "cohort_failure_check.py"
 _TWS_HEALTH_SCRIPT = _REPO / "ops" / "tws_health_probe.py"
+_CIRCUIT_BREAKER_SCRIPT = _REPO / "ops" / "daily_loss_circuit_breaker.py"
+_FLATTEN_EXECUTOR_SCRIPT = _REPO / "ops" / "flatten_eod_executor.py"
+_COMPUTE_MFE_SCRIPT = _REPO / "ops" / "compute_mfe.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -108,14 +111,46 @@ def main() -> int:
                 except Exception as e:
                     log.warning("broker_disconnect_check failed this cycle: %s", e)
 
+            # Daily-loss circuit breaker — every cycle. Cheap (one TWS query +
+            # JSON write). Touches HALT.flag automatically when daily PnL crosses
+            # -2% / -4% thresholds.
+            if _CIRCUIT_BREAKER_SCRIPT.exists():
+                try:
+                    subprocess.run(
+                        [sys.executable, str(_CIRCUIT_BREAKER_SCRIPT)],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=20,
+                    )
+                except Exception as e:
+                    log.warning("daily_loss_circuit_breaker failed this cycle: %s", e)
+
+            # FLATTEN_EOD executor — runs ONLY if FLATTEN_EOD.flag exists.
+            # The script no-ops if flag is absent, so safe to call every cycle.
+            _flatten_flag = _REPO / "argus_flow" / "logs" / "FLATTEN_EOD.flag"
+            if _flatten_flag.exists() and _FLATTEN_EXECUTOR_SCRIPT.exists():
+                try:
+                    subprocess.run(
+                        [sys.executable, str(_FLATTEN_EXECUTOR_SCRIPT)],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    log.warning("flatten_eod_executor failed this cycle: %s", e)
+
             # Hourly: schema validation + canonical reconcile + orphan lock cleanup.
             global _last_hourly_epoch
             now_epoch = time.time()
             if now_epoch - _last_hourly_epoch >= HOURLY_CHECKS_INTERVAL_S:
+                # Circuit breaker runs every cycle (every 3 min via outer loop) — not hourly.
+                # Pre-check it here too for safety.
+                # FLATTEN executor runs only if FLATTEN_EOD.flag is present.
                 for name, script in (("schema_validator", _SCHEMA_SCRIPT),
                                      ("canonical_reconcile", _RECONCILE_SCRIPT),
                                      ("cohort_failure_check", _COHORT_FAILURE_SCRIPT),
-                                     ("tws_health_probe", _TWS_HEALTH_SCRIPT)):
+                                     ("tws_health_probe", _TWS_HEALTH_SCRIPT),
+                                     ("compute_mfe", _COMPUTE_MFE_SCRIPT)):
                     if script.exists():
                         try:
                             subprocess.run(

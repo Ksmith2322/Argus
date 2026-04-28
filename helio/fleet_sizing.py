@@ -323,6 +323,41 @@ def get_effective_risk_pct(strategy_label: str) -> dict:
     }
 
 
+def get_allocation_factor(strategy_label: str | None) -> float:
+    """Per-strategy capital multiplier (Layer 4 MVP from the Decision Engine
+    architecture). Read from argus_flow/configs/allocation_factors.json.
+
+    Default 1.0 if not specified or file missing. Clamped to 0.0-2.0 for safety
+    (so a typo / runaway can't 100x position sizing). 0.0 effectively kills the
+    strategy without stopping its runner.
+
+    Tries multiple label variants since strategies sometimes refer to themselves
+    as 'forge_multi_orb' and sometimes 'multi_orb'.
+    """
+    if not strategy_label:
+        return 1.0
+    try:
+        from pathlib import Path as _Path
+        cfg_path = _Path(__file__).resolve().parents[1] / "argus_flow" / "configs" / "allocation_factors.json"
+        if not cfg_path.exists():
+            return 1.0
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        factors = cfg.get("factors", {}) or {}
+        # Try several label variants
+        candidates = [strategy_label]
+        if strategy_label.startswith("forge_"):
+            candidates.append(strategy_label[len("forge_"):])
+        else:
+            candidates.append("forge_" + strategy_label)
+        for key in candidates:
+            if key in factors:
+                f = float(factors[key])
+                return max(0.0, min(2.0, f))
+        return 1.0
+    except Exception:
+        return 1.0
+
+
 def compute_risk_usd(strategy_or_pct=None, strategy_label: str | None = None) -> float:
     """Dollar risk for a trade. Two call signatures supported:
 
@@ -332,16 +367,22 @@ def compute_risk_usd(strategy_or_pct=None, strategy_label: str | None = None) ->
 
     Prefer the strategy_label form for prod. The legacy form is kept for
     back-compat with code that hasn't been retrofitted.
+
+    The label-based forms apply the per-strategy allocation_factor (Layer 4).
+    Legacy numeric form does NOT apply allocation_factor — caller is using a
+    fixed risk_pct intentionally.
     """
     anchor = get_sizing_anchor_usd()
     # Label-based path
     if isinstance(strategy_or_pct, str):
         info = get_effective_risk_pct(strategy_or_pct)
-        return info["risk_pct"] * anchor
+        factor = get_allocation_factor(strategy_or_pct)
+        return info["risk_pct"] * anchor * factor
     if strategy_label:
         info = get_effective_risk_pct(strategy_label)
-        return info["risk_pct"] * anchor
-    # Legacy numeric risk_pct path — clamp to ceiling
+        factor = get_allocation_factor(strategy_label)
+        return info["risk_pct"] * anchor * factor
+    # Legacy numeric risk_pct path — clamp to ceiling, NO allocation factor applied
     try:
         pct = float(strategy_or_pct)
     except (TypeError, ValueError):
