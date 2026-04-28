@@ -7862,7 +7862,7 @@ function loadMfeCapture() {
       const meanColor = s.mean_capture > 0.5 ? '#00ff88' : (s.mean_capture > 0 ? '#ffc107' : '#ff4444');
       const mfeMaeColor = s.mean_mfe_to_mae > 2.0 ? '#00ff88' : (s.mean_mfe_to_mae > 1.0 ? '#ffc107' : '#ff4444');
       const safeId = s.strategy.replace(/[^a-z0-9]/gi, '_');
-      html += '<tr style="border-top:1px solid #1e2a42;cursor:pointer;" onclick="toggleMfeDrill(\'' + safeId + '\')" title="Click to expand last 20 trades">'
+      html += '<tr style="border-top:1px solid #1e2a42;cursor:pointer;" data-mfe-id="' + safeId + '" onclick="toggleMfeDrill(this.dataset.mfeId)" title="Click to expand last 20 trades">'
         + '<td style="padding:5px 6px;color:#e0e0e0;"><span id="mfe-arrow-' + safeId + '" style="color:#7b8ab8;font-size:0.85em;">▶</span> ' + s.strategy + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.n + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + meanColor + ';font-weight:bold;">' + s.mean_capture.toFixed(2) + '</td>'
@@ -8328,7 +8328,7 @@ function loadDecisionEngine() {
             let cur = 1.0;
             for (const k of tries) { if (k in factors) { cur = factors[k]; break; } }
             if (Math.abs(cur - rec) < 0.01) return '<span style="color:#00e676;font-size:0.85em;" title="current matches recommendation">applied</span>';
-            return '<button onclick="applyAllocFactor(\'' + s.strategy + '\',' + rec + ')" style="background:#1e2a42;border:1px solid #00d4ff;color:#00d4ff;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:0.85em;letter-spacing:1px;font-weight:bold;" title="Set ' + s.strategy + ' allocation to ' + rec + 'x">apply ' + rec + 'x</button>';
+            return '<button data-alloc-strategy="' + s.strategy + '" data-alloc-factor="' + rec + '" onclick="applyAllocFactor(this.dataset.allocStrategy, parseFloat(this.dataset.allocFactor))" style="background:#1e2a42;border:1px solid #00d4ff;color:#00d4ff;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:0.85em;letter-spacing:1px;font-weight:bold;" title="Set ' + s.strategy + ' allocation to ' + rec + 'x">apply ' + rec + 'x</button>';
           })()
         + '</td>'
         + '</tr>';
@@ -8846,8 +8846,8 @@ function loadStaleDataBanner() {
     if (reportAgeS > 900) {  // >15 min stale → daemon likely dead
       el.innerHTML = '<div style="background:#2a0f0f;border:1px solid #ff4444;border-radius:4px;padding:10px 14px;">'
         + '<div style="color:#ff4444;font-weight:bold;font-size:0.85em;letter-spacing:2px;">&#9888; STALE-DATA ALERT</div>'
-        + '<div style="font-size:0.75em;margin-top:4px;">risk_oversight_report.json hasn\'t refreshed in ' + Math.round(reportAgeS/60) + ' min. '
-        + 'The managed_truth_loop daemon may be dead. Check: <code>Get-Process -Name python | Where-Object { $_.CommandLine -like \'*managed_truth_loop*\' }</code></div>'
+        + '<div style="font-size:0.75em;margin-top:4px;">risk_oversight_report.json hasn\\'t refreshed in ' + Math.round(reportAgeS/60) + ' min. '
+        + 'The managed_truth_loop daemon may be dead. Check: <code>Get-Process -Name python | Where-Object { $_.CommandLine -like \\'*managed_truth_loop*\\' }</code></div>'
         + '</div>';
     } else if (reportAgeS > 400) {  // 6-15 min: warn but not alarm
       el.innerHTML = '<div style="background:#2a2010;border:1px solid #ffaa00;border-radius:4px;padding:6px 12px;font-size:0.72em;color:#ffaa00;">'
