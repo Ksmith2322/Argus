@@ -5120,6 +5120,168 @@ async def api_trade_validity_counts():
     })
 
 
+# ── Benchmark alpha (excess return vs passive proxy) ─────────────────────
+# Strategy → benchmark ticker map. Only includes strategies where the
+# passive-proxy comparison is meaningful — FX strategies (no clean ETF
+# proxy) and multi-instrument scanners (no single benchmark) are skipped.
+# This is "excess return vs buy-and-hold," NOT Jensen's alpha or beta-adjusted.
+# Honest framing: are you adding value over just holding the underlying?
+_BENCHMARK_MAP: dict[str, dict[str, str]] = {
+    "forge_vix_intraday":   {"ticker": "UVXY", "label": "UVXY buy-and-hold (decay-prone)"},
+    "forge_spy_mean_rev":   {"ticker": "SPY",  "label": "SPY buy-and-hold"},
+    "forge_multi_orb":      {"ticker": "SPY",  "label": "SPY (multi-orb is multi-symbol; SPY is most representative)"},
+    "forge_gld_pm_long":    {"ticker": "GLD",  "label": "GLD buy-and-hold"},
+    "forge_nq_overnight":   {"ticker": "QQQ",  "label": "QQQ (NQ proxy)"},
+    "forge_nq_london_close":{"ticker": "QQQ",  "label": "QQQ (NQ proxy)"},
+}
+
+# In-memory cache for benchmark price fetches — 1-hour TTL to avoid hammering
+# yfinance on every dashboard refresh.
+_BENCHMARK_PRICE_CACHE: dict[str, tuple[float, float, datetime]] = {}
+
+
+def _fetch_benchmark_return(ticker: str, window_days: int) -> tuple[float | None, str | None]:
+    """Returns (return_pct, error). Caches for 1 hour to avoid repeated downloads."""
+    cache_key = f"{ticker}_{window_days}"
+    cached = _BENCHMARK_PRICE_CACHE.get(cache_key)
+    if cached is not None:
+        ret_pct, _, fetched_at = cached
+        if (datetime.now(timezone.utc) - fetched_at).total_seconds() < 3600:
+            return ret_pct, None
+    try:
+        import warnings
+        warnings.simplefilter("ignore")
+        import yfinance as yf
+        df = yf.download(ticker, period=f"{window_days + 5}d", interval="1d",
+                         progress=False, auto_adjust=False)
+        if df.empty or len(df) < 2:
+            return None, "insufficient bars"
+        # yfinance can return MultiIndex columns; extract Close as float
+        close = df["Close"]
+        first_val = close.iloc[0]
+        last_val = close.iloc[-1]
+        # Handle MultiIndex columns where iloc returns Series
+        if hasattr(first_val, "iloc"):
+            first_val = first_val.iloc[0]
+        if hasattr(last_val, "iloc"):
+            last_val = last_val.iloc[0]
+        first = float(first_val)
+        last = float(last_val)
+        if first <= 0:
+            return None, "invalid first price"
+        ret_pct = (last / first - 1) * 100
+        _BENCHMARK_PRICE_CACHE[cache_key] = (ret_pct, last, datetime.now(timezone.utc))
+        return ret_pct, None
+    except Exception as e:
+        return None, str(e)[:120]
+
+
+@app.get("/api/benchmark_alpha")
+async def api_benchmark_alpha(window_days: int = 30):
+    """Per-strategy excess return vs a passive benchmark over the same window.
+
+    NOT Jensen's alpha. NOT beta-adjusted. Just: (strategy PnL %) - (benchmark
+    buy-and-hold %). This answers the user's review point that the panel
+    formerly called "Alpha Attribution" was actually contribution attribution
+    — true alpha needed benchmark comparison. Now provided.
+
+    Skipped strategies: FX (no clean ETF proxy), multi-instrument scanners
+    (no single benchmark), pair-trades (gdx_gld), Greek family (multi-leg
+    scanners). When all 23 strategies are in scope, this list shrinks.
+
+    Limitation: uses fleet anchor as the denominator for strategy PnL %,
+    which makes the "%" comparable to benchmark buy-and-hold-of-anchor%.
+    For strategies that use less than full anchor capital, this slightly
+    UNDERSTATES their alpha. Honest direction: the bias is conservative.
+    """
+    eff_resp = await api_strategy_efficiency(window_days=window_days)
+    eff = json.loads(eff_resp.body)
+    eff_by = {s["strategy"]: s for s in eff.get("strategies", [])}
+
+    # Use fleet anchor (broker equity) as the percent denominator
+    try:
+        pos = json.loads((await api_positions_open()).body)
+        anchor = float(pos.get("anchor_usd", 0)) or 30000.0
+    except Exception:
+        anchor = 30000.0
+
+    rows = []
+    skipped = []
+
+    # In-scope strategies first
+    for strat, bm in _BENCHMARK_MAP.items():
+        e = eff_by.get(strat)
+        if not e or e.get("trade_count", 0) == 0:
+            skipped.append({"strategy": strat, "reason": "no trades in window"})
+            continue
+        bench_ret_pct, err = _fetch_benchmark_return(bm["ticker"], window_days)
+        if bench_ret_pct is None:
+            skipped.append({"strategy": strat, "reason": f"benchmark fetch failed: {err}"})
+            continue
+        strat_pnl_usd = e.get("total_pnl_usd", 0)
+        strat_pnl_pct = (strat_pnl_usd / anchor * 100) if anchor > 0 else 0
+        excess_pct = strat_pnl_pct - bench_ret_pct
+        # Verdict: alpha_pass when strategy beats benchmark by margin >= 0.1pct (avoid noise threshold)
+        alpha_pass = excess_pct >= 0.1
+        rows.append({
+            "strategy": strat,
+            "benchmark_ticker": bm["ticker"],
+            "benchmark_label": bm["label"],
+            "trade_count": e.get("trade_count", 0),
+            "strategy_pnl_usd": round(strat_pnl_usd, 2),
+            "strategy_pnl_pct": round(strat_pnl_pct, 3),
+            "benchmark_pnl_pct": round(bench_ret_pct, 2),
+            "excess_pct": round(excess_pct, 2),
+            "alpha_pass": alpha_pass,
+            "verdict": (
+                f"Beats benchmark by {excess_pct:+.2f}%pt" if excess_pct > 0
+                else f"Underperforms benchmark by {abs(excess_pct):.2f}%pt"
+            ),
+        })
+
+    # Out-of-scope strategies (FX, multi-leg, scanners)
+    out_of_scope_reasons = {
+        "argus_usdjpy":     "FX — no clean ETF proxy for USD/JPY",
+        "argus_gbpusd":     "FX — no clean ETF proxy for GBP/USD",
+        "argus_cadjpy":     "FX — no clean ETF proxy for CAD/JPY",
+        "forge_jpy_pm_short":      "FX — no clean ETF proxy for JPY pairs",
+        "forge_aud_asian_breakout":"FX — no clean ETF proxy for AUD/USD",
+        "forge_wick_gbpusd":       "FX — no clean ETF proxy for GBP/USD",
+        "forge_gdx_gld":    "Pair trade — benchmark is the spread, not a single ticker",
+        "forge_mamba":      "Multi-instrument scalping; no single benchmark",
+        "forge_tori":       "Multi-instrument; research_only",
+        "forge_cuebanks":   "research_only mode",
+        "forge_vix_revert": "Hourly VIX-conditional; no live trades yet",
+        "forge_rebalance":  "Calendar-windowed; not in regular session",
+        "forge_fomc_drift": "Event-driven (FOMC days only)",
+        "forge_tom_international": "Event-driven (turn-of-month)",
+        "forge_atlas":      "Regime classifier (no trades)",
+        "forge_themis":     "Regime classifier (no trades)",
+        "apollo":           "Earnings scanner (multi-symbol)",
+        "hermes":           "Gap scanner (multi-symbol)",
+        "titan":            "Trend scanner (multi-symbol)",
+        "ares":             "Sector rotator (multi-leg basket)",
+    }
+    for s, reason in out_of_scope_reasons.items():
+        skipped.append({"strategy": s, "reason": reason})
+
+    rows.sort(key=lambda r: -r["excess_pct"])
+    return JSONResponse({
+        "window_days": window_days,
+        "anchor_usd": anchor,
+        "n_in_scope": len(rows),
+        "n_with_alpha": sum(1 for r in rows if r["alpha_pass"]),
+        "n_skipped": len(skipped),
+        "strategies": rows,
+        "skipped": skipped,
+        "method_note": (
+            "Excess return = (strategy PnL / fleet anchor) - (benchmark buy-and-hold %). "
+            "NOT beta-adjusted, NOT Jensen's alpha. Honest read: 'are you adding "
+            "value over just holding the underlying?' alpha_pass = excess >= 0.1%pt."
+        ),
+    })
+
+
 @app.get("/api/strategy_drilldown")
 async def api_strategy_drilldown(strategy: str, window_days: int = 60):
     """Per-strategy subset analysis: groups trades by symbol/direction/exit/hour
@@ -8108,6 +8270,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- FLEET CONTRIBUTION — who is carrying fleet PnL (not benchmark alpha — separate panel post-5/31) -->
 <div id="alpha-attribution-panel" style="margin-bottom:14px;"></div>
 
+<!-- BENCHMARK ALPHA — excess return vs passive buy-and-hold proxy (per-strategy) -->
+<div id="benchmark-alpha-panel" style="margin-bottom:14px;"></div>
+
 <!-- CORRELATION / REDUNDANCY MAP — pairwise correlation + time overlap -->
 <div id="correlation-map-panel" style="margin-bottom:14px;"></div>
 
@@ -9197,6 +9362,67 @@ function loadAlphaAttribution() {
 }
 loadAlphaAttribution();
 setInterval(loadAlphaAttribution, 60000);
+
+// ─── BENCHMARK ALPHA ───────────────────────────────────────────────
+// Excess return vs a passive buy-and-hold proxy. Answers: "is the strategy
+// adding value over just holding the underlying?" — the question the
+// renamed Fleet Contribution panel implicitly promised but couldn't yet
+// answer with raw PnL. NOT Jensen's alpha, NOT beta-adjusted; just simple
+// excess return — honest about what it is.
+function loadBenchmarkAlpha() {
+  fetch('/api/benchmark_alpha?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('benchmark-alpha-panel');
+    if (!el) return;
+    const rows = data.strategies || [];
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    const inScope = data.n_in_scope || 0;
+    const withAlpha = data.n_with_alpha || 0;
+    const headlineColor = withAlpha > 0 ? '#00ff88' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">BENCHMARK ALPHA (30d)</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">excess return vs passive buy-and-hold (NOT beta-adjusted)</span></div>'
+      + '<div style="font-size:0.75em;color:' + headlineColor + ';">'
+      + '<b>' + withAlpha + '/' + inScope + '</b> strategies beat their benchmark · '
+      + (data.n_skipped || 0) + ' skipped (FX/multi-leg/scanner)</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Benchmark</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Strat %</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Bench %</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Excess pp</th>'
+      + '<th style="text-align:center;padding:5px 6px;">Verdict</th>'
+      + '</tr></thead><tbody>';
+    for (const r of rows) {
+      const stratColor = r.strategy_pnl_pct > 0 ? '#00ff88' : (r.strategy_pnl_pct < 0 ? '#ff4444' : '#9da8c7');
+      const benchColor = r.benchmark_pnl_pct > 0 ? '#9da8c7' : (r.benchmark_pnl_pct < 0 ? '#9da8c7' : '#9da8c7');
+      const excessColor = r.excess_pct > 0 ? '#00ff88' : (r.excess_pct < 0 ? '#ff4444' : '#9da8c7');
+      const verdict = r.alpha_pass
+        ? '<span style="background:#0d1c11;border:1px solid #00ff88;color:#00ff88;padding:1px 6px;border-radius:3px;font-weight:bold;font-size:0.92em;">ALPHA</span>'
+        : '<span style="color:#7b8ab8;font-size:0.92em;">no edge vs passive</span>';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + r.strategy + '</td>'
+        + '<td style="padding:5px 6px;color:#9da8c7;" title="' + r.benchmark_label + '">' + r.benchmark_ticker + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + r.trade_count + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + stratColor + ';">' + (r.strategy_pnl_pct >= 0 ? '+' : '') + r.strategy_pnl_pct.toFixed(2) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + benchColor + ';">' + (r.benchmark_pnl_pct >= 0 ? '+' : '') + r.benchmark_pnl_pct.toFixed(2) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + excessColor + ';font-weight:bold;">' + (r.excess_pct >= 0 ? '+' : '') + r.excess_pct.toFixed(2) + 'pp</td>'
+        + '<td style="padding:5px 6px;text-align:center;">' + verdict + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Excess = (strategy PnL / fleet anchor) - (benchmark buy-and-hold). FX + multi-leg + scanner strategies excluded (no clean benchmark). '
+      + 'Conservative bias: strategies using less than full anchor capital are slightly understated.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('benchmark alpha error:', e);});
+}
+loadBenchmarkAlpha();
+setInterval(loadBenchmarkAlpha, 300000);  // 5min — benchmark prices are cached for 1h anyway
 
 // ─── CORRELATION / REDUNDANCY MAP ──────────────────────────────────
 // Pairwise correlation + time-overlap. Strategies with high corr + high
@@ -15378,7 +15604,8 @@ PANEL_IDS_ALL = [
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
-    "alpha-attribution-panel", "correlation-map-panel", "trade-validity-panel",
+    "alpha-attribution-panel", "benchmark-alpha-panel",
+    "correlation-map-panel", "trade-validity-panel",
     # Live / state
     "open-positions-panel", "fleet-health", "fleet-equity-panel",
     "per-strategy-equity-panel", "strategy-performance", "recent-trades-panel",
@@ -15417,7 +15644,8 @@ VIEW_ALLOWLISTS = {
     "research": {
         "capital-safety-bar",
         "efficiency-panel", "opportunity-panel", "mfe-capture-panel",
-        "alpha-attribution-panel", "correlation-map-panel", "trade-validity-panel",
+        "alpha-attribution-panel", "benchmark-alpha-panel",
+        "correlation-map-panel", "trade-validity-panel",
         "dimensions-panel", "fleet-equity-panel", "per-strategy-equity-panel",
         "strategy-performance", "recent-trades-panel",
     },
