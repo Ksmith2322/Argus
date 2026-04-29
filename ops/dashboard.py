@@ -4555,44 +4555,70 @@ async def api_strategy_actions(window_days: int = 30):
       drift=FLAT, eff < 0         -> REDUCE  (consistently negative, no change in trajectory)
       anything else               -> HOLD
     """
-    # Reuse the two existing endpoints' logic by calling them
-    # (avoids duplicating the math)
+    # Reuse the existing endpoints' logic by calling them (avoids duplicate math)
     eff_data = json.loads((await api_strategy_efficiency(window_days=window_days)).body)
     drift_data = json.loads((await api_strategy_drift()).body)
+    # Trade validity → QUARANTINE trigger when dirty_rate > 5%
+    try:
+        validity_data = json.loads((await api_trade_validity_counts()).body)
+    except Exception:
+        validity_data = {"strategies": []}
 
-    # Index by strategy
     eff_by = {r["strategy"]: r for r in eff_data.get("strategies", [])}
     drift_by = {r["strategy"]: r for r in drift_data.get("strategies", [])}
+    validity_by = {r["strategy"]: r for r in validity_data.get("strategies", [])}
 
-    # Union of strategies seen
     all_strategies = set(eff_by.keys()) | set(drift_by.keys())
 
     rows = []
     for strat in sorted(all_strategies):
         e = eff_by.get(strat, {})
         d = drift_by.get(strat, {})
+        v = validity_by.get(strat, {})
 
         n = d.get("n_total", e.get("trade_count", 0))
         eff_score = e.get("efficiency_score", 0)
         pnl = e.get("total_pnl_usd", 0)
         drift_verdict = d.get("drift_verdict", "INSUFFICIENT")
+        dirty_rate = v.get("invalid_pct", 0)  # % of trades flagged experiment_valid=false
 
         # ── Confidence weighting (0-100) ──
-        # Sample size is the primary driver. 30+ trades = full confidence.
         if n >= 30: conf = 100
         elif n >= 10: conf = int((n / 30) * 100)
-        elif n >= 5: conf = 30  # some signal, not enough to act on alone
+        elif n >= 5: conf = 30
         else: conf = 10
 
-        # ── Decision rules ──
-        # When confidence is low we're conservative.
-        if n < 10:
+        # ── Decision rules (v2 — tightened per 2026-04-28 review) ──
+        # Key changes from v1:
+        #   - QUARANTINE tier: dirty_rate > 5% trumps everything else (data hygiene
+        #     issue means we can't trust the rest of the metrics)
+        #   - Confirmed-KILL requires n >= 50 (was n >= 10): smaller samples can be
+        #     statistically negative without proving structural failure
+        #   - REWORK flag: separate from action. action=REDUCE with rework=True means
+        #     "throttle size AND investigate logic" — sizing alone doesn't fix
+        #     structural negative expectancy
+        rework_required = False
+        rework_reason = None
+
+        if dirty_rate > 5.0:
+            action = "QUARANTINE"
+            reason = f"dirty trade rate {dirty_rate:.1f}% > 5% — fix data hygiene before evaluating edge"
+        elif n < 10:
             action, reason = "OBSERVE", f"insufficient sample (n={n})"
         elif drift_verdict == "DECLINING":
-            if pnl < 0:
-                action, reason = "KILL", f"losing money + edge degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%)"
+            if pnl < 0 and n >= 50:
+                action = "KILL"
+                reason = f"losing money + edge degrading + sample large enough to confirm (n={n}, pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%)"
+            elif pnl < 0:
+                # Still degrading + losing but n < 50 — REDUCE with REWORK flag,
+                # not KILL yet. Need more sample to confirm structural failure.
+                action = "REDUCE"
+                reason = f"losing + degrading but n={n} < 50 (need bigger sample before KILL)"
+                rework_required = True
+                rework_reason = "Negative expectancy with declining drift — investigate logic before sample reaches kill threshold"
             else:
-                action, reason = "REDUCE", f"profitable but degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%) — throttle and watch"
+                action = "REDUCE"
+                reason = f"profitable but degrading (pnl=${pnl:.0f}, drift {d.get('delta_pct',0):+.0f}%) — throttle and watch"
         elif drift_verdict == "RISING":
             if eff_score > 5:
                 action, reason = "SCALE_UP", f"improving + efficient (eff={eff_score:.1f}, drift {d.get('delta_pct',0):+.0f}%)"
@@ -4601,8 +4627,16 @@ async def api_strategy_actions(window_days: int = 30):
         elif drift_verdict in ("FLAT", "STABILIZING"):
             if pnl > 0:
                 action, reason = "HOLD", f"working, no change in trajectory (pnl=${pnl:.0f}, eff={eff_score:.1f})"
+            elif pnl < 0 and n >= 30:
+                # Persistent negative expectancy with reasonable sample → REDUCE+REWORK.
+                # User's review point: "simply reducing size does not fix negative
+                # expectancy." Flag for logic investigation, not just sizing tweak.
+                action = "REDUCE"
+                reason = f"consistently negative + n={n} >= 30 — REWORK required, sizing alone won't fix"
+                rework_required = True
+                rework_reason = "Negative expectancy with stable trend — likely structural issue (entry timing, stop placement, regime fit). Subset analysis recommended before KILL."
             elif pnl < 0:
-                action, reason = "REDUCE", f"consistently negative, flat trend (pnl=${pnl:.0f})"
+                action, reason = "REDUCE", f"negative but n={n} < 30 — throttle while sample builds"
             else:
                 action, reason = "HOLD", "neutral — wait for more data"
         elif drift_verdict == "EARLY":
@@ -4614,38 +4648,42 @@ async def api_strategy_actions(window_days: int = 30):
             "strategy": strat,
             "action": action,
             "reason": reason,
+            "rework_required": rework_required,
+            "rework_reason": rework_reason,
+            "dirty_rate_pct": round(dirty_rate, 2),
             "confidence_pct": conf,
             "n_total": n,
             "pnl_usd": pnl,
             "efficiency_score": eff_score,
             "drift_verdict": drift_verdict,
             "drift_delta_pct": d.get("delta_pct", 0),
-            # Pass through the underlying expectancy values for the sparkline
             "expectancy_recent_usd": d.get("expectancy_recent_usd", 0),
             "expectancy_prior_usd":  d.get("expectancy_prior_usd", 0),
-            # Suggested allocation tier (Layer 4 hint, not enforced)
             "allocation_hint": {
-                "SCALE_UP": "20-30% (top tier)",
-                "HOLD":     "5-10% (standard)",
-                "REDUCE":   "0-5% (throttled)",
-                "KILL":     "0% (stop)",
-                "OBSERVE":  "0% (insufficient data)",
+                "SCALE_UP":   "20-30% (top tier)",
+                "HOLD":       "5-10% (standard)",
+                "REDUCE":     "0-5% (throttled)",
+                "KILL":       "0% (stop)",
+                "QUARANTINE": "0% (data hygiene fix required)",
+                "OBSERVE":    "0% (insufficient data)",
             }.get(action, "0%"),
         })
 
-    # Sort: SCALE_UP first, then HOLD, REDUCE, KILL, OBSERVE
-    action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "KILL": 3, "OBSERVE": 4}
-    rows.sort(key=lambda r: (action_order.get(r["action"], 5), -r["pnl_usd"]))
+    # Sort order: SCALE_UP, HOLD, REDUCE, QUARANTINE, KILL, OBSERVE
+    action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "QUARANTINE": 3, "KILL": 4, "OBSERVE": 5}
+    rows.sort(key=lambda r: (action_order.get(r["action"], 6), -r["pnl_usd"]))
     return JSONResponse({
         "window_days": window_days,
-        "rules_version": "v1_2026-04-27",
+        "rules_version": "v2_2026-04-28",
         "strategies": rows,
         "summary": {
-            "scale_up": sum(1 for r in rows if r["action"] == "SCALE_UP"),
-            "hold":     sum(1 for r in rows if r["action"] == "HOLD"),
-            "reduce":   sum(1 for r in rows if r["action"] == "REDUCE"),
-            "kill":     sum(1 for r in rows if r["action"] == "KILL"),
-            "observe":  sum(1 for r in rows if r["action"] == "OBSERVE"),
+            "scale_up":   sum(1 for r in rows if r["action"] == "SCALE_UP"),
+            "hold":       sum(1 for r in rows if r["action"] == "HOLD"),
+            "reduce":     sum(1 for r in rows if r["action"] == "REDUCE"),
+            "rework":     sum(1 for r in rows if r["rework_required"]),
+            "quarantine": sum(1 for r in rows if r["action"] == "QUARANTINE"),
+            "kill":       sum(1 for r in rows if r["action"] == "KILL"),
+            "observe":    sum(1 for r in rows if r["action"] == "OBSERVE"),
         },
     })
 
@@ -5079,6 +5117,145 @@ async def api_trade_validity_counts():
         "fleet_invalid": fleet_total_invalid,
         "fleet_invalid_pct": round(fleet_total_invalid / fleet_total * 100, 2) if fleet_total else 0,
         "strategies": rows,
+    })
+
+
+@app.get("/api/strategy_drilldown")
+async def api_strategy_drilldown(strategy: str, window_days: int = 60):
+    """Per-strategy subset analysis: groups trades by symbol/direction/exit/hour
+    and surfaces salvageable + kill subsets.
+
+    Answers the question the user's 5/1 ceremony spec demands BEFORE killing
+    a strategy: 'is there a salvageable subset?' For multi_orb (n=79, PF
+    0.64, candidate KILL), it tells you whether QQQ+long or some other
+    combination has PF > 1 hiding inside the negative aggregate.
+
+    A subset qualifies as "salvageable" if PF >= 1.5 AND n >= 10 (real edge,
+    enough sample). It's "kill-confirmed" if PF < 0.5 AND n >= 5 (clearly
+    bleeds, even small sample). Single overall PF means nothing — the
+    aggregate hides cohort effects.
+    """
+    # Map strategy label → trades.csv path. Mirrors STRATEGY_REGISTRY in
+    # ops/operational_vetting.py for forge + argus + Greek strategies.
+    label = strategy
+    short = label.removeprefix("forge_").removeprefix("argus_")
+    candidates = [
+        REPO / "forge" / "logs" / short / "trades.csv",      # forge subdirectory pattern
+        REPO / "forge" / "logs" / f"{short}_runner" / "trades.csv",
+        REPO / "argus_flow" / "logs" / short / "trades.csv",  # argus FX pairs
+        REPO / "apollo" / "logs" / "trades.csv" if label == "apollo" else None,
+        REPO / "hermes" / "logs" / "trades.csv" if label == "hermes" else None,
+        REPO / "titan" / "logs" / "trades.csv" if label == "titan" else None,
+    ]
+    csv_path = next((p for p in candidates if p is not None and p.exists()), None)
+    if csv_path is None:
+        return JSONResponse({"status": "missing", "strategy": strategy,
+                             "message": "no trades.csv found at expected paths"})
+    try:
+        with open(csv_path, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    in_window: list[dict] = []
+    for r in rows:
+        # Filter invalid trades
+        if str(r.get("experiment_valid", "")).lower() == "false":
+            continue
+        ts_raw = r.get("ts") or r.get("entry_ts") or ""
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        try:
+            r["_pnl"] = float(r.get("pnl_usd") or 0)
+            r["_hour"] = ts.hour
+        except Exception:
+            continue
+        in_window.append(r)
+
+    def _stats(trades: list[dict]) -> dict:
+        n = len(trades)
+        if n == 0:
+            return {"n": 0, "wins": 0, "losses": 0, "wr_pct": 0.0,
+                    "pf": None, "expectancy_usd": 0.0, "pnl_usd": 0.0}
+        pnls = [t["_pnl"] for t in trades]
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)
+        gross_w = sum(p for p in pnls if p > 0)
+        gross_l = abs(sum(p for p in pnls if p < 0))
+        pf = (gross_w / gross_l) if gross_l > 0 else (None if gross_w == 0 else 99.0)
+        return {
+            "n": n,
+            "wins": wins,
+            "losses": losses,
+            "wr_pct": round(wins / n * 100, 1),
+            "pf": round(pf, 2) if pf is not None else None,
+            "expectancy_usd": round(sum(pnls) / n, 2),
+            "pnl_usd": round(sum(pnls), 2),
+        }
+
+    def _grouped(trades: list[dict], key_fn) -> list[dict]:
+        groups: dict[str, list[dict]] = {}
+        for t in trades:
+            try:
+                k = key_fn(t)
+            except Exception:
+                continue
+            if k is None:
+                continue
+            groups.setdefault(str(k), []).append(t)
+        out = [{"key": k, **_stats(g)} for k, g in groups.items()]
+        out.sort(key=lambda x: -(x.get("pf") or 0))
+        return out
+
+    by_symbol      = _grouped(in_window, lambda t: t.get("symbol"))
+    by_direction   = _grouped(in_window, lambda t: t.get("direction"))
+    by_exit_reason = _grouped(in_window, lambda t: t.get("exit_reason"))
+    by_hour        = _grouped(in_window, lambda t: f"hour {t['_hour']:>02d}")
+    by_symbol_dir  = _grouped(in_window, lambda t: f"{t.get('symbol')} {t.get('direction')}")
+
+    # Salvageable / kill verdicts on combination subsets — those are where the
+    # action is. Pure single-axis groups (just symbol, just direction) blend
+    # too much; the combinations isolate cohort behaviors.
+    salvageable = [
+        {**g, "rationale": f"PF {g['pf']} >= 1.5 with n={g['n']} >= 10"}
+        for g in by_symbol_dir
+        if g["n"] >= 10 and g["pf"] is not None and g["pf"] >= 1.5
+    ]
+    kill_confirmed = [
+        {**g, "rationale": f"PF {g['pf']} < 0.5 with n={g['n']} >= 5 — bleeds the strategy"}
+        for g in by_symbol_dir
+        if g["n"] >= 5 and g["pf"] is not None and g["pf"] < 0.5
+    ]
+
+    overall = _stats(in_window)
+    return JSONResponse({
+        "status": "ok",
+        "strategy": strategy,
+        "window_days": window_days,
+        "trades_path": str(csv_path.relative_to(REPO)),
+        "n_in_window": len(in_window),
+        "overall": overall,
+        "groups": {
+            "by_symbol": by_symbol,
+            "by_direction": by_direction,
+            "by_exit_reason": by_exit_reason,
+            "by_hour": by_hour,
+            "by_symbol_direction": by_symbol_dir,
+        },
+        "salvageable_subsets": salvageable,
+        "kill_confirmed_subsets": kill_confirmed,
+        "verdict_hint": (
+            "Has salvageable subset(s) — consider scope-down before KILL"
+            if salvageable else
+            "No salvageable subset found at PF >= 1.5 / n >= 10 — KILL is data-supported"
+        ),
     })
 
 
@@ -6762,9 +6939,9 @@ async def api_strategy_performance():
         "system": "Titan Validated",
         "strategy": "TREND_FOLLOW long-only (filtered)",
         "instruments": "scoped subset of Titan universe",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "2.09",
+        "backtest_trades": 174,
+        "backtest_wr": "55.7%",
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -6803,9 +6980,9 @@ async def api_strategy_performance():
         "system": "Ares Validated",
         "strategy": "Sector Rotation filtered (rotation exits only)",
         "instruments": "scoped subset of Ares universe — regime gate",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "4.63",
+        "backtest_trades": 27,
+        "backtest_wr": "70%",
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -6843,9 +7020,9 @@ async def api_strategy_performance():
         "system": "Hermes Validated",
         "strategy": "Gap Fill filtered (score>=80 + long + GAP_DOWN)",
         "instruments": "scoped subset of Hermes universe",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "2.06",
+        "backtest_trades": 92,
+        "backtest_wr": "65%",
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -6894,9 +7071,9 @@ async def api_strategy_performance():
         "system": "Apollo Validated",
         "strategy": "Post-ER filtered (surprise 10-20%% + gap 2%+)",
         "instruments": "scoped subset of Apollo universe",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "4.59",
+        "backtest_trades": 15,
+        "backtest_wr": "—",  # WR not recorded in source comment
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -6957,8 +7134,8 @@ async def api_strategy_performance():
         "system": "Mamba YM",
         "strategy": "US30 Breakout — YM-only subset",
         "instruments": "YM=F (MYM)",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
+        "backtest_pf": "1.98",
+        "backtest_trades": 0,  # n not recorded in source comment
         "backtest_wr": "—",
         "live_trades": 0,
         "live_wins": 0,
@@ -6999,9 +7176,9 @@ async def api_strategy_performance():
         "system": "Cue Banks Validated",
         "strategy": "US30 filtered (S/D supply zone only)",
         "instruments": "YM=F (MYM) — supply-zone factor gate",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "3.63",
+        "backtest_trades": 30,
+        "backtest_wr": "—",  # WR not recorded in source comment
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -7043,9 +7220,9 @@ async def api_strategy_performance():
         "system": "Tori Validated",
         "strategy": "4H Trendline Swing filtered (Dow+LONG only)",
         "instruments": "YM=F (Dow) — LONG trades only",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "3.65",
+        "backtest_trades": 78,
+        "backtest_wr": "—",  # WR not recorded in source comment
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -7105,9 +7282,9 @@ async def api_strategy_performance():
         "system": "Index Rebal Validated",
         "strategy": "S&P 500 additions only (index-inclusion effect)",
         "instruments": "scoped subset of Index Rebal universe",
-        "backtest_pf": "—",
-        "backtest_trades": 0,
-        "backtest_wr": "—",
+        "backtest_pf": "7.04",
+        "backtest_trades": 19,
+        "backtest_wr": "—",  # WR not recorded in source comment
         "live_trades": 0,
         "live_wins": 0,
         "live_wr": 0,
@@ -7170,17 +7347,22 @@ async def api_strategy_performance():
 
     # ── FORGE runners added 2026-04-22 (were invisible on Strategy Performance) ──
     # These all have live trades.csv but were never registered here.
+    # Backtest data extracted from forge/<strategy>/STRATEGY_SPEC.md tables on
+    # 2026-04-28 per project_deferred_cleanups_20260424.md. Group A (gld_pm_long /
+    # jpy_pm_short / nq_overnight) had data in their SPEC files. Group B
+    # (spy_mean_rev / multi_orb / vix_intraday / nq_london_close /
+    # aud_asian_breakout) need re-run backtests — left as "—" pending that work.
     _forge_extra = [
-        ("spy_mean_rev",       "SPY Mean Reversion",              "SPY (5m bars 14-20 UTC)",     "forge/logs/spy_mean_rev/trades.csv",       "LIVE"),
-        ("multi_orb",          "Multi-instrument ORB",            "SPY, QQQ, IWM, GLD (5m)",     "forge/logs/multi_orb/trades.csv",          "LIVE"),
-        ("vix_intraday",       "UVXY RSI(2) mean-reversion",      "UVXY (15m)",                  "forge/logs/vix_intraday/trades.csv",       "LIVE"),
-        ("gld_pm_long",        "GLD PM session long",             "GLD (1h, hours 18/19/20 UTC)", "forge/logs/gld_pm_long/trades.csv",        "LIVE"),
-        ("jpy_pm_short",       "JPY PM session short",            "USDJPY/CADJPY (1h, hour 19 UTC)", "forge/logs/jpy_pm_short/trades.csv",    "LIVE"),
-        ("nq_overnight",       "NQ overnight session",            "NQ=F (hours 20-00 UTC)",       "forge/logs/nq_overnight/trades.csv",       "LIVE"),
-        ("nq_london_close",    "NQ London close session",         "NQ=F (London close)",         "forge/logs/nq_london_close/trades.csv",    "LIVE"),
-        ("aud_asian_breakout", "AUDUSD Asian open ORB",           "AUDUSD (1h Tokyo)",           "forge/logs/aud_asian_breakout/trades.csv", "LIVE"),
+        ("spy_mean_rev",       "SPY Mean Reversion",              "SPY (5m bars 14-20 UTC)",     "forge/logs/spy_mean_rev/trades.csv",       "LIVE",  "—",          0,    "—"),
+        ("multi_orb",          "Multi-instrument ORB",            "SPY, QQQ, IWM, GLD (5m)",     "forge/logs/multi_orb/trades.csv",          "LIVE",  "—",          0,    "—"),
+        ("vix_intraday",       "UVXY RSI(2) mean-reversion",      "UVXY (15m)",                  "forge/logs/vix_intraday/trades.csv",       "LIVE",  "—",          0,    "—"),
+        ("gld_pm_long",        "GLD PM session long",             "GLD (1h, hours 18/19/20 UTC)", "forge/logs/gld_pm_long/trades.csv",        "LIVE",  "1.33-2.28", 2401, "—"),
+        ("jpy_pm_short",       "JPY PM session short",            "USDJPY/CADJPY (1h, hour 19 UTC)", "forge/logs/jpy_pm_short/trades.csv",    "LIVE",  "1.32-1.37", 1454, "—"),
+        ("nq_overnight",       "NQ overnight session",            "NQ=F (hours 20-00 UTC)",       "forge/logs/nq_overnight/trades.csv",       "LIVE",  "1.20-1.29", 1776, "—"),
+        ("nq_london_close",    "NQ London close session",         "NQ=F (London close)",         "forge/logs/nq_london_close/trades.csv",    "LIVE",  "—",          0,    "—"),
+        ("aud_asian_breakout", "AUDUSD Asian open ORB",           "AUDUSD (1h Tokyo)",           "forge/logs/aud_asian_breakout/trades.csv", "LIVE",  "—",          0,    "—"),
     ]
-    for sys_slug, strat_name, instruments, csv_rel, status in _forge_extra:
+    for sys_slug, strat_name, instruments, csv_rel, status, bt_pf, bt_trades, bt_wr in _forge_extra:
         n, w, pnl = _count_live(csv_rel)
         label = f"forge_{sys_slug}"
         conf = _compute_conf(label)
@@ -7188,9 +7370,9 @@ async def api_strategy_performance():
             "system": sys_slug.replace("_", " ").title(),
             "strategy": strat_name,
             "instruments": instruments,
-            "backtest_pf": "—",
-            "backtest_trades": 0,
-            "backtest_wr": "—",
+            "backtest_pf": bt_pf,
+            "backtest_trades": bt_trades,
+            "backtest_wr": bt_wr,
             "live_trades": n,
             "live_wins": w,
             "live_wr": round(w / n * 100, 1) if n else 0,
@@ -8553,12 +8735,108 @@ function renderExpectancySpark(priorExp, recentExp) {
 }
 
 const ACTION_COLORS = {
-  SCALE_UP: {bg:'#0d1c11', border:'#00ff88', fg:'#00ff88'},
-  HOLD:     {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'},
-  REDUCE:   {bg:'#2a2010', border:'#ffaa00', fg:'#ffaa00'},
-  KILL:     {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
-  OBSERVE:  {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
+  SCALE_UP:   {bg:'#0d1c11', border:'#00ff88', fg:'#00ff88'},
+  HOLD:       {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'},
+  REDUCE:     {bg:'#2a2010', border:'#ffaa00', fg:'#ffaa00'},
+  QUARANTINE: {bg:'#1f0a2a', border:'#a855f7', fg:'#c084fc'},
+  KILL:       {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
+  OBSERVE:    {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
+
+// ─── Decision-engine subset drilldown ──────────────────────────────
+// Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
+// salvageable subsets BEFORE a kill — answers the ceremony spec's
+// requirement: "you need to know if there's a subset worth keeping."
+function toggleDecisionDrilldown(strategy, safeId) {
+  const row = document.getElementById('dec-drill-' + safeId);
+  const body = document.getElementById('dec-drill-body-' + safeId);
+  if (!row || !body) return;
+  if (row.style.display === 'none') {
+    row.style.display = 'table-row';
+    if (!row.dataset.loaded) {
+      fetch('/api/strategy_drilldown?strategy=' + encodeURIComponent(strategy) + '&window_days=60').then(r=>r.json()).then(d=>{
+        if (d.status !== 'ok') {
+          body.innerHTML = '<span style="color:#ff4444;">' + (d.message || d.status) + '</span>';
+          return;
+        }
+        const ov = d.overall || {};
+        const sd = (d.groups && d.groups.by_symbol_direction) || [];
+        const sv = d.salvageable_subsets || [];
+        const kc = d.kill_confirmed_subsets || [];
+        // Verdict banner
+        const verdictColor = sv.length > 0 ? '#ffaa00' : '#ff4444';
+        let html = '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+          + '<div><span style="color:#00d4ff;font-weight:bold;letter-spacing:1px;">SUBSET ANALYSIS — ' + strategy + '</span>'
+          + ' <span style="color:#7b8ab8;font-size:0.92em;margin-left:8px;">' + d.n_in_window + ' trades · ' + d.window_days + 'd window</span></div>'
+          + '<div style="color:' + verdictColor + ';font-weight:bold;font-size:0.92em;">' + d.verdict_hint + '</div>'
+          + '</div>';
+        // by_symbol_direction table — most actionable group
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.92em;margin-bottom:8px;">'
+          + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+          + '<th style="text-align:left;padding:4px 8px;">Subset (symbol × direction)</th>'
+          + '<th style="text-align:right;padding:4px 8px;">N</th>'
+          + '<th style="text-align:right;padding:4px 8px;">WR</th>'
+          + '<th style="text-align:right;padding:4px 8px;">PF</th>'
+          + '<th style="text-align:right;padding:4px 8px;">Expectancy</th>'
+          + '<th style="text-align:right;padding:4px 8px;">PnL</th>'
+          + '<th style="text-align:center;padding:4px 8px;">Verdict</th>'
+          + '</tr></thead><tbody>';
+        for (const g of sd) {
+          const isSalvage = g.n >= 10 && g.pf != null && g.pf >= 1.5;
+          const isKill = g.n >= 5 && g.pf != null && g.pf < 0.5;
+          const pfColor = g.pf == null ? '#7b8ab8' : g.pf >= 1.5 ? '#00ff88' : g.pf >= 1.0 ? '#9da8c7' : g.pf >= 0.5 ? '#ffaa00' : '#ff4444';
+          const pnlColor = g.pnl_usd > 0 ? '#00ff88' : g.pnl_usd < 0 ? '#ff4444' : '#7b8ab8';
+          let verdict = '';
+          if (isSalvage) verdict = '<span style="background:#0d1c11;border:1px solid #00ff88;color:#00ff88;padding:1px 6px;border-radius:3px;font-size:0.85em;font-weight:bold;">SALVAGEABLE</span>';
+          else if (isKill) verdict = '<span style="background:#3a0a0a;border:1px solid #ff4444;color:#ff4444;padding:1px 6px;border-radius:3px;font-size:0.85em;font-weight:bold;">KILL THIS</span>';
+          else verdict = '<span style="color:#7b8ab8;font-size:0.85em;">—</span>';
+          html += '<tr style="border-top:1px solid #1e2a42;">'
+            + '<td style="padding:4px 8px;color:#e0e0e0;">' + g.key + '</td>'
+            + '<td style="padding:4px 8px;text-align:right;color:#9da8c7;">' + g.n + '</td>'
+            + '<td style="padding:4px 8px;text-align:right;color:#9da8c7;">' + g.wr_pct.toFixed(1) + '%</td>'
+            + '<td style="padding:4px 8px;text-align:right;color:' + pfColor + ';font-weight:bold;">' + (g.pf == null ? '—' : g.pf.toFixed(2)) + '</td>'
+            + '<td style="padding:4px 8px;text-align:right;color:' + pnlColor + ';">' + (g.expectancy_usd >= 0 ? '+' : '') + '$' + g.expectancy_usd.toFixed(2) + '</td>'
+            + '<td style="padding:4px 8px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (g.pnl_usd >= 0 ? '+' : '') + '$' + g.pnl_usd.toFixed(2) + '</td>'
+            + '<td style="padding:4px 8px;text-align:center;">' + verdict + '</td>'
+            + '</tr>';
+        }
+        html += '</tbody></table>';
+        // Action recommendation
+        if (sv.length > 0) {
+          html += '<div style="background:#0d1c11;border-left:3px solid #00ff88;padding:6px 10px;font-size:0.92em;color:#9da8c7;">'
+            + '<b style="color:#00ff88;">SCOPE_DOWN candidate:</b> ' + sv.length + ' subset(s) have PF≥1.5. '
+            + 'Filter strategy to those subsets instead of KILL — preserves the working edge while removing the bleed.'
+            + '</div>';
+        } else if (kc.length > 0) {
+          html += '<div style="background:#3a0a0a;border-left:3px solid #ff4444;padding:6px 10px;font-size:0.92em;color:#9da8c7;">'
+            + '<b style="color:#ff4444;">KILL is data-supported:</b> no subsets at PF≥1.5; ' + kc.length + ' subsets are confirmed-bleeders. '
+            + 'No salvageable structure inside this strategy — proceed with KILL.'
+            + '</div>';
+        }
+        // Per-axis stats (collapsible) — secondary detail
+        html += '<details style="margin-top:8px;color:#7b8ab8;font-size:0.85em;"><summary style="cursor:pointer;color:#9da8c7;">▸ Per-axis breakdown (symbol / direction / exit_reason / hour)</summary>';
+        const axes = [['by_symbol','Symbol'],['by_direction','Direction'],['by_exit_reason','Exit Reason'],['by_hour','Entry Hour']];
+        html += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:6px;">';
+        for (const [ax, label] of axes) {
+          const grps = (d.groups && d.groups[ax]) || [];
+          html += '<div><div style="color:#00d4ff;font-size:0.92em;letter-spacing:1px;margin-bottom:3px;">' + label + '</div>';
+          for (const g of grps) {
+            const pfColor = g.pf == null ? '#7b8ab8' : g.pf >= 1.5 ? '#00ff88' : g.pf >= 1.0 ? '#9da8c7' : g.pf >= 0.5 ? '#ffaa00' : '#ff4444';
+            html += '<div style="font-size:0.92em;color:#9da8c7;">' + g.key + ': n=' + g.n + ' · PF <span style="color:' + pfColor + ';font-weight:bold;">' + (g.pf == null ? '—' : g.pf.toFixed(2)) + '</span> · ' + (g.pnl_usd >= 0 ? '+' : '') + '$' + g.pnl_usd.toFixed(2) + '</div>';
+          }
+          html += '</div>';
+        }
+        html += '</div></details>';
+        body.innerHTML = html;
+        row.dataset.loaded = '1';
+      }).catch(e => {
+        body.innerHTML = '<span style="color:#ff4444;">Error: ' + e + '</span>';
+      });
+    }
+  } else {
+    row.style.display = 'none';
+  }
+}
 function loadDecisionEngine() {
   Promise.all([
     fetch('/api/strategy_actions?window_days=30').then(r=>r.json()),
@@ -8577,6 +8855,8 @@ function loadDecisionEngine() {
       + '<span style="color:' + ACTION_COLORS.SCALE_UP.fg + ';">SCALE_UP ' + (summary.scale_up||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.HOLD.fg + ';">HOLD ' + (summary.hold||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.REDUCE.fg + ';">REDUCE ' + (summary.reduce||0) + '</span> · '
+      + (summary.rework ? '<span style="color:#ffaa00;">↻ REWORK ' + summary.rework + '</span> · ' : '')
+      + '<span style="color:' + ACTION_COLORS.QUARANTINE.fg + ';">QUARANTINE ' + (summary.quarantine||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.KILL.fg + ';">KILL ' + (summary.kill||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.OBSERVE.fg + ';">OBSERVE ' + (summary.observe||0) + '</span>'
       + '</div></div>'
@@ -8600,8 +8880,8 @@ function loadDecisionEngine() {
     // Lean-version "Action Queue": don't add a second panel — re-rank the
     // existing rows so unapplied KILL/REDUCE/SCALE_UP float to the top, then
     // badge the top 3 with DO NOW. Bleeding strategies are surfaced first.
-    const URGENCY_RANK = {KILL: 0, REDUCE: 1, SCALE_UP: 2};
-    const recMapForSort = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, KILL:0.0, OBSERVE:1.0};
+    const URGENCY_RANK = {QUARANTINE: 0, KILL: 1, REDUCE: 2, SCALE_UP: 3};
+    const recMapForSort = {SCALE_UP:1.5, HOLD:1.0, REDUCE:0.5, QUARANTINE:0.0, KILL:0.0, OBSERVE:1.0};
     function currentFactor(strat) {
       const tries = [strat, strat.replace('forge_',''), 'forge_' + strat];
       for (const k of tries) { if (k in factors) return factors[k]; }
@@ -8634,10 +8914,18 @@ function loadDecisionEngine() {
         ? '<span style="background:#ff4444;color:#000;padding:1px 5px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.7em;" title="Top-3 unapplied REDUCE/KILL/SCALE_UP — apply now to stop bleed or capture edge">DO NOW</span>'
         : '';
       const rowBorder = isDoNow ? 'border-top:1px solid #ff4444;border-left:3px solid #ff4444;' : 'border-top:1px solid #1e2a42;';
+      const reworkBadge = s.rework_required
+        ? ' <span style="background:transparent;color:#ffaa00;border:1px solid #ffaa00;padding:1px 5px;border-radius:3px;font-size:0.7em;letter-spacing:1px;font-weight:bold;margin-left:4px;" title="' + (s.rework_reason || 'Rework required') + '">↻ REWORK</span>'
+        : '';
+      const safeStratId = s.strategy.replace(/[^a-z0-9]/gi, '_');
+      // Drilldown link: only useful for strategies with enough trades to subset
+      const drilldownLink = s.n_total >= 10
+        ? '<span data-drilldown-strategy="' + s.strategy + '" data-drilldown-id="' + safeStratId + '" onclick="toggleDecisionDrilldown(this.dataset.drilldownStrategy, this.dataset.drilldownId)" style="cursor:pointer;color:#7b8ab8;font-size:0.78em;margin-left:6px;font-weight:normal;" title="Per-symbol/direction subset analysis — surfaces salvageable subsets before KILL">▾ subsets</span>'
+        : '';
       html += '<tr style="' + rowBorder + 'background:' + c.bg + ';">'
         + '<td style="padding:6px 4px;text-align:center;">' + doNowBadge + '</td>'
-        + '<td style="padding:6px 8px;font-weight:bold;color:#e0e0e0;">' + s.strategy + '</td>'
-        + '<td style="padding:6px 8px;text-align:center;"><span style="background:' + c.border + ';color:#000;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + s.action + '</span></td>'
+        + '<td style="padding:6px 8px;font-weight:bold;color:#e0e0e0;">' + s.strategy + drilldownLink + '</td>'
+        + '<td style="padding:6px 8px;text-align:center;"><span style="background:' + c.border + ';color:#000;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + s.action + '</span>' + reworkBadge + '</td>'
         + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.confidence_pct + '%</td>'
         + '<td style="padding:6px 8px;text-align:right;color:#9da8c7;">' + s.n_total + '</td>'
         + '<td style="padding:6px 8px;text-align:right;color:' + pnlColor + ';font-weight:bold;">' + (s.pnl_usd >= 0 ? '+' : '') + '$' + s.pnl_usd.toFixed(2) + '</td>'
@@ -8669,9 +8957,16 @@ function loadDecisionEngine() {
           })()
         + '</td>'
         + '</tr>';
+      // Hidden drilldown row — populated lazily by toggleDecisionDrilldown
+      if (s.n_total >= 10) {
+        html += '<tr id="dec-drill-' + safeStratId + '" style="display:none;background:#0a1224;">'
+          + '<td colspan="13" style="padding:0;">'
+          + '<div id="dec-drill-body-' + safeStratId + '" style="padding:10px 18px;color:#9da8c7;font-size:0.82em;">Loading subset analysis…</div>'
+          + '</td></tr>';
+      }
     }
     html += '</tbody></table>'
-      + '<div style="margin-top:8px;font-size:0.72em;color:#7b8ab8;">Rules: n&lt;10→OBSERVE · declining+losing→KILL · declining+winning→REDUCE · rising+eff&gt;5→SCALE_UP · flat+positive→HOLD · flat+losing→REDUCE</div>'
+      + '<div style="margin-top:8px;font-size:0.72em;color:#7b8ab8;">Rules v2: dirty&gt;5%→QUARANTINE · n&lt;10→OBSERVE · declining+losing+n≥50→KILL · declining+losing+n&lt;50→REDUCE+REWORK · flat+losing+n≥30→REDUCE+REWORK · flat+losing+n&lt;30→REDUCE · rising+eff&gt;5→SCALE_UP · flat+positive→HOLD</div>'
       + '</div>';
     el.innerHTML = html;
   }).catch(e=>{console.error('decision engine error:', e);});
