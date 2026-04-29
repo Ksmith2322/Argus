@@ -3512,11 +3512,42 @@ async def api_promotion_ladder():
             trade_progress = 100.0
             pf_progress = 100.0
             progress_pct = 100.0
+        # ─── Critical-gate evaluation ───────────────────────────────
+        # Per project_dashboard_upgrades_capital_safety.md: a strategy with
+        # negative expectancy or chronic execution issues should NOT show
+        # "84% promotion progress" — that's a misleading green light.
+        # Promotion progress only makes sense if the strategy is operationally
+        # eligible to advance. When any critical gate fails, return
+        # gate_status=BLOCKED with the reason; progress_pct is suppressed
+        # in the UI.
+        live_pnl_usd = s.get("live_total_pnl_usd") or 0
+        op_verdict = s.get("verdict") or ""
+        gate_blockers: list[str] = []
+        # Gate 1: live PF < 1.0 with reasonable sample (n >= 10) = losing money structurally
+        if pf is not None and pf < 1.0 and n >= 10:
+            gate_blockers.append(f"PF {pf:.2f} < 1.00 (negative expectancy on n={n})")
+        # Gate 2: cumulative PnL negative with sample
+        if n >= 10 and live_pnl_usd < 0:
+            gate_blockers.append(f"cumulative PnL ${live_pnl_usd:.2f} negative on n={n}")
+        # Gate 3: operational_maturity flagged DEGRADED
+        if op_verdict == "DEGRADED":
+            gate_blockers.append("operational_maturity = DEGRADED")
+        # Gate 4: insufficient sample to evaluate (n < 5) — distinguish from
+        # active-progress; show as INSUFFICIENT_SAMPLE not BLOCKED
+        if n < 5:
+            gate_status = "INSUFFICIENT_SAMPLE"
+            gate_blockers = [f"n={n} < 5 (need more trades to evaluate)"]
+        elif gate_blockers:
+            gate_status = "BLOCKED"
+        else:
+            gate_status = "ACTIVE"
+
         strategies.append({
             "strategy": s.get("strategy"),
             "verdict": s.get("verdict"),
             "live_trades": n,
             "live_pf": pf,
+            "live_pnl_usd": round(live_pnl_usd, 2) if live_pnl_usd else 0,
             "backtest_pf": s.get("backtest_pf"),
             "current_tier": current["name"],
             "current_risk_pct": current["risk_pct"],
@@ -3524,12 +3555,21 @@ async def api_promotion_ladder():
             "next_tier_risk_pct": next_tier["risk_pct"] if next_tier else None,
             "trades_needed": trades_needed,
             "pf_gap": pf_gap,
-            "progress_pct": progress_pct,
+            # Only expose progress_pct meaningfully when the gate is ACTIVE.
+            # The display layer suppresses % rendering for BLOCKED so the
+            # raw number can't mislead.
+            "progress_pct": progress_pct if gate_status == "ACTIVE" else None,
+            "progress_pct_raw": progress_pct,  # available for debug if needed
             "trade_progress_pct": round(trade_progress, 1),
             "pf_progress_pct": None if pf_progress is None else round(pf_progress, 1),
+            "gate_status": gate_status,
+            "gate_blockers": gate_blockers,
         })
-    # Sort by progress (nearest to promotion first)
-    strategies.sort(key=lambda x: (-x["progress_pct"], x["strategy"]))
+    # Sort: ACTIVE strategies first (by progress desc), then BLOCKED, then INSUFFICIENT
+    state_order = {"ACTIVE": 0, "BLOCKED": 1, "INSUFFICIENT_SAMPLE": 2}
+    strategies.sort(key=lambda x: (state_order.get(x["gate_status"], 9),
+                                   -(x["progress_pct"] or 0),
+                                   x["strategy"]))
     return JSONResponse({"strategies": strategies})
 
 
@@ -11417,26 +11457,42 @@ function loadStrategyPerformance() {
       }
       const riskPctStr = tierInfo ? ((Number(tierInfo.risk_pct || 0) * 100).toFixed(2) + '%') : '—';
 
-      // Render promotion progress as 0-100 bar + % label + verdict color
+      // Render promotion progress — gate-aware. A strategy with PF < 1.0
+      // (losing money) at "84%" is misleading; show BLOCKED with the
+      // failing-gate reason instead. Per project_dashboard_upgrades_capital_safety.
       let promCell = '<span style="color:#555;">—</span>';
       if (promInfo) {
-        const pct = Math.max(0, Math.min(100, Number(promInfo.progress_pct) || 0));
-        const verdict = promInfo.verdict || '';
-        const barColor = verdict === 'DEGRADED' ? '#ff4444'
-                       : pct >= 75 ? '#00ff88'
-                       : pct >= 50 ? '#ffc107'
-                       : '#7b8ab8';
-        const subtitle = promInfo.next_tier
-          ? ('→ ' + promInfo.next_tier + ' · need ' + (promInfo.trades_needed || 0) + ' trades'
-             + (promInfo.pf_gap > 0 ? ' · PF gap ' + Number(promInfo.pf_gap).toFixed(2) : ''))
-          : 'at max tier';
-        promCell = '<div style="display:flex;align-items:center;gap:6px;min-width:100px;">'
-          + '<div style="flex:1;background:#1e2a42;border-radius:3px;height:6px;overflow:hidden;">'
-          + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div>'
-          + '</div>'
-          + '<span style="color:' + barColor + ';font-weight:bold;font-size:0.95em;">' + pct.toFixed(0) + '%</span>'
-          + '</div>'
-          + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;" title="' + subtitle + '">' + subtitle + '</div>';
+        const gateStatus = promInfo.gate_status || 'ACTIVE';
+        const blockers = promInfo.gate_blockers || [];
+        if (gateStatus === 'BLOCKED') {
+          // Misleading-progress fix: show BLOCKED + first blocker. Tooltip = full list.
+          const firstBlocker = blockers[0] || 'gate failed';
+          const allBlockers = blockers.join(' · ');
+          promCell = '<span style="background:#3a0a0a;border:1px solid #ff4444;color:#ff4444;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.85em;" title="' + allBlockers.replace(/"/g, '&quot;') + '">BLOCKED</span>'
+            + '<div style="font-size:0.78em;color:#9da8c7;margin-top:2px;">' + firstBlocker + '</div>';
+        } else if (gateStatus === 'INSUFFICIENT_SAMPLE') {
+          promCell = '<span style="color:#7b8ab8;font-size:0.85em;">insufficient sample</span>'
+            + '<div style="font-size:0.78em;color:#7b8ab8;margin-top:2px;">' + (blockers[0] || '') + '</div>';
+        } else {
+          // ACTIVE: render the bar normally
+          const pct = Math.max(0, Math.min(100, Number(promInfo.progress_pct) || 0));
+          const verdict = promInfo.verdict || '';
+          const barColor = verdict === 'DEGRADED' ? '#ff4444'
+                         : pct >= 75 ? '#00ff88'
+                         : pct >= 50 ? '#ffc107'
+                         : '#7b8ab8';
+          const subtitle = promInfo.next_tier
+            ? ('→ ' + promInfo.next_tier + ' · need ' + (promInfo.trades_needed || 0) + ' trades'
+               + (promInfo.pf_gap > 0 ? ' · PF gap ' + Number(promInfo.pf_gap).toFixed(2) : ''))
+            : 'at max tier';
+          promCell = '<div style="display:flex;align-items:center;gap:6px;min-width:100px;">'
+            + '<div style="flex:1;background:#1e2a42;border-radius:3px;height:6px;overflow:hidden;">'
+            + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div>'
+            + '</div>'
+            + '<span style="color:' + barColor + ';font-weight:bold;font-size:0.95em;">' + pct.toFixed(0) + '%</span>'
+            + '</div>'
+            + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;" title="' + subtitle + '">' + subtitle + '</div>';
+        }
       }
 
       // Confidence cell: number (or —) + source badge + sample warning tooltip
