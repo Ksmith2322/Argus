@@ -489,18 +489,28 @@ def run_checklist(strat: str, reg: dict, tasks_data: dict | None) -> dict:
 
 
 def _duplicate_process_advisory() -> dict:
-    """Advisory check (outside the 15-item spec): list any strategy with two
-    or more python.exe processes running its runner module. Duplicate runners
-    are failure mode #1 in the runbook — both connect to IBKR with the same
-    client_id, both fire signals on the same evaluation cycle. Detect, do
-    NOT auto-kill — let the user decide which PID to terminate.
+    """Advisory check (outside the 15-item spec): list any module running in
+    multiple INDEPENDENT process trees.
+
+    Important: on Windows with Python 3.12 venv, every `.venv\\Scripts\\python.exe`
+    invocation is a 270KB redirector shim that spawns the real interpreter from
+    `base_prefix` (the system Python install) and waits on it. Both processes
+    appear in WMI but they're ONE logical invocation. We MUST exclude these
+    redirector pairs from "duplicate" detection — confusing them for double-
+    launches led to the 2026-04-28 incident where killing system children also
+    killed the venv shims as collateral.
+
+    Real duplicate = two trees running the same module where neither tree is the
+    parent of the other. This catches genuine double-launches (e.g. user ran
+    a launch script twice) without false-positiving normal venv behavior.
     """
     import subprocess
     try:
         cmd = (
             "powershell.exe -NoProfile -Command \"Get-CimInstance Win32_Process "
             "-Filter \\\"name='python.exe'\\\" | "
-            "Select-Object ProcessId, CreationDate, CommandLine | ConvertTo-Json -Depth 3 -Compress\""
+            "Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine | "
+            "ConvertTo-Json -Depth 3 -Compress\""
         )
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
         procs = json.loads(result.stdout) if result.stdout.strip() else []
@@ -508,25 +518,57 @@ def _duplicate_process_advisory() -> dict:
             procs = [procs]
     except Exception as e:
         return {"status": "skipped", "error": str(e)}
-    # Group by runner module (-m forge.foo.runner / -m forge.foo_runner / etc)
-    by_module: dict[str, list[dict]] = {}
+
     import re as _re
+    # Build PID → ProcInfo index so we can identify shim/real pairs.
+    info_by_pid: dict[int, dict] = {}
     for p in procs:
-        cmd = str(p.get("CommandLine") or "")
-        m = _re.search(r"-m\s+(\S+)", cmd)
+        pid = p.get("ProcessId")
+        if pid is None:
+            continue
+        cmdline = str(p.get("CommandLine") or "")
+        info_by_pid[int(pid)] = {
+            "ppid": int(p.get("ParentProcessId") or 0),
+            "cmdline": cmdline,
+            "interp": ".venv" if ".venv" in cmdline else "system",
+            "started": str(p.get("CreationDate") or "")[:19],
+        }
+
+    # Group by runner module
+    by_module: dict[str, list[dict]] = {}
+    for pid, info in info_by_pid.items():
+        m = _re.search(r"-m\s+(\S+)", info["cmdline"])
         if not m:
             continue
         mod = m.group(1)
-        by_module.setdefault(mod, []).append({
-            "pid": p.get("ProcessId"),
-            "interp": ".venv" if ".venv" in cmd else "system",
-            "started": str(p.get("CreationDate") or "")[:19],
-        })
-    duplicates = {mod: pids for mod, pids in by_module.items() if len(pids) > 1}
+        by_module.setdefault(mod, []).append({"pid": pid, **info})
+
+    # For modules with > 1 process, filter out the (shim, real) redirector pairs.
+    # A pair is a redirector if one process's PPID == the other's PID AND they're
+    # different interp types (shim=venv, real=system).
+    real_duplicates: dict[str, list[dict]] = {}
+    for mod, pids in by_module.items():
+        if len(pids) <= 1:
+            continue
+        # Identify "tree roots" — processes whose parent is NOT another process in
+        # this module's group. The number of roots = number of independent launches.
+        pids_set = {p["pid"] for p in pids}
+        roots = [p for p in pids if p["ppid"] not in pids_set]
+        if len(roots) > 1:
+            real_duplicates[mod] = roots
+
     return {
         "status": "ok",
-        "n_duplicate_runners": len(duplicates),
-        "duplicates": duplicates,
+        "n_total_python_processes": len(info_by_pid),
+        "n_modules_running": len(by_module),
+        "n_duplicate_modules": len(real_duplicates),
+        "duplicates": real_duplicates,
+        "note": (
+            "Each running module typically shows TWO python.exe processes: a venv "
+            "redirector shim + the real interpreter (its child). That's normal "
+            "Python 3.12 venv behavior on Windows, NOT a duplicate. This advisory "
+            "only flags genuinely independent process trees running the same module."
+        ),
     }
 
 
@@ -583,17 +625,21 @@ def main() -> int:
     print(f"OPERATIONAL_VERIFIED_AUTO: {payload['verdict_summary']['OPERATIONAL_VERIFIED_AUTO']}")
     print(f"INSUFFICIENT_AUTO_CHECKS:  {payload['verdict_summary']['INSUFFICIENT_AUTO_CHECKS']}")
 
-    # Advisory: duplicate-process check (outside the 15-item spec, but high-value).
+    # Advisory: duplicate-process check (outside the 15-item spec).
+    # NOTE: Each running module legitimately shows TWO python.exe processes on
+    # Windows (Python 3.12 venv redirector shim + real interpreter child). That
+    # is NOT a duplicate. The advisory only fires when there are multiple
+    # INDEPENDENT process trees running the same module.
     dup = payload.get("advisory_duplicate_processes", {})
-    if dup.get("status") == "ok" and dup.get("n_duplicate_runners", 0) > 0:
+    if dup.get("status") == "ok" and dup.get("n_duplicate_modules", 0) > 0:
         print()
-        print(f"[ADVISORY] {dup['n_duplicate_runners']} runner module(s) have duplicate processes:")
+        print(f"[ADVISORY] {dup['n_duplicate_modules']} module(s) have GENUINELY independent duplicate trees:")
         for mod, pids in dup["duplicates"].items():
             print(f"  {mod}:")
             for p in pids:
-                print(f"    PID={p['pid']:>6}  interp={p['interp']:<8}  started={p['started']}")
-        print(f"  Failure mode #1 in reference_failure_modes.md. User should decide")
-        print(f"  which PID to keep and Stop-Process the other(s).")
+                print(f"    PID={p['pid']:>6}  ppid={p['ppid']:<6}  interp={p['interp']:<8}  started={p['started']}")
+        print(f"  This is failure mode #1 from reference_failure_modes.md.")
+        print(f"  User should decide which tree to keep and Stop-Process the other(s).")
     return 0
 
 
