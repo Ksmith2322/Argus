@@ -5942,6 +5942,60 @@ async def api_positions_open():
     fleet_budget_pct = 6.0
     fleet_budget_usd = anchor * fleet_budget_pct / 100.0
 
+    # Sizing Sanity per-position: risk %, USD-normalized notional, multiplier
+    # vs anchor, and a sizing_status flag. This catches mis-sized positions
+    # before real money — a 23x-anchor position is the kind of bug that's
+    # catastrophic when live but invisible in raw notional dollars alone.
+    # (Per project_dashboard_upgrades_capital_safety.md priority #1.)
+    NOTIONAL_CAPS = {
+        "stock": 1.0,         # 1.0x anchor max for stocks/ETFs (per CLAUDE.md, tightened 4/24)
+        "etf": 1.0,
+        "fx": 20.0,           # 20.0x for FX (pip stops keep risk small)
+        "future": 5.0,        # 5.0x for micro futures
+        "unknown": 1.5,       # conservative default
+    }
+    def _instrument_class(symbol: str) -> str:
+        s = (symbol or "").upper().replace("/", "")
+        # FX heuristic: 6-letter pair like USDJPY/GBPUSD/CADJPY/AUDUSD
+        if len(s) == 6 and s.isalpha() and s[:3] in ("USD","EUR","GBP","JPY","CAD","AUD","CHF","NZD","CAD") and s[3:] in ("USD","EUR","GBP","JPY","CAD","AUD","CHF","NZD","CAD"):
+            return "fx"
+        if s in ("MNQ","NQ","MYM","YM","MES","ES","M2K","RTY"):
+            return "future"
+        # Default: stock/ETF
+        return "stock"
+
+    for p in positions:
+        sym = p.get("instrument") or p.get("strategy", "")
+        # Look up symbol from heartbeat data — instrument key for plural-form, otherwise infer from strategy
+        symbol_for_class = p.get("instrument") or _strategy_to_symbol_hint(p.get("strategy", ""))
+        instr_class = _instrument_class(symbol_for_class)
+        try:
+            entry_px = float(p.get("entry_px") or 0)
+            size = float(p.get("size") or 0)
+            risk_usd = float(p.get("risk_usd") or 0)
+        except Exception:
+            entry_px, size, risk_usd = 0, 0, 0
+        # USD-normalized notional via the existing FX helper
+        fx_norm = _fx_normalized_exposure_usd(symbol_for_class, size, entry_px)
+        notional_usd = fx_norm if fx_norm is not None else abs(entry_px * size)
+        notional_x_anchor = (notional_usd / anchor) if anchor > 0 else 0
+        risk_pct = (risk_usd / anchor * 100.0) if anchor > 0 else 0
+        # Sizing status flags
+        cap = NOTIONAL_CAPS.get(instr_class, NOTIONAL_CAPS["unknown"])
+        if notional_x_anchor > cap * 1.20:  # 20% over cap = alarm
+            status = "OVER_NOTIONAL_CAP"
+        elif notional_x_anchor > cap:  # at-cap = caution
+            status = f"CHECK_{instr_class.upper()}_MULTIPLIER"
+        elif risk_pct > 2.0:  # >2% per trade is unusually high
+            status = "OVER_RISK_CAP"
+        else:
+            status = "OK"
+        p["instrument_class"] = instr_class
+        p["notional_usd"] = round(notional_usd, 2)
+        p["notional_x_anchor"] = round(notional_x_anchor, 2)
+        p["risk_pct_of_anchor"] = round(risk_pct, 3)
+        p["sizing_status"] = status
+
     return JSONResponse({
         "positions": positions,
         "count": len(positions),
@@ -5952,6 +6006,26 @@ async def api_positions_open():
         "fleet_budget_usd": round(fleet_budget_usd, 2),
         "pct_of_budget_used": round(total_risk / fleet_budget_usd * 100.0, 1) if fleet_budget_usd > 0 else 0,
     })
+
+
+def _strategy_to_symbol_hint(strategy: str) -> str:
+    """Best-effort mapping of strategy name → primary symbol for sizing classification.
+    Fallback only — when heartbeat doesn't include explicit instrument key.
+    """
+    s = (strategy or "").lower()
+    if "usdjpy" in s: return "USDJPY"
+    if "gbpusd" in s: return "GBPUSD"
+    if "cadjpy" in s: return "CADJPY"
+    if "audjpy" in s or "aud_asian" in s: return "AUDUSD"
+    if "wick_gbpusd" in s: return "GBPUSD"
+    if "jpy_pm" in s: return "USDJPY"  # may also trade CADJPY; USDJPY is primary
+    if "vix_intraday" in s or "vix_revert" in s: return "UVXY"
+    if "spy_mean_rev" in s: return "SPY"
+    if "multi_orb" in s: return "SPY"  # one of several but most common
+    if "gld_pm" in s or "gdx_gld" in s: return "GLD"
+    if "nq_overnight" in s or "nq_london" in s: return "NQ"
+    if "tom_international" in s: return "EFA"
+    return ""
 
 
 @app.get("/api/operational_maturity")
@@ -9839,6 +9913,9 @@ function loadPositionsAndRisk() {
       + '<th style="text-align:right;padding:4px;">Target</th>'
       + '<th style="text-align:right;padding:4px;">Size</th>'
       + '<th style="text-align:right;padding:4px;">Risk $</th>'
+      + '<th style="text-align:right;padding:4px;" title="Risk as % of fleet anchor (broker equity)">Risk %</th>'
+      + '<th style="text-align:right;padding:4px;" title="USD-normalized notional, multiplier of fleet anchor">Notional ×</th>'
+      + '<th style="text-align:center;padding:4px;" title="Sizing sanity flag: OK / CHECK_MULTIPLIER / OVER_NOTIONAL_CAP / OVER_RISK_CAP">Sizing</th>'
       + '</tr></thead><tbody>';
     for (const p of data.positions) {
       let entryLocal = '—';
@@ -9850,6 +9927,19 @@ function loadPositionsAndRisk() {
         }
       } catch(e){}
       const dirColor = p.direction === 'long' ? '#00ff88' : p.direction === 'short' ? '#ff4444' : '#9da8c7';
+      // Sizing sanity coloring — OK green, CHECK yellow, OVER red. The eye should
+      // land on red instantly when something is mis-sized.
+      const ss = p.sizing_status || 'OK';
+      let sizingColor = '#00ff88';  // OK
+      if (ss.startsWith('CHECK_')) sizingColor = '#ffaa00';
+      else if (ss.startsWith('OVER_')) sizingColor = '#ff4444';
+      const sizingBadge = ss === 'OK'
+        ? '<span style="color:#00ff88;font-size:0.92em;">OK</span>'
+        : '<span style="background:' + sizingColor + ';color:#000;padding:1px 5px;border-radius:3px;font-weight:bold;font-size:0.85em;letter-spacing:1px;" title="instrument_class=' + (p.instrument_class || '?') + '">' + ss + '</span>';
+      const riskPct = p.risk_pct_of_anchor != null ? p.risk_pct_of_anchor.toFixed(2) + '%' : '—';
+      const riskPctColor = p.risk_pct_of_anchor != null && p.risk_pct_of_anchor > 1.5 ? '#ffaa00' : '#9da8c7';
+      const notX = p.notional_x_anchor != null ? p.notional_x_anchor.toFixed(2) + 'x' : '—';
+      const notXColor = p.notional_x_anchor != null && p.notional_x_anchor > 5 ? '#ff4444' : p.notional_x_anchor != null && p.notional_x_anchor > 1.5 ? '#ffaa00' : '#9da8c7';
       html += '<tr style="border-bottom:1px solid #151c2c;">'
         + '<td style="padding:4px;color:#00d4ff;">' + (p.strategy||'—') + (p.instrument ? ' <span style="color:#7b8ab8;">['+p.instrument+']</span>':'') + '</td>'
         + '<td style="padding:4px;color:#9da8c7;">' + entryLocal + '</td>'
@@ -9859,6 +9949,9 @@ function loadPositionsAndRisk() {
         + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + (p.target_px ? Number(p.target_px).toFixed(4).replace(/\.?0+$/, '') : '—') + '</td>'
         + '<td style="padding:4px;text-align:right;color:#9da8c7;">' + (p.size||'—') + '</td>'
         + '<td style="padding:4px;text-align:right;color:#ffaa00;">' + (p.risk_usd ? '$' + Number(p.risk_usd).toFixed(2) : '—') + '</td>'
+        + '<td style="padding:4px;text-align:right;color:' + riskPctColor + ';">' + riskPct + '</td>'
+        + '<td style="padding:4px;text-align:right;color:' + notXColor + ';font-weight:bold;">' + notX + '</td>'
+        + '<td style="padding:4px;text-align:center;">' + sizingBadge + '</td>'
         + '</tr>';
     }
     html += '</tbody></table></div>';
