@@ -5661,29 +5661,66 @@ async def api_readiness_check():
         content = md_path.read_text(encoding="utf-8")
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)})
-    # Count lines like "- [ ]" (pending) and "- [x]" / "- [X]" (passed) in the
-    # "## The 20 points" section only — ignore example checkboxes elsewhere.
+    # Walk lines, track section headers (### lines), attach each checkbox item
+    # to the section it falls under. Returns full per-item detail (passed/pending
+    # + section + title + body context) for the expandable UI.
     import re as _re
-    section = content.split("## The 20 points", 1)
-    body = section[1] if len(section) > 1 else content
-    body = body.split("## Sign-off", 1)[0]  # stop at sign-off block
-    items = _re.findall(r"- \[([ xX])\]\s+\*\*(\d+)\.\s+([^*]+)\*\*", body)
-    total = len(items)
-    passed = sum(1 for marker, _, _ in items if marker.lower() == "x")
-    pending = [{"n": int(num), "title": title.strip()} for marker, num, title in items if marker == " "]
-    # Days until 5/31 freeze (negative if past)
+    section_text = content.split("## The 20 points", 1)
+    body = section_text[1] if len(section_text) > 1 else content
+    body = body.split("## Sign-off", 1)[0]
+
+    sections: list[dict] = []
+    cur_section: dict | None = None
+    # Match the checkbox + numbered title; capture optional trailing detail
+    # without anchoring on it (some items have text after the closing `**`
+    # that's not separated by an em-dash).
+    item_re = _re.compile(r"- \[([ xX])\]\s+\*\*(\d+)\.\s+([^*]+)\*\*\s*(.*)")
+
+    for line in body.splitlines():
+        line_stripped = line.rstrip()
+        if line_stripped.startswith("### "):
+            cur_section = {"name": line_stripped.removeprefix("### ").strip(), "items": []}
+            sections.append(cur_section)
+            continue
+        m = item_re.search(line_stripped)
+        if m and cur_section is not None:
+            marker, num, title, detail = m.group(1), m.group(2), m.group(3), m.group(4)
+            # Strip leading em-dash/hyphen + space if present, since the visual
+            # cue is just delimiting the body from the title.
+            detail = _re.sub(r"^[—-]\s*", "", detail).strip()
+            cur_section["items"].append({
+                "n": int(num),
+                "title": title.strip(),
+                "detail": detail,
+                "passed": marker.lower() == "x",
+            })
+
+    # Aggregate
+    all_items = [item for s in sections for item in s["items"]]
+    total = len(all_items)
+    passed = sum(1 for item in all_items if item["passed"])
+    pending_summary = [{"n": item["n"], "title": item["title"]} for item in all_items if not item["passed"]]
     today = datetime.now(timezone.utc).date()
     target = datetime(2026, 5, 31, tzinfo=timezone.utc).date()
     days_left = (target - today).days
     pct = round(passed / total * 100, 1) if total else 0
+    # Per-section progress
+    for s in sections:
+        s_total = len(s["items"])
+        s_passed = sum(1 for item in s["items"] if item["passed"])
+        s["passed"] = s_passed
+        s["total"] = s_total
+        s["pct"] = round(s_passed / s_total * 100, 1) if s_total else 0
     return JSONResponse({
         "status": "ok",
         "passed": passed,
         "total": total,
         "pct": pct,
-        "pending": pending,
+        "pending": pending_summary,
+        "sections": sections,
         "days_until_freeze": days_left,
         "freeze_date": "2026-05-31",
+        "source_path": str(md_path),
     })
 
 
@@ -9111,9 +9148,14 @@ loadCapitalSafetyBar();
 setInterval(loadCapitalSafetyBar, 15000);  // every 15s during market hours
 
 // ─── REAL-MONEY READINESS BAR ──────────────────────────────────────
-// Thin progress strip — single source of truth is the markdown checklist
-// in the user's memory dir. Renders nothing when status=missing or after
-// the freeze date (5/31) or once 100% complete (no need to clutter the UI).
+// Thin progress strip with click-to-expand for the full 20-item view.
+// Single source of truth is the markdown checklist in the user's memory
+// dir. Renders nothing when status=missing or after freeze + complete.
+let _READINESS_EXPANDED = false;
+function toggleReadinessExpand() {
+  _READINESS_EXPANDED = !_READINESS_EXPANDED;
+  loadReadinessBar();
+}
 function loadReadinessBar() {
   fetch('/api/readiness_check').then(r=>r.json()).then(d=>{
     const el = document.getElementById('readiness-bar');
@@ -9127,16 +9169,50 @@ function loadReadinessBar() {
     const daysLabel = d.days_until_freeze < 0
       ? Math.abs(d.days_until_freeze) + 'd past 5/31 freeze'
       : d.days_until_freeze + 'd to 5/31 freeze';
-    const pendingTitles = (d.pending || []).slice(0, 5).map(p => p.n + '. ' + p.title).join(' · ');
-    const tip = pendingTitles ? 'Pending: ' + pendingTitles + (d.pending.length > 5 ? ' …' : '') : 'All items checked';
-    el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:6px 14px;font-size:0.74em;display:flex;align-items:center;gap:12px;" title="' + tip.replace(/"/g, '&quot;') + '">'
-      + '<span style="color:#7b8ab8;letter-spacing:1px;font-weight:bold;">REAL-MONEY READINESS</span>'
+    const arrow = _READINESS_EXPANDED ? '▼' : '▶';
+    // Compact bar (always shown)
+    let html = '<div onclick="toggleReadinessExpand()" style="cursor:pointer;background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:6px 14px;font-size:0.74em;display:flex;align-items:center;gap:12px;" title="Click to ' + (_READINESS_EXPANDED ? 'collapse' : 'expand') + ' the 20-item checklist">'
+      + '<span style="color:#7b8ab8;letter-spacing:1px;font-weight:bold;">' + arrow + ' REAL-MONEY READINESS</span>'
       + '<div style="flex:1;background:#0a1224;border:1px solid #1e2a42;border-radius:3px;height:10px;position:relative;overflow:hidden;">'
       + '<div style="background:' + barColor + ';height:100%;width:' + Math.min(100, pct) + '%;"></div>'
       + '</div>'
       + '<span style="color:' + barColor + ';font-weight:bold;min-width:90px;text-align:right;">' + d.passed + '/' + d.total + ' (' + pct + '%)</span>'
       + '<span style="color:' + daysColor + ';font-size:0.92em;min-width:130px;text-align:right;">' + daysLabel + '</span>'
       + '</div>';
+    // Expanded section list (only when toggled open)
+    if (_READINESS_EXPANDED) {
+      html += '<div style="background:#0a1224;border:1px solid #1e2a42;border-top:none;border-radius:0 0 6px 6px;padding:10px 14px;font-size:0.78em;">';
+      html += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;">';
+      for (const sec of (d.sections || [])) {
+        const secColor = sec.pct >= 80 ? '#00ff88' : sec.pct >= 50 ? '#ffc107' : '#7b8ab8';
+        html += '<div style="padding:6px 0;">'
+          + '<div style="display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #1e2a42;padding-bottom:3px;margin-bottom:4px;">'
+          + '<span style="color:#00d4ff;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + sec.name + '</span>'
+          + '<span style="color:' + secColor + ';font-size:0.85em;font-weight:bold;">' + sec.passed + '/' + sec.total + '</span>'
+          + '</div>';
+        for (const item of (sec.items || [])) {
+          const checkColor = item.passed ? '#00ff88' : '#7b8ab8';
+          const checkBox = item.passed ? '☑' : '☐';
+          const titleColor = item.passed ? '#9da8c7' : '#e0e0e0';
+          const titleStyle = item.passed ? 'text-decoration:line-through;' : '';
+          html += '<div style="padding:3px 0;display:flex;gap:6px;align-items:flex-start;">'
+            + '<span style="color:' + checkColor + ';font-size:1.1em;font-weight:bold;flex-shrink:0;">' + checkBox + '</span>'
+            + '<div style="flex:1;">'
+            + '<span style="color:' + titleColor + ';' + titleStyle + 'font-weight:' + (item.passed ? 'normal' : 'bold') + ';">#' + item.n + ' ' + item.title + '</span>'
+            + (item.detail ? '<div style="color:#7b8ab8;font-size:0.85em;margin-top:1px;">' + item.detail + '</div>' : '')
+            + '</div>'
+            + '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+      html += '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #1e2a42;font-size:0.85em;color:#7b8ab8;">'
+        + 'Source: <span style="color:#9da8c7;">' + (d.source_path || '—').replace(/\\\\/g, '/') + '</span>. '
+        + 'Edit checkboxes in the markdown file (`- [ ]` → `- [x]`); the dashboard will pick up changes within 10 min.'
+        + '</div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
   }).catch(()=>{
     const el = document.getElementById('readiness-bar');
     if (el) el.style.display = 'none';
