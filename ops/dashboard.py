@@ -5282,6 +5282,171 @@ async def api_benchmark_alpha(window_days: int = 30):
     })
 
 
+@app.get("/api/recommended_actions")
+async def api_recommended_actions(window_days: int = 30):
+    """Cross-panel synthesis: turns scattered insights into a ranked do-list.
+
+    The Decision Engine already says "REDUCE+REWORK forge_multi_orb." But
+    the WHY is in three other places: subset drilldown, benchmark alpha,
+    trade validity. Without synthesis the operator has to mentally cross-
+    reference 4+ panels to know what to actually DO. This endpoint does
+    that join and emits a small set of high-confidence prioritized actions
+    with reasoning that cites the supporting data.
+
+    Output is intentionally short — a focused 5-10 item to-do list, not
+    every possible finding. Operator's time is the scarce resource.
+    """
+    # Pull from existing endpoints (avoid duplicating computation)
+    actions_resp = json.loads((await api_strategy_actions(window_days=window_days)).body)
+    bench_resp = json.loads((await api_benchmark_alpha(window_days=window_days)).body)
+    decision_by = {s["strategy"]: s for s in actions_resp.get("strategies", [])}
+    bench_by = {s["strategy"]: s for s in bench_resp.get("strategies", [])}
+
+    actions: list[dict] = []
+
+    # ── 1. KILL_CANDIDATES: action=KILL OR (REDUCE+REWORK + drilldown shows
+    #      no salvageable subset + benchmark alpha negative). Priority HIGH.
+    for s in decision_by.values():
+        if s["action"] == "KILL":
+            actions.append({
+                "priority": 1,
+                "action": "KILL",
+                "strategy": s["strategy"],
+                "reason": s["reason"],
+                "data_citations": ["decision_engine"],
+            })
+            continue
+        if s["action"] == "REDUCE" and s.get("rework_required"):
+            # Pull the drilldown to confirm before promoting to KILL
+            try:
+                dd = json.loads((await api_strategy_drilldown(strategy=s["strategy"], window_days=60)).body)
+            except Exception:
+                dd = {"status": "error"}
+            bench = bench_by.get(s["strategy"])
+            kill_supported = (
+                dd.get("status") == "ok"
+                and not dd.get("salvageable_subsets")
+                and bench and not bench["alpha_pass"]
+            )
+            scope_down_supported = (
+                dd.get("status") == "ok" and dd.get("salvageable_subsets")
+            )
+            if kill_supported:
+                cites = ["decision_engine: REDUCE+REWORK"]
+                cites.append(f"drilldown: no salvageable subset (n={dd['n_in_window']})")
+                if bench:
+                    cites.append(f"benchmark: {bench['excess_pct']:+.2f}pp vs {bench['benchmark_ticker']}")
+                actions.append({
+                    "priority": 1,
+                    "action": "KILL_CANDIDATE",
+                    "strategy": s["strategy"],
+                    "reason": "All three signals agree: drilldown found no salvageable subset, benchmark underperformed, decision engine flagged REWORK. Data-supported KILL.",
+                    "data_citations": cites,
+                })
+            elif scope_down_supported:
+                top = dd["salvageable_subsets"][0]
+                cites = ["decision_engine: REDUCE+REWORK"]
+                cites.append(f"drilldown: subset {top['key']} has PF {top['pf']} on n={top['n']} (+${top['pnl_usd']})")
+                if bench:
+                    cites.append(f"benchmark: {bench['excess_pct']:+.2f}pp vs {bench['benchmark_ticker']}")
+                actions.append({
+                    "priority": 2,
+                    "action": "SCOPE_DOWN",
+                    "strategy": s["strategy"],
+                    "reason": f"Has salvageable subset(s): {', '.join(g['key'] for g in dd['salvageable_subsets'])}. Filter strategy to those instead of KILL — preserves working edge, removes bleed.",
+                    "data_citations": cites,
+                })
+            else:
+                # REDUCE+REWORK but drilldown inconclusive — keep as REVIEW
+                actions.append({
+                    "priority": 3,
+                    "action": "REVIEW",
+                    "strategy": s["strategy"],
+                    "reason": "REDUCE+REWORK flag set but drilldown is inconclusive (likely thin sample per subset). Watch another 1-2 weeks before kill/scope decision.",
+                    "data_citations": ["decision_engine: REDUCE+REWORK"],
+                })
+
+    # ── 2. PROMOTE_REVIEW: strategies with high benchmark alpha — they may
+    #      deserve more capital. Priority MEDIUM. Filters: alpha > 5pp AND
+    #      decision != OBSERVE (i.e. has enough sample to act on)
+    for strat, bench in bench_by.items():
+        if not bench["alpha_pass"]:
+            continue
+        if bench["excess_pct"] < 5.0:
+            continue  # only flag meaningful alpha
+        d = decision_by.get(strat, {})
+        if d.get("action") == "OBSERVE":
+            continue  # alpha exists but sample too thin to scale
+        actions.append({
+            "priority": 2,
+            "action": "PROMOTE_REVIEW",
+            "strategy": strat,
+            "reason": f"Beats {bench['benchmark_ticker']} buy-and-hold by {bench['excess_pct']:+.2f}pp over {window_days}d. Real edge — review whether it deserves more capital allocation.",
+            "data_citations": [
+                f"benchmark: {bench['excess_pct']:+.2f}pp vs {bench['benchmark_ticker']}",
+                f"decision_engine: {d.get('action', 'unknown')} (n={d.get('n_total', 0)})",
+            ],
+        })
+
+    # ── 3. ALPHA_NEGATIVE: strategies with positive PnL but negative alpha
+    #      vs benchmark — illusory wins. Priority MEDIUM. The user explicitly
+    #      noted nq_overnight as the canonical case (highest PnL but -7.7pp alpha).
+    for strat, bench in bench_by.items():
+        if bench["alpha_pass"]:
+            continue
+        if bench["strategy_pnl_pct"] <= 0:
+            continue  # already losing absolute money; the kill rules cover that
+        if bench["excess_pct"] > -2.0:
+            continue  # close to benchmark = neutral, not "illusory"
+        d = decision_by.get(strat, {})
+        actions.append({
+            "priority": 3,
+            "action": "ALPHA_NEGATIVE",
+            "strategy": strat,
+            "reason": f"Looks profitable absolutely (+${bench['strategy_pnl_usd']:.0f}) but {abs(bench['excess_pct']):.2f}pp BELOW {bench['benchmark_ticker']} buy-and-hold. PnL is market-drift, not edge. Don't promote on absolute PnL alone.",
+            "data_citations": [
+                f"benchmark: {bench['excess_pct']:+.2f}pp vs {bench['benchmark_ticker']} (underperforms)",
+                f"strategy_pnl: +${bench['strategy_pnl_usd']:.2f} (looks good but isn't)",
+                f"decision_engine: {d.get('action', 'unknown')}",
+            ],
+        })
+
+    # ── 4. QUARANTINE: dirty trade rate > 5%
+    for s in decision_by.values():
+        if s["action"] == "QUARANTINE":
+            actions.append({
+                "priority": 1,
+                "action": "QUARANTINE",
+                "strategy": s["strategy"],
+                "reason": f"Dirty trade rate {s.get('dirty_rate_pct', 0):.1f}% > 5%. Fix data hygiene (reconcile drift, OCO double-fires, reset artifacts) BEFORE evaluating edge.",
+                "data_citations": [f"decision_engine: dirty_rate {s.get('dirty_rate_pct', 0)}%"],
+            })
+
+    # Sort: priority asc, then action priority order within tier
+    action_rank = {"KILL": 0, "QUARANTINE": 1, "KILL_CANDIDATE": 2, "SCOPE_DOWN": 3,
+                   "PROMOTE_REVIEW": 4, "ALPHA_NEGATIVE": 5, "REVIEW": 6}
+    actions.sort(key=lambda a: (a["priority"], action_rank.get(a["action"], 99)))
+
+    return JSONResponse({
+        "window_days": window_days,
+        "n_actions": len(actions),
+        "summary": {
+            "kill_candidates":  sum(1 for a in actions if a["action"] in ("KILL", "KILL_CANDIDATE")),
+            "scope_down":       sum(1 for a in actions if a["action"] == "SCOPE_DOWN"),
+            "quarantine":       sum(1 for a in actions if a["action"] == "QUARANTINE"),
+            "promote_review":   sum(1 for a in actions if a["action"] == "PROMOTE_REVIEW"),
+            "alpha_negative":   sum(1 for a in actions if a["action"] == "ALPHA_NEGATIVE"),
+            "review":           sum(1 for a in actions if a["action"] == "REVIEW"),
+        },
+        "actions": actions,
+        "method_note": (
+            "Cross-references decision_engine + strategy_drilldown + benchmark_alpha "
+            "+ trade_validity. Each action cites its supporting data. KILL_CANDIDATE "
+            "fires only when all three independent signals agree."
+        ),
+    })
+
+
 @app.get("/api/strategy_drilldown")
 async def api_strategy_drilldown(strategy: str, window_days: int = 60):
     """Per-strategy subset analysis: groups trades by symbol/direction/exit/hour
@@ -8240,6 +8405,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
 <div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
 
+<!-- RECOMMENDED ACTIONS — cross-panel synthesis, what to actually do now -->
+<div id="recommended-actions-panel" style="margin-bottom:14px;"></div>
+
 <!-- DECISION ENGINE — primary decision view, top of strategy area -->
 <div id="decision-engine-panel" style="margin-bottom:14px;"></div>
 
@@ -8907,6 +9075,76 @@ const ACTION_COLORS = {
   KILL:       {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
   OBSERVE:    {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
+
+// ─── RECOMMENDED ACTIONS ──────────────────────────────────────────
+// Cross-panel synthesis: pulls findings from decision_engine + drilldown
+// + benchmark_alpha + trade_validity into a single priority-ranked do-list.
+// Hides itself when there are no actions (clean fleet = clean dashboard).
+const ACTION_VISUAL = {
+  KILL:           {color: '#ff4444', label: 'KILL'},
+  KILL_CANDIDATE: {color: '#ff4444', label: 'KILL CANDIDATE'},
+  QUARANTINE:     {color: '#a855f7', label: 'QUARANTINE'},
+  SCOPE_DOWN:     {color: '#ffaa00', label: 'SCOPE DOWN'},
+  PROMOTE_REVIEW: {color: '#00ff88', label: 'PROMOTE REVIEW'},
+  ALPHA_NEGATIVE: {color: '#ffc107', label: 'ALPHA NEGATIVE'},
+  REVIEW:         {color: '#9da8c7', label: 'REVIEW'},
+};
+function loadRecommendedActions() {
+  fetch('/api/recommended_actions?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('recommended-actions-panel');
+    if (!el) return;
+    const actions = data.actions || [];
+    if (actions.length === 0) {
+      el.innerHTML = '<div style="background:#0d1c11;border:1px solid #00ff88;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#00ff88;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">RECOMMENDED ACTIONS</span> · <span style="color:#9da8c7;">no actions queued — fleet is in steady state</span>'
+        + '</div>';
+      return;
+    }
+    const sum = data.summary || {};
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">RECOMMENDED ACTIONS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">cross-panel synthesis · ' + actions.length + ' action' + (actions.length===1?'':'s') + ' queued</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">'
+      + (sum.kill_candidates ? '<span style="color:#ff4444;">' + sum.kill_candidates + ' kill</span> · ' : '')
+      + (sum.scope_down      ? '<span style="color:#ffaa00;">' + sum.scope_down + ' scope-down</span> · ' : '')
+      + (sum.quarantine      ? '<span style="color:#c084fc;">' + sum.quarantine + ' quarantine</span> · ' : '')
+      + (sum.promote_review  ? '<span style="color:#00ff88;">' + sum.promote_review + ' promote</span> · ' : '')
+      + (sum.alpha_negative  ? '<span style="color:#ffc107;">' + sum.alpha_negative + ' illusory PnL</span> · ' : '')
+      + (sum.review          ? '<span style="color:#9da8c7;">' + sum.review + ' review</span>' : '')
+      + '</div></div>';
+    // Action list — priority groups visually separated
+    let lastPriority = null;
+    for (const a of actions) {
+      const v = ACTION_VISUAL[a.action] || {color: '#9da8c7', label: a.action};
+      if (lastPriority !== null && a.priority !== lastPriority) {
+        html += '<div style="border-top:1px dashed #1e2a42;margin:6px 0;"></div>';
+      }
+      lastPriority = a.priority;
+      const priorityBadge = a.priority === 1 ? 'P1' : a.priority === 2 ? 'P2' : 'P3';
+      const priorityColor = a.priority === 1 ? '#ff4444' : a.priority === 2 ? '#ffaa00' : '#9da8c7';
+      html += '<div style="display:flex;gap:10px;padding:6px 0;align-items:flex-start;">'
+        + '<span style="background:transparent;color:' + priorityColor + ';border:1px solid ' + priorityColor + ';padding:2px 6px;border-radius:3px;font-weight:bold;font-size:0.7em;letter-spacing:1px;flex-shrink:0;align-self:flex-start;">' + priorityBadge + '</span>'
+        + '<span style="background:' + v.color + ';color:#000;padding:2px 8px;border-radius:3px;font-weight:bold;font-size:0.78em;letter-spacing:1px;flex-shrink:0;align-self:flex-start;">' + v.label + '</span>'
+        + '<div style="flex:1;font-size:0.85em;">'
+        + '<div style="color:#e0e0e0;font-weight:bold;margin-bottom:2px;">' + a.strategy + '</div>'
+        + '<div style="color:#9da8c7;font-size:0.92em;">' + a.reason + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.85em;margin-top:3px;">'
+        + (a.data_citations || []).map(c => '↳ ' + c).join(' &nbsp; · &nbsp; ')
+        + '</div>'
+        + '</div>'
+        + '</div>';
+    }
+    html += '<div style="margin-top:10px;font-size:0.7em;color:#7b8ab8;border-top:1px solid #1e2a42;padding-top:6px;">'
+      + 'Synthesizes decision_engine + strategy_drilldown + benchmark_alpha + trade_validity. '
+      + 'KILL_CANDIDATE fires only when all three independent signals agree.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('recommended actions error:', e);});
+}
+loadRecommendedActions();
+setInterval(loadRecommendedActions, 60000);
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
@@ -15601,6 +15839,7 @@ PANEL_IDS_ALL = [
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
     # Decision / fleet panels
+    "recommended-actions-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
@@ -15619,12 +15858,14 @@ VIEW_ALLOWLISTS = {
         "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
-        "maturity-summary-banner", "fleet-health", "open-positions-panel",
+        "maturity-summary-banner", "recommended-actions-panel",
+        "fleet-health", "open-positions-panel",
     },
     # Fleet Ops = decision-layer view
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
+        "recommended-actions-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
         "efficiency-panel", "fleet-health", "open-positions-panel",
     },
