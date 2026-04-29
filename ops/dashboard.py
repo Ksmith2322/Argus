@@ -8618,18 +8618,30 @@ function setStatus(msg, kind) {
   el.className = "status " + (kind || "");
 }
 
+// In-memory map of strategy → recommended action (populated alongside skeleton load).
+// Inline display on each card eliminates context-switching to /api/recommended_actions.
+let RECOMMENDATIONS = {};
+
 function loadData() {
   const date = document.getElementById("date-input").value.trim();
   setStatus("Loading...");
-  fetch("/api/verdict_filled?date=" + encodeURIComponent(date)).then(r=>r.json()).then(d=>{
+  Promise.all([
+    fetch("/api/verdict_filled?date=" + encodeURIComponent(date)).then(r=>r.json()),
+    fetch("/api/recommended_actions?window_days=30").then(r=>r.json()).catch(()=>({actions:[]})),
+  ]).then(([d, recs])=>{
     if (d.status === "missing") {
       setStatus("No skeleton found for date " + date + ". Run ops.generate_verdict_skeleton first.", "err");
       return;
     }
     DATA = d;
     DATA.review_date_compact = date;
+    // Index recommendations by strategy for O(1) lookup during render
+    RECOMMENDATIONS = {};
+    for (const a of (recs.actions || [])) {
+      RECOMMENDATIONS[a.strategy] = a;
+    }
     render();
-    setStatus("Loaded " + (d._source || "skeleton") + " — " + (d.n_strategies || 0) + " strategies", "ok");
+    setStatus("Loaded " + (d._source || "skeleton") + " — " + (d.n_strategies || 0) + " strategies, " + (recs.n_actions || 0) + " recommended actions", "ok");
   }).catch(e => setStatus("Load error: " + e, "err"));
 }
 
@@ -8669,6 +8681,26 @@ function renderCard(s, originalIdx) {
   const elig = s.criteria_eligibility || {};
   const refs = s.references || {};
 
+  // Inline recommendation pill — pulls from /api/recommended_actions cached
+  // at load time. Eliminates context-switching to look up "what does the
+  // engine think we should do" while filling each card.
+  const rec = RECOMMENDATIONS[s.strategy];
+  let recPill = '';
+  if (rec) {
+    const recColor = rec.priority === 1 ? '#ff4444' : rec.priority === 2 ? '#ffaa00' : '#9da8c7';
+    const actionColor = {
+      KILL: '#ff4444', KILL_CANDIDATE: '#ff4444', QUARANTINE: '#c084fc',
+      SCOPE_DOWN: '#ffaa00', PROMOTE_REVIEW: '#00ff88', ALPHA_NEGATIVE: '#ffc107',
+      REVIEW: '#9da8c7',
+    }[rec.action] || '#9da8c7';
+    const tooltip = (rec.reason || '').replace(/"/g, '&quot;');
+    recPill = '<div style="margin:6px 0 8px;padding:6px 10px;background:#0a1224;border:1px solid ' + recColor + ';border-radius:4px;font-size:0.85em;" title="' + tooltip + '">'
+      + '<span style="color:' + recColor + ';font-weight:bold;letter-spacing:1px;">P' + rec.priority + ' ENGINE SUGGESTS:</span> '
+      + '<span style="background:' + actionColor + ';color:#000;padding:1px 6px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.92em;">' + rec.action + '</span> '
+      + '<span style="color:#9da8c7;">' + (rec.reason || '') + '</span>'
+      + '</div>';
+  }
+
   const metrics = [
     ['n', s.live_trades_post_clamp ?? '—'],
     ['PF', s.live_pf ?? '—'],
@@ -8705,6 +8737,7 @@ function renderCard(s, originalIdx) {
     + metrics.map(([k, v]) => '<span class="metric">' + k + ': <b>' + v + '</b></span>').join('')
     + '</div>'
     + '<div style="font-size:0.78em;color:#7b8ab8;margin-bottom:8px;">Eligibility: ' + eligDisplay + '</div>'
+    + recPill
     + '<div class="form-row">'
     + '<label>Verdict:</label>'
     + '<select onchange="updateField(' + originalIdx + ', \\'verdict\\', this.value)">' + verdictOpts + '</select>'
