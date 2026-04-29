@@ -93,6 +93,31 @@ def main() -> int:
         pr_row = pr_by.get(name, {})
         vet_row = vet_by.get(name)
 
+        # Auto-fill verdicts that are FACTUAL (not judgmental) per the ceremony spec.
+        # OBSERVE for thin samples (n<5) and BLOCKED for operational gaps are
+        # criteria-driven, not "rehearsing the verdict." Strategies with enough
+        # sample to require actual judgment (multi_orb, spy_mean_rev, vix_intraday,
+        # etc) are LEFT BLANK so the user fills them on 5/1.
+        vetting_verdict = vet_row.get("verdict_auto") if vet_row else None
+        auto_verdict, auto_reasoning, auto_action, auto_next = None, None, None, None
+        elig = _criteria_eligibility(n, pf, op_verdict)
+        if vetting_verdict == "BLOCKED":
+            auto_verdict = "BLOCKED"
+            auto_reasoning = "Operational vetting failed structural checks (see operational_vetting_<date>.json). Cannot judge edge until rails are verified."
+            auto_action = "Repair window 5/1-5/15: fix operational issues per vetting checklist. Re-vet on 5/15."
+            auto_next = "2026-05-15"
+        elif vetting_verdict == "LOW_FREQUENCY_OBSERVE":
+            auto_verdict = "OBSERVE"
+            auto_reasoning = "By-design quiet (event-driven OR research_only mode). Operationally healthy; expected silence given current conditions."
+            auto_action = "Continue paper. Track expected fire rate vs actual."
+            auto_next = "2026-05-15"
+        elif elig["observe_quant_threshold_met"] and vetting_verdict != "BLOCKED":
+            # n<5 + not blocked = thin sample, formal OBSERVE
+            auto_verdict = "OBSERVE"
+            auto_reasoning = f"Thin sample (n={n}) — insufficient evidence for any decision."
+            auto_action = "Continue paper. Re-evaluate when n>=10."
+            auto_next = "2026-05-15"
+
         entry = {
             # Pre-filled structural facts (operational_maturity is the primary source —
             # fleet_perf_summary's per-strategy array is sometimes empty between rebuilds)
@@ -112,15 +137,23 @@ def main() -> int:
             "promotion_review_gate_passed": pr_row.get("review_gate_passed"),
             "promotion_blockers": pr_row.get("review_gate_blockers", []),
             "blocking_disposition": pr_row.get("blocking_disposition"),
-            "operational_vetting_auto": vet_row.get("verdict_auto") if vet_row else "n/a (had trades)",
-            "criteria_eligibility": _criteria_eligibility(n, pf, op_verdict),
-            # Empty fields for the ceremony to fill in
-            "verdict": None,           # FILL: BLOCKED / OBSERVE / KEEP-PAPER / WINNER-CANDIDATE / REAL-CANDIDATE / REWORK / QUARANTINE / KILL
-            "reasoning": None,         # FILL: 1-3 sentences citing the data above
-            "action": None,            # FILL: concrete next step (continue paper / apply 0.5x / kill runner / etc)
-            "named_rework_fix": None,  # FILL only if verdict=REWORK: the ONE specific fix
-            "next_review_date": None,  # FILL: typically 2026-05-15 or 2026-05-31
-            # Ceremony-fixed fields
+            "operational_vetting_auto": vetting_verdict if vetting_verdict else "n/a (had trades)",
+            "criteria_eligibility": elig,
+            # Cross-references — direct paths the user can hit on 5/1 without
+            # context-switching between dashboard panels.
+            "references": {
+                "drilldown": f"http://localhost:8080/api/strategy_drilldown?strategy={name}&window_days=60",
+                "benchmark_alpha_section": f"In /api/benchmark_alpha → look for strategy='{name}' in 'strategies' or 'skipped'",
+                "recommended_actions_section": f"In /api/recommended_actions → look for strategy='{name}' in 'actions'",
+                "operational_vetting_section": f"In argus_flow/logs/ceremony_prep/operational_vetting_<date>.json → strategies[?] where strategy='{name}'",
+            },
+            # Auto-filled when criteria are unambiguous; user can override on 5/1.
+            "verdict": auto_verdict,
+            "reasoning": auto_reasoning,
+            "action": auto_action,
+            "named_rework_fix": None,                # FILL only if verdict=REWORK
+            "next_review_date": auto_next,
+            "auto_filled": auto_verdict is not None,  # operator hint: "this was auto"
             "owner": "ksmith2322",
             "review_date": "2026-05-01",
         }
@@ -133,15 +166,20 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "verdict_20260501_skeleton.json"
 
+    n_auto = sum(1 for e in entries if e["auto_filled"])
+    n_manual = len(entries) - n_auto
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "purpose": "5/1 ceremony verdict template — structural fields pre-filled, decision fields empty",
+        "purpose": "5/1 ceremony verdict template — auto-filled where criteria are unambiguous; manual fields blank for actual decisions",
         "instructions": (
-            "Fill the four 'FILL' fields per strategy: verdict, reasoning, action, next_review_date. "
-            "Use criteria_eligibility for quantitative gates and the 6-tier vocabulary from "
-            "project_5_1_review_ceremony_20260501.md. Save filled version as verdict_20260501.json."
+            f"Of {len(entries)} strategies, {n_auto} have auto-filled verdicts (OBSERVE/BLOCKED based on objective criteria). "
+            f"{n_manual} strategies have enough sample to require manual judgment — fill verdict, reasoning, action, "
+            f"named_rework_fix (if REWORK), next_review_date for those. The auto_filled=true entries can still be "
+            f"overridden if the user sees something the criteria missed. Save filled version as verdict_20260501.json."
         ),
         "n_strategies": len(entries),
+        "n_auto_filled": n_auto,
+        "n_requiring_manual_judgment": n_manual,
         "verdict_vocabulary": [
             "BLOCKED", "OBSERVE", "KEEP-PAPER", "WINNER-CANDIDATE",
             "REAL-CANDIDATE", "REWORK", "QUARANTINE", "KILL",

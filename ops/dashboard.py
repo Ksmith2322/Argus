@@ -5642,6 +5642,79 @@ async def api_strategy_drilldown(strategy: str, window_days: int = 60):
     })
 
 
+# ── Verdict editor — multi-ceremony tool (5/1, 5/15, 5/31, future) ─────
+# Reads the auto-generated skeleton, lets the user fill the 3-5 manual-
+# judgment fields per strategy, saves to verdict_<date>.json. Avoids 60-90
+# min of manual JSON editing per ceremony.
+
+@app.get("/api/verdict_skeleton")
+async def api_verdict_skeleton(date: str = "20260501"):
+    """Read the auto-generated skeleton for a given ceremony date."""
+    p = REPO / "argus_flow" / "logs" / "ceremony_prep" / f"verdict_{date}_skeleton.json"
+    if not p.exists():
+        return JSONResponse({"status": "missing", "path": str(p.relative_to(REPO))})
+    try:
+        return JSONResponse(json.loads(p.read_text(encoding="utf-8")))
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.get("/api/verdict_filled")
+async def api_verdict_filled(date: str = "20260501"):
+    """Return the filled verdict file if it exists, else fall back to the skeleton.
+
+    Lets the editor resume where the user left off across browser refreshes.
+    """
+    filled_path = REPO / "argus_flow" / "logs" / f"verdict_{date}.json"
+    skeleton_path = REPO / "argus_flow" / "logs" / "ceremony_prep" / f"verdict_{date}_skeleton.json"
+    src_path = filled_path if filled_path.exists() else skeleton_path
+    if not src_path.exists():
+        return JSONResponse({"status": "missing"})
+    try:
+        data = json.loads(src_path.read_text(encoding="utf-8"))
+        data["_source"] = "filled" if src_path == filled_path else "skeleton"
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.post("/api/save_verdict")
+async def api_save_verdict(request: Request):
+    """Persist the filled verdict to argus_flow/logs/verdict_<date>.json.
+
+    Idempotent: same date = overwrite. Backup the previous file with .bak
+    extension so accidental saves don't lose prior work.
+    """
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"invalid JSON: {e}"}, status_code=400)
+    date = body.get("review_date_compact") or "20260501"
+    out_dir = REPO / "argus_flow" / "logs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"verdict_{date}.json"
+    if out_path.exists():
+        # Keep one prior version as .bak in case of accidental save
+        bak = out_path.with_suffix(".json.bak")
+        try:
+            bak.write_text(out_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+    body["saved_at_utc"] = datetime.now(timezone.utc).isoformat()
+    try:
+        out_path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+        return JSONResponse({"status": "ok", "path": str(out_path.relative_to(REPO)),
+                             "saved_at_utc": body["saved_at_utc"]})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/verdict_editor", response_class=HTMLResponse)
+async def verdict_editor_page():
+    """Standalone editor page for the ceremony verdict file."""
+    return _VERDICT_EDITOR_HTML
+
+
 @app.get("/api/readiness_check")
 async def api_readiness_check():
     """Parse the 20-point real-money readiness checklist and return progress.
@@ -8416,6 +8489,235 @@ def _build_trade_analytics(summaries: list, max_runs: int = 15) -> dict:
 # ---------------------------------------------------------------------------
 # Dashboard HTML (single page, self-contained)
 # ---------------------------------------------------------------------------
+
+_VERDICT_EDITOR_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verdict Editor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Consolas', 'Monaco', monospace; background: #0a0e17; color: #e0e0e0; padding: 16px; line-height: 1.4; }
+  h1 { color: #00d4ff; font-size: 1.3em; margin-bottom: 6px; letter-spacing: 2px; }
+  .subtitle { color: #7b8ab8; font-size: 0.85em; margin-bottom: 14px; }
+  .controls { display:flex; gap:10px; align-items:center; margin-bottom:14px; padding:10px 14px; background:#141b2d; border:1px solid #1e2a42; border-radius:6px; flex-wrap:wrap; }
+  .controls label { color:#9da8c7; font-size:0.85em; }
+  .controls input { background:#0a1224; color:#e0e0e0; border:1px solid #1e2a42; padding:4px 8px; border-radius:3px; font-family:inherit; }
+  button { background:#1e2a42; border:1px solid #00d4ff; color:#00d4ff; padding:6px 14px; border-radius:4px; cursor:pointer; font-family:inherit; font-weight:bold; letter-spacing:1px; }
+  button:hover { background:#2a3a5a; }
+  button.primary { background:#0d1c11; border-color:#00ff88; color:#00ff88; }
+  button.primary:hover { background:#143021; }
+  .status { color:#7b8ab8; font-size:0.85em; }
+  .status.ok { color:#00ff88; }
+  .status.err { color:#ff4444; }
+  .summary-bar { display:flex; gap:14px; padding:8px 14px; background:#0a1224; border:1px solid #1e2a42; border-radius:6px; margin-bottom:14px; font-size:0.85em; flex-wrap:wrap; }
+  .summary-bar span { color:#9da8c7; }
+  .summary-bar b { color:#fff; }
+  .strategy-card { background:#141b2d; border:1px solid #1e2a42; border-radius:6px; padding:14px; margin-bottom:14px; }
+  .strategy-card.auto-filled { opacity:0.78; border-left:3px solid #7b8ab8; }
+  .strategy-card.manual { border-left:3px solid #00d4ff; }
+  .card-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px; gap:14px; flex-wrap:wrap; }
+  .strategy-name { color:#00d4ff; font-weight:bold; font-size:1.1em; letter-spacing:1px; }
+  .badge { padding:2px 8px; border-radius:3px; font-size:0.75em; letter-spacing:1px; font-weight:bold; }
+  .badge.auto { background:transparent; border:1px solid #7b8ab8; color:#7b8ab8; }
+  .badge.manual { background:transparent; border:1px solid #00d4ff; color:#00d4ff; }
+  .metric-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px 14px; margin-bottom:10px; font-size:0.85em; }
+  .metric-grid .metric { color:#9da8c7; }
+  .metric-grid .metric b { color:#e0e0e0; }
+  .form-row { display:flex; gap:10px; margin-bottom:8px; flex-wrap:wrap; align-items:flex-start; }
+  .form-row label { color:#9da8c7; font-size:0.85em; min-width:120px; padding-top:6px; }
+  .form-row select, .form-row input, .form-row textarea {
+    background:#0a1224; color:#e0e0e0; border:1px solid #1e2a42; padding:5px 8px;
+    border-radius:3px; font-family:inherit; font-size:0.92em;
+  }
+  .form-row textarea { width:100%; min-height:46px; resize:vertical; }
+  .form-row select { min-width:200px; }
+  .form-row .grow { flex:1; min-width:200px; }
+  .ref-links { display:flex; gap:14px; font-size:0.78em; margin-top:6px; flex-wrap:wrap; }
+  .ref-links a { color:#7b8ab8; text-decoration:none; }
+  .ref-links a:hover { color:#00d4ff; text-decoration:underline; }
+  .reasoning { color:#9da8c7; font-size:0.85em; margin-top:4px; }
+  .v-color-OBSERVE { color:#7b8ab8; }
+  .v-color-BLOCKED { color:#ffaa00; }
+  .v-color-KEEP-PAPER { color:#9da8c7; }
+  .v-color-WINNER-CANDIDATE { color:#00ff88; }
+  .v-color-REAL-CANDIDATE { color:#00ff88; }
+  .v-color-REWORK { color:#ffaa00; }
+  .v-color-QUARANTINE { color:#c084fc; }
+  .v-color-KILL { color:#ff4444; }
+</style>
+</head>
+<body>
+<h1>VERDICT EDITOR</h1>
+<div class="subtitle">5/1 ceremony decision-capture. Auto-filled rows are pre-judged from criteria; manual rows need your call.</div>
+
+<div class="controls">
+  <label>Ceremony date: <input id="date-input" type="text" value="20260501" maxlength="8" size="8"></label>
+  <button onclick="loadData()">Load</button>
+  <button class="primary" onclick="saveData()">Save All</button>
+  <span id="status" class="status">Ready.</span>
+</div>
+
+<div id="summary-bar" class="summary-bar"></div>
+<div id="strategies"></div>
+
+<script>
+const VERDICT_OPTIONS = ["BLOCKED","OBSERVE","KEEP-PAPER","WINNER-CANDIDATE","REAL-CANDIDATE","REWORK","QUARANTINE","KILL"];
+let DATA = null;
+
+function setStatus(msg, kind) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status " + (kind || "");
+}
+
+function loadData() {
+  const date = document.getElementById("date-input").value.trim();
+  setStatus("Loading...");
+  fetch("/api/verdict_filled?date=" + encodeURIComponent(date)).then(r=>r.json()).then(d=>{
+    if (d.status === "missing") {
+      setStatus("No skeleton found for date " + date + ". Run ops.generate_verdict_skeleton first.", "err");
+      return;
+    }
+    DATA = d;
+    DATA.review_date_compact = date;
+    render();
+    setStatus("Loaded " + (d._source || "skeleton") + " — " + (d.n_strategies || 0) + " strategies", "ok");
+  }).catch(e => setStatus("Load error: " + e, "err"));
+}
+
+function render() {
+  if (!DATA) return;
+  const sb = document.getElementById("summary-bar");
+  const counts = {};
+  for (const s of (DATA.strategies || [])) {
+    const v = s.verdict || "(unfilled)";
+    counts[v] = (counts[v] || 0) + 1;
+  }
+  sb.innerHTML = '<span>Source: <b>' + (DATA._source || "?") + '</b></span>'
+    + '<span>Total: <b>' + (DATA.n_strategies || 0) + '</b></span>'
+    + '<span>Auto-filled: <b>' + (DATA.n_auto_filled || 0) + '</b></span>'
+    + '<span>Manual needed: <b>' + (DATA.n_requiring_manual_judgment || 0) + '</b></span>'
+    + '<span>|</span>'
+    + Object.entries(counts).map(([k,v]) =>
+        '<span>' + k + ': <b class="v-color-' + k + '">' + v + '</b></span>'
+      ).join('');
+
+  const root = document.getElementById("strategies");
+  // Manual-judgment cards first (the actual work), then auto-filled.
+  const sorted = (DATA.strategies || []).slice().sort((a,b)=>{
+    const aAuto = a.auto_filled ? 1 : 0;
+    const bAuto = b.auto_filled ? 1 : 0;
+    if (aAuto !== bAuto) return aAuto - bAuto;
+    return -(a.live_trades_post_clamp || 0) - -(b.live_trades_post_clamp || 0);
+  });
+  root.innerHTML = sorted.map((s, idx) => renderCard(s, DATA.strategies.indexOf(s))).join('');
+}
+
+function renderCard(s, originalIdx) {
+  const cls = s.auto_filled ? "auto-filled" : "manual";
+  const badge = s.auto_filled
+    ? '<span class="badge auto">AUTO</span>'
+    : '<span class="badge manual">MANUAL</span>';
+  const elig = s.criteria_eligibility || {};
+  const refs = s.references || {};
+
+  const metrics = [
+    ['n', s.live_trades_post_clamp ?? '—'],
+    ['PF', s.live_pf ?? '—'],
+    ['PnL', s.live_pnl_usd != null ? '$' + s.live_pnl_usd.toFixed(2) : '—'],
+    ['expectancy', s.live_expectancy_usd != null ? '$' + s.live_expectancy_usd.toFixed(2) : '—'],
+    ['win rate', s.live_win_rate_pct != null ? s.live_win_rate_pct + '%' : '—'],
+    ['op maturity', s.operational_maturity || '—'],
+    ['op vetting', s.operational_vetting_auto || '—'],
+  ];
+  const eligLabels = [
+    ['REAL-CAND quant', elig.real_candidate_quant_thresholds_met],
+    ['WINNER-CAND quant', elig.winner_candidate_quant_thresholds_met],
+    ['KEEP-PAPER quant', elig.keep_paper_quant_thresholds_met],
+    ['KILL quant', elig['kill_quant_threshold_met (n>=30 + PF<1.0)']],
+    ['OBSERVE quant', elig.observe_quant_threshold_met],
+  ];
+  const eligDisplay = eligLabels
+    .filter(([_, v]) => v === true)
+    .map(([l, _]) => '<span style="color:#00ff88;">' + l + '</span>')
+    .join(' · ') || '<span style="color:#7b8ab8;">none triggered</span>';
+
+  const verdictOpts = ['<option value="">(unfilled)</option>'].concat(
+    VERDICT_OPTIONS.map(v =>
+      '<option value="' + v + '"' + (s.verdict === v ? ' selected' : '') + '>' + v + '</option>'
+    )
+  ).join('');
+
+  return '<div class="strategy-card ' + cls + '">'
+    + '<div class="card-header">'
+    + '<span class="strategy-name">' + s.strategy + '</span>'
+    + badge
+    + '</div>'
+    + '<div class="metric-grid">'
+    + metrics.map(([k, v]) => '<span class="metric">' + k + ': <b>' + v + '</b></span>').join('')
+    + '</div>'
+    + '<div style="font-size:0.78em;color:#7b8ab8;margin-bottom:8px;">Eligibility: ' + eligDisplay + '</div>'
+    + '<div class="form-row">'
+    + '<label>Verdict:</label>'
+    + '<select onchange="updateField(' + originalIdx + ', \\'verdict\\', this.value)">' + verdictOpts + '</select>'
+    + '<input type="date" value="' + (s.next_review_date || '') + '" onchange="updateField(' + originalIdx + ', \\'next_review_date\\', this.value)">'
+    + '<span style="color:#7b8ab8;font-size:0.78em;align-self:center;">next review</span>'
+    + '</div>'
+    + '<div class="form-row">'
+    + '<label>Reasoning:</label>'
+    + '<textarea class="grow" onchange="updateField(' + originalIdx + ', \\'reasoning\\', this.value)" placeholder="1-3 sentences citing the metrics above">' + (s.reasoning || '') + '</textarea>'
+    + '</div>'
+    + '<div class="form-row">'
+    + '<label>Action:</label>'
+    + '<input class="grow" value="' + (s.action || '').replace(/"/g, '&quot;') + '" onchange="updateField(' + originalIdx + ', \\'action\\', this.value)" placeholder="concrete next step">'
+    + '</div>'
+    + '<div class="form-row">'
+    + '<label>Rework fix:</label>'
+    + '<input class="grow" value="' + (s.named_rework_fix || '').replace(/"/g, '&quot;') + '" onchange="updateField(' + originalIdx + ', \\'named_rework_fix\\', this.value)" placeholder="ONE specific fix (only if verdict=REWORK)">'
+    + '</div>'
+    + '<div class="ref-links">'
+    + (refs.drilldown ? '<a href="' + refs.drilldown + '" target="_blank">↗ subset drilldown</a>' : '')
+    + '<a href="/api/benchmark_alpha" target="_blank">↗ benchmark alpha</a>'
+    + '<a href="/api/recommended_actions" target="_blank">↗ recommended actions</a>'
+    + '<a href="/" target="_blank">↗ main dashboard</a>'
+    + '</div>'
+    + '</div>';
+}
+
+function updateField(idx, field, value) {
+  if (!DATA || !DATA.strategies[idx]) return;
+  DATA.strategies[idx][field] = value || null;
+  // If verdict changed, the auto_filled badge becomes meaningful — recompute summary
+  if (field === 'verdict') {
+    DATA.strategies[idx].auto_filled = false;  // user touched it
+    render();
+  }
+}
+
+function saveData() {
+  if (!DATA) { setStatus("Nothing loaded", "err"); return; }
+  setStatus("Saving...");
+  fetch("/api/save_verdict", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(DATA),
+  }).then(r=>r.json()).then(d=>{
+    if (d.status === "ok") {
+      setStatus("Saved to " + d.path + " at " + d.saved_at_utc, "ok");
+    } else {
+      setStatus("Save failed: " + (d.message || JSON.stringify(d)), "err");
+    }
+  }).catch(e => setStatus("Save error: " + e, "err"));
+}
+
+// Auto-load on first paint
+loadData();
+</script>
+</body>
+</html>"""
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
