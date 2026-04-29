@@ -5282,6 +5282,62 @@ async def api_benchmark_alpha(window_days: int = 30):
     })
 
 
+# Reset epoch — single source of truth for "what's the live-paper boundary?".
+# Mirrors operational_maturity_*.json's `post_clamp_cutoff`. When a future reset
+# happens, update both this constant AND the operational_maturity generator.
+RESET_CUTOFF_UTC = "2026-04-23T14:00:00+00:00"
+RESET_LABEL = "2026-04-23 paper reset"
+
+
+@app.get("/api/data_epoch")
+async def api_data_epoch():
+    """Single source of truth for the dashboard's data-provenance epoch.
+
+    Returns the live-paper reset cutoff, days since reset, and any prior
+    epoch markers (the _archive/pre_reset_* directories) so panels can label
+    their data correctly. Per the dashboard upgrades memo: 'Data provenance
+    labels are mandatory on every panel — without these, legacy data ghosts
+    contaminate operational decisions.'
+    """
+    try:
+        cutoff = datetime.fromisoformat(RESET_CUTOFF_UTC)
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days_since = (now - cutoff).total_seconds() / 86400
+    except Exception:
+        cutoff, days_since = None, None
+    # Read the operational_maturity post_clamp_cutoff to verify they agree
+    om_cutoff = None
+    try:
+        om = json.loads((REPO / "argus_flow" / "logs" / "operational_maturity_latest.json").read_text(encoding="utf-8"))
+        om_cutoff = om.get("post_clamp_cutoff")
+    except Exception:
+        pass
+    # List archived prior epochs from logs/_archive/
+    prior_epochs = []
+    archive_root = REPO / "argus_flow" / "logs" / "_archive"
+    if archive_root.exists():
+        for d in sorted(archive_root.iterdir()):
+            if d.is_dir() and d.name.startswith("pre_reset_"):
+                prior_epochs.append(d.name)
+    in_sync = (om_cutoff == RESET_CUTOFF_UTC) if om_cutoff else None
+    return JSONResponse({
+        "current_epoch": {
+            "label": RESET_LABEL,
+            "cutoff_utc": RESET_CUTOFF_UTC,
+            "days_since_reset": round(days_since, 1) if days_since is not None else None,
+        },
+        "operational_maturity_cutoff": om_cutoff,
+        "in_sync": in_sync,  # True if api + report agree; False would mean drift to investigate
+        "prior_epochs": prior_epochs,
+        "note": (
+            "All live-paper trade aggregations should filter by entries >= cutoff_utc. "
+            "Pre-reset data is in _archive/ for forensics only."
+        ),
+    })
+
+
 @app.get("/api/recommended_actions")
 async def api_recommended_actions(window_days: int = 30):
     """Cross-panel synthesis: turns scattered insights into a ranked do-list.
@@ -8476,6 +8532,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span style="color:#7b8ab8;">Loading market clock...</span>
 </div>
 
+<!-- Data epoch banner — provenance for "what window is this dashboard showing?" -->
+<div id="data-epoch-bar" style="display:none;margin-bottom:10px;"></div>
+
 <!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
 <div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
 
@@ -8571,6 +8630,45 @@ function loadMarketClock() {
 loadMarketClock();
 setInterval(loadMarketClock, 60000);   // re-fetch every 60s
 setInterval(renderMarketClock, 1000);  // tick countdown every 1s (no network)
+
+// ─── DATA EPOCH BANNER ─────────────────────────────────────────────
+// Shows the live-paper reset cutoff so panels showing "n=N trades" are
+// understood in context. Without this, "30d window" misleadingly suggests
+// the data spans pre + post reset epochs. Per the dashboard upgrades memo:
+// "Data provenance labels are mandatory on every panel."
+// Hidden when in_sync=true and days_since_reset <= 7 (mostly noisy then);
+// shown otherwise so the operator never forgets the boundary.
+let _DATA_EPOCH = null;  // module-level cache for use by other panels
+function loadDataEpoch() {
+  fetch('/api/data_epoch').then(r=>r.json()).then(data=>{
+    _DATA_EPOCH = data;
+    const el = document.getElementById('data-epoch-bar');
+    if (!el) return;
+    const cur = data.current_epoch || {};
+    const days = cur.days_since_reset;
+    const inSync = data.in_sync;
+    // Always show — provenance is the kind of thing that gets forgotten if hidden
+    const syncBadge = inSync === false
+      ? '<span style="background:#3a0a0a;color:#ff4444;padding:1px 6px;border-radius:3px;font-weight:bold;font-size:0.85em;letter-spacing:1px;">⚠ DRIFT</span>'
+      : (inSync === true
+         ? '<span style="background:#0d1c11;color:#00ff88;padding:1px 6px;border-radius:3px;font-size:0.85em;letter-spacing:1px;">in sync</span>'
+         : '<span style="color:#7b8ab8;font-size:0.85em;">unknown</span>');
+    el.style.display = 'block';
+    el.innerHTML = '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:6px;padding:6px 14px;font-size:0.74em;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">'
+      + '<span style="color:#7b8ab8;letter-spacing:2px;">DATA EPOCH</span>'
+      + '<span style="color:#9da8c7;">Live epoch: <b style="color:#fff;">' + (cur.label || '—') + '</b></span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Cutoff: <b style="color:#fff;">' + (cur.cutoff_utc || '—').replace('T', ' ').replace('+00:00', ' UTC') + '</b></span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Days since reset: <b style="color:#fff;">' + (days != null ? days.toFixed(1) + 'd' : '—') + '</b></span>'
+      + '<span style="color:#1e2a42;">|</span>'
+      + '<span style="color:#9da8c7;">Generators ' + syncBadge + '</span>'
+      + (data.prior_epochs && data.prior_epochs.length ? '<span style="color:#1e2a42;">|</span><span style="color:#7b8ab8;font-size:0.85em;" title="prior epochs archived for forensics">' + data.prior_epochs.length + ' prior epoch(s) archived</span>' : '')
+      + '</div>';
+  }).catch(()=>{});
+}
+loadDataEpoch();
+setInterval(loadDataEpoch, 600000);  // 10 min — epoch rarely changes, just verifying sync
 
 // ─── HALT BANNER ───────────────────────────────────────────────────
 function loadHaltStatus() {
@@ -9327,7 +9425,7 @@ function loadDecisionEngine() {
     let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
       + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
       + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">DECISION ENGINE</span>'
-      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">rules ' + (data.rules_version||'') + ' · 30d window</span></div>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;" title="Sample windows use post-reset cutoff from operational_maturity (currently 2026-04-23 14:00 UTC)">rules ' + (data.rules_version||'') + ' · 30d window · post-reset</span></div>'
       + '<div style="font-size:0.78em;color:#7b8ab8;">'
       + '<span style="color:' + ACTION_COLORS.SCALE_UP.fg + ';">SCALE_UP ' + (summary.scale_up||0) + '</span> · '
       + '<span style="color:' + ACTION_COLORS.HOLD.fg + ';">HOLD ' + (summary.hold||0) + '</span> · '
@@ -15928,7 +16026,7 @@ window.addEventListener('load', function() {
 PANEL_IDS_ALL = [
     # Top-of-page bars / banners
     "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
-    "halt-banner", "market-clock-bar", "blocked-entries-bar",
+    "halt-banner", "market-clock-bar", "data-epoch-bar", "blocked-entries-bar",
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
     # Decision / fleet panels
