@@ -6173,14 +6173,50 @@ async def api_readiness_check():
     today = datetime.now(timezone.utc).date()
     target = datetime(2026, 5, 31, tzinfo=timezone.utc).date()
     days_left = (target - today).days
+
+    # Merge in auto-eval results from ops.readiness_eval (data-driven check
+    # of items 1, 4-10, 19, 20). Auto-eval is authoritative for those —
+    # operator's markdown checkbox is overridden by the live data.
+    auto_eval_path = REPO / "argus_flow" / "logs" / "readiness_eval_latest.json"
+    auto_by_n: dict[int, dict] = {}
+    auto_evaluated_at: str | None = None
+    if auto_eval_path.exists():
+        try:
+            ae = json.loads(auto_eval_path.read_text(encoding="utf-8"))
+            auto_evaluated_at = ae.get("evaluated_at_utc")
+            for it in ae.get("items", []):
+                if it.get("auto_status") in ("PASS", "FAIL"):
+                    auto_by_n[it["n"]] = it
+        except Exception:
+            pass
+
+    # Apply auto-eval overrides per item: where auto says PASS, mark passed=True
+    # (regardless of markdown). Where auto says FAIL, mark passed=False AND
+    # attach evidence so the UI can explain. Items not auto-checkable retain
+    # their markdown state.
+    for s in sections:
+        for item in s["items"]:
+            ae = auto_by_n.get(item["n"])
+            if ae is None:
+                continue
+            item["auto_status"] = ae["auto_status"]
+            item["auto_evidence"] = ae["evidence"]
+            item["passed"] = (ae["auto_status"] == "PASS")
+
+    # Recompute counts after override
+    all_items = [item for s in sections for item in s["items"]]
+    total = len(all_items)
+    passed = sum(1 for item in all_items if item["passed"])
+    pending_summary = [{"n": item["n"], "title": item["title"]} for item in all_items if not item["passed"]]
     pct = round(passed / total * 100, 1) if total else 0
-    # Per-section progress
+    # Per-section progress (after auto-eval merge)
     for s in sections:
         s_total = len(s["items"])
         s_passed = sum(1 for item in s["items"] if item["passed"])
         s["passed"] = s_passed
         s["total"] = s_total
         s["pct"] = round(s_passed / s_total * 100, 1) if s_total else 0
+
     return JSONResponse({
         "status": "ok",
         "passed": passed,
@@ -6191,6 +6227,8 @@ async def api_readiness_check():
         "days_until_freeze": days_left,
         "freeze_date": "2026-05-31",
         "source_path": str(md_path),
+        "auto_eval_at": auto_evaluated_at,
+        "auto_items_evaluated": len(auto_by_n),
     })
 
 

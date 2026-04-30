@@ -58,6 +58,7 @@ _COMPUTE_MFE_SCRIPT = _REPO / "ops" / "compute_mfe.py"
 _BROKER_DRIFT_SCRIPT = _REPO / "ops" / "broker_drift_aggregator.py"
 _AUTO_ALLOCATOR_SCRIPT = _REPO / "ops" / "auto_allocator.py"
 _REC_ACTIONS_ALERT_SCRIPT = _REPO / "ops" / "recommended_actions_alert.py"
+_READINESS_EVAL_SCRIPT = _REPO / "ops" / "readiness_eval.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -156,7 +157,8 @@ def main() -> int:
                                      ("compute_mfe", _COMPUTE_MFE_SCRIPT),
                                      ("broker_drift_aggregator", _BROKER_DRIFT_SCRIPT),
                                      ("auto_allocator", _AUTO_ALLOCATOR_SCRIPT),
-                                     ("recommended_actions_alert", _REC_ACTIONS_ALERT_SCRIPT)):
+                                     ("recommended_actions_alert", _REC_ACTIONS_ALERT_SCRIPT),
+                                     ("readiness_eval", _READINESS_EVAL_SCRIPT)):
                     if script.exists():
                         try:
                             subprocess.run(
