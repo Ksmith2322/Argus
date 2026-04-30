@@ -5329,6 +5329,97 @@ RESET_CUTOFF_UTC = "2026-04-23T14:00:00+00:00"
 RESET_LABEL = "2026-04-23 paper reset"
 
 
+@app.get("/api/active_bleeders")
+async def api_active_bleeders(window_days: int = 7, top_n: int = 3):
+    """Top-N strategies by cumulative bleed over the last `window_days`.
+
+    Different angle from /api/changes_24h (which is delta-focused) and
+    /api/recommended_actions (which is verdict-focused). This is purely
+    "who is costing the most right now" — a fast operational read for
+    "where's my capital actually going to die."
+
+    Reads canonical_fills.jsonl filtered to the window. Ranks strategies
+    by total negative PnL. Excludes profitable strategies (they aren't
+    bleeders). Excludes strategies with n<3 fills in window (single bad
+    trade ≠ bleeding pattern).
+    """
+    fills_path = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+    if not fills_path.exists():
+        return JSONResponse({"status": "missing", "bleeders": []})
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    by_strat: dict[str, dict] = {}
+    try:
+        with open(fills_path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                strat = r.get("strategy") or "unknown"
+                exit_ts_raw = str(r.get("exit_ts") or r.get("entry_ts") or "")
+                try:
+                    ts = datetime.fromisoformat(exit_ts_raw.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+                try:
+                    pnl = float(r.get("pnl_usd") or 0)
+                except Exception:
+                    continue
+                d = by_strat.setdefault(strat, {"pnl_total": 0.0, "n_total": 0, "n_wins": 0, "n_losses": 0,
+                                                "worst_trade_usd": 0.0, "worst_trade_ts": None})
+                d["pnl_total"] += pnl
+                d["n_total"] += 1
+                if pnl > 0:
+                    d["n_wins"] += 1
+                elif pnl < 0:
+                    d["n_losses"] += 1
+                if pnl < d["worst_trade_usd"]:
+                    d["worst_trade_usd"] = pnl
+                    d["worst_trade_ts"] = ts.isoformat()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+    # Filter to actual bleeders: net-negative + at least 3 fills (avoid 1-bad-trade noise)
+    bleeders = []
+    for strat, d in by_strat.items():
+        if d["pnl_total"] >= 0:
+            continue
+        if d["n_total"] < 3:
+            continue
+        bleeders.append({
+            "strategy": strat,
+            "pnl_total_usd": round(d["pnl_total"], 2),
+            "n_total": d["n_total"],
+            "n_wins": d["n_wins"],
+            "n_losses": d["n_losses"],
+            "win_rate_pct": round(d["n_wins"] / d["n_total"] * 100, 1) if d["n_total"] else 0,
+            "avg_pnl_per_trade": round(d["pnl_total"] / d["n_total"], 2),
+            "worst_trade_usd": round(d["worst_trade_usd"], 2),
+            "worst_trade_ts": d["worst_trade_ts"],
+        })
+    bleeders.sort(key=lambda x: x["pnl_total_usd"])  # most-negative first
+    bleeders = bleeders[:top_n]
+
+    return JSONResponse({
+        "status": "ok",
+        "window_days": window_days,
+        "top_n": top_n,
+        "n_strategies_bleeding": len(bleeders),
+        "total_bleed_usd": round(sum(b["pnl_total_usd"] for b in bleeders), 2),
+        "bleeders": bleeders,
+        "method_note": (
+            "Cumulative net-negative PnL over the window, ranked by total bleed. "
+            f"Filters: net-negative + n>=3 fills (excludes 1-bad-trade noise). Window={window_days}d."
+        ),
+    })
+
+
 @app.get("/api/changes_24h")
 async def api_changes_24h():
     """24-hour delta view: compare today's operational_maturity snapshot to
@@ -6285,6 +6376,34 @@ async def api_positions_open():
         p["risk_pct_of_anchor"] = round(risk_pct, 3)
         p["sizing_status"] = status
 
+    # Today's PnL — sum of canonical_fills.jsonl pnl_usd where exit_ts is today (UTC)
+    # so the dashboard can show a single "today's number" alongside cumulative risk.
+    pnl_today_usd = 0.0
+    pnl_today_count = 0
+    try:
+        fills_path = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
+        if fills_path.exists():
+            today_iso = datetime.now(timezone.utc).date().isoformat()
+            with open(fills_path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    exit_ts = str(r.get("exit_ts") or r.get("entry_ts") or "")
+                    if not exit_ts.startswith(today_iso):
+                        continue
+                    try:
+                        pnl_today_usd += float(r.get("pnl_usd") or 0)
+                        pnl_today_count += 1
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    pnl_today_pct = (pnl_today_usd / anchor * 100.0) if anchor > 0 else 0
+
     return JSONResponse({
         "positions": positions,
         "count": len(positions),
@@ -6294,6 +6413,9 @@ async def api_positions_open():
         "fleet_budget_pct": fleet_budget_pct,
         "fleet_budget_usd": round(fleet_budget_usd, 2),
         "pct_of_budget_used": round(total_risk / fleet_budget_usd * 100.0, 1) if fleet_budget_usd > 0 else 0,
+        "pnl_today_usd": round(pnl_today_usd, 2),
+        "pnl_today_pct_of_anchor": round(pnl_today_pct, 3),
+        "pnl_today_trade_count": pnl_today_count,
     })
 
 
@@ -9085,6 +9207,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- 24H CHANGES — what moved last 24h (PnL/PF/n/verdict deltas) -->
 <div id="changes-24h-panel" style="margin-bottom:14px;"></div>
 
+<!-- ACTIVE BLEEDERS — top-3 strategies costing the most over 7d -->
+<div id="active-bleeders-panel" style="margin-bottom:14px;"></div>
+
 <!-- DECISION ENGINE — primary decision view, top of strategy area -->
 <div id="decision-engine-panel" style="margin-bottom:14px;"></div>
 
@@ -9642,6 +9767,18 @@ function loadCapitalSafetyBar() {
       + '<span style="color:#9da8c7;">Gross notional: <b style="color:' + grossColor + ';">$' + grossUsd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b> (' + grossPct.toFixed(0) + '% of equity)</span>'
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
+      // Today's PnL — single-number snapshot. Different from cumulative
+      // equity curve; shows just-today's session impact at a glance.
+      + (function(){
+          const pnlT = pos.pnl_today_usd;
+          if (pnlT == null) return '';
+          const pnlTPct = pos.pnl_today_pct_of_anchor || 0;
+          const tcount = pos.pnl_today_trade_count || 0;
+          const pColor = pnlT > 0 ? '#00ff88' : pnlT < 0 ? '#ff4444' : '#9da8c7';
+          const sign = pnlT >= 0 ? '+' : '';
+          return '<span style="color:#1e2a42;">|</span>'
+            + '<span style="color:#9da8c7;" title="Sum of pnl_usd from canonical_fills with exit_ts on today UTC, across ' + tcount + ' fill(s)">Today: <b style="color:' + pColor + ';">' + sign + '$' + pnlT.toFixed(2) + '</b> (' + sign + pnlTPct.toFixed(2) + '% · ' + tcount + ' fills)</span>';
+        })()
       + marginSeg
       + driftSeg
       + integritySeg
@@ -9965,6 +10102,66 @@ function loadChanges24h() {
 }
 loadChanges24h();
 setInterval(loadChanges24h, 600000);  // 10 min — daily snapshot only changes overnight
+
+// ─── ACTIVE BLEEDERS PANEL ─────────────────────────────────────────
+// Cumulative-bleed leaderboard over last 7d. Different angle from 24h
+// changes (delta-focused) and recommended_actions (verdict-focused) —
+// this is "who is killing my capital RIGHT NOW." Hides when no bleeders.
+function loadActiveBleeders() {
+  fetch('/api/active_bleeders?window_days=7&top_n=3').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('active-bleeders-panel');
+    if (!el) return;
+    const bleeders = data.bleeders || [];
+    if (bleeders.length === 0) {
+      el.innerHTML = '<div style="background:#0d1c11;border:1px solid #143021;border-radius:6px;padding:6px 14px;font-size:0.78em;color:#00ff88;">'
+        + '<span style="letter-spacing:1px;font-weight:bold;">ACTIVE BLEEDERS (7d)</span> · <span style="color:#9da8c7;">none — no strategy net-negative on n>=3 fills</span></div>';
+      return;
+    }
+    const totalBleed = data.total_bleed_usd || 0;
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">ACTIVE BLEEDERS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">top ' + (data.top_n || 3) + ' by cumulative bleed · last ' + (data.window_days || 7) + 'd</span></div>'
+      + '<div style="font-size:0.78em;color:#ff4444;font-weight:bold;">total bleed: $' + totalBleed.toFixed(2) + '</div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Win rate</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Avg / trade</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Worst single</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Cumulative</th>'
+      + '</tr></thead><tbody>';
+    for (let i = 0; i < bleeders.length; i++) {
+      const b = bleeders[i];
+      const rankBadge = i === 0
+        ? '<span style="background:#3a0a0a;color:#ff4444;padding:1px 6px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.78em;margin-right:6px;">#1</span>'
+        : '<span style="color:#7b8ab8;margin-right:6px;font-size:0.85em;">#' + (i+1) + '</span>';
+      const wrColor = b.win_rate_pct < 35 ? '#ff4444' : b.win_rate_pct < 50 ? '#ffaa00' : '#9da8c7';
+      const worstColor = b.worst_trade_usd < -50 ? '#ff4444' : '#ffaa00';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + rankBadge + b.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + b.n_total + ' (' + b.n_wins + 'W/' + b.n_losses + 'L)</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + wrColor + ';">' + b.win_rate_pct.toFixed(1) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">$' + b.avg_pnl_per_trade.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + worstColor + ';">$' + b.worst_trade_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;font-weight:bold;">$' + b.pnl_total_usd.toFixed(2) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Net-negative + n>=3 over ' + (data.window_days || 7) + 'd. Different from 24h-changes (deltas) and recommended_actions (verdicts).'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('active-bleeders-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadActiveBleeders();
+setInterval(loadActiveBleeders, 300000);  // 5 min refresh
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
@@ -16835,7 +17032,7 @@ PANEL_IDS_ALL = [
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
     # Decision / fleet panels
-    "recommended-actions-panel", "changes-24h-panel",
+    "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
@@ -16855,14 +17052,14 @@ VIEW_ALLOWLISTS = {
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
         "maturity-summary-banner", "recommended-actions-panel",
-        "changes-24h-panel",
+        "changes-24h-panel", "active-bleeders-panel",
         "fleet-health", "open-positions-panel",
     },
     # Fleet Ops = decision-layer view
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
-        "recommended-actions-panel", "changes-24h-panel",
+        "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
         "efficiency-panel", "fleet-health", "open-positions-panel",
     },
