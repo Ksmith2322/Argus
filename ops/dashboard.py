@@ -9425,6 +9425,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- TOM TRADE OUTCOME — basket tracker for tom_international's monthly event -->
 <div id="tom-outcome-panel" style="margin-bottom:14px;"></div>
 
+<!-- DECISION HISTORY — governance audit trail (factor changes, verdicts, culls) -->
+<div id="decision-history-panel" style="margin-bottom:14px;"></div>
+
 <!-- DECISION ENGINE — primary decision view, top of strategy area -->
 <div id="decision-engine-panel" style="margin-bottom:14px;"></div>
 
@@ -10445,6 +10448,71 @@ function loadTomOutcome() {
 }
 loadTomOutcome();
 setInterval(loadTomOutcome, 300000);  // 5 min refresh
+
+// ─── DECISION HISTORY PANEL ────────────────────────────────────────
+// Governance audit trail — every allocation factor change with timestamp +
+// source + reason. Renders the 10 most-recent. Hides itself when no
+// history exists (clean panel for clean fleet). Per project_capital_allocator_policy
+// "Manual approval until 90 days real evidence" — having this surfaced
+// on the dashboard makes the governance discipline visible.
+function loadDecisionHistory() {
+  fetch('/api/decision_history?limit=10').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('decision-history-panel');
+    if (!el) return;
+    const records = data.records || [];
+    if (records.length === 0) {
+      el.innerHTML = '';  // hide empty
+      return;
+    }
+    const currentFactors = data.current_factors || {};
+    const factorRows = Object.entries(currentFactors).map(([s, f]) =>
+      '<span style="color:#9da8c7;">' + s + ': <b style="color:' + (f === 0 ? '#ff4444' : f < 1 ? '#ffaa00' : f > 1 ? '#00ff88' : '#fff') + ';">' + f + 'x</b></span>'
+    ).join(' · ');
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">DECISION HISTORY</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">capital governance audit trail · ' + records.length + ' recent</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">Current factors: ' + (factorRows || '<i>none set</i>') + '</div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;width:130px;">When (UTC)</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Before → After</th>'
+      + '<th style="text-align:left;padding:5px 6px;width:90px;">Source</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Reason</th>'
+      + '</tr></thead><tbody>';
+    for (const r of records) {
+      const when = (r.ts || '').substring(0, 19).replace('T', ' ');
+      const before = r.before == null ? '<i>unset</i>' : r.before + 'x';
+      const after = r.after == null ? '?' : r.after + 'x';
+      // Color the after-value by direction: down = orange/red, up = green
+      let arrowColor = '#9da8c7';
+      if (r.before != null && r.after != null) {
+        if (r.after < r.before) arrowColor = r.after === 0 ? '#ff4444' : '#ffaa00';
+        else if (r.after > r.before) arrowColor = '#00ff88';
+      }
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#7b8ab8;">' + when + '</td>'
+        + '<td style="padding:5px 6px;color:#e0e0e0;font-weight:bold;">' + (r.strategy || '?') + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + before + ' <span style="color:' + arrowColor + ';">→</span> <b style="color:' + arrowColor + ';">' + after + '</b></td>'
+        + '<td style="padding:5px 6px;color:#9da8c7;font-size:0.92em;">' + (r.source || '?') + '</td>'
+        + '<td style="padding:5px 6px;color:#9da8c7;font-size:0.92em;">' + (r.reason || '').substring(0, 90) + ((r.reason || '').length > 90 ? '…' : '') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Source: argus_flow/logs/decision_history.jsonl. Append-only audit trail; every POST /api/allocation_factors logs here automatically.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('decision-history-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadDecisionHistory();
+setInterval(loadDecisionHistory, 60000);  // 1 min refresh — captures new POSTs quickly
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
@@ -17316,7 +17384,7 @@ PANEL_IDS_ALL = [
     "maturity-summary-banner",
     # Decision / fleet panels
     "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
-    "tom-outcome-panel",
+    "tom-outcome-panel", "decision-history-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
