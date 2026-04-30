@@ -1,68 +1,205 @@
 
-function renderEquityCurve(points, width, height, anchor) {
+// Window-level cache so the hover handler can read the data without
+// re-fetching. Keyed by chart-instance id (just one chart for now).
+window._equityChartData = null;
+
+function renderEquityCurve(points, width, height, anchor, spyPoints) {
   if (!points || points.length < 2) {
     return '<div style="color:#7b8ab8;font-size:0.7em;padding:20px;text-align:center;">Not enough trades in window to plot.</div>';
   }
-  const pad = {top: 10, right: 10, bottom: 20, left: 44};
+  spyPoints = spyPoints || [];
+  const pad = {top: 14, right: 60, bottom: 22, left: 50};
   const W = width, H = height;
   const innerW = W - pad.left - pad.right;
   const innerH = H - pad.top - pad.bottom;
-  const vals = points.map(p => p.cumulative_pnl_usd);
-  let vMin = Math.min(0, ...vals);
-  let vMax = Math.max(0, ...vals);
+
+  // Y-axis: use % return so fleet and SPY are directly comparable.
+  // Fleet: cumulative_pnl_pct (already on response). SPY: spy_pct_from_start.
+  const fleetPctVals = points.map(p => p.cumulative_pnl_pct || 0);
+  const spyPctVals = spyPoints.map(p => p.spy_pct_from_start || 0);
+  const allVals = fleetPctVals.concat(spyPctVals);
+  let vMin = Math.min(0, ...allVals);
+  let vMax = Math.max(0, ...allVals);
   if (vMax === vMin) vMax = vMin + 1;
   const pad_v = (vMax - vMin) * 0.08;
   vMin -= pad_v; vMax += pad_v;
-  const t0 = new Date(points[0].ts).getTime();
-  const t1 = new Date(points[points.length-1].ts).getTime();
+
+  // Combined time-range so both lines share x-axis
+  const allTs = points.map(p => new Date(p.ts).getTime())
+    .concat(spyPoints.map(p => new Date(p.ts).getTime()));
+  const t0 = Math.min(...allTs);
+  const t1 = Math.max(...allTs);
   const tSpan = Math.max(t1 - t0, 1);
   const x = (ts) => pad.left + ((new Date(ts).getTime() - t0) / tSpan) * innerW;
   const y = (v) => pad.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
 
-  // Path (smoothed cubic bezier) + area under curve
-  // Falls back to straight lines if smoothPath helper isn't defined yet (script load order safety).
-  const linePath = (typeof smoothPath === 'function')
-    ? smoothPath(points, x, y)
-    : points.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.ts).toFixed(1) + ',' + y(p.cumulative_pnl_usd).toFixed(1)).join(' ');
+  // Cache for hover handler
+  window._equityChartData = {
+    points: points, spyPoints: spyPoints,
+    pad: pad, W: W, H: H, t0: t0, t1: t1, tSpan: tSpan, vMin: vMin, vMax: vMax,
+    innerW: innerW, innerH: innerH,
+  };
+
+  // Fleet path
+  const fleetLinePath = (typeof smoothPath === 'function')
+    ? smoothPath(points.map(p => ({ts: p.ts, cumulative_pnl_usd: p.cumulative_pnl_pct})), x, (v) => y(v))
+    : points.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.ts).toFixed(1) + ',' + y(p.cumulative_pnl_pct || 0).toFixed(1)).join(' ');
   let areaPath = '';
   if (points.length) {
     const x0 = x(points[0].ts), x1 = x(points[points.length-1].ts), yZero = y(0);
-    // Area = smoothed top edge + vertical drop to baseline + close back to start
-    areaPath = linePath + ' L' + x1.toFixed(1) + ',' + yZero.toFixed(1) + ' L' + x0.toFixed(1) + ',' + yZero.toFixed(1) + ' Z';
+    areaPath = fleetLinePath + ' L' + x1.toFixed(1) + ',' + yZero.toFixed(1) + ' L' + x0.toFixed(1) + ',' + yZero.toFixed(1) + ' Z';
+  }
+  const fleetFinalPct = fleetPctVals[fleetPctVals.length-1];
+  const fleetStroke = fleetFinalPct >= 0 ? '#00ff88' : '#ff4444';
+  const fleetFill = fleetFinalPct >= 0 ? 'rgba(0,255,136,0.10)' : 'rgba(255,68,68,0.10)';
+
+  // SPY path (no area, dashed cyan line)
+  let spyPath = '';
+  let spyLegendHtml = '';
+  if (spyPoints.length >= 2) {
+    spyPath = spyPoints.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.ts).toFixed(1) + ',' + y(p.spy_pct_from_start || 0).toFixed(1)).join(' ');
+    const spyFinal = spyPctVals[spyPctVals.length-1];
+    const delta = fleetFinalPct - spyFinal;
+    const deltaColor = delta >= 0 ? '#00ff88' : '#ff4444';
+    spyLegendHtml = '<text x="' + (W - pad.right + 4) + '" y="' + (pad.top + 2) + '" fill="#00d4ff" font-size="10" text-anchor="start">━ SPY ' + (spyFinal >= 0 ? '+' : '') + spyFinal.toFixed(2) + '%</text>'
+      + '<text x="' + (W - pad.right + 4) + '" y="' + (pad.top + 16) + '" fill="' + fleetStroke + '" font-size="10" text-anchor="start">━ Fleet ' + (fleetFinalPct >= 0 ? '+' : '') + fleetFinalPct.toFixed(2) + '%</text>'
+      + '<text x="' + (W - pad.right + 4) + '" y="' + (pad.top + 30) + '" fill="' + deltaColor + '" font-size="10" text-anchor="start">Δ ' + (delta >= 0 ? '+' : '') + delta.toFixed(2) + 'pp</text>';
   }
 
-  const finalVal = vals[vals.length-1];
-  const stroke = finalVal >= 0 ? '#00ff88' : '#ff4444';
-  const fill = finalVal >= 0 ? 'rgba(0,255,136,0.10)' : 'rgba(255,68,68,0.10)';
-
-  // Y ticks (3 values)
+  // Y ticks (3 values, % format)
   const yTicks = [vMin, (vMin+vMax)/2, vMax];
   let yTickHtml = '';
   for (const v of yTicks) {
     const py = y(v);
     yTickHtml += '<line x1="' + pad.left + '" y1="' + py.toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + py.toFixed(1) + '" stroke="#1e2a42" stroke-width="1" stroke-dasharray="2,3"/>';
-    yTickHtml += '<text x="' + (pad.left - 6) + '" y="' + (py + 3).toFixed(1) + '" fill="#7b8ab8" font-size="10" text-anchor="end">$' + v.toFixed(0) + '</text>';
+    yTickHtml += '<text x="' + (pad.left - 6) + '" y="' + (py + 3).toFixed(1) + '" fill="#7b8ab8" font-size="10" text-anchor="end">' + (v >= 0 ? '+' : '') + v.toFixed(2) + '%</text>';
   }
 
-  // Zero line (if in range)
+  // Zero line
   let zeroLine = '';
   if (vMin < 0 && vMax > 0) {
     const yZero = y(0);
     zeroLine = '<line x1="' + pad.left + '" y1="' + yZero.toFixed(1) + '" x2="' + (W-pad.right) + '" y2="' + yZero.toFixed(1) + '" stroke="#334" stroke-width="1"/>';
   }
 
-  // X date labels (start, middle, end)
+  // X date labels
   const fmt = (ts) => { const d = new Date(ts); return (d.getMonth()+1) + '/' + d.getDate(); };
-  const xLabels = '<text x="' + pad.left + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10">' + fmt(points[0].ts) + '</text>'
-    + '<text x="' + (W/2) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="middle">' + fmt(points[Math.floor(points.length/2)].ts) + '</text>'
-    + '<text x="' + (W-pad.right) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="end">' + fmt(points[points.length-1].ts) + '</text>';
+  const xLabels = '<text x="' + pad.left + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10">' + fmt(t0) + '</text>'
+    + '<text x="' + (W/2) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="middle">' + fmt((t0+t1)/2) + '</text>'
+    + '<text x="' + (W-pad.right) + '" y="' + (H-4) + '" fill="#7b8ab8" font-size="10" text-anchor="end">' + fmt(t1) + '</text>';
 
-  return '<svg width="' + W + '" height="' + H + '" style="display:block;">'
+  // Hover overlay (transparent rect that captures mouse events) + tooltip group
+  const hoverRect = '<rect id="equity-hover-rect" x="' + pad.left + '" y="' + pad.top + '" width="' + innerW + '" height="' + innerH + '" fill="transparent" pointer-events="all" onmousemove="handleEquityHover(evt)" onmouseleave="hideEquityHover()"/>';
+  const hoverGroup = '<g id="equity-hover-group" style="display:none;pointer-events:none;">'
+    + '<line id="equity-hover-line" x1="0" y1="' + pad.top + '" x2="0" y2="' + (pad.top + innerH) + '" stroke="#7b8ab8" stroke-width="1" stroke-dasharray="3,3"/>'
+    + '<circle id="equity-hover-dot-fleet" cx="0" cy="0" r="3.5" fill="' + fleetStroke + '" stroke="#0a0e17" stroke-width="1"/>'
+    + (spyPoints.length ? '<circle id="equity-hover-dot-spy" cx="0" cy="0" r="3.5" fill="#00d4ff" stroke="#0a0e17" stroke-width="1"/>' : '')
+    + '</g>';
+
+  return '<div style="position:relative;">'
+    + '<svg width="' + W + '" height="' + H + '" style="display:block;">'
     + yTickHtml + zeroLine
-    + '<path d="' + areaPath + '" fill="' + fill + '" stroke="none"/>'
-    + '<path d="' + linePath + '" fill="none" stroke="' + stroke + '" stroke-width="1.5"/>'
+    + '<path d="' + areaPath + '" fill="' + fleetFill + '" stroke="none"/>'
+    + (spyPath ? '<path d="' + spyPath + '" fill="none" stroke="#00d4ff" stroke-width="1.3" stroke-dasharray="4,3" opacity="0.85"/>' : '')
+    + '<path d="' + fleetLinePath + '" fill="none" stroke="' + fleetStroke + '" stroke-width="1.6"/>'
+    + spyLegendHtml
     + xLabels
-    + '</svg>';
+    + hoverGroup
+    + hoverRect
+    + '</svg>'
+    + '<div id="equity-hover-tooltip" style="display:none;position:absolute;background:#0a1224;border:1px solid #1e2a42;border-radius:4px;padding:6px 10px;font-size:0.78em;pointer-events:none;z-index:10;min-width:180px;"></div>'
+    + '</div>';
+}
+
+// Find the closest point in `arr` (each {ts: ...}) to a given timestamp.
+// Returns the matching object or null if arr is empty.
+function findClosestByTs(arr, targetMs) {
+  if (!arr || arr.length === 0) return null;
+  let best = arr[0], bestDelta = Math.abs(new Date(arr[0].ts).getTime() - targetMs);
+  for (let i = 1; i < arr.length; i++) {
+    const d = Math.abs(new Date(arr[i].ts).getTime() - targetMs);
+    if (d < bestDelta) { best = arr[i]; bestDelta = d; }
+  }
+  return best;
+}
+
+// Mouse handler — reads window._equityChartData cached during render.
+// Inline event handler in the SVG so we don't need to re-attach listeners
+// on every chart re-render (the inline handler always points at the latest
+// global state).
+function handleEquityHover(evt) {
+  const cache = window._equityChartData;
+  if (!cache) return;
+  const svg = evt.target.ownerSVGElement;
+  if (!svg) return;
+  // Compute the mouse position in SVG coordinates
+  const rect = svg.getBoundingClientRect();
+  const mouseX = evt.clientX - rect.left;
+  const {pad, t0, t1, tSpan, vMin, vMax, innerW, innerH, points, spyPoints} = cache;
+  const xFrac = (mouseX - pad.left) / innerW;
+  const targetMs = t0 + xFrac * tSpan;
+  // Find nearest fleet + spy points
+  const fleetPt = findClosestByTs(points, targetMs);
+  const spyPt = findClosestByTs(spyPoints, targetMs);
+  if (!fleetPt) return;
+  // Position dots + line at the fleet point's x (it's the primary series)
+  const xCoord = pad.left + ((new Date(fleetPt.ts).getTime() - t0) / tSpan) * innerW;
+  const fleetY = pad.top + (1 - ((fleetPt.cumulative_pnl_pct || 0) - vMin) / (vMax - vMin)) * innerH;
+  const group = document.getElementById('equity-hover-group');
+  const line = document.getElementById('equity-hover-line');
+  const fleetDot = document.getElementById('equity-hover-dot-fleet');
+  const spyDot = document.getElementById('equity-hover-dot-spy');
+  if (group && line && fleetDot) {
+    group.style.display = '';
+    line.setAttribute('x1', xCoord);
+    line.setAttribute('x2', xCoord);
+    fleetDot.setAttribute('cx', xCoord);
+    fleetDot.setAttribute('cy', fleetY);
+    if (spyDot && spyPt) {
+      const spyY = pad.top + (1 - ((spyPt.spy_pct_from_start || 0) - vMin) / (vMax - vMin)) * innerH;
+      spyDot.setAttribute('cx', xCoord);
+      spyDot.setAttribute('cy', spyY);
+      spyDot.style.display = '';
+    } else if (spyDot) {
+      spyDot.style.display = 'none';
+    }
+  }
+  // Tooltip text
+  const tip = document.getElementById('equity-hover-tooltip');
+  if (tip) {
+    const fleetDate = new Date(fleetPt.ts);
+    const dateStr = (fleetDate.getMonth()+1) + '/' + fleetDate.getDate() + ' ' + String(fleetDate.getHours()).padStart(2,'0') + ':' + String(fleetDate.getMinutes()).padStart(2,'0');
+    const fleetPct = (fleetPt.cumulative_pnl_pct || 0).toFixed(3);
+    const fleetUsd = (fleetPt.cumulative_pnl_usd || 0).toFixed(2);
+    const fleetSign = (fleetPt.cumulative_pnl_pct || 0) >= 0 ? '+' : '';
+    let html = '<div style="color:#9da8c7;font-size:0.85em;margin-bottom:3px;">' + dateStr + '</div>'
+      + '<div><span style="color:#7b8ab8;">Fleet:</span> <b style="color:#e0e0e0;">' + fleetSign + fleetPct + '%</b> <span style="color:#7b8ab8;">(' + fleetSign + '$' + fleetUsd + ')</span></div>';
+    if (spyPt) {
+      const spyPct = (spyPt.spy_pct_from_start || 0).toFixed(2);
+      const spySign = (spyPt.spy_pct_from_start || 0) >= 0 ? '+' : '';
+      const delta = (fleetPt.cumulative_pnl_pct || 0) - (spyPt.spy_pct_from_start || 0);
+      const deltaColor = delta >= 0 ? '#00ff88' : '#ff4444';
+      const deltaSign = delta >= 0 ? '+' : '';
+      html += '<div><span style="color:#7b8ab8;">SPY:</span> <b style="color:#00d4ff;">' + spySign + spyPct + '%</b></div>'
+        + '<div style="margin-top:2px;color:' + deltaColor + ';"><b>Δ ' + deltaSign + delta.toFixed(2) + 'pp</b></div>';
+    }
+    tip.innerHTML = html;
+    tip.style.display = 'block';
+    // Position tooltip — keep on screen by flipping side at right edge
+    const wrapW = svg.parentNode.clientWidth;
+    const tipW = tip.offsetWidth || 200;
+    let left = xCoord + 12;
+    if (left + tipW > wrapW) left = xCoord - tipW - 12;
+    tip.style.left = left + 'px';
+    tip.style.top = (fleetY - 8) + 'px';
+  }
+}
+
+function hideEquityHover() {
+  const group = document.getElementById('equity-hover-group');
+  const tip = document.getElementById('equity-hover-tooltip');
+  if (group) group.style.display = 'none';
+  if (tip) tip.style.display = 'none';
 }
 
 function loadFleetEquityCurve() {
@@ -98,7 +235,7 @@ function loadFleetEquityCurve() {
       + '<div style="font-size:1.0em;color:' + pnlColor + ';">' + sign + pct.toFixed(3) + '%</div>'
       + '<div style="font-size:0.7em;color:#7b8ab8;">of fleet anchor</div>'
       + '</div>';
-    html += '<div>' + renderEquityCurve(data.points || [], Math.max(el.clientWidth - 28, 600), 180, anchor) + '</div>';
+    html += '<div>' + renderEquityCurve(data.points || [], Math.max(el.clientWidth - 28, 600), 180, anchor, data.spy_points || []) + '</div>';
     html += contribHtml;
     el.innerHTML = html;
   }).catch((e)=>{

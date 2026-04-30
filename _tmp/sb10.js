@@ -94,13 +94,17 @@ function loadStrategyPerformance() {
       : (fleetSrc === 'insufficient_sample'
         ? '<span style="background:#3a2f10;color:#ffc107;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="' + fleetConfDetail + '">INSUFFICIENT SAMPLE</span>'
         : '<span style="background:#3a1010;color:#ff8888;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="Manual constant — not data-derived">HARDCODED</span>');
-    const expectedBadge = (data.expected_annual_source === 'hardcoded')
-      ? '<span style="background:#3a1010;color:#ff8888;padding:1px 5px;margin-left:4px;border-radius:3px;font-size:0.8em;" title="Manual constant — not data-derived">HARDCODED</span>'
-      : '';
+    // Expected-annual was a hardcoded "40-75%" label that biased decisions
+    // toward optimism without evidence. Removed 2026-04-29; show a clear
+    // "disabled until 30+ valid trades on a top strategy" placeholder so
+    // the operator never confuses an unvalidated guess for a forecast.
+    const expectedHtml = data.expected_annual
+      ? 'Expected annual: ' + data.expected_annual
+      : '<span style="color:#7b8ab8;" title="Disabled until 30+ valid trades exist on a top strategy. Replaces the prior 40-75% hardcoded estimate which biased decisions.">Expected annual: <i>disabled until evidence</i></span>';
     const anchorLabel = anchorUsd > 0 ? ' | anchor $' + anchorUsd.toLocaleString(undefined,{maximumFractionDigits:0}) : '';
     let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
       + '<div style="color:#00d4ff;font-weight:bold;font-size:0.95em;letter-spacing:2px;">STRATEGY PERFORMANCE</div>'
-      + '<div style="font-size:0.7em;color:#7b8ab8;" title="' + fleetConfDetail + '">Fleet confidence: ' + fleetConfText + fleetBadge + ' | Expected annual: ' + data.expected_annual + expectedBadge + anchorLabel + '</div>'
+      + '<div style="font-size:0.7em;color:#7b8ab8;" title="' + fleetConfDetail + '">Fleet confidence: ' + fleetConfText + fleetBadge + ' | ' + expectedHtml + anchorLabel + '</div>'
       + '</div>';
 
     html += '<table style="width:100%;border-collapse:collapse;font-size:0.72em;background:#141b2d;border:1px solid #1e2a42;border-radius:6px;overflow:hidden;">';
@@ -149,26 +153,42 @@ function loadStrategyPerformance() {
       }
       const riskPctStr = tierInfo ? ((Number(tierInfo.risk_pct || 0) * 100).toFixed(2) + '%') : '—';
 
-      // Render promotion progress as 0-100 bar + % label + verdict color
+      // Render promotion progress — gate-aware. A strategy with PF < 1.0
+      // (losing money) at "84%" is misleading; show BLOCKED with the
+      // failing-gate reason instead. Per project_dashboard_upgrades_capital_safety.
       let promCell = '<span style="color:#555;">—</span>';
       if (promInfo) {
-        const pct = Math.max(0, Math.min(100, Number(promInfo.progress_pct) || 0));
-        const verdict = promInfo.verdict || '';
-        const barColor = verdict === 'DEGRADED' ? '#ff4444'
-                       : pct >= 75 ? '#00ff88'
-                       : pct >= 50 ? '#ffc107'
-                       : '#7b8ab8';
-        const subtitle = promInfo.next_tier
-          ? ('→ ' + promInfo.next_tier + ' · need ' + (promInfo.trades_needed || 0) + ' trades'
-             + (promInfo.pf_gap > 0 ? ' · PF gap ' + Number(promInfo.pf_gap).toFixed(2) : ''))
-          : 'at max tier';
-        promCell = '<div style="display:flex;align-items:center;gap:6px;min-width:100px;">'
-          + '<div style="flex:1;background:#1e2a42;border-radius:3px;height:6px;overflow:hidden;">'
-          + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div>'
-          + '</div>'
-          + '<span style="color:' + barColor + ';font-weight:bold;font-size:0.95em;">' + pct.toFixed(0) + '%</span>'
-          + '</div>'
-          + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;" title="' + subtitle + '">' + subtitle + '</div>';
+        const gateStatus = promInfo.gate_status || 'ACTIVE';
+        const blockers = promInfo.gate_blockers || [];
+        if (gateStatus === 'BLOCKED') {
+          // Misleading-progress fix: show BLOCKED + first blocker. Tooltip = full list.
+          const firstBlocker = blockers[0] || 'gate failed';
+          const allBlockers = blockers.join(' · ');
+          promCell = '<span style="background:#3a0a0a;border:1px solid #ff4444;color:#ff4444;padding:2px 8px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.85em;" title="' + allBlockers.replace(/"/g, '&quot;') + '">BLOCKED</span>'
+            + '<div style="font-size:0.78em;color:#9da8c7;margin-top:2px;">' + firstBlocker + '</div>';
+        } else if (gateStatus === 'INSUFFICIENT_SAMPLE') {
+          promCell = '<span style="color:#7b8ab8;font-size:0.85em;">insufficient sample</span>'
+            + '<div style="font-size:0.78em;color:#7b8ab8;margin-top:2px;">' + (blockers[0] || '') + '</div>';
+        } else {
+          // ACTIVE: render the bar normally
+          const pct = Math.max(0, Math.min(100, Number(promInfo.progress_pct) || 0));
+          const verdict = promInfo.verdict || '';
+          const barColor = verdict === 'DEGRADED' ? '#ff4444'
+                         : pct >= 75 ? '#00ff88'
+                         : pct >= 50 ? '#ffc107'
+                         : '#7b8ab8';
+          const subtitle = promInfo.next_tier
+            ? ('→ ' + promInfo.next_tier + ' · need ' + (promInfo.trades_needed || 0) + ' trades'
+               + (promInfo.pf_gap > 0 ? ' · PF gap ' + Number(promInfo.pf_gap).toFixed(2) : ''))
+            : 'at max tier';
+          promCell = '<div style="display:flex;align-items:center;gap:6px;min-width:100px;">'
+            + '<div style="flex:1;background:#1e2a42;border-radius:3px;height:6px;overflow:hidden;">'
+            + '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;"></div>'
+            + '</div>'
+            + '<span style="color:' + barColor + ';font-weight:bold;font-size:0.95em;">' + pct.toFixed(0) + '%</span>'
+            + '</div>'
+            + '<div style="font-size:0.82em;color:#7b8ab8;margin-top:2px;" title="' + subtitle + '">' + subtitle + '</div>';
+        }
       }
 
       // Confidence cell: number (or —) + source badge + sample warning tooltip

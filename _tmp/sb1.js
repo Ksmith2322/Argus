@@ -507,6 +507,18 @@ function loadCapitalSafetyBar() {
       + '<span style="color:#9da8c7;">Gross notional: <b style="color:' + grossColor + ';">$' + grossUsd.toLocaleString(undefined,{maximumFractionDigits:0}) + '</b> (' + grossPct.toFixed(0) + '% of equity)</span>'
       + '<span style="color:#1e2a42;">|</span>'
       + '<span style="color:#9da8c7;">Total cap usage: <b style="color:' + totalColor + ';">' + totalCapPct.toFixed(1) + '%</b></span>'
+      // Today's PnL — single-number snapshot. Different from cumulative
+      // equity curve; shows just-today's session impact at a glance.
+      + (function(){
+          const pnlT = pos.pnl_today_usd;
+          if (pnlT == null) return '';
+          const pnlTPct = pos.pnl_today_pct_of_anchor || 0;
+          const tcount = pos.pnl_today_trade_count || 0;
+          const pColor = pnlT > 0 ? '#00ff88' : pnlT < 0 ? '#ff4444' : '#9da8c7';
+          const sign = pnlT >= 0 ? '+' : '';
+          return '<span style="color:#1e2a42;">|</span>'
+            + '<span style="color:#9da8c7;" title="Sum of pnl_usd from canonical_fills with exit_ts on today UTC, across ' + tcount + ' fill(s)">Today: <b style="color:' + pColor + ';">' + sign + '$' + pnlT.toFixed(2) + '</b> (' + sign + pnlTPct.toFixed(2) + '% · ' + tcount + ' fills)</span>';
+        })()
       + marginSeg
       + driftSeg
       + integritySeg
@@ -765,6 +777,131 @@ function loadRecommendedActions() {
 }
 loadRecommendedActions();
 setInterval(loadRecommendedActions, 60000);
+
+// ─── 24H CHANGES PANEL ─────────────────────────────────────────────
+// Diffs the two most-recent operational_maturity snapshots and shows
+// which strategies actually moved in the last 24h. Hides itself when
+// nothing material changed (clean fleet = clean dashboard).
+function loadChanges24h() {
+  fetch('/api/changes_24h').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('changes-24h-panel');
+    if (!el) return;
+    if (data.status !== 'ok' || !data.changes || data.changes.length === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    // Header with snapshot dates
+    const todayDate = (data.today_snapshot || '').replace('operational_maturity_','').replace('.json','');
+    const yestDate = (data.yesterday_snapshot || '').replace('operational_maturity_','').replace('.json','');
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">24H CHANGES</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">what moved between '
+      + yestDate + ' → ' + todayDate + ' snapshots</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + data.n_changes + ' material change' + (data.n_changes === 1 ? '' : 's')
+      + (data.n_verdict_transitions > 0 ? ' · <b style="color:#ffaa00;">' + data.n_verdict_transitions + ' verdict transition' + (data.n_verdict_transitions === 1 ? '' : 's') + '</b>' : '')
+      + '</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N (Δ)</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PF yest → today (Δ)</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL yest → today (Δ)</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Verdict</th>'
+      + '</tr></thead><tbody>';
+    for (const c of data.changes) {
+      const pnlDelta = c.pnl_delta || 0;
+      const pnlDeltaColor = pnlDelta > 0 ? '#00ff88' : pnlDelta < 0 ? '#ff4444' : '#9da8c7';
+      const pfDelta = c.pf_delta;
+      const pfDeltaColor = pfDelta == null ? '#7b8ab8' : pfDelta > 0 ? '#00ff88' : pfDelta < 0 ? '#ff4444' : '#9da8c7';
+      const nDeltaColor = c.n_delta > 0 ? '#9da8c7' : c.n_delta < 0 ? '#ffaa00' : '#7b8ab8';
+      const pfYest = c.pf_yest != null ? c.pf_yest.toFixed(2) : '—';
+      const pfToday = c.pf_today != null ? c.pf_today.toFixed(2) : '—';
+      const pfDeltaStr = pfDelta != null ? (pfDelta >= 0 ? '+' : '') + pfDelta.toFixed(2) : '—';
+      const verdictCell = c.verdict_changed
+        ? '<span style="color:#ffaa00;font-weight:bold;">' + (c.verdict_yest || '?') + ' → ' + (c.verdict_today || '?') + '</span>'
+        : '<span style="color:#7b8ab8;">' + (c.verdict_today || '—') + '</span>';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + c.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + c.n_yest + ' → ' + c.n_today + ' <span style="color:' + nDeltaColor + ';font-weight:bold;">(' + (c.n_delta >= 0 ? '+' : '') + c.n_delta + ')</span></td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + pfYest + ' → ' + pfToday + ' <span style="color:' + pfDeltaColor + ';font-weight:bold;">(' + pfDeltaStr + ')</span></td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + (c.pnl_yest >= 0 ? '+' : '') + c.pnl_yest.toFixed(2) + ' → $' + (c.pnl_today >= 0 ? '+' : '') + c.pnl_today.toFixed(2) + ' <span style="color:' + pnlDeltaColor + ';font-weight:bold;">($' + (pnlDelta >= 0 ? '+' : '') + pnlDelta.toFixed(2) + ')</span></td>'
+        + '<td style="padding:5px 6px;">' + verdictCell + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Filter: shown only when |PnL Δ| ≥ $5, |PF Δ| ≥ 0.10, n changed, or verdict transitioned. Sorted by |PnL Δ| desc.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('changes-24h-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadChanges24h();
+setInterval(loadChanges24h, 600000);  // 10 min — daily snapshot only changes overnight
+
+// ─── ACTIVE BLEEDERS PANEL ─────────────────────────────────────────
+// Cumulative-bleed leaderboard over last 7d. Different angle from 24h
+// changes (delta-focused) and recommended_actions (verdict-focused) —
+// this is "who is killing my capital RIGHT NOW." Hides when no bleeders.
+function loadActiveBleeders() {
+  fetch('/api/active_bleeders?window_days=7&top_n=3').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('active-bleeders-panel');
+    if (!el) return;
+    const bleeders = data.bleeders || [];
+    if (bleeders.length === 0) {
+      el.innerHTML = '<div style="background:#0d1c11;border:1px solid #143021;border-radius:6px;padding:6px 14px;font-size:0.78em;color:#00ff88;">'
+        + '<span style="letter-spacing:1px;font-weight:bold;">ACTIVE BLEEDERS (7d)</span> · <span style="color:#9da8c7;">none — no strategy net-negative on n>=3 fills</span></div>';
+      return;
+    }
+    const totalBleed = data.total_bleed_usd || 0;
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">ACTIVE BLEEDERS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">top ' + (data.top_n || 3) + ' by cumulative bleed · last ' + (data.window_days || 7) + 'd</span></div>'
+      + '<div style="font-size:0.78em;color:#ff4444;font-weight:bold;">total bleed: $' + totalBleed.toFixed(2) + '</div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Win rate</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Avg / trade</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Worst single</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Cumulative</th>'
+      + '</tr></thead><tbody>';
+    for (let i = 0; i < bleeders.length; i++) {
+      const b = bleeders[i];
+      const rankBadge = i === 0
+        ? '<span style="background:#3a0a0a;color:#ff4444;padding:1px 6px;border-radius:3px;font-weight:bold;letter-spacing:1px;font-size:0.78em;margin-right:6px;">#1</span>'
+        : '<span style="color:#7b8ab8;margin-right:6px;font-size:0.85em;">#' + (i+1) + '</span>';
+      const wrColor = b.win_rate_pct < 35 ? '#ff4444' : b.win_rate_pct < 50 ? '#ffaa00' : '#9da8c7';
+      const worstColor = b.worst_trade_usd < -50 ? '#ff4444' : '#ffaa00';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + rankBadge + b.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + b.n_total + ' (' + b.n_wins + 'W/' + b.n_losses + 'L)</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + wrColor + ';">' + b.win_rate_pct.toFixed(1) + '%</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;">$' + b.avg_pnl_per_trade.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + worstColor + ';">$' + b.worst_trade_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#ff4444;font-weight:bold;">$' + b.pnl_total_usd.toFixed(2) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Net-negative + n>=3 over ' + (data.window_days || 7) + 'd. Different from 24h-changes (deltas) and recommended_actions (verdicts).'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('active-bleeders-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadActiveBleeders();
+setInterval(loadActiveBleeders, 300000);  // 5 min refresh
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
