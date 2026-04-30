@@ -2,8 +2,8 @@
   "_comment": "Per-strategy capital multiplier (auto-allocator Layer 4 MVP). compute_risk_usd() multiplies the tier risk_pct by the strategy's factor. Default 1.0 for unlisted strategies. Decision Engine ACTION recommendations: SCALE_UP=1.5x, HOLD=1.0x, REDUCE=0.5x, KILL=0.0x, IGNORE=1.0x. Manual write OR via POST /api/allocation_factors {strategy, factor} - operator review required per project_capital_allocator_policy.md ('Manual approval until 90 days real evidence'). Clamped to 0.0-2.0 in code.",
   "factors": {
     "forge_multi_orb": 0.5,
-    "forge_spy_mean_rev": 0.5
+    "forge_spy_mean_rev": 0.0
   },
   "version": "v1_2026-04-28",
-  "last_updated": "2026-04-30T03:03:15.926016+00:00"
+  "last_updated": "2026-04-30T14:30:46.671394+00:00"
 }
