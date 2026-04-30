@@ -4087,9 +4087,10 @@ async def api_allocation_factors():
 
 @app.post("/api/allocation_factors")
 async def api_allocation_factors_set(request: Request):
-    """Set ONE strategy's allocation factor. Body: {strategy: str, factor: float}.
+    """Set ONE strategy's allocation factor. Body: {strategy: str, factor: float, reason?: str}.
     Clamped to 0.0-2.0. Operator-driven write — Decision Engine surfaces a
-    'recommended' factor but apply requires explicit user click."""
+    'recommended' factor but apply requires explicit user click. Every change
+    is logged to argus_flow/logs/decision_history.jsonl for governance audit."""
     try:
         body = await request.json()
     except Exception:
@@ -4102,18 +4103,96 @@ async def api_allocation_factors_set(request: Request):
     except (TypeError, ValueError):
         return JSONResponse({"error": "factor must be a number"}, status_code=400)
     factor = max(0.0, min(2.0, factor))
+    reason = body.get("reason") or "manual_api_call"
+
     fp = REPO / "argus_flow" / "configs" / "allocation_factors.json"
     if fp.exists():
         try: cfg = json.loads(fp.read_text(encoding="utf-8"))
         except Exception: cfg = {}
     else:
         cfg = {}
-    cfg.setdefault("factors", {})[strategy] = factor
+    factors = cfg.setdefault("factors", {})
+    before = factors.get(strategy, 1.0)  # default 1.0 if previously unlisted
+    factors[strategy] = factor
     cfg["last_updated"] = datetime.now(timezone.utc).isoformat()
     cfg.setdefault("version", "v1_2026-04-28")
     fp.parent.mkdir(parents=True, exist_ok=True)
     fp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    return JSONResponse({"ok": True, "strategy": strategy, "factor": factor})
+
+    # Log to decision history if the value actually changed
+    if before != factor:
+        _log_decision(
+            kind="allocation_factor_change",
+            strategy=strategy,
+            before=before,
+            after=factor,
+            source="manual_api",
+            reason=reason,
+        )
+    return JSONResponse({"ok": True, "strategy": strategy, "factor": factor, "before": before})
+
+
+_DECISION_HISTORY_PATH = REPO / "argus_flow" / "logs" / "decision_history.jsonl"
+
+
+def _log_decision(kind: str, **kwargs) -> None:
+    """Append a governance audit-trail entry. Used for capital factor changes,
+    verdict assignments, cull executions — anything that's a discrete decision
+    a future operator should be able to reconstruct.
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        **kwargs,
+    }
+    _DECISION_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _DECISION_HISTORY_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # don't let logging failure break the action
+
+
+@app.get("/api/decision_history")
+async def api_decision_history(limit: int = 100, kind: str | None = None):
+    """Read the governance audit trail. Most-recent first.
+
+    Query params:
+      limit: max records to return (default 100)
+      kind:  filter by kind (e.g. allocation_factor_change)
+    """
+    if not _DECISION_HISTORY_PATH.exists():
+        return JSONResponse({"records": [], "count": 0, "note": "no decision history yet"})
+    records = []
+    try:
+        with _DECISION_HISTORY_PATH.open(encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if kind and r.get("kind") != kind:
+                    continue
+                records.append(r)
+    except Exception as e:
+        return JSONResponse({"records": [], "error": str(e)})
+    records.reverse()  # most-recent first
+    if limit:
+        records = records[:limit]
+    # Per-strategy current state — convenience join so consumers don't
+    # have to also fetch /api/allocation_factors.
+    try:
+        cfg = json.loads((REPO / "argus_flow" / "configs" / "allocation_factors.json").read_text(encoding="utf-8"))
+        current_factors = cfg.get("factors", {})
+    except Exception:
+        current_factors = {}
+    return JSONResponse({
+        "records": records,
+        "count": len(records),
+        "current_factors": current_factors,
+    })
 
 
 @app.get("/api/mfe_capture")
@@ -5327,6 +5406,110 @@ async def api_benchmark_alpha(window_days: int = 30):
 # happens, update both this constant AND the operational_maturity generator.
 RESET_CUTOFF_UTC = "2026-04-23T14:00:00+00:00"
 RESET_LABEL = "2026-04-23 paper reset"
+
+
+@app.get("/api/tom_outcome")
+async def api_tom_outcome():
+    """tom_international's basket trade tracker.
+
+    The TOM (turn-of-month) strategy fires once a month, opens a basket of
+    ~6 international ETFs, and exits after N days. First fired 2026-04-30
+    14:28 UTC. This endpoint surfaces per-position P&L vs entry, and the
+    aggregate basket PnL, so the operator can watch the trade play out
+    without manual broker math.
+
+    Reads broker_snapshot.json (TWS-confirmed avg_cost + qty) + yfinance
+    last close for each ticker. Empty when tom_international is FLAT.
+    """
+    snap_path = REPO / "argus_flow" / "logs" / "_broker" / "broker_snapshot.json"
+    hb_path = REPO / "forge" / "logs" / "tom_international" / "heartbeat.json"
+    if not (snap_path.exists() and hb_path.exists()):
+        return JSONResponse({"status": "missing"})
+    try:
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        hb = json.loads(hb_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+    if hb.get("position", "FLAT") == "FLAT" or not hb.get("instruments"):
+        return JSONResponse({
+            "status": "flat",
+            "next_entry_day": hb.get("next_entry_day"),
+            "instruments": hb.get("instruments", []),
+        })
+
+    instruments = hb.get("instruments", [])
+    snap_positions = snap.get("positions", {})
+
+    # Fetch current prices via yfinance (1d bar tail)
+    current_prices: dict[str, float] = {}
+    try:
+        import warnings
+        warnings.simplefilter("ignore")
+        import yfinance as yf
+        tickers = [s for s in instruments if s in snap_positions]
+        if tickers:
+            df = yf.download(" ".join(tickers), period="2d", interval="1d",
+                             progress=False, auto_adjust=False, group_by="ticker")
+            for t in tickers:
+                try:
+                    if len(tickers) == 1:
+                        last = float(df["Close"].iloc[-1])
+                    else:
+                        last = float(df[t]["Close"].iloc[-1])
+                    if last > 0:
+                        current_prices[t] = last
+                except Exception:
+                    continue
+    except Exception:
+        pass  # falling back to avg_cost as price means $0 unrealized
+
+    rows = []
+    total_unrealized = 0.0
+    total_basis = 0.0
+    for sym in instruments:
+        pos = snap_positions.get(sym, {})
+        avg_cost = float(pos.get("avg_cost") or 0)
+        qty = float(pos.get("qty") or 0)
+        last_price = current_prices.get(sym)
+        basis = avg_cost * qty
+        if last_price and qty > 0:
+            mark = last_price * qty
+            unrealized = mark - basis
+            unrealized_pct = (last_price / avg_cost - 1) * 100 if avg_cost > 0 else 0
+        else:
+            mark = None
+            unrealized = None
+            unrealized_pct = None
+        if unrealized is not None:
+            total_unrealized += unrealized
+        total_basis += basis
+        rows.append({
+            "instrument": sym,
+            "qty": qty,
+            "avg_cost": round(avg_cost, 4),
+            "last_price": round(last_price, 4) if last_price else None,
+            "basis_usd": round(basis, 2),
+            "mark_usd": round(mark, 2) if mark is not None else None,
+            "unrealized_usd": round(unrealized, 2) if unrealized is not None else None,
+            "unrealized_pct": round(unrealized_pct, 3) if unrealized_pct is not None else None,
+        })
+    rows.sort(key=lambda r: -(r["unrealized_pct"] or -999))  # best performer first
+
+    return JSONResponse({
+        "status": "open",
+        "entry_ts": hb.get("ts"),
+        "next_entry_day": hb.get("next_entry_day"),
+        "instruments_count": len(instruments),
+        "total_basis_usd": round(total_basis, 2),
+        "total_unrealized_usd": round(total_unrealized, 2),
+        "total_unrealized_pct": round((total_unrealized / total_basis * 100), 3) if total_basis > 0 else 0,
+        "positions": rows,
+        "method_note": (
+            "Prices from yfinance daily-bar tail. avg_cost + qty from broker_snapshot.json. "
+            "Empty unrealized fields = price fetch failed for that ticker."
+        ),
+    })
 
 
 @app.get("/api/active_bleeders")
@@ -9239,6 +9422,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- ACTIVE BLEEDERS — top-3 strategies costing the most over 7d -->
 <div id="active-bleeders-panel" style="margin-bottom:14px;"></div>
 
+<!-- TOM TRADE OUTCOME — basket tracker for tom_international's monthly event -->
+<div id="tom-outcome-panel" style="margin-bottom:14px;"></div>
+
 <!-- DECISION ENGINE — primary decision view, top of strategy area -->
 <div id="decision-engine-panel" style="margin-bottom:14px;"></div>
 
@@ -10191,6 +10377,74 @@ function loadActiveBleeders() {
 }
 loadActiveBleeders();
 setInterval(loadActiveBleeders, 300000);  // 5 min refresh
+
+// ─── TOM TRADE OUTCOME PANEL ───────────────────────────────────────
+// Surfaces the 6-ETF basket P&L when tom_international holds an open
+// position. Hides itself when FLAT. Tactical view — different from the
+// generic Open Positions table (which doesn't aggregate by strategy).
+function loadTomOutcome() {
+  fetch('/api/tom_outcome').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('tom-outcome-panel');
+    if (!el) return;
+    if (d.status !== 'open') {
+      el.innerHTML = '';  // hide when flat or missing
+      return;
+    }
+    const totalUnr = d.total_unrealized_usd || 0;
+    const totalUnrPct = d.total_unrealized_pct || 0;
+    const totColor = totalUnr > 0 ? '#00ff88' : totalUnr < 0 ? '#ff4444' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">TOM BASKET</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">forge_tom_international turn-of-month event</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">'
+      + d.instruments_count + ' positions · entry ' + (d.entry_ts || '?').substring(0, 16).replace('T', ' ')
+      + ' · next entry ' + (d.next_entry_day || '?')
+      + '</div>'
+      + '</div>'
+      + '<div style="display:flex;gap:20px;align-items:baseline;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #1e2a42;">'
+      + '<div><span style="color:#9da8c7;">Basis: </span><b style="color:#fff;">$' + (d.total_basis_usd || 0).toLocaleString(undefined,{maximumFractionDigits:2}) + '</b></div>'
+      + '<div><span style="color:#9da8c7;">Mark: </span><b style="color:#fff;">$' + ((d.total_basis_usd || 0) + totalUnr).toLocaleString(undefined,{maximumFractionDigits:2}) + '</b></div>'
+      + '<div><span style="color:#9da8c7;">Unrealized: </span><b style="color:' + totColor + ';">' + (totalUnr >= 0 ? '+' : '') + '$' + totalUnr.toFixed(2) + '</b> '
+      + '<span style="color:' + totColor + ';">(' + (totalUnrPct >= 0 ? '+' : '') + totalUnrPct.toFixed(2) + '%)</span></div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Instrument</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Qty</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Avg cost</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Last</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Basis</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Mark</th>'
+      + '<th style="text-align:right;padding:5px 6px;">Unrealized</th>'
+      + '<th style="text-align:right;padding:5px 6px;">% from entry</th>'
+      + '</tr></thead><tbody>';
+    for (const r of (d.positions || [])) {
+      const unr = r.unrealized_usd;
+      const unrPct = r.unrealized_pct;
+      const c = unr == null ? '#7b8ab8' : unr > 0 ? '#00ff88' : unr < 0 ? '#ff4444' : '#9da8c7';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;font-weight:bold;">' + r.instrument + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + r.qty + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + r.avg_cost.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + (r.last_price != null ? '$' + r.last_price.toFixed(2) : '—') + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + r.basis_usd.toFixed(2) + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + (r.mark_usd != null ? '$' + r.mark_usd.toFixed(2) : '—') + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + c + ';font-weight:bold;">' + (unr != null ? (unr >= 0 ? '+' : '') + '$' + unr.toFixed(2) : '—') + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:' + c + ';">' + (unrPct != null ? (unrPct >= 0 ? '+' : '') + unrPct.toFixed(2) + '%' : '—') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">Prices: yfinance daily-bar tail. Position basis: TWS broker_snapshot.json.</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('tom-outcome-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadTomOutcome();
+setInterval(loadTomOutcome, 300000);  // 5 min refresh
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
@@ -17062,6 +17316,7 @@ PANEL_IDS_ALL = [
     "maturity-summary-banner",
     # Decision / fleet panels
     "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
+    "tom-outcome-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
