@@ -5329,6 +5329,89 @@ RESET_CUTOFF_UTC = "2026-04-23T14:00:00+00:00"
 RESET_LABEL = "2026-04-23 paper reset"
 
 
+@app.get("/api/changes_24h")
+async def api_changes_24h():
+    """24-hour delta view: compare today's operational_maturity snapshot to
+    yesterday's. Surfaces what actually changed per strategy — n delta, PF
+    shift, PnL delta, verdict transitions — so the operator can answer
+    "what moved last 24 hours?" without manually diffing.
+
+    Reads dated operational_maturity_<YYYYMMDD>.json files and picks the
+    two most-recent for the comparison. If only one exists, returns
+    status=insufficient_history.
+    """
+    log_dir = REPO / "argus_flow" / "logs"
+    candidates = sorted(log_dir.glob("operational_maturity_2*.json"))
+    if len(candidates) < 2:
+        return JSONResponse({"status": "insufficient_history",
+                             "available_snapshots": [c.name for c in candidates]})
+    today_path = candidates[-1]
+    yest_path = candidates[-2]
+    try:
+        today = json.loads(today_path.read_text(encoding="utf-8"))
+        yest = json.loads(yest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+    yest_by = {s["strategy"]: s for s in yest.get("strategies", [])}
+    today_by = {s["strategy"]: s for s in today.get("strategies", [])}
+
+    changes: list[dict] = []
+    for name in sorted(set(today_by.keys()) | set(yest_by.keys())):
+        t = today_by.get(name, {})
+        y = yest_by.get(name, {})
+        d_n = (t.get("live_trades") or 0) - (y.get("live_trades") or 0)
+        # Nullable diffs for PF — both sides need values to compute meaningfully
+        t_pf = t.get("live_pf"); y_pf = y.get("live_pf")
+        d_pf = round(t_pf - y_pf, 2) if (t_pf is not None and y_pf is not None) else None
+        d_pnl = round((t.get("live_total_pnl_usd") or 0) - (y.get("live_total_pnl_usd") or 0), 2)
+        t_v = t.get("verdict"); y_v = y.get("verdict")
+        verdict_changed = t_v != y_v
+        # Filter to "interesting": >0 trade delta, |PnL delta| >= $5, |PF delta| >= 0.10, verdict change
+        interesting = (
+            abs(d_n) > 0
+            or abs(d_pnl) >= 5.0
+            or (d_pf is not None and abs(d_pf) >= 0.10)
+            or verdict_changed
+        )
+        if not interesting:
+            continue
+        changes.append({
+            "strategy": name,
+            "n_today": t.get("live_trades", 0),
+            "n_yest": y.get("live_trades", 0),
+            "n_delta": d_n,
+            "pf_today": t_pf,
+            "pf_yest": y_pf,
+            "pf_delta": d_pf,
+            "pnl_today": round(t.get("live_total_pnl_usd") or 0, 2),
+            "pnl_yest": round(y.get("live_total_pnl_usd") or 0, 2),
+            "pnl_delta": d_pnl,
+            "verdict_today": t_v,
+            "verdict_yest": y_v,
+            "verdict_changed": verdict_changed,
+        })
+
+    # Sort: largest absolute PnL delta first (the changes that matter most for capital)
+    changes.sort(key=lambda c: -abs(c["pnl_delta"] or 0))
+
+    return JSONResponse({
+        "status": "ok",
+        "today_snapshot": today_path.name,
+        "yesterday_snapshot": yest_path.name,
+        "today_generated_at": today.get("generated_at"),
+        "yesterday_generated_at": yest.get("generated_at"),
+        "n_changes": len(changes),
+        "n_verdict_transitions": sum(1 for c in changes if c["verdict_changed"]),
+        "changes": changes,
+        "method_note": (
+            "Compares the two most-recent operational_maturity_<DATE>.json snapshots. "
+            "Only strategies with material change (>=1 new trade, |PnL delta|>=$5, "
+            "|PF delta|>=0.10, or verdict change) are shown. Sorted by |PnL delta| desc."
+        ),
+    })
+
+
 @app.get("/api/data_epoch")
 async def api_data_epoch():
     """Single source of truth for the dashboard's data-provenance epoch.
@@ -8999,6 +9082,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- RECOMMENDED ACTIONS — cross-panel synthesis, what to actually do now -->
 <div id="recommended-actions-panel" style="margin-bottom:14px;"></div>
 
+<!-- 24H CHANGES — what moved last 24h (PnL/PF/n/verdict deltas) -->
+<div id="changes-24h-panel" style="margin-bottom:14px;"></div>
+
 <!-- DECISION ENGINE — primary decision view, top of strategy area -->
 <div id="decision-engine-panel" style="margin-bottom:14px;"></div>
 
@@ -9814,6 +9900,71 @@ function loadRecommendedActions() {
 }
 loadRecommendedActions();
 setInterval(loadRecommendedActions, 60000);
+
+// ─── 24H CHANGES PANEL ─────────────────────────────────────────────
+// Diffs the two most-recent operational_maturity snapshots and shows
+// which strategies actually moved in the last 24h. Hides itself when
+// nothing material changed (clean fleet = clean dashboard).
+function loadChanges24h() {
+  fetch('/api/changes_24h').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('changes-24h-panel');
+    if (!el) return;
+    if (data.status !== 'ok' || !data.changes || data.changes.length === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    // Header with snapshot dates
+    const todayDate = (data.today_snapshot || '').replace('operational_maturity_','').replace('.json','');
+    const yestDate = (data.yesterday_snapshot || '').replace('operational_maturity_','').replace('.json','');
+    let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;">24H CHANGES</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">what moved between '
+      + yestDate + ' → ' + todayDate + ' snapshots</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + data.n_changes + ' material change' + (data.n_changes === 1 ? '' : 's')
+      + (data.n_verdict_transitions > 0 ? ' · <b style="color:#ffaa00;">' + data.n_verdict_transitions + ' verdict transition' + (data.n_verdict_transitions === 1 ? '' : 's') + '</b>' : '')
+      + '</div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
+      + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
+      + '<th style="text-align:right;padding:5px 6px;">N (Δ)</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PF yest → today (Δ)</th>'
+      + '<th style="text-align:right;padding:5px 6px;">PnL yest → today (Δ)</th>'
+      + '<th style="text-align:left;padding:5px 6px;">Verdict</th>'
+      + '</tr></thead><tbody>';
+    for (const c of data.changes) {
+      const pnlDelta = c.pnl_delta || 0;
+      const pnlDeltaColor = pnlDelta > 0 ? '#00ff88' : pnlDelta < 0 ? '#ff4444' : '#9da8c7';
+      const pfDelta = c.pf_delta;
+      const pfDeltaColor = pfDelta == null ? '#7b8ab8' : pfDelta > 0 ? '#00ff88' : pfDelta < 0 ? '#ff4444' : '#9da8c7';
+      const nDeltaColor = c.n_delta > 0 ? '#9da8c7' : c.n_delta < 0 ? '#ffaa00' : '#7b8ab8';
+      const pfYest = c.pf_yest != null ? c.pf_yest.toFixed(2) : '—';
+      const pfToday = c.pf_today != null ? c.pf_today.toFixed(2) : '—';
+      const pfDeltaStr = pfDelta != null ? (pfDelta >= 0 ? '+' : '') + pfDelta.toFixed(2) : '—';
+      const verdictCell = c.verdict_changed
+        ? '<span style="color:#ffaa00;font-weight:bold;">' + (c.verdict_yest || '?') + ' → ' + (c.verdict_today || '?') + '</span>'
+        : '<span style="color:#7b8ab8;">' + (c.verdict_today || '—') + '</span>';
+      html += '<tr style="border-top:1px solid #1e2a42;">'
+        + '<td style="padding:5px 6px;color:#e0e0e0;">' + c.strategy + '</td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + c.n_yest + ' → ' + c.n_today + ' <span style="color:' + nDeltaColor + ';font-weight:bold;">(' + (c.n_delta >= 0 ? '+' : '') + c.n_delta + ')</span></td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + pfYest + ' → ' + pfToday + ' <span style="color:' + pfDeltaColor + ';font-weight:bold;">(' + pfDeltaStr + ')</span></td>'
+        + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">$' + (c.pnl_yest >= 0 ? '+' : '') + c.pnl_yest.toFixed(2) + ' → $' + (c.pnl_today >= 0 ? '+' : '') + c.pnl_today.toFixed(2) + ' <span style="color:' + pnlDeltaColor + ';font-weight:bold;">($' + (pnlDelta >= 0 ? '+' : '') + pnlDelta.toFixed(2) + ')</span></td>'
+        + '<td style="padding:5px 6px;">' + verdictCell + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="margin-top:6px;font-size:0.7em;color:#7b8ab8;">'
+      + 'Filter: shown only when |PnL Δ| ≥ $5, |PF Δ| ≥ 0.10, n changed, or verdict transitioned. Sorted by |PnL Δ| desc.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    const el = document.getElementById('changes-24h-panel');
+    if (el) el.innerHTML = '';
+  });
+}
+loadChanges24h();
+setInterval(loadChanges24h, 600000);  // 10 min — daily snapshot only changes overnight
 
 // ─── Decision-engine subset drilldown ──────────────────────────────
 // Lazy-loads /api/strategy_drilldown when user expands a row. Surfaces
@@ -16684,7 +16835,7 @@ PANEL_IDS_ALL = [
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
     # Decision / fleet panels
-    "recommended-actions-panel",
+    "recommended-actions-panel", "changes-24h-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
     "cluster-exposure-panel", "three-state-panel", "dimensions-panel",
@@ -16704,13 +16855,14 @@ VIEW_ALLOWLISTS = {
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
         "maturity-summary-banner", "recommended-actions-panel",
+        "changes-24h-panel",
         "fleet-health", "open-positions-panel",
     },
     # Fleet Ops = decision-layer view
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
-        "recommended-actions-panel",
+        "recommended-actions-panel", "changes-24h-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
         "efficiency-panel", "fleet-health", "open-positions-panel",
     },
