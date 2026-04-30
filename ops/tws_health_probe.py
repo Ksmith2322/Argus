@@ -39,16 +39,60 @@ ACCOUNT_QUERY_TIMEOUT_S = 8
 
 
 def write_status(status: str, exit_code: int, reason: str, **extra) -> None:
-    """Snapshot the probe result for dashboard consumption."""
+    """Snapshot the probe result for dashboard consumption + Discord alert
+    on transitions away from healthy.
+
+    Transition detection: read prior state from disk, send Discord only when
+    status changed FROM healthy TO unreachable/degraded/error. Avoids per-hour
+    spam during a sustained outage; surfaces it loudly on the first detection.
+    """
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    prior_status = None
+    if OUT_PATH.exists():
+        try:
+            prior = json.loads(OUT_PATH.read_text(encoding="utf-8"))
+            prior_status = prior.get("status")
+        except Exception:
+            pass
     payload = {
         "ts_utc": datetime.now(timezone.utc).isoformat(),
         "status": status,           # "healthy" | "unreachable" | "degraded" | "error"
         "exit_code": exit_code,
         "reason": reason,
+        "prior_status": prior_status,
         **extra,
     }
     OUT_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # Alert on transitions: healthy → degraded/unreachable/error (red flag)
+    # AND degraded/unreachable/error → healthy (recovery confirmation).
+    # Skipped on first run (no prior state) to avoid post-deploy false alarm.
+    if prior_status is None:
+        return
+    is_alert_to_bad = (prior_status == "healthy" and status != "healthy")
+    is_recovery = (prior_status != "healthy" and status == "healthy")
+    if not (is_alert_to_bad or is_recovery):
+        return
+    try:
+        from argus_flow.ops.discord_alerts import send_discord
+        if is_alert_to_bad:
+            emoji = "🚨"
+            head = f"{emoji} **TWS HEALTH DROP**"
+            body = (
+                f"Status: `{prior_status}` → `{status}`\n"
+                f"Reason: {reason}\n"
+                f"Action: re-auth TWS in the UI, then run "
+                f"`python -m ops.tws_recover` to refresh."
+            )
+        else:
+            emoji = "✅"
+            head = f"{emoji} **TWS HEALTH RECOVERED**"
+            body = f"Status: `{prior_status}` → `{status}`\n{reason}"
+        send_discord(content=f"{head}\n{body}")
+    except Exception:
+        # Don't let an alerting failure break the probe — write_status
+        # still succeeded; the snapshot is on disk.
+        pass
 
 
 def main() -> int:

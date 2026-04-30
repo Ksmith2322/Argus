@@ -6309,6 +6309,35 @@ async def api_positions_open():
                         "target_px": t.get("target_px"),
                         "stop_px": t.get("stop_px"),
                     })
+            # Multi-instrument basket format (forge_tom_international's TOM event):
+            # heartbeat has `position: "LONG"|"SHORT"` + `instruments: [...]` + `open_trade_count`.
+            # Each instrument is a separate position. Without this branch the dashboard
+            # missed all 6 of tom_international's TOM-fired positions on 2026-04-30.
+            position_str = hb.get("position")
+            instruments = hb.get("instruments")
+            if (
+                isinstance(position_str, str)
+                and position_str.upper() in ("LONG", "SHORT")
+                and isinstance(instruments, list)
+                and instruments
+                and not open_trade
+                and not open_trades
+            ):
+                direction = position_str.lower()
+                for instr in instruments:
+                    positions.append({
+                        "strategy": system,
+                        "instrument": instr,
+                        "entry_ts": hb.get("ts") or "",
+                        "entry_px": None,
+                        "direction": direction,
+                        "size": None,
+                        "risk_usd": None,
+                        "target_px": None,
+                        "stop_px": None,
+                        # Mark this as broker-source so consumers know risk_usd is unknown
+                        "source": "heartbeat_basket",
+                    })
 
     # Aggregate risk
     total_risk = sum(float(p.get("risk_usd") or 0) for p in positions)
