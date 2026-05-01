@@ -108,6 +108,65 @@ def _classify_action(action: str) -> tuple[str, str | None]:
     return ("OTHER", None)
 
 
+# Per-strategy schema adapters — translate non-standard signal CSVs into
+# the canonical (kind, reason) tuple. Keys must match `csv_path.parent.name`.
+def _adapt_mamba(row: dict) -> tuple[str, str | None]:
+    """mamba: direction=LONG/SHORT + confluences int. Below threshold = blocked."""
+    d = (row.get("direction") or "").upper()
+    if d not in ("LONG", "SHORT"):
+        return ("OTHER", None)
+    try:
+        conf = int(row.get("confluences", 0) or 0)
+    except (ValueError, TypeError):
+        conf = 0
+    if conf >= 5:
+        return ("ENTRY", None)
+    return ("BLOCKED", f"insufficient_confluence_{conf}")
+
+
+def _adapt_gdx_gld(row: dict) -> tuple[str, str | None]:
+    """gdx_gld: 'signal' col with NO_SIGNAL/LONG_SPREAD/SHORT_SPREAD/EXIT/STOP."""
+    s = (row.get("signal") or "").upper()
+    if s in ("LONG_SPREAD", "SHORT_SPREAD"):
+        return ("ENTRY", None)
+    if s == "NO_SIGNAL":
+        # Use z-score band as a proxy reason
+        try:
+            z = abs(float(row.get("z_score", 0) or 0))
+        except (ValueError, TypeError):
+            z = 0
+        if z < 1.0:
+            return ("BLOCKED", "z_within_band")
+        if z < 2.0:
+            return ("BLOCKED", "z_approaching_threshold")
+        return ("BLOCKED", "no_setup")
+    return ("OTHER", None)
+
+
+def _adapt_argus_pair(row: dict) -> tuple[str, str | None]:
+    """argus FX pairs: 'direction' col empty=no setup, LONG/SHORT=entry candidate.
+    Without the runner emitting blocked-reason actions, we can only detect
+    take vs no-setup. Pairs need MTF gate fields written for V2 to be useful.
+    """
+    d = (row.get("direction") or "").upper()
+    if d in ("LONG", "SHORT"):
+        return ("ENTRY", None)
+    if d == "":
+        return ("BLOCKED", "no_setup")
+    return ("OTHER", None)
+
+
+# Map from CSV directory name to adapter. Strategies not in this map fall
+# back to the standard NO_TRIGGER_* / ENTRY_* parsing.
+STRATEGY_ADAPTERS: dict[str, callable] = {
+    "mamba":   _adapt_mamba,
+    "gdx_gld": _adapt_gdx_gld,
+    "cadjpy":  _adapt_argus_pair,
+    "gbpusd":  _adapt_argus_pair,
+    "usdjpy":  _adapt_argus_pair,
+}
+
+
 def _fetch_daily_closes(symbols: list[str], window_days: int) -> dict[str, dict[str, float]]:
     """Return {symbol: {YYYY-MM-DD: close}} via yfinance. Empty on failure."""
     try:
@@ -163,6 +222,7 @@ def main() -> int:
         strat = csv_path.parent.name
         if strat not in SYMBOL_MAP:
             continue
+        adapter = STRATEGY_ADAPTERS.get(strat)
         try:
             with csv_path.open(encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -171,7 +231,10 @@ def main() -> int:
                     ts = _parse_ts(ts_raw)
                     if not ts or ts < cutoff:
                         continue
-                    kind, reason = _classify_action(row.get("action") or "")
+                    if adapter:
+                        kind, reason = adapter(row)
+                    else:
+                        kind, reason = _classify_action(row.get("action") or "")
                     if kind != "BLOCKED":
                         continue
                     by_key[(strat, reason or "unknown")].append(ts.strftime("%Y-%m-%d"))

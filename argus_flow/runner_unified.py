@@ -3595,19 +3595,37 @@ def reconcile_instruments(ib, instruments: list) -> dict:
         else:
             log.info(f"[{inst.symbol}] RECONCILE: {result}")
 
-    # Check for orphaned broker positions not tracked by any runner
+    # Check for orphaned broker positions not tracked by any runner.
+    # Argus only owns FX (CADJPY/GBPUSD/USDJPY). Forge runners own equities
+    # and futures (SPY, GLD, EEM, EFA, etc) — those positions show up at the
+    # broker but aren't argus's responsibility. Treat any non-FX broker
+    # position as "owned by another runner" (logged but not flagged as
+    # UNRESOLVED, which would trip RECOVERY_REQUIRED and block argus entries).
     tracked_keys = {_runner_to_ib_key(inst) for inst in instruments}
+    argus_instrument_types = {(inst.cfg or {}).get("instrument_type", "forex") for inst in instruments}
+    # Heuristic: argus FX keys look like "AUD.USD", "GBP.USD", "USD.JPY" (cash).
+    # Forge equity/ETF keys look like "SPY", "GLD", etc (no dot).
+    # Forge futures look like "MNQ", "MYM" (also no dot, but with exchange context).
+    def _is_fx_key(k: str) -> bool:
+        return "." in str(k) or len(str(k)) == 6  # AUDUSD or USDJPY style
     for key, info in broker_positions.items():
-        if key not in tracked_keys and info["direction"] != "FLAT":
-            log.warning(f"ORPHAN DETECTED: broker has {info['direction']} in {key} -- not tracked by any runner")
-            results[f"_orphan_{key}"] = {
-                "result": ReconcileResult.UNRESOLVED,
-                "local_position": "NONE",
-                "broker_position": info["direction"],
-                "broker_qty": info["qty"],
-                "detail": f"Untracked broker position in {key}",
-                "ib_key": key,
-            }
+        if key in tracked_keys or info["direction"] == "FLAT":
+            continue
+        # Non-tracked non-flat: classify
+        if "forex" in argus_instrument_types and not _is_fx_key(key):
+            # Likely a forge-runner position. Log informationally, do NOT flag UNRESOLVED.
+            log.info(f"NON-ARGUS POSITION: broker has {info['direction']} in {key} (owned by another runner — not argus's concern)")
+            continue
+        # FX-style key not tracked by argus = real orphan (or unmapped argus pair)
+        log.warning(f"ORPHAN DETECTED: broker has {info['direction']} in {key} -- not tracked by any runner")
+        results[f"_orphan_{key}"] = {
+            "result": ReconcileResult.UNRESOLVED,
+            "local_position": "NONE",
+            "broker_position": info["direction"],
+            "broker_qty": info["qty"],
+            "detail": f"Untracked broker position in {key}",
+            "ib_key": key,
+        }
 
     return results
 

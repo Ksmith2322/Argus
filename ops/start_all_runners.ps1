@@ -40,7 +40,10 @@ $runners = @(
     @{Module='forge.gld_pm_long.runner';      Args=@('--loop')},
     @{Module='forge.jpy_pm_short.runner';     Args=@('--loop')},
     @{Module='forge.nq_overnight.runner';     Args=@('--loop')},
-    @{Module='forge.spy_mean_rev.runner';     Args=@('--loop')},
+    # 2026-04-30: forge.spy_mean_rev.runner KILLED. Already at factor 0.0
+    # via allocation_factors.json; no point spawning the process. Re-add
+    # if a successor mean-reversion strategy is built.
+    # @{Module='forge.spy_mean_rev.runner';     Args=@('--loop')},
     @{Module='forge.vix_intraday.runner';     Args=@('--loop')},
     @{Module='forge.nq_london_close.runner';  Args=@('--loop')},
     @{Module='forge.aud_asian_breakout.runner'; Args=@('--loop')},
