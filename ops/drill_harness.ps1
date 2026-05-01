@@ -111,12 +111,14 @@ function Drill-Kill {
     Start-Sleep -Seconds 30
 
     Write-DrillStep "Step 3: Sample log scan for KILL_SWITCH detection lines"
-    $detectionLog = Get-Content "$repo\argus_flow\logs\runner_unified.log" -Tail 30 -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match 'KILL_SWITCH|kill.switch|HALT' }
-    if ($detectionLog) {
-        Write-DrillStep "argus runner detected (sample: $($detectionLog[0]))" 'OK'
+    # Force array context with @(...) so single-line matches don't degrade to a string
+    # (where [0] would return the first character instead of the line).
+    $detectionLog = @(Get-Content "$repo\argus_flow\logs\runner_unified.log" -Tail 30 -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match 'KILL_SWITCH|kill[_\s-]switch' })
+    if ($detectionLog.Count -gt 0) {
+        Write-DrillStep "argus detected KILL_SWITCH ($($detectionLog.Count) line(s); sample: $($detectionLog[0]))" 'OK'
     } else {
-        Write-DrillStep "no KILL_SWITCH detection in argus log within 30s" 'WARN'
+        Write-DrillStep "no KILL_SWITCH detection in argus log within 30s - flag may not be checked, OR no eval cycle ran" 'WARN'
     }
 
     Write-DrillStep "Step 4: Removing $killFile" 'INFO'
@@ -185,13 +187,14 @@ function Drill-CircuitBreaker {
         Pop-Location
     }
 
-    $verdictPath = "$repo\argus_flow\logs\daily_loss_state.json"
+    $verdictPath = "$repo\argus_flow\logs\_risk\circuit_breaker_state.json"
     if (Test-Path $verdictPath) {
         $v = Get-Content $verdictPath | ConvertFrom-Json
-        Write-DrillStep "Circuit breaker verdict file exists" 'OK'
-        Write-DrillStep "Latest state: $(($v | ConvertTo-Json -Compress))"
+        Write-DrillStep "Circuit breaker state file exists" 'OK'
+        Write-DrillStep ("Latest: tier={0} equity=`${1} pnl_pct={2}% ts={3}" -f `
+            $v.current_tier, $v.latest_equity_usd, $v.latest_pnl_pct, $v.latest_ts)
     } else {
-        Write-DrillStep "no daily_loss_state.json - script may not have written output" 'WARN'
+        Write-DrillStep "no circuit_breaker_state.json at expected path - script may not have written output" 'WARN'
     }
     Write-DrillStep "CircuitBreaker drill complete." 'OK'
 }
