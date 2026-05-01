@@ -43,10 +43,20 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Strategies emit reason strings with the indicator value baked in
+# (`NO_TRIGGER_RSI_NEUTRAL_67.6`). Strip trailing `_<num>` so all RSI-neutral
+# blocks aggregate as one reason instead of fragmenting into 50 buckets.
+_NUMERIC_SUFFIX_RE = re.compile(r"(_\d+(\.\d+)?)+$")
+
+
+def _normalize_reason(raw: str) -> str:
+    return _NUMERIC_SUFFIX_RE.sub("", (raw or "unknown").lower()) or "unknown"
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "argus_flow" / "logs" / "block_outcomes_latest.json"
@@ -86,11 +96,10 @@ def _classify_action(action: str) -> tuple[str, str | None]:
     if a.startswith("ENTRY_") or a.startswith("ENTER_"):
         return ("ENTRY", None)
     if a.startswith("NO_TRIGGER_"):
-        return ("BLOCKED", a[len("NO_TRIGGER_"):].lower() or "unknown")
+        return ("BLOCKED", _normalize_reason(a[len("NO_TRIGGER_"):]))
     if a.startswith("BLOCKED_") or a.startswith("SKIP_") or a.startswith("REJECT_"):
         prefix = a.split("_", 1)[0]
-        suffix = a[len(prefix) + 1:].lower() or "unknown"
-        return ("BLOCKED", suffix)
+        return ("BLOCKED", _normalize_reason(a[len(prefix) + 1:]))
     return ("OTHER", None)
 
 

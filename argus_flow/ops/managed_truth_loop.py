@@ -61,6 +61,7 @@ _REC_ACTIONS_ALERT_SCRIPT = _REPO / "ops" / "recommended_actions_alert.py"
 _READINESS_EVAL_SCRIPT = _REPO / "ops" / "readiness_eval.py"
 _BLOCK_OUTCOME_SCRIPT = _REPO / "ops" / "block_outcome_tracker.py"
 _BLOCK_OUTCOME_V2_SCRIPT = _REPO / "ops" / "block_outcome_v2.py"
+_WATCHDOG_HEALTH_SCRIPT = _REPO / "ops" / "watchdog_health_check.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -130,6 +131,21 @@ def main() -> int:
                     )
                 except Exception as e:
                     log.warning("daily_loss_circuit_breaker failed this cycle: %s", e)
+
+            # Watchdog health check — every cycle. Cheap (one stat() call).
+            # Auto-respawns ArgusWatchdog if its log goes stale, since the
+            # task's BootTrigger means it doesn't auto-recover from crashes.
+            # Internal mutex + 30min respawn cooldown prevent thrash.
+            if _WATCHDOG_HEALTH_SCRIPT.exists():
+                try:
+                    subprocess.run(
+                        [sys.executable, str(_WATCHDOG_HEALTH_SCRIPT)],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=15,
+                    )
+                except Exception as e:
+                    log.warning("watchdog_health_check failed this cycle: %s", e)
 
             # FLATTEN_EOD executor — runs ONLY if FLATTEN_EOD.flag exists.
             # The script no-ops if flag is absent, so safe to call every cycle.

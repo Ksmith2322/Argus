@@ -38,9 +38,18 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Match the MVP tracker: strip trailing `_<num>` so `rsi_neutral_67.6` and
+# `rsi_neutral_20.0` aggregate as one reason instead of splitting into 50.
+_NUMERIC_SUFFIX_RE = re.compile(r"(_\d+(\.\d+)?)+$")
+
+
+def _normalize_reason(raw: str) -> str:
+    return _NUMERIC_SUFFIX_RE.sub("", (raw or "unknown").lower()) or "unknown"
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "argus_flow" / "logs" / "block_outcomes_v2_latest.json"
@@ -81,7 +90,7 @@ def _classify_action(action: str) -> tuple[str, str | None]:
     if a.startswith("ENTRY_") or a.startswith("ENTER_"):
         return ("ENTRY", None)
     if a.startswith("NO_TRIGGER_"):
-        return ("BLOCKED", a[len("NO_TRIGGER_"):].lower() or "unknown")
+        return ("BLOCKED", _normalize_reason(a[len("NO_TRIGGER_"):]))
     return ("OTHER", None)
 
 

@@ -15,10 +15,15 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+# Reason normalization for blocked signals — strip numeric suffixes so all
+# `rsi_neutral_*` and `range_pips_outside_band_*` variants aggregate.
+_NUMERIC_REASON_SUFFIX_RE = re.compile(r"(_\d+(\.\d+)?)+$")
 from decimal import Decimal
 from pathlib import Path
 
@@ -4626,8 +4631,11 @@ async def api_opportunity_vs_taken(window_days: int = 7):
                     if action.startswith("ENTRY_"):
                         taken += 1
                     elif action.startswith("NO_TRIGGER_"):
-                        # Reason is the part after NO_TRIGGER_
-                        reason = action[len("NO_TRIGGER_"):].lower() or "unknown"
+                        # Reason is the part after NO_TRIGGER_, with numeric
+                        # suffixes stripped so `rsi_neutral_67.6` aggregates
+                        # with all other rsi_neutral_* values.
+                        raw = action[len("NO_TRIGGER_"):].lower() or "unknown"
+                        reason = _NUMERIC_REASON_SUFFIX_RE.sub("", raw) or "unknown"
                         blocked_by_reason[reason] = blocked_by_reason.get(reason, 0) + 1
                     else:
                         # Other action (BLOCKED_*, SKIP_*, etc.) — bucket as misc
