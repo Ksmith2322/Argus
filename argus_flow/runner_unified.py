@@ -2284,8 +2284,15 @@ class InstrumentRunner:
 
         try:
             action = "BUY" if direction == "long" else "SELL"
-            # ib_insync MarketOrder: totalQuantity must be positive
-            order = MarketOrder(action, abs(size))
+            # ib_insync MarketOrder: totalQuantity must be positive AND integer
+            # for IBKR FX (IdealPro). 2026-05-01: order 39/40 cancelled with
+            # Error 10318 "doesn't support fractional quantity trading" because
+            # the sizing layer produced 23300.509...; round to int here.
+            qty = int(abs(size))
+            if qty <= 0:
+                self._log.warning(f"REAL_ENTRY ABORTED: rounded size={qty} (was {size}); skipping")
+                return False
+            order = MarketOrder(action, qty)
             order.account = getattr(self, 'stage_account', '') or ''
             trade = ib.placeOrder(self.contract, order)
             s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
@@ -2370,7 +2377,7 @@ class InstrumentRunner:
             self._cancel_order_by_id(s.target_order_id, "target")
 
             close_action = "SELL" if s.position == "LONG" else "BUY"
-            order = MarketOrder(close_action, abs(s.position_size))
+            order = MarketOrder(close_action, int(abs(s.position_size)))
             order.account = getattr(self, 'stage_account', '') or ''
             trade = ib.placeOrder(self.contract, order)
             s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
@@ -2647,7 +2654,7 @@ class InstrumentRunner:
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, abs(s.position_size))
+                        order = MarketOrder(close_action, int(abs(s.position_size)))
                         order.account = getattr(self, 'stage_account', '') or ''
                         order.tif = "IOC"  # Immediate-or-Cancel for urgency
                         trade = ib.placeOrder(self.contract, order)
@@ -2668,7 +2675,7 @@ class InstrumentRunner:
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, abs(s.position_size))
+                        order = MarketOrder(close_action, int(abs(s.position_size)))
                         order.account = getattr(self, 'stage_account', '') or ''
                         order.tif = "GTC"
                         trade = ib.placeOrder(self.contract, order)
