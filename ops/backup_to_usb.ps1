@@ -127,14 +127,17 @@ if (Test-Path $logsSource) {
     Write-BackupLog "Copied $copied log files from last $LogRetentionDays days"
 }
 
-# Step 3: Verify key files exist on backup
+# Step 3: Verify key files exist on backup. Updated 2026-05-01: replaced
+# crypto-era files (engine.py, runner_live.py, state.py, config.py,
+# eth_usd_1m.csv — all removed during 2026-04-24 IBKR conversion) with
+# current architecture's critical files.
 $keyFiles = @(
-    "repo\runner_live.py",
-    "repo\engine.py",
-    "repo\state.py",
-    "repo\config.py",
-    "repo\.env",
-    "repo\data\eth_usd_1m.csv"
+    "repo\argus_flow\runner_unified.py",
+    "repo\argus_flow\configs\hashes.json",
+    "repo\argus_flow\configs\fleet_sizing.json",
+    "repo\helio\ibkr_execution.py",
+    "repo\ops\dashboard.py",
+    "repo\.env"
 )
 $missing = @()
 foreach ($kf in $keyFiles) {
