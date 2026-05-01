@@ -60,6 +60,7 @@ _AUTO_ALLOCATOR_SCRIPT = _REPO / "ops" / "auto_allocator.py"
 _REC_ACTIONS_ALERT_SCRIPT = _REPO / "ops" / "recommended_actions_alert.py"
 _READINESS_EVAL_SCRIPT = _REPO / "ops" / "readiness_eval.py"
 _BLOCK_OUTCOME_SCRIPT = _REPO / "ops" / "block_outcome_tracker.py"
+_BLOCK_OUTCOME_V2_SCRIPT = _REPO / "ops" / "block_outcome_v2.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -221,6 +222,19 @@ def main() -> int:
                             )
                     except Exception as me:
                         log.warning("operational_maturity refresh failed: %s", me)
+                # Block-outcome V2 refresh (yfinance fetch — once a day is enough).
+                # Marker `_last_maturity_day` is shared because both run on the
+                # same daily cadence and we don't need a second flag.
+                if _BLOCK_OUTCOME_V2_SCRIPT.exists():
+                    try:
+                        subprocess.run(
+                            [sys.executable, str(_BLOCK_OUTCOME_V2_SCRIPT)],
+                            cwd=str(_REPO),
+                            capture_output=True,
+                            timeout=180,
+                        )
+                    except Exception as e:
+                        log.warning("block_outcome_v2 refresh failed: %s", e)
             consecutive_failures = 0
             elapsed = time.monotonic() - start
             log.info("cycle %d OK (%.2fs)", cycle, elapsed)

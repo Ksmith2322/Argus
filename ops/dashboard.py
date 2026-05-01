@@ -4649,6 +4649,49 @@ async def api_opportunity_vs_taken(window_days: int = 7):
             "top_block_reasons": [{"reason": k, "count": v} for k, v in top_blocks],
         })
     rows.sort(key=lambda x: -x["signals_evaluated"])
+
+    # Merge follow-through rate from block_outcome_tracker output (30d window).
+    # FT% = blocked signals that had an ENTRY within 120 min after — high FT%
+    # = transient/healthy gate; low FT% = gate held (could be save OR alpha leak).
+    ft_by_strat: dict[str, float] = {}
+    bo_path = REPO / "argus_flow" / "logs" / "block_outcomes_latest.json"
+    try:
+        bo = json.loads(bo_path.read_text(encoding="utf-8"))
+        for s in bo.get("by_strategy", []) or []:
+            name = s.get("strategy")
+            if name:
+                ft_by_strat[name] = float(s.get("follow_through_rate_pct", 0) or 0)
+    except Exception:
+        pass
+
+    # Merge V2 verdict (top-reason gate quality) from block_outcome_v2.
+    # We pick the strategy's HIGHEST-n result and surface its verdict +
+    # mean_counterfactual_pct. Gives a one-glance read on whether the
+    # dominant gate is saving or costing alpha.
+    v2_by_strat: dict[str, dict] = {}
+    v2_path = REPO / "argus_flow" / "logs" / "block_outcomes_v2_latest.json"
+    try:
+        v2 = json.loads(v2_path.read_text(encoding="utf-8"))
+        for r2 in v2.get("results", []) or []:
+            name = r2.get("strategy")
+            if not name:
+                continue
+            existing = v2_by_strat.get(name)
+            if existing is None or r2.get("n_samples", 0) > existing.get("n_samples", 0):
+                v2_by_strat[name] = r2
+    except Exception:
+        pass
+
+    for r in rows:
+        r["follow_through_rate_pct_30d"] = ft_by_strat.get(r["strategy"])
+        v2 = v2_by_strat.get(r["strategy"])
+        if v2:
+            r["v2_top_reason"] = v2.get("reason")
+            r["v2_n_samples"] = v2.get("n_samples")
+            r["v2_mean_cf_pct"] = v2.get("mean_counterfactual_pct")
+            r["v2_save_rate_pct"] = v2.get("save_rate_pct")
+            r["v2_verdict"] = v2.get("verdict")
+
     return JSONResponse({"window_days": window_days, "strategies": rows})
 
 
@@ -10843,23 +10886,49 @@ function loadOpportunity() {
     if (rows.length === 0) { el.innerHTML = ''; return; }
     let html = '<div style="background:#141b2d;border:1px solid #1e2a42;border-radius:6px;padding:10px 14px;">'
       + '<div style="color:#00d4ff;font-weight:bold;font-size:0.85em;letter-spacing:2px;margin-bottom:6px;">OPPORTUNITY vs TAKEN (7d)'
-      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">low take-rate + high block count → filters may be too tight</span></div>'
+      + ' <span style="color:#7b8ab8;font-size:0.85em;font-weight:normal;letter-spacing:1px;margin-left:8px;">FT% (30d) = blocks with ENTRY within 2h → transient gate (healthy). Low FT% = held gate (save or alpha leak).</span></div>'
       + '<table style="width:100%;border-collapse:collapse;font-size:0.74em;">'
       + '<thead><tr style="border-bottom:1px solid #1e2a42;color:#7b8ab8;">'
       + '<th style="text-align:left;padding:5px 6px;">Strategy</th>'
       + '<th style="text-align:right;padding:5px 6px;">Evaluated</th>'
       + '<th style="text-align:right;padding:5px 6px;">Taken</th>'
       + '<th style="text-align:right;padding:5px 6px;">Take rate</th>'
+      + '<th style="text-align:right;padding:5px 6px;" title="Follow-through % (30d): blocks that had an ENTRY within 2 hours">FT% (30d)</th>'
+      + '<th style="text-align:left;padding:5px 6px;" title="V2 verdict on dominant gate: save/cost alpha (price-joined counterfactual)">V2 verdict</th>'
       + '<th style="text-align:left;padding:5px 6px;">Top block reasons</th>'
       + '</tr></thead><tbody>';
     for (const s of rows) {
       const takeColor = s.take_rate_pct >= 5 ? '#00ff88' : (s.take_rate_pct >= 1 ? '#ffc107' : '#ff4444');
       const blocks = (s.top_block_reasons || []).map(b => b.reason + '×' + b.count).join(' · ') || '—';
+      const ft = s.follow_through_rate_pct_30d;
+      let ftCell;
+      if (ft === null || ft === undefined) {
+        ftCell = '<td style="padding:5px 6px;text-align:right;color:#7b8ab8;">—</td>';
+      } else {
+        const ftColor = ft >= 20 ? '#00ff88' : (ft >= 5 ? '#ffc107' : '#ff4444');
+        ftCell = '<td style="padding:5px 6px;text-align:right;color:' + ftColor + ';font-weight:bold;">' + ft.toFixed(1) + '%</td>';
+      }
+      // V2 verdict cell — one-line summary with color cued by category
+      let v2Cell;
+      const v2v = s.v2_verdict;
+      if (!v2v) {
+        v2Cell = '<td style="padding:5px 6px;color:#5a6890;font-size:0.92em;">—</td>';
+      } else {
+        let v2Color = '#9da8c7';
+        if (v2v.startsWith('SAVING')) v2Color = '#00ff88';
+        else if (v2v.startsWith('COSTING')) v2Color = '#ff4444';
+        else if (v2v.startsWith('PROTECTIVE')) v2Color = '#ffc107';
+        const cf = (s.v2_mean_cf_pct !== null && s.v2_mean_cf_pct !== undefined) ? (s.v2_mean_cf_pct >= 0 ? '+' : '') + s.v2_mean_cf_pct.toFixed(2) + '%' : '';
+        const tip = (s.v2_top_reason || '') + ' (n=' + (s.v2_n_samples || 0) + ', cf=' + cf + ')';
+        v2Cell = '<td style="padding:5px 6px;color:' + v2Color + ';font-size:0.92em;" title="' + tip.replace(/"/g, '&quot;') + '">' + v2v.split(' (')[0] + '</td>';
+      }
       html += '<tr style="border-top:1px solid #1e2a42;">'
         + '<td style="padding:5px 6px;color:#e0e0e0;">' + s.strategy + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#9da8c7;">' + s.signals_evaluated + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:#fff;font-weight:bold;">' + s.signals_taken + '</td>'
         + '<td style="padding:5px 6px;text-align:right;color:' + takeColor + ';font-weight:bold;">' + s.take_rate_pct.toFixed(2) + '%</td>'
+        + ftCell
+        + v2Cell
         + '<td style="padding:5px 6px;color:#7b8ab8;font-size:0.92em;">' + blocks + '</td>'
         + '</tr>';
     }

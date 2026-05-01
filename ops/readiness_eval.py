@@ -38,7 +38,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "argus_flow" / "logs" / "readiness_eval_latest.json"
 
-STALE_TASK_DAYS = 7
+# Trigger-aware staleness thresholds. Without these, a weekly task that ran
+# 8 days ago looks "stale" but is actually fine; a Boot trigger always looks
+# stale once you've been up for a week.
+STALE_DAYS_BY_TRIGGER = {
+    "TimeTrigger":   2,   # repeating timers (e.g. ArgusManagedTruth every 3min)
+    "DailyTrigger":  3,   # daily backups, daily WiFi schedule
+    "WeeklyTrigger": 14,  # weekly digest, weekly verify
+    "BootTrigger":   None,  # only fires on boot — age irrelevant; check log freshness
+    "LogonTrigger":  None,  # only fires at logon — same
+    "Unknown":       7,
+}
+DEPRECATED_LAST_RESULT = "4294967295"  # 0xFFFFFFFF = "task did not start" sentinel
 _LIVE_TASKS_CACHE: dict[str, dict] | None = None
 
 
@@ -46,7 +57,7 @@ def _query_live_scheduled_tasks() -> dict[str, dict]:
     """Query Windows Task Scheduler for Argus* tasks. Cached per-process.
 
     Returns {TaskName: {"last_result": str, "last_run_age_days": float|None,
-    "state": str}}. Empty dict if PowerShell unavailable or query fails.
+    "state": str, "trigger_type": str}}. Empty dict if PowerShell unavailable.
     """
     global _LIVE_TASKS_CACHE
     if _LIVE_TASKS_CACHE is not None:
@@ -58,10 +69,12 @@ def _query_live_scheduled_tasks() -> dict[str, dict]:
     ps_cmd = (
         "Get-ScheduledTask -TaskName 'Argus*' -ErrorAction SilentlyContinue | "
         "ForEach-Object { $info = $_ | Get-ScheduledTaskInfo; "
+        "$trig = if ($_.Triggers) { $_.Triggers[0].CimClass.CimClassName -replace 'MSFT_Task','' } else { 'Unknown' }; "
         "[PSCustomObject]@{ "
         "TaskName=$_.TaskName; State=[string]$_.State; "
         "LastTaskResult=$info.LastTaskResult; "
-        "LastRunTime=$info.LastRunTime.ToString('o') } } | "
+        "LastRunTime=$info.LastRunTime.ToString('o'); "
+        "TriggerType=$trig } } | "
         "ConvertTo-Json -Compress"
     )
     try:
@@ -86,7 +99,6 @@ def _query_live_scheduled_tasks() -> dict[str, dict]:
                 lr = datetime.fromisoformat(str(last_run_raw).replace("Z", "+00:00"))
                 if lr.tzinfo is None:
                     lr = lr.replace(tzinfo=timezone.utc)
-                # Epoch sentinel ~ 1999 means "never ran"
                 if lr.year >= 2020:
                     age_days = (now - lr).total_seconds() / 86400.0
             except Exception:
@@ -95,6 +107,7 @@ def _query_live_scheduled_tasks() -> dict[str, dict]:
                 "last_result": str(entry.get("LastTaskResult", "")),
                 "last_run_age_days": age_days,
                 "state": entry.get("State") or "",
+                "trigger_type": entry.get("TriggerType") or "Unknown",
             }
     except Exception:
         pass
@@ -105,17 +118,38 @@ def _query_live_scheduled_tasks() -> dict[str, dict]:
 def _classify_task(t: dict) -> tuple[str, str]:
     """Given a task info dict, return (status, reason).
 
-    status ∈ {PASS, FAIL, STALE, NEVER_RAN}.
+    status ∈ {PASS, FAIL, STALE, NEVER_RAN, DEPRECATED}.
+
+    Trigger-type aware: weekly tasks aren't penalized for being 8 days old;
+    Boot/Logon triggers don't have an "age" health signal at all (their job
+    is to launch a long-running process — once running, the task's age is
+    meaningless).
     """
     age = t.get("last_run_age_days")
     last = str(t.get("last_result", ""))
+    trig = t.get("trigger_type", "Unknown")
+
+    # Sentinel: 0xFFFFFFFF = "task did not start" — usually means deprecated
+    # (action target gone) or runner-already-up collision. Not a runtime fail.
+    if last == DEPRECATED_LAST_RESULT:
+        return ("DEPRECATED", f"last_result=4294967295 (did-not-start; trigger={trig})")
+
     if age is None:
-        return ("NEVER_RAN", "task registered but never executed")
-    if age > STALE_TASK_DAYS:
-        return ("STALE", f"last ran {age:.1f}d ago (>{STALE_TASK_DAYS}d threshold)")
+        return ("NEVER_RAN", f"task registered but never executed (trigger={trig})")
+
+    threshold = STALE_DAYS_BY_TRIGGER.get(trig, 7)
+
+    # Boot/Logon triggers: age doesn't carry health signal — just report state
+    if threshold is None:
+        if last == "0":
+            return ("PASS", f"{trig}: last_result=0 (last fired {age:.1f}d ago)")
+        return ("FAIL", f"{trig}: last_result={last} (last fired {age:.1f}d ago) — process may need restart")
+
+    if age > threshold:
+        return ("STALE", f"last ran {age:.1f}d ago (>{threshold}d threshold for {trig})")
     if last == "0":
-        return ("PASS", f"last_result=0 ({age:.1f}d ago)")
-    return ("FAIL", f"last_result={last} ({age:.1f}d ago)")
+        return ("PASS", f"last_result=0 ({age:.1f}d ago, {trig})")
+    return ("FAIL", f"last_result={last} ({age:.1f}d ago, {trig})")
 
 
 def _safe_load(p: Path) -> dict | None:
@@ -223,32 +257,47 @@ def check_tasks_lastresult(item_n: int, task_name: str) -> dict:
 
 
 def check_9_all_tasks_zero() -> dict:
-    """All ACTIVE scheduled tasks last_result=0. Stale (>7d) tasks excluded."""
+    """All ACTIVE scheduled tasks last_result=0.
+
+    Buckets (trigger-aware via _classify_task):
+      PASS       — counted as healthy
+      FAIL       — counted as failing
+      STALE      — task type expects more frequent runs, didn't happen
+      DEPRECATED — last_result=4294967295 (did-not-start sentinel); excluded
+      NEVER_RAN  — never executed; excluded
+    """
     tasks = _query_live_scheduled_tasks()
     if not tasks:
         return _result(9, "MANUAL", "live task query unavailable (PowerShell error)")
-    active_pass: list[str] = []
-    active_fail: list[str] = []
-    stale: list[str] = []
+    buckets: dict[str, list[str]] = {
+        "PASS": [], "FAIL": [], "STALE": [], "DEPRECATED": [], "NEVER_RAN": [],
+    }
     for name, t in tasks.items():
         status, _ = _classify_task(t)
-        if status == "PASS":
-            active_pass.append(name)
-        elif status == "FAIL":
-            active_fail.append(name)
-        else:
-            stale.append(name)
+        buckets.setdefault(status, []).append(name)
+
+    active_pass = buckets["PASS"]
+    active_fail = buckets["FAIL"]
+    stale = buckets["STALE"]
+    deprecated = buckets["DEPRECATED"]
+
     if active_fail:
         return _result(
             9, "FAIL",
-            f"{len(active_fail)}/{len(active_pass)+len(active_fail)} active tasks failing: {active_fail[:3]} "
-            f"(stale={len(stale)} excluded)",
+            f"{len(active_fail)}/{len(active_pass)+len(active_fail)} active failing: {active_fail[:3]} "
+            f"(stale={len(stale)}, deprecated={len(deprecated)} excluded)",
+        )
+    if stale:
+        return _result(
+            9, "FAIL",
+            f"{len(stale)} tasks stale beyond their trigger window: {stale[:3]} "
+            f"(deprecated={len(deprecated)} excluded)",
         )
     if not active_pass:
-        return _result(9, "MANUAL", f"no active tasks within {STALE_TASK_DAYS}d window (stale={len(stale)})")
+        return _result(9, "MANUAL", f"no active tasks (deprecated={len(deprecated)})")
     return _result(
         9, "PASS",
-        f"all {len(active_pass)} active tasks last_result=0 (stale={len(stale)} excluded)",
+        f"all {len(active_pass)} active tasks last_result=0 (deprecated={len(deprecated)} excluded)",
     )
 
 
