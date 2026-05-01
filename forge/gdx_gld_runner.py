@@ -673,10 +673,41 @@ def _run_signal_only_loop(equity: float) -> None:
     log.info("Signal-only evaluation complete.")
 
 
+def _connect_with_backoff(ib, port: int, max_attempts: int = 12) -> bool:
+    """Connect to TWS with exponential backoff (5s -> 10s -> ... -> 300s cap).
+
+    Returns True on success, False if all attempts exhausted.
+    """
+    delay = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ib.connect("127.0.0.1", port, clientId=IBKR_CLIENT_ID)
+            log.info("Connected to IBKR on attempt %d", attempt)
+            return True
+        except Exception as e:
+            log.warning(
+                "TWS connect attempt %d/%d failed: %s. Retry in %ds...",
+                attempt, max_attempts, e, delay,
+            )
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+    log.error("TWS connect exhausted %d attempts; giving up", max_attempts)
+    return False
+
+
 def _run_ibkr_live_loop(equity: float, port: int) -> None:
     """
     Full IBKR live trading loop. Connects to TWS, subscribes to daily bars,
     evaluates signal at market close, and submits orders.
+
+    Survives transient TWS disconnects: if ib.isConnected() becomes False
+    mid-loop, attempts reconnect-with-backoff before resuming. This is the
+    fix for the recurring "gdx_gld TWS socket dropped overnight" failure
+    — runner used to exit on first socket error and require manual restart.
     """
     try:
         from ib_insync import IB, Stock, MarketOrder, util
@@ -692,8 +723,9 @@ def _run_ibkr_live_loop(equity: float, port: int) -> None:
 
     try:
         log.info(f"Connecting to IBKR at 127.0.0.1:{port} (client_id={IBKR_CLIENT_ID})...")
-        ib.connect("127.0.0.1", port, clientId=IBKR_CLIENT_ID)
-        log.info("Connected to IBKR.")
+        if not _connect_with_backoff(ib, port):
+            log.error("Initial connect failed; aborting")
+            return
 
         ib.qualifyContracts(gdx_contract, gld_contract)
 
@@ -734,7 +766,24 @@ def _run_ibkr_live_loop(equity: float, port: int) -> None:
         log.info("Entering live loop. Evaluating at 16:00 ET daily...")
 
         while True:
-            ib.sleep(10)  # ib_insync event loop
+            # Reconnect-on-drop: if TWS socket died, back off + retry
+            # before doing any ib.* calls (they would raise otherwise).
+            if not ib.isConnected():
+                log.warning("TWS socket lost; attempting reconnect with backoff...")
+                if not _connect_with_backoff(ib, port):
+                    log.error("Reconnect failed; exiting loop so watchdog can respawn")
+                    return
+                try:
+                    ib.qualifyContracts(gdx_contract, gld_contract)
+                except Exception as e:
+                    log.warning("re-qualify after reconnect failed: %s", e)
+                log.info("Reconnected to TWS — resuming live loop")
+
+            try:
+                ib.sleep(10)  # ib_insync event loop
+            except Exception as e:
+                log.warning("ib.sleep raised %s; will attempt reconnect on next iteration", e)
+                continue
 
             now_utc = datetime.now(timezone.utc)
             # Approximate ET (UTC-4 or UTC-5 depending on DST)

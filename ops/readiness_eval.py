@@ -30,11 +30,92 @@ Schedule: hourly via managed_truth_loop (alongside tws_health_probe, etc).
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_PATH = REPO / "argus_flow" / "logs" / "readiness_eval_latest.json"
+
+STALE_TASK_DAYS = 7
+_LIVE_TASKS_CACHE: dict[str, dict] | None = None
+
+
+def _query_live_scheduled_tasks() -> dict[str, dict]:
+    """Query Windows Task Scheduler for Argus* tasks. Cached per-process.
+
+    Returns {TaskName: {"last_result": str, "last_run_age_days": float|None,
+    "state": str}}. Empty dict if PowerShell unavailable or query fails.
+    """
+    global _LIVE_TASKS_CACHE
+    if _LIVE_TASKS_CACHE is not None:
+        return _LIVE_TASKS_CACHE
+    out: dict[str, dict] = {}
+    if sys.platform != "win32":
+        _LIVE_TASKS_CACHE = out
+        return out
+    ps_cmd = (
+        "Get-ScheduledTask -TaskName 'Argus*' -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $info = $_ | Get-ScheduledTaskInfo; "
+        "[PSCustomObject]@{ "
+        "TaskName=$_.TaskName; State=[string]$_.State; "
+        "LastTaskResult=$info.LastTaskResult; "
+        "LastRunTime=$info.LastRunTime.ToString('o') } } | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=30,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            _LIVE_TASKS_CACHE = out
+            return out
+        data = json.loads(res.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        now = datetime.now(timezone.utc)
+        for entry in data:
+            name = entry.get("TaskName")
+            if not name:
+                continue
+            last_run_raw = entry.get("LastRunTime") or ""
+            age_days: float | None = None
+            try:
+                lr = datetime.fromisoformat(str(last_run_raw).replace("Z", "+00:00"))
+                if lr.tzinfo is None:
+                    lr = lr.replace(tzinfo=timezone.utc)
+                # Epoch sentinel ~ 1999 means "never ran"
+                if lr.year >= 2020:
+                    age_days = (now - lr).total_seconds() / 86400.0
+            except Exception:
+                age_days = None
+            out[name] = {
+                "last_result": str(entry.get("LastTaskResult", "")),
+                "last_run_age_days": age_days,
+                "state": entry.get("State") or "",
+            }
+    except Exception:
+        pass
+    _LIVE_TASKS_CACHE = out
+    return out
+
+
+def _classify_task(t: dict) -> tuple[str, str]:
+    """Given a task info dict, return (status, reason).
+
+    status ∈ {PASS, FAIL, STALE, NEVER_RAN}.
+    """
+    age = t.get("last_run_age_days")
+    last = str(t.get("last_result", ""))
+    if age is None:
+        return ("NEVER_RAN", "task registered but never executed")
+    if age > STALE_TASK_DAYS:
+        return ("STALE", f"last ran {age:.1f}d ago (>{STALE_TASK_DAYS}d threshold)")
+    if last == "0":
+        return ("PASS", f"last_result=0 ({age:.1f}d ago)")
+    return ("FAIL", f"last_result={last} ({age:.1f}d ago)")
 
 
 def _safe_load(p: Path) -> dict | None:
@@ -124,44 +205,51 @@ def check_6_canonical_reconciles() -> dict:
 
 
 def check_tasks_lastresult(item_n: int, task_name: str) -> dict:
-    """Generic check: scheduled task last_result=0."""
-    audits = sorted((REPO / "docs" / "audits").glob("*/tasks.json"))
-    if not audits:
-        return _result(item_n, "MANUAL", "no recent full_audit tasks.json")
-    try:
-        tasks = json.loads(audits[-1].read_text(encoding="utf-8"))
-    except Exception:
-        return _result(item_n, "MANUAL", "tasks.json parse error")
+    """Generic check: scheduled task last_result=0 (live PowerShell query)."""
+    tasks = _query_live_scheduled_tasks()
+    if not tasks:
+        return _result(item_n, "MANUAL", "live task query unavailable (PowerShell error)")
     t = tasks.get(task_name)
     if not t:
-        return _result(item_n, "FAIL", f"task '{task_name}' not registered")
-    last = str(t.get("last_result", ""))
-    if last == "0":
-        return _result(item_n, "PASS", f"{task_name} last_result=0")
-    return _result(item_n, "FAIL", f"{task_name} last_result={last}")
+        return _result(item_n, "FAIL", f"task '{task_name}' not registered in Windows")
+    status, reason = _classify_task(t)
+    if status == "PASS":
+        return _result(item_n, "PASS", f"{task_name}: {reason}")
+    if status == "STALE":
+        return _result(item_n, "FAIL", f"{task_name}: {reason} — task may be deprecated")
+    if status == "NEVER_RAN":
+        return _result(item_n, "FAIL", f"{task_name}: {reason}")
+    return _result(item_n, "FAIL", f"{task_name}: {reason}")
 
 
 def check_9_all_tasks_zero() -> dict:
-    """All scheduled tasks last_result=0."""
-    audits = sorted((REPO / "docs" / "audits").glob("*/tasks.json"))
-    if not audits:
-        return _result(9, "MANUAL", "no recent full_audit tasks.json")
-    try:
-        tasks = json.loads(audits[-1].read_text(encoding="utf-8"))
-    except Exception:
-        return _result(9, "MANUAL", "tasks.json parse error")
-    # Defensively handle non-dict entries (some tasks.json values are bare strings)
-    bad = []
-    checked = 0
+    """All ACTIVE scheduled tasks last_result=0. Stale (>7d) tasks excluded."""
+    tasks = _query_live_scheduled_tasks()
+    if not tasks:
+        return _result(9, "MANUAL", "live task query unavailable (PowerShell error)")
+    active_pass: list[str] = []
+    active_fail: list[str] = []
+    stale: list[str] = []
     for name, t in tasks.items():
-        if not isinstance(t, dict):
-            continue
-        checked += 1
-        if str(t.get("last_result", "0")) != "0":
-            bad.append(name)
-    if bad:
-        return _result(9, "FAIL", f"{len(bad)} of {checked} tasks have non-zero last_result: {bad[:3]}")
-    return _result(9, "PASS", f"all {checked} scheduled tasks last_result=0")
+        status, _ = _classify_task(t)
+        if status == "PASS":
+            active_pass.append(name)
+        elif status == "FAIL":
+            active_fail.append(name)
+        else:
+            stale.append(name)
+    if active_fail:
+        return _result(
+            9, "FAIL",
+            f"{len(active_fail)}/{len(active_pass)+len(active_fail)} active tasks failing: {active_fail[:3]} "
+            f"(stale={len(stale)} excluded)",
+        )
+    if not active_pass:
+        return _result(9, "MANUAL", f"no active tasks within {STALE_TASK_DAYS}d window (stale={len(stale)})")
+    return _result(
+        9, "PASS",
+        f"all {len(active_pass)} active tasks last_result=0 (stale={len(stale)} excluded)",
+    )
 
 
 def check_10_no_down_runners() -> dict:
