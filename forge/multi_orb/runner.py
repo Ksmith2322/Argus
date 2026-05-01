@@ -1,10 +1,26 @@
-"""forge_multi_orb — opening-range breakout on 4 instruments simultaneously.
+"""forge_multi_orb — opening-range breakout, QQQ-only (scoped down 2026-05-01).
 
-Tickers: SPY, QQQ, IWM, GLD. Range defined by the 14:30 UTC 5-minute bar
-(NY open). Break above range high → LONG, below → SHORT. Target 1.0 ATR,
-stop 0.5 ATR, max hold 12 bars (60 min).
+Originally traded SPY/QQQ/IWM/GLD. 5/1 ceremony REWORK verdict scoped this
+down to QQQ-only based on the drilldown finding:
+  - QQQ short  (n=10, PF 1.99, +$9.15)   ← keep
+  - QQQ long   (n=14, PF 1.82, +$71.85)  ← keep
+  - SPY long   (n=11, PF 0.95)           dropped
+  - SPY short  (n=9,  PF 0.68)           dropped
+  - IWM short  (n=11, PF 1.01)           dropped (neutral)
+  - GLD short  (n=11, PF 0.44, -$63.30)  dropped (bleeder)
+  - IWM long   (n=6,  PF 0.28, -$71.24)  dropped (bleeder)
+  - GLD long   (n=4,  PF 0.37, -$9.76)   dropped (bleeder)
 
-Cadence target: ~1 signal/instrument/day = 20 signals/week fleet-wide.
+Net effect: QQQ-only would have made +$81 on n=24 over the same period
+the broad strategy lost -$73 over n=99. Re-evaluate at 5/15 — if QQQ-only
+PF stays >= 1.30 over n>=15 post-filter, promote. If no improvement by
+5/31, auto-convert to KILL per ceremony spec.
+
+Range defined by the 14:30 UTC 5-minute bar (NY open). Break above
+range high → LONG, below → SHORT. Target 1.0 ATR, stop 0.5 ATR,
+max hold 12 bars (60 min).
+
+Cadence target post-scope-down: ~1 signal/day = 5 signals/week.
 
 Usage:
     python -m forge.multi_orb.runner --evaluate
@@ -47,8 +63,8 @@ IBKR_CLIENT_ID = 109
 _SIGNAL_ONLY_MODE = False
 
 PARAMS = {
-    "version": "v1",
-    "tickers": ["SPY", "QQQ", "IWM", "GLD"],
+    "version": "v2_qqq_only",  # was "v1" with SPY/QQQ/IWM/GLD; scoped 2026-05-01
+    "tickers": ["QQQ"],  # was ["SPY", "QQQ", "IWM", "GLD"]; QQQ-only per 5/1 REWORK verdict
     "timeframe": "5m",
     "range_start_utc_hour": 14,      # NY open hour
     "range_start_utc_min": 30,       # 14:30 UTC = 9:30 ET
