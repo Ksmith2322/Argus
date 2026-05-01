@@ -790,6 +790,8 @@ def run_live():
 
     log.info(f"tori LIVE mode starting (client_id={IBKR_CLIENT_ID})")
 
+    heartbeat_path = LOG_DIR / "heartbeat.json"
+
     while True:
         try:
             ib = None
@@ -797,6 +799,23 @@ def run_live():
                 ib = ibkr.connect(IBKR_CLIENT_ID)
             except Exception as exc:
                 log.warning("IBKR connect failed: %s", exc)
+
+            # Heartbeat at top of each cycle so the dashboard's stale-detector
+            # doesn't false-flag tori when it's just mid-4hr-sleep (failure mode #5).
+            try:
+                heartbeat_path.write_text(json.dumps({
+                    "system": "tori",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "instruments": list(TICKERS),
+                    "status": "ok",
+                    "mode": "live",
+                    "client_id": IBKR_CLIENT_ID,
+                    "open_trade_count": len(state.get("open_trades", {})),
+                    "trade_count": state.get("trade_count", 0),
+                    "next_cycle_in_s": LOOP_S,
+                }, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
             try:
                 # 1. Manage open positions

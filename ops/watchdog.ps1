@@ -354,7 +354,9 @@ while ($true) {
     # Periodic heartbeat log (every 5 min)
     if ($now.Minute % 5 -eq 0 -and $now.Second -lt 65) {
         $fxStr = if ($fxAlive) { "UP" } else { "DOWN" }
-        $futStr = if ($futuresAlive) { "UP" } else { "DOWN" }
+        # Futures lane was killed in 4/07 fleet consolidation; futuresConfigs.Count == 0
+        # means we're not expecting a futures runner. Don't mis-report DOWN.
+        $futStr = if ($futuresConfigs.Count -eq 0) { "N/A" } elseif ($futuresAlive) { "UP" } else { "DOWN" }
         Log "HEARTBEAT | FX=$fxStr | Futures=$futStr | Port=$portListening | Fresh=$freshCount Stale=$staleCount"
     }
 }
