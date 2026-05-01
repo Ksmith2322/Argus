@@ -96,15 +96,34 @@ CLUSTER_CAPS: dict[str, float] = {
     "INTERNATIONAL_EQ": 1.2,  # tightened from spec 2.0x
 }
 
-SINGLE_INSTRUMENT_CAP_X         = 0.6   # no single non-futures instrument > 60% of equity across the fleet
+SINGLE_INSTRUMENT_CAP_X         = 0.6   # stocks/ETFs — no single position > 60% of equity
 FUTURES_SINGLE_INSTRUMENT_CAP_X = 2.0   # futures cap higher because risk = margin not notional (1 MNQ ~ $54K notional but ~$5.4K margin)
-TOTAL_NOTIONAL_CAP_X            = 5.0   # bumped 3.0→5.0: 1 MNQ + a few stock/FX positions can easily total >3x
+# 2026-05-01: FX needs a separate higher cap. FX risk is bounded by pip-stop
+# distance (15 pips on a $30K notional trade = ~$45 risk), not by notional
+# itself. Treating FX same as stocks (0.6x cap) was blocking argus_gbpusd
+# entries: full-size at $31K exceeded 0.6x but IdealPro min is $25K, leaving
+# no valid trade window. fleet_sizing.json v6 already allows fx 20x anchor;
+# this matches that. Net portfolio risk still bounded by per-trade risk_pct
+# and FX_USD cluster cap.
+FX_SINGLE_INSTRUMENT_CAP_X      = 5.0   # one FX pair up to 5x equity (anchor=$31K -> $155K notional cap)
+TOTAL_NOTIONAL_CAP_X            = 8.0   # bumped 5.0->8.0 to accommodate FX up to 5x + futures + stocks
 
 # Symbols that count as futures for the purposes of the per-instrument cap.
 FUTURES_SYMBOLS: set[str] = {
     "MNQ", "MES", "MYM", "M2K",  # micro futures
     "NQ", "ES",                   # full-size index futures
     "ZN", "ZF", "ZT",             # rate futures
+}
+
+# FX pairs route through FX_SINGLE_INSTRUMENT_CAP_X instead of the stock cap.
+# Match either canonical 6-char form (USDJPY) or dotted form (USD.JPY).
+FX_SYMBOLS: set[str] = {
+    "USDJPY", "EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
+    "EURJPY", "GBPJPY", "CADJPY", "CHFJPY", "AUDJPY", "NZDJPY",
+    "EURGBP", "EURCHF", "EURAUD", "EURCAD", "EURNZD",
+    "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD",
+    "AUDCHF", "AUDCAD", "AUDNZD",
+    "NZDCHF", "NZDCAD", "CADCHF",
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -269,9 +288,17 @@ def would_breach_cluster_cap(
     expo = compute_cluster_exposure()
     sym = symbol.upper()
 
-    # 1. Single-instrument cap (separate cap for futures since they're margin-not-notional risk)
+    # 1. Single-instrument cap. Three regimes by asset class:
+    #   - Futures: 2x (margin-not-notional risk)
+    #   - FX: 5x (pip-stop bounds risk; notional is leverage-implied)
+    #   - Everything else (stocks/ETFs): 0.6x
     sym_after = expo["by_symbol"].get(sym, 0.0) + notional_usd
-    cap_x = FUTURES_SINGLE_INSTRUMENT_CAP_X if sym in FUTURES_SYMBOLS else SINGLE_INSTRUMENT_CAP_X
+    if sym in FUTURES_SYMBOLS:
+        cap_x = FUTURES_SINGLE_INSTRUMENT_CAP_X
+    elif sym in FX_SYMBOLS:
+        cap_x = FX_SINGLE_INSTRUMENT_CAP_X
+    else:
+        cap_x = SINGLE_INSTRUMENT_CAP_X
     sym_cap_usd = cap_x * anchor
     if sym_after > sym_cap_usd:
         return f"SINGLE_INSTRUMENT:{sym}"
