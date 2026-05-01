@@ -39,6 +39,10 @@
     "dist_long_threshold": 0.35,
     "dist_short_threshold": 0.65
   },
+  "hour_filter": {
+    "enabled": false,
+    "_note": "Disabled 2026-04-30: default profitable_hours [0,2,5,10,12,20,21,22,23] only overlaps session [7-20] at 10/12/20, killing 99.95% of signals. Re-enable with backtest-validated hours after 50+ trades."
+  },
   "replay_expectations": {
     "signals_per_day": 18.9,
     "signals_per_day_range": [

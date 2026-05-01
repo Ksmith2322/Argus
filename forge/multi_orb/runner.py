@@ -63,12 +63,12 @@ IBKR_CLIENT_ID = 109
 _SIGNAL_ONLY_MODE = False
 
 PARAMS = {
-    "version": "v2_qqq_only",  # was "v1" with SPY/QQQ/IWM/GLD; scoped 2026-05-01
+    "version": "v3_qqq_window32",  # 2026-04-30: window 24->32 per V2 9152-sample evidence
     "tickers": ["QQQ"],  # was ["SPY", "QQQ", "IWM", "GLD"]; QQQ-only per 5/1 REWORK verdict
     "timeframe": "5m",
     "range_start_utc_hour": 14,      # NY open hour
     "range_start_utc_min": 30,       # 14:30 UTC = 9:30 ET
-    "breakout_window_bars": 24,      # 2 hours (24 × 5m) to detect breakout after range close
+    "breakout_window_bars": 32,      # 2h40m. Was 24 (2hr); V2 found `breakout_window_expired` COSTING ALPHA on n=9152 (mean +0.38% LONG, only 22% saves). The 10:30-11:00 ET window was being prematurely cut.
     "atr_period": 14,
     "hold_bars": 12,                 # 60 min
     "target_atr_mult": 1.0,

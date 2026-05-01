@@ -840,6 +840,11 @@ def run_loop():
                 exhaustion = detect_exhaustion(df_5m, len(df_5m) - 1)
                 consol = detect_consolidation_break(df_5m, len(df_5m) - 1)
 
+                # Critical: backtest mode passes sd_zones; loop+live were missing it.
+                # Without sd_zones, score_confluence skips S/D detection entirely,
+                # and SCOPE_SD_SUPPLY_ZONE_ONLY filter never matches => 0 signals.
+                sd_zones = find_supply_demand_zones(df_h4, lookback_bars=60)
+
                 result = score_confluence(
                     price=current_price,
                     sr_levels=h4_sr,
@@ -849,6 +854,7 @@ def run_loop():
                     trendline_break=False,
                     consolidation_break=consol,
                     gap=None,
+                    sd_zones=sd_zones,
                 )
 
                 log.info(f"  Price={current_price:,.2f} Score={result['score']} "
@@ -973,10 +979,14 @@ def run_live():
                         exhaustion = detect_exhaustion(df_5m, len(df_5m) - 1)
                         consol = detect_consolidation_break(df_5m, len(df_5m) - 1)
 
+                        # Match backtest path — pass sd_zones so SCOPE filter can match
+                        sd_zones = find_supply_demand_zones(df_h4, lookback_bars=60)
+
                         result = score_confluence(
                             price=current_price, sr_levels=h4_sr, fib_levels=fib_levels,
                             structure=h4_structure, exhaustion=exhaustion,
                             trendline_break=False, consolidation_break=consol, gap=None,
+                            sd_zones=sd_zones,
                         )
 
                         if result["tradeable"]:

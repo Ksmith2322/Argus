@@ -54,6 +54,7 @@ PARAMS = {
     "timeframe": "15m",
     "session_start_utc": 14,
     "session_end_utc": 20,
+    "blackout_hours_utc": [17],  # 2026-04-30: stop-loss analysis showed 80% stop rate on n=10 entries at 17 UTC. Excluding this hour until n>=20 confirms pattern.
     "rsi_period": 2,
     "rsi_short_threshold": 85,   # short on pop
     "rsi_long_threshold": 10,    # long on washout (rare)
@@ -154,6 +155,8 @@ def signal_check(df):
     ts = df.index[i]
     if ts.hour < PARAMS["session_start_utc"] or ts.hour >= PARAMS["session_end_utc"]:
         return "none", {"reason": f"outside_session_{ts.hour}"}
+    if ts.hour in PARAMS.get("blackout_hours_utc", []):
+        return "none", {"reason": f"blackout_hour_{ts.hour}"}
     rsi = _rsi(df["Close"], PARAMS["rsi_period"])
     atr_s = _atr(df, PARAMS["atr_period"])
     r = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else None

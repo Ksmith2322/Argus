@@ -420,9 +420,9 @@
         "recommended_actions_section": "In /api/recommended_actions \u2192 look for strategy='apollo' in 'actions'",
         "operational_vetting_section": "In argus_flow/logs/ceremony_prep/operational_vetting_<date>.json \u2192 strategies[?] where strategy='apollo'"
       },
-      "verdict": "OBSERVE",
+      "verdict": "KILL",
       "reasoning": "Thin sample (n=0) \u2014 insufficient evidence for any decision.",
-      "action": "Continue paper. Re-evaluate when n>=10.",
+      "action": "2026-04-30: KILLED per master game plan audit. See project_master_game_plan_20260501.md for reasoning.",
       "named_rework_fix": null,
       "next_review_date": "2026-05-15",
       "auto_filled": true,
@@ -706,9 +706,9 @@
         "recommended_actions_section": "In /api/recommended_actions \u2192 look for strategy='forge_rebalance' in 'actions'",
         "operational_vetting_section": "In argus_flow/logs/ceremony_prep/operational_vetting_<date>.json \u2192 strategies[?] where strategy='forge_rebalance'"
       },
-      "verdict": "OBSERVE",
+      "verdict": "KILL",
       "reasoning": "By-design quiet (event-driven OR research_only mode). Operationally healthy; expected silence given current conditions.",
-      "action": "Continue paper. Track expected fire rate vs actual.",
+      "action": "2026-04-30: KILLED per master game plan audit. See project_master_game_plan_20260501.md for reasoning.",
       "named_rework_fix": null,
       "next_review_date": "2026-05-15",
       "auto_filled": true,
@@ -908,9 +908,9 @@
         "recommended_actions_section": "In /api/recommended_actions \u2192 look for strategy='hermes' in 'actions'",
         "operational_vetting_section": "In argus_flow/logs/ceremony_prep/operational_vetting_<date>.json \u2192 strategies[?] where strategy='hermes'"
       },
-      "verdict": "OBSERVE",
+      "verdict": "KILL",
       "reasoning": "Thin sample (n=0) \u2014 insufficient evidence for any decision.",
-      "action": "Continue paper. Re-evaluate when n>=10.",
+      "action": "2026-04-30: KILLED per master game plan audit. See project_master_game_plan_20260501.md for reasoning.",
       "named_rework_fix": null,
       "next_review_date": "2026-05-15",
       "auto_filled": true,
@@ -948,9 +948,9 @@
         "recommended_actions_section": "In /api/recommended_actions \u2192 look for strategy='titan' in 'actions'",
         "operational_vetting_section": "In argus_flow/logs/ceremony_prep/operational_vetting_<date>.json \u2192 strategies[?] where strategy='titan'"
       },
-      "verdict": "OBSERVE",
+      "verdict": "KILL",
       "reasoning": "Thin sample (n=0) \u2014 insufficient evidence for any decision.",
-      "action": "Continue paper. Re-evaluate when n>=10.",
+      "action": "2026-04-30: KILLED per master game plan audit. See project_master_game_plan_20260501.md for reasoning.",
       "named_rework_fix": null,
       "next_review_date": "2026-05-15",
       "auto_filled": true,
@@ -963,5 +963,15 @@
   "ceremony_run_via": "recommended_then_accepted (operator approved 3/3 recommendations)",
   "n_manual_decisions_filled": 3,
   "review_date_compact": "20260501",
-  "saved_at_utc": "2026-05-01T00:05:44.114317+00:00"
+  "saved_at_utc": "2026-05-01T00:05:44.114317+00:00",
+  "_2026_04_30_amendment": {
+    "note": "Tier 1 KILL applied per master game plan audit",
+    "strategies_killed": [
+      "apollo",
+      "forge_rebalance",
+      "hermes",
+      "titan"
+    ],
+    "amended_at": "2026-04-30T18:30:00+00:00"
+  }
 }

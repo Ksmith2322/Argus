@@ -62,18 +62,32 @@ HOLD_DAYS = 1  # how far ahead to read price
 # Direction is HEURISTIC and reflects the strategy's dominant bias. None
 # means "mixed long/short" — those strategies fall back to absolute-move
 # saved-rate (where save = small move, miss = big move).
+# Note: V2 only picks up strategies whose signals.csv has an "action" column
+# with NO_TRIGGER_* labels. Argus pairs (cadjpy/gbpusd/usdjpy) emit a different
+# schema (ts/price/direction/...) and won't show up here until their runner is
+# updated to emit action labels. Same for mamba (direction column) and gdx_gld
+# (signal column). Listed below for forward compatibility — they're inert until
+# their CSV schema matches.
 SYMBOL_MAP: dict[str, tuple[str, str | None]] = {
     "multi_orb":          ("QQQ",       "LONG"),    # opening-range breakout (post 4/30 QQQ-only)
     "spy_mean_rev":       ("SPY",       "LONG"),    # buys oversold RSI(2)
     "vix_intraday":       ("UVXY",      "LONG"),    # long vol when VIX oversold
-    "nq_overnight":       ("QQQ",       "LONG"),    # overnight long bias
+    "nq_overnight":       ("QQQ",       "LONG"),    # overnight long bias (NQ futures proxy)
     "nq_london_close":    ("QQQ",       "SHORT"),   # afternoon fade
     "gld_pm_long":        ("GLD",       "LONG"),
     "jpy_pm_short":       ("JPY=X",     "SHORT"),   # short USDJPY in PM (historically)
     "aud_asian_breakout": ("AUDUSD=X",  "LONG"),
     "wick_gbpusd":        ("GBPUSD=X",  None),      # wick reversal — both directions
     "fomc_drift":         ("SPY",       None),      # event-driven, mixed direction
-    "mamba":              ("QQQ",       None),      # multi-bias
+    "mamba":              ("YM=F",      None),      # 4/30: YM futures (Dow micro). Mamba scope-down validated on YM only (PF 1.98).
+    # 4/30 expansion: argus FX pairs + tom_international + cuebanks/tori
+    "cadjpy":             ("CADJPY=X",  None),      # MTF range trader, both directions
+    "gbpusd":             ("GBPUSD=X",  None),      # range_accel, both directions
+    "usdjpy":             ("JPY=X",     None),      # MTF, both directions
+    "tori":               ("YM=F",      "LONG"),    # validated subset: Dow LONG only (PF 3.65)
+    "cuebanks":           ("YM=F",      None),      # MYM micro futures, both directions
+    "tom_international":  ("EEM",       "LONG"),    # 6-ETF basket, EEM as proxy
+    "gdx_gld":            ("GDX",       None),      # pairs trade, GDX as primary leg
 }
 
 
@@ -141,7 +155,11 @@ def main() -> int:
 
     # Phase 1: collect blocked signals per (strategy, reason) with their dates
     by_key: dict[tuple[str, str], list[str]] = defaultdict(list)  # date strings
-    for csv_path in sorted((REPO / "forge" / "logs").glob("*/signals.csv")):
+    csv_paths = sorted(
+        list((REPO / "forge" / "logs").glob("*/signals.csv"))
+        + list((REPO / "argus_flow" / "logs").glob("*/signals.csv"))
+    )
+    for csv_path in csv_paths:
         strat = csv_path.parent.name
         if strat not in SYMBOL_MAP:
             continue

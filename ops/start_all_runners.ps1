@@ -49,16 +49,26 @@ $runners = @(
     @{Module='forge.tom_international.runner'; Args=@('--loop')},
     @{Module='forge.wick_gbpusd.runner';      Args=@('--loop')},
     @{Module='forge.vix_revert_runner';       Args=@('--loop')},
-    @{Module='forge.mamba.runner';            Args=@('--loop')},
-    @{Module='forge.tori.runner';             Args=@('--loop')},
+    # 2026-04-30: tori/mamba switched --loop -> --live so signals actually
+    # submit orders. They were silent because --loop is signal-only.
+    @{Module='forge.mamba.runner';            Args=@('--live')},
+    @{Module='forge.tori.runner';             Args=@('--live')},
     @{Module='forge.cuebanks.runner';         Args=@('--loop')},
-    @{Module='forge.rebalance_runner';        Args=@('--loop')},
+    # 2026-04-30: forge.rebalance_runner KILLED — silent calendar-event scanner,
+    # no events pending in May, validated PF 1.31 backtest but execution friction
+    # often eats it. Revisit post-5/31 if Q3 events appear.
+    # @{Module='forge.rebalance_runner';        Args=@('--loop')},
     @{Module='forge.gdx_gld_runner';          Args=@('--live','--loop')},
     @{Module='forge.atlas.runner';            Args=@('--loop','--interval-sec','120')},
-    @{Module='forge.themis.runner';           Args=@('--loop','--interval-min','360')},
-    @{Module='apollo.runner';                 Args=@('--loop','--live')},
-    @{Module='hermes.runner';                 Args=@('--execute','--loop','--interval-min','30')},
-    @{Module='titan.runner';                  Args=@('--loop','--live')}
+    @{Module='forge.themis.runner';           Args=@('--loop','--interval-min','360')}
+    # 2026-04-30: apollo/hermes/titan KILLED. Per master game plan:
+    #   - apollo: earnings calendar scanner, data feed broken Q2 2026, no automated execution
+    #   - hermes: backtest PF=0.88 (NEGATIVE expectancy on 20-trade history)
+    #   - titan: no backtest, no clear edge thesis, stale state
+    # Removed from auto-launch. Re-add manually if reactivated.
+    # @{Module='apollo.runner';                 Args=@('--loop','--live')},
+    # @{Module='hermes.runner';                 Args=@('--execute','--loop','--interval-min','30')},
+    # @{Module='titan.runner';                  Args=@('--loop','--live')}
 )
 
 Log "=== Argus fleet startup (target: $($runners.Count) logical runners) ==="
