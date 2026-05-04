@@ -62,6 +62,7 @@ _READINESS_EVAL_SCRIPT = _REPO / "ops" / "readiness_eval.py"
 _BLOCK_OUTCOME_SCRIPT = _REPO / "ops" / "block_outcome_tracker.py"
 _BLOCK_OUTCOME_V2_SCRIPT = _REPO / "ops" / "block_outcome_v2.py"
 _WATCHDOG_HEALTH_SCRIPT = _REPO / "ops" / "watchdog_health_check.py"
+_FLEET_VS_SPY_SCRIPT = _REPO / "ops" / "daily_fleet_vs_spy.py"
 
 
 INTERVAL_S = 180  # refresh every 3 minutes
@@ -251,6 +252,19 @@ def main() -> int:
                         )
                     except Exception as e:
                         log.warning("block_outcome_v2 refresh failed: %s", e)
+                # Daily fleet-vs-SPY accountability report (Discord on transition).
+                # Headline: "did the bot beat SPY today?" The bigger question per
+                # 5/3 strategy review.
+                if _FLEET_VS_SPY_SCRIPT.exists():
+                    try:
+                        subprocess.run(
+                            [sys.executable, str(_FLEET_VS_SPY_SCRIPT)],
+                            cwd=str(_REPO),
+                            capture_output=True,
+                            timeout=120,
+                        )
+                    except Exception as e:
+                        log.warning("daily_fleet_vs_spy failed: %s", e)
             consecutive_failures = 0
             elapsed = time.monotonic() - start
             log.info("cycle %d OK (%.2fs)", cycle, elapsed)

@@ -63,7 +63,12 @@ $runners = @(
     # @{Module='forge.rebalance_runner';        Args=@('--loop')},
     @{Module='forge.gdx_gld_runner';          Args=@('--live','--loop')},
     @{Module='forge.atlas.runner';            Args=@('--loop','--interval-sec','120')},
-    @{Module='forge.themis.runner';           Args=@('--loop','--interval-min','360')}
+    @{Module='forge.themis.runner';           Args=@('--loop','--interval-min','360')},
+    # 2026-05-03: SPY trend-follower (50/200 SMA regime). Long-equity-beta
+    # sleeve to close the 8.34pp SPY gap. 5y backtest PF 22.19 / 70% capture
+    # of buy-and-hold. Deploy in signal-only first, promote to --live after
+    # 2-3 cycles validate regime detection. 4hr loop is plenty for daily strategy.
+    @{Module='forge.spy_trend_follower.runner'; Args=@('--signal-only','--loop','--interval-min','240')}
     # 2026-04-30: apollo/hermes/titan KILLED. Per master game plan:
     #   - apollo: earnings calendar scanner, data feed broken Q2 2026, no automated execution
     #   - hermes: backtest PF=0.88 (NEGATIVE expectancy on 20-trade history)
