@@ -2430,6 +2430,66 @@ class InstrumentRunner:
             self._log.warning(f"Cancel {label} order {order_id} failed: {exc}")
             return False
 
+    def adopt_orphan_position(self, broker_dir: str, broker_qty: float,
+                              broker_avg_cost: float) -> None:
+        """Adopt a broker-side position into local state.
+
+        Called from reconcile_instruments() when LOCAL_FLAT_BROKER_OPEN is
+        detected — the runner restarted between order-submission and fill,
+        so ib_insync's execDetailsEvent never fired for this fill (the new
+        connection only sees future fills, not past ones from the prior
+        session).
+
+        Sets local position to match broker, derives synthetic stop/target
+        from configured stop_pips/target_pips. Does NOT submit bracket
+        orders to the broker — those would risk firing immediately if
+        price has moved past the synthetic stop. Argus manages the adopted
+        position via time-stop and price monitoring; on next exit the
+        normal close path applies.
+
+        2026-05-04: introduced after Friday's argus FX restart cycle left
+        orphan positions that argus didn't know about, blocking entries
+        via RECON_DRIFT permanently.
+        """
+        s = self.state
+        s.position = broker_dir.upper()
+        s.entry_price = broker_avg_cost
+        s.avg_entry_price = broker_avg_cost
+        s.position_size = abs(broker_qty)
+        s.entry_time = datetime.now(timezone.utc)  # We don't know the real entry time
+        s.timeout_time = (s.entry_time.replace(second=0, microsecond=0)
+                          + timedelta(minutes=self.timeout_min))
+        s.last_signal_time = s.entry_time
+
+        # Synthetic stop/target from config (FX uses pips; futures use bps)
+        if self.uses_pips and self.pip_size > 0 and self.stop_pips > 0:
+            stop_dist = self.stop_pips * self.pip_size
+            target_dist = self.target_pips * self.pip_size if self.target_pips > 0 else stop_dist * 2
+            if broker_dir.upper() == "LONG":
+                s.stop_price = broker_avg_cost - stop_dist
+                s.target_price = broker_avg_cost + target_dist
+            else:  # SHORT
+                s.stop_price = broker_avg_cost + stop_dist
+                s.target_price = broker_avg_cost - target_dist
+            s.hard_stop_price = s.stop_price
+        # else: non-FX adoption — leave stop/target zero, time-stop only
+
+        s.entry_pending = False
+        s.entry_fill_px = broker_avg_cost
+        s.trade_count += 1
+        s.account_equity_at_entry = self._get_account_equity()
+        s.entry_regime = "ADOPTED_ORPHAN"
+        s.sizing_policy = "adopted"
+        s.entry_risk_usd = self._risk_usd_for_size(broker_avg_cost, s.stop_price, s.position_size) \
+            if s.stop_price > 0 else 0.0
+        s.save()
+
+        self._log.warning(
+            f"ADOPTED ORPHAN: {broker_dir.upper()} qty={s.position_size} @ {broker_avg_cost:.5f}  "
+            f"stop={s.stop_price:.5f}  target={s.target_price:.5f}  "
+            f"(synthetic stop/target from config; runner will manage via time-stop and price-watch)"
+        )
+
     def _on_fill(self, trade, fill) -> None:
         """Callback when an order fills. Routes to entry/exit handling."""
         # ── Fill deduplication ──
@@ -3568,8 +3628,24 @@ def reconcile_instruments(ib, instruments: list) -> dict:
                 inst.state.clear_trade_state()
                 inst.state.save()
         elif local_pos == "FLAT" and broker_dir in ("LONG", "SHORT"):
-            result = ReconcileResult.LOCAL_FLAT_BROKER_OPEN
-            detail = f"Orphan: broker has {broker_dir} qty={broker_info['qty']} but runner is FLAT"
+            # 2026-05-04: ADOPT the orphan position into local state instead of
+            # leaving it as UNRESOLVED forever. The orphan exists because the
+            # runner restarted between order-submission and fill, so the fill
+            # callback never fired. Adopting lets argus manage the position
+            # (time-stop, price-watch) instead of permanently blocking entries.
+            try:
+                inst.adopt_orphan_position(
+                    broker_dir, broker_info["qty"], broker_info.get("avg_cost", 0.0)
+                )
+                result = ReconcileResult.CLEAN_OPEN_MATCHED
+                detail = (f"Adopted orphan: {broker_dir} qty={broker_info['qty']} "
+                          f"@ avg {broker_info.get('avg_cost', 0):.5f}")
+            except Exception as exc:
+                # If adoption fails, fall back to original blocking behavior
+                log.error(f"adopt_orphan_position failed for {inst.symbol}: {exc}")
+                result = ReconcileResult.LOCAL_FLAT_BROKER_OPEN
+                detail = (f"Orphan adoption failed: broker has {broker_dir} "
+                          f"qty={broker_info['qty']}, runner FLAT, adopt error={exc}")
         elif local_pos in ("LONG", "SHORT") and broker_dir == "FLAT":
             result = ReconcileResult.LOCAL_OPEN_BROKER_FLAT
             detail = f"Phantom: runner says {local_pos} but broker is FLAT -- forcing local FLAT"
