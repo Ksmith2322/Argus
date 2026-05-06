@@ -4580,14 +4580,20 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             if time.time() - _last_periodic_recon >= 300:
                 _last_periodic_recon = time.time()
                 try:
-                    # Use same normalized key as startup reconciliation
-                    broker_positions = {}
+                    # Use same normalized key as startup reconciliation.
+                    # 2026-05-06: capture avg_cost too so we can adopt orphans
+                    # mid-session (same fix as startup reconcile_instruments).
+                    broker_positions: dict[str, dict] = {}
                     for p in ib.positions():
                         key = _normalize_ib_key(p.contract)
-                        broker_positions[key] = float(p.position)
+                        broker_positions[key] = {
+                            "qty": float(p.position),
+                            "avg_cost": float(getattr(p, "avgCost", 0) or 0),
+                        }
                     for inst in instruments:
                         ib_key = _runner_to_ib_key(inst)
-                        bp = broker_positions.get(ib_key, 0)
+                        bp_info = broker_positions.get(ib_key, {"qty": 0, "avg_cost": 0})
+                        bp = bp_info["qty"]
                         local_pos = inst.state.position
                         broker_flat = (bp == 0)
                         local_flat = (local_pos == "FLAT")
@@ -4596,6 +4602,33 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
                         # local state. Old paper-skip branch removed — drift
                         # check now runs for paper too.
                         if broker_flat != local_flat:
+                            # 2026-05-06: when broker has position and local says FLAT
+                            # (LOCAL_FLAT_BROKER_OPEN), this is the orphan-fill bug
+                            # (fill confirmation lost across reconnect/restart). Adopt
+                            # the position into local state instead of blocking forever.
+                            # The other direction (broker FLAT, local OPEN) is harder
+                            # to auto-resolve safely — we still block on that case.
+                            if not broker_flat and local_flat:
+                                broker_dir = "LONG" if bp > 0 else "SHORT"
+                                try:
+                                    inst.adopt_orphan_position(
+                                        broker_dir, bp, bp_info["avg_cost"]
+                                    )
+                                    log.warning(
+                                        f"RECON_DRIFT RESOLVED: {inst.symbol} adopted "
+                                        f"orphan {broker_dir} qty={bp} @ "
+                                        f"{bp_info['avg_cost']:.5f}"
+                                    )
+                                    inst._recon_blocked = False
+                                    inst._recon_block_reason = ""
+                                    _sync_entry_block_state(inst)
+                                    continue
+                                except Exception as exc:
+                                    log.error(
+                                        f"Runtime orphan adoption failed for "
+                                        f"{inst.symbol}: {exc} — falling back to BLOCK"
+                                    )
+                                    # Fall through to block path
                             log.warning(
                                 f"RECON_DRIFT: {inst.symbol} local={local_pos} "
                                 f"broker_qty={bp} key={ib_key} — BLOCKING ENTRIES"
