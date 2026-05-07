@@ -56,7 +56,9 @@ $runners = @(
     # submit orders. They were silent because --loop is signal-only.
     @{Module='forge.mamba.runner';            Args=@('--live')},
     @{Module='forge.tori.runner';             Args=@('--live')},
-    @{Module='forge.cuebanks.runner';         Args=@('--loop')},
+    # 2026-05-07 audit: cuebanks was still on --loop despite 4/30 sd_zones bug fix.
+    # That's why 0 signals fired post-fix: runner was in signal-only mode all week.
+    @{Module='forge.cuebanks.runner';         Args=@('--live')},
     # 2026-04-30: forge.rebalance_runner KILLED — silent calendar-event scanner,
     # no events pending in May, validated PF 1.31 backtest but execution friction
     # often eats it. Revisit post-5/31 if Q3 events appear.

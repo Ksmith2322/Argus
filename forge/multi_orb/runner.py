@@ -63,12 +63,12 @@ IBKR_CLIENT_ID = 109
 _SIGNAL_ONLY_MODE = False
 
 PARAMS = {
-    "version": "v3_qqq_window32",  # 2026-04-30: window 24->32 per V2 9152-sample evidence
+    "version": "v4_qqq_window24_revert",  # 2026-05-07 audit: v3 window=32 was a NET LOSS (PF 0.78->0.28, -64%). Revert to 24.
     "tickers": ["QQQ"],  # was ["SPY", "QQQ", "IWM", "GLD"]; QQQ-only per 5/1 REWORK verdict
     "timeframe": "5m",
     "range_start_utc_hour": 14,      # NY open hour
     "range_start_utc_min": 30,       # 14:30 UTC = 9:30 ET
-    "breakout_window_bars": 32,      # 2h40m. Was 24 (2hr); V2 found `breakout_window_expired` COSTING ALPHA on n=9152 (mean +0.38% LONG, only 22% saves). The 10:30-11:00 ET window was being prematurely cut.
+    "breakout_window_bars": 24,      # 2hr. v3 tried 32 per V2 counterfactual evidence; live trades disagreed strongly with V2 prediction. Revert to 24 baseline; revisit if V2 model is corrected.
     "atr_period": 14,
     "hold_bars": 12,                 # 60 min
     "target_atr_mult": 1.0,
@@ -205,20 +205,27 @@ def _open(state, ticker, df, direction, ctx, ib=None):
         risk_budget = compute_risk_usd(strategy_label="forge_multi_orb")
     except Exception:
         risk_budget = 300.0
-    stop_dollars = abs(plan_entry - stop)
-    shares = max(1, int(risk_budget / max(stop_dollars, 0.01)))
+    # 2026-05-07 audit: replaced raw `int(risk_budget / stop_dollars)` with
+    # the safe_position_size helper. Old formula produced phantom 1419-share
+    # QQQ orders ($965K notional) on 5/5 because tight stops divided the
+    # risk budget into explosive share counts. New helper uses an ATR-based
+    # sizing floor so a temporarily-compressed stop can't blow up size.
     try:
-        # Multi-symbol fleet caveat: this strategy can hold up to 4 simultaneous
-        # positions. To prevent total fleet exposure from compounding past the
-        # account, divide the per-position cap by the ticker count so the
-        # combined notional stays under 1× anchor.
         cap = max_notional_usd("stock") / max(len(PARAMS["tickers"]), 1)
-        if cap > 0 and plan_entry * shares > cap:
-            shares = max(1, int(cap / max(plan_entry, 1e-6)))
     except Exception:
-        pass
+        cap = None
+    from helio.strategy_common import safe_position_size
+    shares, sizing_policy = safe_position_size(
+        risk_usd=risk_budget,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,  # never size as if stop were tighter than 1×ATR
+        max_notional_usd=cap if cap and cap > 0 else None,
+        point_value_usd=1.0,
+    )
     if shares <= 0:
-        log.warning("SIZE_ZERO: skipping entry for %s", ticker)
+        log.warning("SIZE_ZERO: skipping entry for %s (policy=%s)", ticker, sizing_policy)
         return
 
     entry_px = plan_entry

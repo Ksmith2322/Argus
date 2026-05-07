@@ -87,3 +87,82 @@ def ensure_parent_dir(path: Path) -> Path:
     the path for chaining. A tiny helper, but every runner re-invents it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def safe_position_size(
+    risk_usd: float,
+    entry_px: float,
+    stop_px: float,
+    *,
+    atr: float | None = None,
+    sizing_floor_atr_mult: float = 1.0,
+    abs_floor_per_unit: float = 0.01,
+    max_notional_usd: float | None = None,
+    max_size: int | None = None,
+    point_value_usd: float = 1.0,
+) -> tuple[int, str]:
+    """Compute a position size that is bounded by a stop-distance floor.
+
+    Background (2026-05-07 audit): the naive formula
+        shares = int(risk_usd / abs(entry_px - stop_px))
+    blows up when the stop is unusually tight relative to ATR. On 5/5
+    multi_orb produced sizes 681-1419 QQQ shares ($500K-$965K notional
+    on a $33K account) because stop_distance was $0.21 on a $680 stock.
+    Same bug in nq_london_close produced 417 NQ contracts ($11.7M
+    notional). All paper-side phantoms; broker rejected them. But the
+    underlying math is broken.
+
+    Fix: cap sizing at a per-unit risk no smaller than `sizing_floor_atr_mult * atr`
+    (default 1.0× — at least a "normal" 1-ATR move worth of risk per unit).
+    The actual execution stop can still be tighter (good R:R), but the SIZING
+    math doesn't get to ride a temporarily-compressed stop into 1400 shares.
+
+    Args:
+        risk_usd: dollar risk budget for this trade
+        entry_px: planned entry price
+        stop_px: planned stop price (the actual execution stop)
+        atr: ATR value at entry; if None, sizing_floor_atr_mult is ignored
+        sizing_floor_atr_mult: minimum atr-multiple for sizing (NOT the
+            execution stop). Default 1.0 — never size as if stop were
+            less than 1 ATR away. Use 0.5 if your strategy genuinely
+            needs tighter sizing.
+        abs_floor_per_unit: absolute floor per unit (e.g., $0.01 stocks,
+            0.0001 forex pip). Catches weird zero-ATR cases.
+        max_notional_usd: optional notional cap; size clamped if breached
+        max_size: optional hard size cap
+        point_value_usd: dollar value per point per unit (1.0 stocks/ETF,
+            2.0 MNQ, 5.0 MES, etc.)
+
+    Returns (size, sizing_policy_label). Always returns size >= 0.
+    """
+    actual_dist = abs(float(entry_px) - float(stop_px))
+    floor_dist = 0.0
+    if atr is not None and atr > 0 and sizing_floor_atr_mult > 0:
+        floor_dist = float(atr) * float(sizing_floor_atr_mult)
+    sizing_dist = max(actual_dist, floor_dist, abs_floor_per_unit)
+
+    per_unit_risk = sizing_dist * point_value_usd
+    if per_unit_risk <= 0:
+        return 0, "zero_per_unit_risk"
+
+    raw = float(risk_usd) / per_unit_risk
+    size = max(0, int(raw))
+
+    if floor_dist > actual_dist:
+        policy = "atr_sizing_floor"
+    elif sizing_dist == abs_floor_per_unit:
+        policy = "abs_floor"
+    else:
+        policy = "actual_stop"
+
+    if max_notional_usd is not None and max_notional_usd > 0 and entry_px > 0:
+        cap_size = int(max_notional_usd / float(entry_px))
+        if size > cap_size:
+            size = cap_size
+            policy = "notional_cap"
+
+    if max_size is not None and max_size > 0 and size > max_size:
+        size = max_size
+        policy = "max_size_cap"
+
+    return max(0, size), policy

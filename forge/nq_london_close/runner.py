@@ -216,20 +216,35 @@ def _open(state: dict, df: pd.DataFrame, ctx: dict, ib=None) -> None:
     except Exception:
         risk_budget_usd = 1000.0 * PARAMS["risk_pct_default"] * 1000
 
-    stop_pts = abs(stop - plan_entry)
+    # 2026-05-07 audit: replaced raw `risk_budget / stop_dist` with safe_position_size
+    # helper. Previous formula produced a phantom 417-contract NQ order on 5/5
+    # ($11.7M notional on $33K equity) because stop_pts=10pts × pt_usd=$2 = $20/contract
+    # × 25 contracts buffer somehow misaligned. ATR-based sizing floor prevents
+    # tight-stop explosion. point_value_usd is in PARAMS (5.0 for MNQ — 1pt = $5/contract).
     pt_usd = PARAMS["point_value_usd"]
-    raw_contracts = risk_budget_usd / max(stop_pts * pt_usd, 1e-6)
-    pos_size = max(1, int(round(raw_contracts)))
-
     try:
         cap_usd = max_notional_usd("micro_future")
-        notional = plan_entry * pt_usd * pos_size
-        if cap_usd > 0 and notional > cap_usd:
-            pos_size = max(1, int(cap_usd / max(plan_entry * pt_usd, 1e-6)))
+        # cap is in USD notional; need to convert via pt_usd to share-equivalent
+        # for safe_position_size (which expects a notional cap). Notional per contract
+        # = entry_price * pt_usd, so size cap = cap_usd / (entry_price * pt_usd).
+        # Pass cap_usd directly; helper computes size cap = cap / entry_px which
+        # is wrong for futures (uses point_value). Pass max_size instead.
+        max_contracts_from_cap = int(cap_usd / max(plan_entry * pt_usd, 1e-6)) if cap_usd > 0 else None
     except Exception:
-        pass
+        max_contracts_from_cap = None
+
+    from helio.strategy_common import safe_position_size
+    pos_size, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,  # never size as if stop tighter than 1×ATR
+        max_size=max_contracts_from_cap,
+        point_value_usd=pt_usd,
+    )
     if pos_size <= 0:
-        log.warning("SIZE_ZERO: skipping entry")
+        log.warning("SIZE_ZERO: skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = plan_entry
