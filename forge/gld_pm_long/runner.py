@@ -330,13 +330,21 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     target = plan_entry + PARAMS["target_atr"] * a
     stop = plan_entry - PARAMS["stop_atr"] * a
     risk_budget_usd = compute_risk_usd(strategy_label="forge_gld_pm_long")
-    pos_size = int(risk_budget_usd / max(plan_entry - stop, 0.01))
-    cap_shares = int(max_notional_usd("etf") / plan_entry) if plan_entry > 0 else pos_size
-    if cap_shares > 0 and pos_size > cap_shares:
-        log.warning("NOTIONAL_CAP: GLD shares %d > cap %d", pos_size, cap_shares)
-        pos_size = cap_shares
+    # 2026-05-07 audit: same sizing-formula fix as multi_orb / vix_intraday.
+    # ATR-based sizing floor prevents tight-stop explosion.
+    cap_usd = max_notional_usd("etf") if plan_entry > 0 else None
+    from helio.strategy_common import safe_position_size
+    pos_size, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        max_notional_usd=cap_usd if cap_usd and cap_usd > 0 else None,
+        point_value_usd=1.0,
+    )
     if pos_size <= 0:
-        log.warning("SIZE_ZERO: computed size <= 0, skipping entry")
+        log.warning("SIZE_ZERO: computed size <= 0, skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = plan_entry

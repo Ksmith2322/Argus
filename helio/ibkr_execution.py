@@ -220,6 +220,32 @@ def disconnect(ib: IB) -> None:
         log.warning(f"disconnect raised (ignored): {exc}")
 
 
+def recover_pending_at_startup(ib: IB, strategy: str) -> list[dict]:
+    """Forge-runner startup helper. Resolves any orders this strategy submitted
+    in a prior process whose fills landed during the gap.
+
+    Call once after connect(), before submitting any new orders. Returns the
+    resolved entries (caller logs/ingests them as adopted).
+
+    Safe to call every wake-cycle — only resolves entries belonging to the
+    given strategy and only if broker has a matching position.
+    """
+    try:
+        from helio.pending_fills import reconcile_pending
+        resolved = reconcile_pending(ib, strategy=strategy)
+        for r in resolved:
+            log.warning(
+                f"PENDING_FILL_RESOLVED: strategy={r.get('strategy')} "
+                f"symbol={r.get('symbol')} dir={r.get('direction')} "
+                f"size={r.get('size')} broker_qty={r.get('broker_qty_observed')} "
+                f"order_id={r.get('order_id')} (filled during prior-session gap)"
+            )
+        return resolved
+    except Exception as exc:
+        log.warning(f"recover_pending_at_startup failed (non-fatal): {exc}")
+        return []
+
+
 def make_contract(symbol: str, instrument_type: str) -> Contract:
     """Build a qualified IBKR contract. Caller should ib.qualifyContracts() it.
 
@@ -275,6 +301,7 @@ def submit_bracket(
     price_decimals: int = 5,
     entry_fill_timeout_s: float = 15.0,
     est_entry_px: Optional[float] = None,
+    strategy_label: Optional[str] = None,
 ) -> BracketResult:
     """Submit market entry + protective stop + target limit (true OCO).
 
@@ -386,7 +413,10 @@ def submit_bracket(
 
         try:
             from helio.cluster_exposure import would_breach_cluster_cap
-            breach = would_breach_cluster_cap(contract.symbol, direction, est_notional)
+            breach = would_breach_cluster_cap(
+                contract.symbol, direction, est_notional,
+                strategy_label=strategy_label,
+            )
             if breach:
                 log.warning(
                     f"CLUSTER_CAP_BREACH: {breach} would exceed cap on "
@@ -405,6 +435,28 @@ def submit_bracket(
     if account:
         entry_order.account = account
     entry_trade = ib.placeOrder(contract, entry_order)
+
+    # 2026-05-07 audit: persistent pending-fills queue. Write the order
+    # to disk BEFORE waiting for fill so it survives any crash during the
+    # fill-wait window. Cleared after confirmed fill below.
+    _pending_order_id = str(getattr(entry_trade.order, "orderId", "") or "")
+    try:
+        from helio.pending_fills import write_pending
+        if _pending_order_id and est_entry_px is not None:
+            write_pending(
+                client_id=int(getattr(ib, "client", None) and ib.client.clientId or 0),
+                order_id=_pending_order_id,
+                strategy=strategy_label or "unknown",
+                symbol=contract.symbol,
+                direction=direction,
+                size=float(abs(size)),
+                est_entry_px=float(est_entry_px),
+                stop_px=float(stop_px),
+                target_px=float(target_px),
+            )
+    except Exception as exc:
+        log.warning(f"pending_fills write failed (non-fatal): {exc}")
+
     entry_fill = _wait_for_fill(ib, entry_trade, timeout_s=entry_fill_timeout_s)
 
     if not entry_fill.filled:
@@ -412,7 +464,22 @@ def submit_bracket(
             f"ENTRY NOT FILLED: {entry_action} {size} {contract.symbol} "
             f"reason={entry_fill.reject_reason}"
         )
+        # Clear the pending entry — broker rejected/cancelled, no orphan possible
+        try:
+            from helio.pending_fills import clear_pending
+            if _pending_order_id:
+                clear_pending(order_id=_pending_order_id)
+        except Exception:
+            pass
         return BracketResult(entry=entry_fill)
+
+    # Fill confirmed — clear pending
+    try:
+        from helio.pending_fills import clear_pending
+        if _pending_order_id:
+            clear_pending(order_id=_pending_order_id)
+    except Exception:
+        pass
 
     log.info(
         f"ENTRY FILLED: {entry_action} {size} {contract.symbol} @ {entry_fill.fill_price:.5f} "

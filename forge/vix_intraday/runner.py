@@ -186,16 +186,27 @@ def _open(state, df, direction, ctx, ib=None):
         risk_budget = compute_risk_usd(strategy_label="forge_vix_intraday")
     except Exception:
         risk_budget = 300.0
-    stop_dollars = abs(plan_entry - stop)
-    shares = max(1, int(risk_budget / max(stop_dollars, 0.01)))
+    # 2026-05-07 audit: replaced raw `int(risk_budget / stop_dollars)` with
+    # safe_position_size (same root fix as multi_orb). Vix_intraday on 5/5
+    # produced 1771-1979 share UVXY orders ($65-72K notional on $33K equity)
+    # for the same reason: tight ATR-based stops divided risk into explosive
+    # share counts. ATR sizing floor prevents this.
     try:
         cap = max_notional_usd("stock")
-        if cap > 0 and plan_entry * shares > cap:
-            shares = max(1, int(cap / max(plan_entry, 1e-6)))
     except Exception:
-        pass
+        cap = None
+    from helio.strategy_common import safe_position_size
+    shares, sizing_policy = safe_position_size(
+        risk_usd=risk_budget,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        max_notional_usd=cap if cap and cap > 0 else None,
+        point_value_usd=1.0,
+    )
     if shares <= 0:
-        log.warning("SIZE_ZERO: skipping entry")
+        log.warning("SIZE_ZERO: skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = plan_entry

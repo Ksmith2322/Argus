@@ -138,6 +138,39 @@ LEVERAGED_ETF_SYMBOLS = {"UVXY", "VIXY", "SQQQ", "SPXS", "SPXL", "TQQQ", "SOXL"}
 # IBKR's 10% margin alert threshold. On 5/7 we hit 91% (1.57% cushion).
 MAX_FLEET_MAINT_MARGIN_PCT = 0.5
 
+# Per-strategy notional caps (added 2026-05-07 audit P3).
+# Prevents one strategy from saturating the fleet's total cap.
+# Values are fraction of anchor (e.g. 0.4 = 40% of equity max for one strategy).
+# Strategies not listed default to PER_STRATEGY_DEFAULT_CAP.
+PER_STRATEGY_NOTIONAL_CAP_X: dict[str, float] = {
+    # Stock/ETF strategies — moderate cap
+    "forge_multi_orb":          0.4,   # historically over-stacked QQQ
+    "forge_spy_mean_rev":       0.0,   # KILL'd, factor=0 — keep at 0
+    "forge_vix_intraday":       0.4,   # UVXY positions can be sizeable
+    "forge_gld_pm_long":        0.4,
+    "forge_spy_trend_follower": 0.4,   # 30% allocation per design
+    "forge_fomc_drift":         0.4,
+    "forge_tom_international":  0.5,   # multi-instrument basket needs more headroom
+    # Futures strategies — higher cap because margin/notional is small
+    "forge_nq_overnight":       1.0,   # MNQ futures
+    "forge_nq_london_close":    1.0,   # MNQ futures
+    "forge_mamba":              1.0,   # YM futures
+    "forge_tori":               1.0,   # YM futures
+    "forge_cuebanks":           1.0,   # MYM futures
+    # FX strategies — still high (FX leverage is fine in small notional terms)
+    "argus_cadjpy":             2.0,
+    "argus_gbpusd":             2.0,
+    "argus_usdjpy":             2.0,
+    "forge_jpy_pm_short":       2.0,
+    "forge_aud_asian_breakout": 2.0,
+    "forge_wick_gbpusd":        2.0,
+    # Pairs / special
+    "forge_gdx_gld":            0.6,
+    # Environmentally silent — small caps
+    "forge_vix_revert":         0.3,
+}
+PER_STRATEGY_DEFAULT_CAP = 0.4
+
 # Symbols that count as futures for the purposes of the per-instrument cap.
 FUTURES_SYMBOLS: set[str] = {
     "MNQ", "MES", "MYM", "M2K",  # micro futures
@@ -318,6 +351,7 @@ def would_breach_cluster_cap(
     symbol: str,
     direction: str,
     notional_usd: float,
+    strategy_label: Optional[str] = None,
 ) -> Optional[str]:
     """Pre-trade check: would adding this proposed position breach any cap?
 
@@ -327,6 +361,9 @@ def would_breach_cluster_cap(
 
     Reads the current fleet exposure from heartbeat files. Conservative: the
     proposed notional is added to current exposure, then checked against caps.
+
+    `strategy_label` (optional, e.g. "forge_multi_orb") enables a per-strategy
+    notional cap check — prevents one strategy saturating the fleet cap.
     """
     if notional_usd <= 0 or not symbol:
         return None
@@ -368,6 +405,25 @@ def would_breach_cluster_cap(
     # 3. Total notional catch-all
     if expo["total_notional"] + notional_usd > TOTAL_NOTIONAL_CAP_X * anchor:
         return "TOTAL_NOTIONAL"
+
+    # 3b. Per-strategy notional cap (added 2026-05-07 audit P3).
+    # Sum existing notional from positions tagged with this strategy_label
+    # via heartbeat 'system' field.
+    if strategy_label:
+        cap_x = PER_STRATEGY_NOTIONAL_CAP_X.get(strategy_label, PER_STRATEGY_DEFAULT_CAP)
+        cap_usd = cap_x * anchor
+        if cap_usd > 0:
+            strat_notional = 0.0
+            for p in expo.get("positions", []) or []:
+                ps = (p.get("system") or "").lower()
+                if ps == strategy_label.lower() or ps == strategy_label.replace("forge_", "").lower():
+                    try:
+                        strat_notional += abs(float(p.get("entry_px", 0) or 0)
+                                             * float(p.get("size", 0) or 0))
+                    except Exception:
+                        pass
+            if strat_notional + notional_usd > cap_usd:
+                return f"PER_STRATEGY:{strategy_label}"
 
     # 4. Margin-aware cap (added 2026-05-07 after near-margin-call incident).
     # Estimates total fleet maintenance margin requirement and refuses if

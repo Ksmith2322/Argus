@@ -4262,6 +4262,23 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     log.info(f"Loaded {len(instruments)} instruments ({skipped} skipped)")
     log.info("-" * 70)
 
+    # -- Pending-fills queue reconcile (orphan-fill root fix) ----------
+    # Any entry order submitted in a prior session whose fill arrived
+    # during the gap is recovered here BEFORE reconcile_instruments runs,
+    # so position state is correct when reconcile checks it.
+    try:
+        from helio.pending_fills import reconcile_pending
+        resolved_pending = reconcile_pending(ib)
+        for r in resolved_pending:
+            log.warning(
+                f"PENDING_FILL_RESOLVED: strategy={r.get('strategy')} "
+                f"symbol={r.get('symbol')} dir={r.get('direction')} "
+                f"size={r.get('size')} broker_qty={r.get('broker_qty_observed')} "
+                f"order_id={r.get('order_id')} (filled during prior-session gap)"
+            )
+    except Exception as exc:
+        log.warning(f"reconcile_pending failed (non-fatal): {exc}")
+
     # -- Broker reconciliation gate ------------------------------------
     log.info("Running broker reconciliation...")
     runtime_mode = RuntimeMode.RECONCILING
