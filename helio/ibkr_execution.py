@@ -334,9 +334,34 @@ def submit_bracket(
 
     # Cluster cap pre-trade check (only when caller passes est_entry_px)
     if est_entry_px is not None and est_entry_px > 0:
+        est_notional = float(size) * float(est_entry_px)
+
+        # 2026-05-07: hard sanity cap independent of cluster math. Catches
+        # sizing-layer bugs that produce phantom oversized orders (the
+        # 1,400-share QQQ / 417-contract NQ trades observed in trades.csv
+        # but never actually filled at broker). Threshold: any single order
+        # > 50% of NetLiq notional is refused outright. This is a circuit
+        # breaker — strategies that legitimately need bigger sizing should
+        # split the entry across multiple orders.
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+            if anchor > 0 and est_notional > 0.5 * anchor:
+                log.error(
+                    f"OVERSIZED_ORDER_REJECTED: {direction} {size} "
+                    f"{contract.symbol} notional=${est_notional:,.0f} > "
+                    f"50% of NetLiq=${anchor:,.0f} ({est_notional/anchor*100:.0f}%). "
+                    f"Sizing-layer likely buggy; refusing to submit."
+                )
+                return BracketResult(entry=FillResult(
+                    filled=False,
+                    reject_reason=f"oversized_order:{est_notional:.0f}>{0.5*anchor:.0f}"
+                ))
+        except Exception as exc:
+            log.warning(f"hard size cap check failed (allowing trade): {exc}")
+
         try:
             from helio.cluster_exposure import would_breach_cluster_cap
-            est_notional = float(size) * float(est_entry_px)
             breach = would_breach_cluster_cap(contract.symbol, direction, est_notional)
             if breach:
                 log.warning(

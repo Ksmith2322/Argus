@@ -106,7 +106,12 @@ FUTURES_SINGLE_INSTRUMENT_CAP_X = 2.0   # futures cap higher because risk = marg
 # this matches that. Net portfolio risk still bounded by per-trade risk_pct
 # and FX_USD cluster cap.
 FX_SINGLE_INSTRUMENT_CAP_X      = 5.0   # one FX pair up to 5x equity (anchor=$31K -> $155K notional cap)
-TOTAL_NOTIONAL_CAP_X            = 8.0   # bumped 5.0->8.0 to accommodate FX up to 5x + futures + stocks
+# 2026-05-07: tightened 8.0 -> 1.5. Previous value let the fleet stack so
+# many positions that maintenance-margin cushion crashed to 1.57% — IBKR
+# margin alert + near-forced-liquidation. 1.5x means total fleet notional
+# can be 150% of equity (small leverage allowed), but no more. This is the
+# fleet-wide guardrail that prevents what happened on 5/7 from recurring.
+TOTAL_NOTIONAL_CAP_X            = 1.5
 
 # Symbols that count as futures for the purposes of the per-instrument cap.
 FUTURES_SYMBOLS: set[str] = {
