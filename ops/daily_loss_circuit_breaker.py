@@ -35,10 +35,24 @@ STATE_PATH = REPO / "argus_flow" / "logs" / "_risk" / "circuit_breaker_state.jso
 HALT_PATH = REPO / "argus_flow" / "logs" / "HALT.flag"
 FLATTEN_PATH = REPO / "argus_flow" / "logs" / "FLATTEN_EOD.flag"
 
-# Tier thresholds (% of day-open equity, NEGATIVE values)
-TIER_WARN     = -1.0
-TIER_PAUSE    = -2.0
-TIER_FLATTEN  = -4.0
+# Tier thresholds (% of day-open equity, NEGATIVE values).
+# 2026-05-07 audit: added hysteresis to prevent oscillation. On 5/7 the breaker
+# transitioned 11 times in 6 hours as PnL bounced around the -2% boundary
+# (HALT.flag set/cleared/set/cleared cascading). Hysteresis = stricter exit
+# threshold than entry. Minimum dwell time = once a tier fires, hold for at
+# least N minutes regardless of recovery, so a transient 0.1% rebound can't
+# trigger a tier downgrade.
+TIER_WARN     = -1.0   # entry: enter WARN at -1%
+TIER_PAUSE    = -2.0   # entry: enter PAUSE at -2%
+TIER_FLATTEN  = -4.0   # entry: enter FLATTEN at -4%
+
+# Hysteresis: must recover this far above tier entry to demote
+TIER_PAUSE_EXIT   = -1.5   # exit PAUSE only when pnl > -1.5% (0.5pp gap from entry)
+TIER_FLATTEN_EXIT = -3.0   # exit FLATTEN only when pnl > -3% (1pp gap from entry)
+
+# Minimum dwell time once a tier fires (seconds)
+TIER_PAUSE_MIN_DWELL_S    = 30 * 60       # 30 min
+TIER_FLATTEN_MIN_DWELL_S  = 4 * 60 * 60   # 4 hours
 
 PROBE_CLIENT_ID = 187
 
@@ -107,17 +121,51 @@ def main() -> int:
     open_eq = state["day_open_equity_usd"]
     pnl_pct = (equity - open_eq) / open_eq * 100.0
 
-    # Determine current tier
-    if pnl_pct <= TIER_FLATTEN:
-        tier = "FLATTEN"
-    elif pnl_pct <= TIER_PAUSE:
-        tier = "PAUSE"
-    elif pnl_pct <= TIER_WARN:
-        tier = "WARN"
-    else:
-        tier = "OK"
-
     prev_tier = state.get("current_tier", "OK")
+    last_tier_change_iso = state.get("last_tier_change_ts", state.get("first_probe_ts", now_utc))
+    try:
+        last_change = datetime.fromisoformat(str(last_tier_change_iso).replace("Z", "+00:00"))
+        if last_change.tzinfo is None:
+            last_change = last_change.replace(tzinfo=timezone.utc)
+        dwell_s = (datetime.now(timezone.utc) - last_change).total_seconds()
+    except Exception:
+        dwell_s = 0.0
+
+    # Determine NATURAL tier (what we'd be in given pnl_pct alone)
+    if pnl_pct <= TIER_FLATTEN:
+        natural_tier = "FLATTEN"
+    elif pnl_pct <= TIER_PAUSE:
+        natural_tier = "PAUSE"
+    elif pnl_pct <= TIER_WARN:
+        natural_tier = "WARN"
+    else:
+        natural_tier = "OK"
+
+    # Apply hysteresis + minimum dwell on DEMOTIONS (escalations always fire immediately)
+    tier_rank = {"OK": 0, "WARN": 1, "PAUSE": 2, "FLATTEN": 3}
+    is_escalation = tier_rank[natural_tier] > tier_rank[prev_tier]
+    is_demotion = tier_rank[natural_tier] < tier_rank[prev_tier]
+
+    if is_demotion:
+        # Apply hysteresis exit thresholds
+        if prev_tier == "FLATTEN":
+            # Require pnl > TIER_FLATTEN_EXIT AND minimum dwell
+            if pnl_pct <= TIER_FLATTEN_EXIT or dwell_s < TIER_FLATTEN_MIN_DWELL_S:
+                tier = "FLATTEN"  # hold
+            else:
+                tier = natural_tier
+        elif prev_tier == "PAUSE":
+            if pnl_pct <= TIER_PAUSE_EXIT or dwell_s < TIER_PAUSE_MIN_DWELL_S:
+                tier = "PAUSE"  # hold
+            else:
+                tier = natural_tier
+        else:
+            tier = natural_tier
+    else:
+        tier = natural_tier
+
+    if tier != prev_tier:
+        state["last_tier_change_ts"] = now_utc
     state["current_tier"] = tier
     state["latest_equity_usd"] = equity
     state["latest_pnl_pct"] = round(pnl_pct, 3)

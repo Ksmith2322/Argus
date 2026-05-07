@@ -113,6 +113,31 @@ FX_SINGLE_INSTRUMENT_CAP_X      = 5.0   # one FX pair up to 5x equity (anchor=$3
 # fleet-wide guardrail that prevents what happened on 5/7 from recurring.
 TOTAL_NOTIONAL_CAP_X            = 1.5
 
+# 2026-05-07 audit follow-up: notional caps DON'T approximate margin requirements.
+# A $51K notional fleet with the right mix can have $25K maint margin (76%
+# cushion) or $32K maint margin (5% cushion — margin call zone). Notional
+# alone is a poor proxy. The margin-aware check below estimates IBKR
+# maintenance-margin by asset class and refuses entries that would push
+# total fleet maint margin past `MAX_FLEET_MAINT_MARGIN_PCT` of equity.
+#
+# Per-asset-class ratios (conservative IBKR-Reg-T-ish):
+MAINT_MARGIN_RATIOS = {
+    "stock":          0.25,   # 25% of notional (IBKR Reg-T baseline)
+    "leveraged_etf":  0.90,   # UVXY/VIXY/SQQQ/SPXS — much higher per IBKR
+    "etf":            0.25,   # plain index ETFs
+    "micro_future":   0.10,   # MNQ/MES/MYM ~5-10% margin/notional
+    "future":         0.10,
+    "forex":          0.03,   # FX leverage ~30:1 = ~3% margin/notional
+    "rate_future":    0.05,   # ZN/ZF/ZT
+}
+# Symbols that route to leveraged_etf bucket (higher margin)
+LEVERAGED_ETF_SYMBOLS = {"UVXY", "VIXY", "SQQQ", "SPXS", "SPXL", "TQQQ", "SOXL"}
+
+# Maximum total fleet maint-margin requirement as fraction of NetLiq.
+# 0.5 = 50% of equity in margin requirement = 50% cushion = WELL above
+# IBKR's 10% margin alert threshold. On 5/7 we hit 91% (1.57% cushion).
+MAX_FLEET_MAINT_MARGIN_PCT = 0.5
+
 # Symbols that count as futures for the purposes of the per-instrument cap.
 FUTURES_SYMBOLS: set[str] = {
     "MNQ", "MES", "MYM", "M2K",  # micro futures
@@ -132,6 +157,31 @@ FX_SYMBOLS: set[str] = {
 }
 
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _maint_margin_ratio(symbol: str) -> float:
+    """Estimate IBKR maintenance margin requirement as fraction of notional.
+    Heuristic by symbol shape — leveraged ETFs > stocks > futures > FX."""
+    sym = (symbol or "").upper()
+    if sym in LEVERAGED_ETF_SYMBOLS:
+        return MAINT_MARGIN_RATIOS["leveraged_etf"]
+    if sym in FUTURES_SYMBOLS:
+        return MAINT_MARGIN_RATIOS["micro_future"]
+    if sym in FX_SYMBOLS:
+        return MAINT_MARGIN_RATIOS["forex"]
+    if sym in {"ZN", "ZF", "ZT", "TLT", "IEF"}:
+        return MAINT_MARGIN_RATIOS["rate_future"]
+    return MAINT_MARGIN_RATIOS["stock"]  # default: stocks/ETFs
+
+
+def estimate_fleet_maint_margin_usd() -> float:
+    """Approximate fleet total maintenance margin requirement from open positions."""
+    expo = compute_cluster_exposure()
+    total = 0.0
+    for sym, notional in (expo.get("by_symbol") or {}).items():
+        ratio = _maint_margin_ratio(sym)
+        total += notional * ratio
+    return total
 
 
 def get_cluster_memberships(symbol: str, direction: str) -> list[str]:
@@ -318,5 +368,30 @@ def would_breach_cluster_cap(
     # 3. Total notional catch-all
     if expo["total_notional"] + notional_usd > TOTAL_NOTIONAL_CAP_X * anchor:
         return "TOTAL_NOTIONAL"
+
+    # 4. Margin-aware cap (added 2026-05-07 after near-margin-call incident).
+    # Estimates total fleet maintenance margin requirement and refuses if
+    # adding this trade would push us past MAX_FLEET_MAINT_MARGIN_PCT of equity.
+    # This is the structural protection that notional caps don't provide:
+    # a $51K notional fleet might have $25K or $32K maint margin depending
+    # on asset mix; only the latter is dangerous.
+    try:
+        existing_margin = sum(
+            n * _maint_margin_ratio(s)
+            for s, n in (expo.get("by_symbol") or {}).items()
+        )
+        proposed_margin = notional_usd * _maint_margin_ratio(sym)
+        total_margin_after = existing_margin + proposed_margin
+        margin_cap_usd = MAX_FLEET_MAINT_MARGIN_PCT * anchor
+        if total_margin_after > margin_cap_usd:
+            log.warning(
+                f"MARGIN_CAP_BREACH: existing=${existing_margin:,.0f} + "
+                f"proposed=${proposed_margin:,.0f} = ${total_margin_after:,.0f} "
+                f"> {MAX_FLEET_MAINT_MARGIN_PCT*100:.0f}% of ${anchor:,.0f} "
+                f"= ${margin_cap_usd:,.0f}"
+            )
+            return "MAINT_MARGIN_CAP"
+    except Exception as exc:
+        log.warning(f"margin-aware check failed (allowing trade): {exc}")
 
     return None

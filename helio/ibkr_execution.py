@@ -319,6 +319,30 @@ def submit_bracket(
         )
         return BracketResult(entry=FillResult(filled=False, reject_reason="market_closed"))
 
+    # 2026-05-07 audit: pre-entry broker reconciliation.
+    # If broker already has a position in this contract that the runner
+    # doesn't know about, refuse to enter — submitting another order would
+    # double the position. This is the proactive analog of the post-hoc
+    # orphan adoption logic in argus_flow/runner_unified.py. Strategies
+    # using submit_bracket() don't have argus's reconciliation loop, so
+    # they need a check here. The block reason `orphan_at_broker` flags
+    # the case for operator review.
+    try:
+        existing_qty = query_position(ib, contract)
+        if existing_qty is not None and abs(float(existing_qty)) > 0:
+            log.error(
+                f"ORPHAN_AT_BROKER: refusing entry {direction} {size} "
+                f"{contract.symbol} — broker already has qty={existing_qty}. "
+                f"Strategy state likely diverged from broker. Manual reconcile required."
+            )
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason=f"orphan_at_broker:{existing_qty:.2f}",
+            ))
+    except Exception as exc:
+        # Don't block on a transient query failure — but log it so we know
+        log.warning(f"pre-entry broker query failed (allowing trade): {exc}")
+
     # FX-specific: floor at IdealPro's $25K USD-equivalent minimum lot.
     # Below that, IBKR routes as odd-lot with materially worse spread; we'd
     # rather skip the entry than take a degraded fill.
