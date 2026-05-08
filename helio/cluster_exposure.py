@@ -45,20 +45,37 @@ CLUSTER_MAP: dict[str, dict[str, list[str]]] = {
     "IWM": {"long": ["EQUITY_BETA"], "short": ["EQUITY_BETA_SHORT"]},
 
     # Volatility (UVXY/VIXY are LONG-VIX ETFs; long them = long vol; short them = short vol)
-    "UVXY": {"long": ["LONG_VOL"], "short": ["SHORT_VOL"]},
-    "VIXY": {"long": ["LONG_VOL"], "short": ["SHORT_VOL"]},
+    # 2026-05-07 audit P3 #12: cross-cluster correlation. Long UVXY is also a
+    # short-equity bet (correlation with SPY ~-0.85), so it should ALSO count
+    # toward EQUITY_BETA_SHORT cluster. This is the key fix: previously a
+    # strategy could go long SPY (EQUITY_BETA cap) AND short UVXY (SHORT_VOL
+    # cap) simultaneously and both clear because they're "different clusters",
+    # but they're really the same correlated long-equity-beta bet.
+    "UVXY": {"long": ["LONG_VOL", "EQUITY_BETA_SHORT"],
+             "short": ["SHORT_VOL", "EQUITY_BETA"]},
+    "VIXY": {"long": ["LONG_VOL", "EQUITY_BETA_SHORT"],
+             "short": ["SHORT_VOL", "EQUITY_BETA"]},
+    "SQQQ": {"long": ["EQUITY_BETA_SHORT"], "short": ["EQUITY_BETA"]},  # 3x inverse QQQ
+    "SPXS": {"long": ["EQUITY_BETA_SHORT"], "short": ["EQUITY_BETA"]},  # 3x inverse SPY
+    "SPXL": {"long": ["EQUITY_BETA"], "short": ["EQUITY_BETA_SHORT"]},  # 3x SPY
+    "TQQQ": {"long": ["EQUITY_BETA"], "short": ["EQUITY_BETA_SHORT"]},  # 3x QQQ
+    "SOXL": {"long": ["EQUITY_BETA"], "short": ["EQUITY_BETA_SHORT"]},  # 3x semis (correlates ~0.85 with QQQ)
 
     # Metals
     "GLD": {"long": ["METALS"], "short": ["METALS"]},
     "GDX": {"long": ["METALS"], "short": ["METALS"]},
     "SLV": {"long": ["METALS"], "short": ["METALS"]},
 
-    # International equity
-    "EEM": {"long": ["INTERNATIONAL_EQ"], "short": ["INTERNATIONAL_EQ"]},
-    "EWJ": {"long": ["INTERNATIONAL_EQ"], "short": ["INTERNATIONAL_EQ"]},
-    "VGK": {"long": ["INTERNATIONAL_EQ"], "short": ["INTERNATIONAL_EQ"]},
-    "EFA": {"long": ["INTERNATIONAL_EQ"], "short": ["INTERNATIONAL_EQ"]},
-    "INDA": {"long": ["INTERNATIONAL_EQ"], "short": ["INTERNATIONAL_EQ"]},
+    # International equity. 2026-05-07 audit P3 #12: international equities
+    # have ~0.7 correlation with US equity beta during normal markets, ~0.95
+    # in crisis. Map them into EQUITY_BETA cluster too so the fleet doesn't
+    # think 50% SPY + 50% EEM is "diversified" — it's effectively all
+    # equity-beta in a drawdown.
+    "EEM":  {"long": ["INTERNATIONAL_EQ", "EQUITY_BETA"], "short": ["INTERNATIONAL_EQ", "EQUITY_BETA_SHORT"]},
+    "EWJ":  {"long": ["INTERNATIONAL_EQ", "EQUITY_BETA"], "short": ["INTERNATIONAL_EQ", "EQUITY_BETA_SHORT"]},
+    "VGK":  {"long": ["INTERNATIONAL_EQ", "EQUITY_BETA"], "short": ["INTERNATIONAL_EQ", "EQUITY_BETA_SHORT"]},
+    "EFA":  {"long": ["INTERNATIONAL_EQ", "EQUITY_BETA"], "short": ["INTERNATIONAL_EQ", "EQUITY_BETA_SHORT"]},
+    "INDA": {"long": ["INTERNATIONAL_EQ", "EQUITY_BETA"], "short": ["INTERNATIONAL_EQ", "EQUITY_BETA_SHORT"]},
 
     # Index futures (equity beta) — micro and full
     "MNQ": {"long": ["EQUITY_BETA"], "short": ["EQUITY_BETA_SHORT"]},

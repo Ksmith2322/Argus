@@ -117,7 +117,12 @@ def merge_fleet_snapshots(snapshots: list[dict]) -> dict | None:
                 equity = float(equity)
             except (TypeError, ValueError):
                 equity = float("-inf")
-            if equity >= best_equity:
+            # 2026-05-07 audit: reject zero or negative equity snapshots.
+            # When TWS resets, runners briefly report account={..., net_liquidation_usd: 0}
+            # before re-subscribing. Letting equity=0 win the merge propagated
+            # into fleet_sizing as the sizing anchor, which (correctly) refused
+            # to size, but masked the underlying TWS-reset symptom.
+            if equity > 0 and equity >= best_equity:
                 best_equity = equity
                 best_account = account
 
@@ -134,6 +139,11 @@ def merge_fleet_snapshots(snapshots: list[dict]) -> dict | None:
         "source": "merged_runner_snapshots",
         "broker_connected": any(bool(snap.get("broker_connected")) for snap in snapshots),
         "account": best_account,
+        # 2026-05-07: visibility flag for the "all snapshots had zero equity"
+        # case (TWS reset window). Downstream consumers (risk_oversight,
+        # fleet_sizing) can detect and surface this rather than silently
+        # serving $0 anchor.
+        "equity_unavailable": (best_equity <= 0),
         "positions": merged_positions,
         "open_orders": merged_orders,
         "reconciliation": merged_reconciliation,
