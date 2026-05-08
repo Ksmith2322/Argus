@@ -85,7 +85,9 @@ ZSCORE_STOP     = _RC["ZSCORE_STOP"]  # 3.5 live (diverges from backtest 3.0)
 ZSCORE_LOOKBACK = _RC["ZSCORE_LOOKBACK"]
 
 RISK_PER_TRADE_PCT = 0.02     # 2% of equity
-IBKR_CLIENT_ID = 101          # reserved range 100-199 for forge
+IBKR_CLIENT_ID = 120          # rotated from 101 on 2026-05-08 — TWS locked
+                              # slot 101 stuck after Force-kill cascade.
+                              # See reference_tws_error_326_stale_client_ids.md.
 IBKR_DEFAULT_PORT = 7497      # paper trading
 EVAL_HOUR_ET = 16             # evaluate at market close (4pm ET)
 HEARTBEAT_INTERVAL_S = 60
@@ -440,13 +442,15 @@ class ProcessLock:
         if self.lock_path.exists():
             try:
                 old_pid = int(self.lock_path.read_text().strip())
-                # Check if the old process is still running
+                # On Windows, os.kill(pid, 0) on a dead PID raises SystemError
+                # ("returned a result with an exception set") in addition to OSError.
+                # Treat both as "PID not alive" so stale locks are cleaned up.
                 try:
                     os.kill(old_pid, 0)
                     log.error(f"Another instance is running (PID {old_pid}). "
                               f"Remove {self.lock_path} if stale.")
                     return False
-                except OSError:
+                except (OSError, SystemError):
                     log.warning(f"Stale lock from PID {old_pid}, removing.")
                     self.lock_path.unlink(missing_ok=True)
             except (ValueError, OSError):

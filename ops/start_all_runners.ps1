@@ -47,7 +47,13 @@ $runners = @(
     @{Module='forge.vix_intraday.runner';     Args=@('--loop')},
     @{Module='forge.nq_london_close.runner';  Args=@('--loop')},
     @{Module='forge.aud_asian_breakout.runner'; Args=@('--loop')},
-    @{Module='forge.multi_orb.runner';        Args=@('--loop')},
+    # 2026-05-07: forge.multi_orb.runner KILLED. Already at factor 0.0 via
+    # allocation_factors.json. n=161 real trades, PF=0.83, ROI=-12% (plus 7
+    # phantoms worth -$1,194). Tried v1 24-bar / v3 32-bar / v4 24-bar revert,
+    # plus the safe_position_size sizing-floor fix. Thesis exhausted — equity
+    # ETF opening-range breakout doesn't have edge as configured. Re-add only
+    # if a successor breakout strategy is built with new evidence.
+    # @{Module='forge.multi_orb.runner';        Args=@('--loop')},
     @{Module='forge.fomc_drift.runner';       Args=@('--loop')},
     @{Module='forge.tom_international.runner'; Args=@('--loop')},
     @{Module='forge.wick_gbpusd.runner';      Args=@('--loop')},

@@ -1,0 +1,10 @@
+{
+  "_comment": "Real-money allowlist. Default = empty + global_enabled=false = paper only. Adding a strategy requires (1) a capital_promotion_ledger.jsonl entry, (2) ledger_entry_id field set below, (3) approver+signed_at fields set, (4) global_enabled flipped to true. See helio/real_money.py and project_real_money_boundary.md.",
+  "global_enabled": false,
+  "strategies": [],
+  "max_strategies_real": 1,
+  "ledger_entry_id": "",
+  "approver": "",
+  "signed_at": "",
+  "notes": "Scaffold created 2026-05-07. No strategy authorized for real money. Real account ID also not yet populated (REAL_ACCOUNT_ID=None in helio/real_money.py)."
+}

@@ -973,13 +973,19 @@ RESEARCH_ONLY = False  # 2026-04-26: flipped to False to let it fire and accumul
 
 def write_heartbeat(status: str = "running", extra: dict | None = None):
     """Write heartbeat file."""
+    if "--live" in sys.argv:
+        mode = "live"
+    elif "--loop" in sys.argv:
+        mode = "loop_signal_only"
+    else:
+        mode = "research_only"
     hb = {
         "system": "mamba",
         "version": "v2",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "tickers": TICKERS,
-        "mode": "research_only",
+        "mode": mode,
     }
     if extra:
         hb.update(extra)

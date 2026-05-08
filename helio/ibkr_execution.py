@@ -208,7 +208,12 @@ def connect(client_id: int, timeout: int = 15) -> IB:
         ib.connect(IBKR_HOST, IBKR_PORT, clientId=client_id, timeout=timeout)
         return ib
     except Exception as exc:
-        raise IBKRExecutionError(f"connect failed: {exc}") from exc
+        # Include exception type + repr so empty-message failures (TimeoutError,
+        # asyncio CancelledError, etc.) still surface a diagnosable trace.
+        # Without this, mamba/cuebanks logged "connect failed: connect failed:"
+        # for hours with no clue why — see 2026-05-08 investigation.
+        msg = f"connect failed: {type(exc).__name__}: {exc!r} (host={IBKR_HOST} port={IBKR_PORT} client_id={client_id})"
+        raise IBKRExecutionError(msg) from exc
 
 
 def disconnect(ib: IB) -> None:
@@ -319,6 +324,33 @@ def submit_bracket(
         raise IBKRExecutionError(f"bad direction: {direction!r}")
     if size <= 0:
         raise IBKRExecutionError(f"size must be positive, got {size}")
+
+    # Real-money boundary — no-op for paper connections. For real connections,
+    # validates strategy is allowlisted, allowlist is internally consistent,
+    # and notional is within cap. Any violation rejects the order before any
+    # broker round-trip. See helio/real_money.py and project_real_money_boundary.md.
+    try:
+        from helio.real_money import (
+            enforce_real_money_boundary,
+            AccountBoundaryViolationError,
+        )
+        est_notional_for_boundary = None
+        if est_entry_px is not None and est_entry_px > 0:
+            est_notional_for_boundary = float(size) * float(est_entry_px)
+        enforce_real_money_boundary(
+            ib,
+            strategy_label=strategy_label or "unknown",
+            notional_usd=est_notional_for_boundary,
+        )
+    except AccountBoundaryViolationError as exc:
+        log.error(
+            f"REAL_MONEY_BOUNDARY: refusing {direction} {size} {contract.symbol} "
+            f"strategy={strategy_label} — {exc}"
+        )
+        return BracketResult(entry=FillResult(
+            filled=False,
+            reject_reason=f"real_money_boundary:{str(exc)[:80]}",
+        ))
 
     # Kill-switch — fleet-wide halt. Refuses all new entries; existing positions
     # can still exit via close_position_market.
