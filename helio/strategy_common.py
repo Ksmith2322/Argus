@@ -156,10 +156,14 @@ def safe_position_size(
         policy = "actual_stop"
 
     if max_notional_usd is not None and max_notional_usd > 0 and entry_px > 0:
-        cap_size = int(max_notional_usd / float(entry_px))
-        if size > cap_size:
-            size = cap_size
-            policy = "notional_cap"
+        # Notional per unit = entry_px * point_value_usd (for futures, point
+        # value matters; for stocks point_value_usd=1.0 collapses to entry_px).
+        notional_per_unit = float(entry_px) * float(point_value_usd)
+        if notional_per_unit > 0:
+            cap_size = int(max_notional_usd / notional_per_unit)
+            if size > cap_size:
+                size = cap_size
+                policy = "notional_cap"
 
     if max_size is not None and max_size > 0 and size > max_size:
         size = max_size

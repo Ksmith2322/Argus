@@ -264,9 +264,22 @@ def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float, ib=None) 
     target = plan_entry - PARAMS["target_atr"] * a  # SHORT: target below
     stop = plan_entry + PARAMS["stop_atr"] * a       # SHORT: stop above
     risk_budget_usd = compute_risk_usd(strategy_label="forge_jpy_pm_short")
-    stop_pips = (stop - plan_entry) * (100 if "JPY" in sym else 10000)
-    pip_value = 10.0 if "JPY" in sym else 10.0  # both 100K lot ~$10/pip
-    pos_size = max(1, int(risk_budget_usd / max(stop_pips * pip_value / 100000, 0.001)))
+    # 2026-05-07 audit P3: safe_position_size + ATR floor. USDJPY pip = 0.01.
+    # point_value_usd=0.01 because per_unit_risk = stop_distance * 0.01 (algebra
+    # from existing formula with pip_value=$10/lot and stop_pips=(stop-entry)*100).
+    is_jpy = "JPY" in sym
+    pt_usd = 0.01 if is_jpy else 1.0
+    abs_floor = 0.01 if is_jpy else 0.0001
+    from helio.strategy_common import safe_position_size
+    pos_size, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        abs_floor_per_unit=abs_floor,
+        point_value_usd=pt_usd,
+    )
     usd_jpy_ref = plan_entry if sym == "USDJPY" else None
     notional_per_unit = fx_notional_per_unit_usd(sym, quote_price=plan_entry, usd_jpy_price=usd_jpy_ref)
     cap_units = int(max_notional_usd("fx") / max(notional_per_unit, 1e-9))
@@ -274,7 +287,7 @@ def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float, ib=None) 
         log.warning("NOTIONAL_CAP: %s units %d > cap %d", sym, pos_size, cap_units)
         pos_size = cap_units
     if pos_size <= 0:
-        log.warning("SIZE_ZERO: %s computed size <= 0, skipping entry", sym)
+        log.warning("SIZE_ZERO: %s computed size <= 0, skipping entry (policy=%s)", sym, sizing_policy)
         return
 
     entry_px = plan_entry

@@ -254,14 +254,21 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     target = plan_entry + PARAMS["target_atr"] * a
     stop = plan_entry - PARAMS["stop_atr"] * a
     risk_budget_usd = compute_risk_usd(strategy_label="forge_nq_overnight")
-    stop_dist_pts = plan_entry - stop
-    contracts = max(1, int(risk_budget_usd / (stop_dist_pts * PARAMS["point_value_usd"])))
-    cap_contracts = int(max_notional_usd("micro_future") / (plan_entry * PARAMS["point_value_usd"])) if plan_entry > 0 else contracts
-    if cap_contracts > 0 and contracts > cap_contracts:
-        log.warning("NOTIONAL_CAP: MNQ contracts %d > cap %d", contracts, cap_contracts)
-        contracts = cap_contracts
+    # 2026-05-07 audit P3: safe_position_size + ATR floor prevents
+    # tight-stop contract-count explosion (same root fix as multi_orb).
+    cap_usd = max_notional_usd("micro_future") if plan_entry > 0 else None
+    from helio.strategy_common import safe_position_size
+    contracts, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        max_notional_usd=cap_usd if cap_usd and cap_usd > 0 else None,
+        point_value_usd=float(PARAMS["point_value_usd"]),
+    )
     if contracts <= 0:
-        log.warning("SIZE_ZERO: computed contracts <= 0, skipping entry")
+        log.warning("SIZE_ZERO: computed contracts <= 0, skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = plan_entry

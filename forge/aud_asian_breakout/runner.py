@@ -216,16 +216,30 @@ def _open(state: dict, df: pd.DataFrame, direction: str, ctx: dict, ib=None) -> 
     except Exception:
         risk_budget_usd = 500.0
 
-    pos_size = max(1, int(risk_budget_usd / max(stop_pips * pip_value_per_lot / 100_000, 1e-6)))
+    # 2026-05-07 audit P3: safe_position_size + ATR floor. AUDUSD pip = 0.0001.
+    # point_value_usd=1.0 because per_unit_risk in safe_position_size formula
+    # equals stop_distance for USD-quote FX pairs (algebra: risk_usd / stop_pips
+    # / pip_value_per_unit == risk_usd / (stop_distance_in_price)).
+    from helio.strategy_common import safe_position_size
+    pos_size, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=plan_entry,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        abs_floor_per_unit=0.0001,
+        point_value_usd=1.0,
+    )
     try:
         npu = fx_notional_per_unit_usd(PARAMS["symbol"], quote_price=plan_entry)
         cap_units = int(max_notional_usd("fx") / max(npu, 1e-9))
-        if pos_size > cap_units:
+        if cap_units > 0 and pos_size > cap_units:
+            log.warning("NOTIONAL_CAP: %s units %d > cap %d", PARAMS["symbol"], pos_size, cap_units)
             pos_size = cap_units
     except Exception:
         pass
     if pos_size <= 0:
-        log.warning("SIZE_ZERO: skipping entry")
+        log.warning("SIZE_ZERO: skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = plan_entry

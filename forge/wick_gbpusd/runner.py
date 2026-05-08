@@ -269,16 +269,25 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
     target = entry_anchor + PARAMS["target_atr"] * a
     stop = entry_anchor - PARAMS["stop_atr"] * a
     risk_budget_usd = compute_risk_usd(strategy_label="forge_wick_gbpusd")
-    pip_value = 10.0  # GBPUSD per pip per 100K — approximate
-    stop_distance_pips = (entry_anchor - stop) / 0.0001
-    pos_size = int(risk_budget_usd / (stop_distance_pips * pip_value / 100_000)) if stop_distance_pips > 0 else 0
+    # 2026-05-07 audit P3: safe_position_size + ATR floor. GBPUSD pip = 0.0001.
+    from helio.strategy_common import safe_position_size
+    pos_size, sizing_policy = safe_position_size(
+        risk_usd=risk_budget_usd,
+        entry_px=entry_anchor,
+        stop_px=stop,
+        atr=a,
+        sizing_floor_atr_mult=1.0,
+        abs_floor_per_unit=0.0001,
+        point_value_usd=1.0,
+    )
+    stop_distance_pips = (entry_anchor - stop) / 0.0001  # kept for downstream risk_usd record
     notional_per_unit = fx_notional_per_unit_usd("GBPUSD", quote_price=entry_anchor)
     cap_units = int(max_notional_usd("fx") / max(notional_per_unit, 1e-9)) if entry_anchor > 0 else pos_size
     if cap_units > 0 and pos_size > cap_units:
         log.warning("NOTIONAL_CAP: GBPUSD units %d > cap %d", pos_size, cap_units)
         pos_size = cap_units
     if pos_size <= 0:
-        log.warning("SIZE_ZERO: skipping entry")
+        log.warning("SIZE_ZERO: skipping entry (policy=%s)", sizing_policy)
         return
 
     entry_px = entry_anchor

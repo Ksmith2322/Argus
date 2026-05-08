@@ -996,11 +996,23 @@ def run_live():
                             target_px = float(result["tp1"])
 
                             risk_budget = compute_risk_usd(strategy_label="forge_cuebanks")
-                            stop_dist = abs(entry - stop_px)
-                            contracts = max(1, int(risk_budget / max(stop_dist * POINT_VALUE_MYM, 1e-6)))
-                            cap = max_notional_usd("micro_future")
-                            if cap > 0 and entry * POINT_VALUE_MYM * contracts > cap:
-                                contracts = max(1, int(cap / max(entry * POINT_VALUE_MYM, 1e-6)))
+                            # 2026-05-07 audit P3: safe_position_size with absolute
+                            # 5-point floor (no ATR available in this scope; SD-zone
+                            # stops can be tight on MYM around 38000).
+                            cap_usd = max_notional_usd("micro_future")
+                            from helio.strategy_common import safe_position_size
+                            contracts, sizing_policy = safe_position_size(
+                                risk_usd=risk_budget,
+                                entry_px=entry,
+                                stop_px=stop_px,
+                                atr=None,
+                                abs_floor_per_unit=5.0,
+                                max_notional_usd=cap_usd if cap_usd and cap_usd > 0 else None,
+                                point_value_usd=POINT_VALUE_MYM,
+                            )
+                            if contracts <= 0:
+                                log.warning(f"SIZE_ZERO: cuebanks MYM skipping (policy={sizing_policy})")
+                                continue
 
                             sig = sx.SignalEntry(
                                 symbol="MYM", direction=result["direction"], size=contracts,

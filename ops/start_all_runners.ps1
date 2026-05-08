@@ -63,7 +63,10 @@ $runners = @(
     # no events pending in May, validated PF 1.31 backtest but execution friction
     # often eats it. Revisit post-5/31 if Q3 events appear.
     # @{Module='forge.rebalance_runner';        Args=@('--loop')},
-    @{Module='forge.gdx_gld_runner';          Args=@('--live','--loop')},
+    # 2026-05-07 audit: gdx_gld silent-deaths every ~22:00 UTC. Capture stderr
+    # so the next death leaves a diagnostic trace (asyncio crashes, ib_insync
+    # Connection_lost, segfaults — anything not emitted via Python logger).
+    @{Module='forge.gdx_gld_runner';          Args=@('--live','--loop'); CaptureStderr=$true},
     @{Module='forge.atlas.runner';            Args=@('--loop','--interval-sec','120')},
     @{Module='forge.themis.runner';           Args=@('--loop','--interval-min','360')},
     # 2026-05-03: SPY trend-follower (50/200 SMA regime). Long-equity-beta
@@ -132,7 +135,15 @@ foreach ($r in $runners) {
 
     Log "  LAUNCH $module $($r.Args -join ' ')"
     $argList = @('-m', $module) + $r.Args
-    Start-Process -FilePath $python -ArgumentList $argList -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
+    if ($r.ContainsKey('CaptureStderr') -and $r.CaptureStderr) {
+        $stderrTag = ($module -replace '[\.\\/]', '_')
+        $dateTag = (Get-Date).ToString('yyyyMMdd')
+        $stderrLog = Join-Path $logDir "${stderrTag}_stderr_${dateTag}.log"
+        Log "    stderr -> $stderrLog"
+        Start-Process -FilePath $python -ArgumentList $argList -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden -RedirectStandardError $stderrLog
+    } else {
+        Start-Process -FilePath $python -ArgumentList $argList -WorkingDirectory "C:\Argus\repo" -WindowStyle Hidden
+    }
     Start-Sleep -Milliseconds 800
     $launched++
 }

@@ -1145,12 +1145,21 @@ def run_live():
                                     micro = TICKER_TO_MICRO.get(ticker, ticker)
                                     pt_usd = POINT_VALUES.get(ticker, 0.50)
                                     risk_budget = compute_risk_usd(strategy_label="forge_mamba")
-                                    stop_dist_pts = abs(entry_anchor - stop_px)
-                                    contracts = max(1, int(risk_budget / max(stop_dist_pts * pt_usd, 1e-6)))
-                                    cap = max_notional_usd("micro_future")
-                                    notional = entry_anchor * pt_usd * contracts
-                                    if cap > 0 and notional > cap:
-                                        contracts = max(1, int(cap / max(entry_anchor * pt_usd, 1e-6)))
+                                    # 2026-05-07 audit P3: safe_position_size + ATR floor.
+                                    cap_usd = max_notional_usd("micro_future")
+                                    from helio.strategy_common import safe_position_size
+                                    contracts, sizing_policy = safe_position_size(
+                                        risk_usd=risk_budget,
+                                        entry_px=entry_anchor,
+                                        stop_px=stop_px,
+                                        atr=atr_now,
+                                        sizing_floor_atr_mult=1.0,
+                                        max_notional_usd=cap_usd if cap_usd and cap_usd > 0 else None,
+                                        point_value_usd=pt_usd,
+                                    )
+                                    if contracts <= 0:
+                                        log.warning(f"SIZE_ZERO: mamba {micro} skipping (policy={sizing_policy})")
+                                        continue
 
                                     sig = sx.SignalEntry(
                                         symbol=micro,
