@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -18,7 +19,7 @@ REPO = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO / "argus_flow" / "data"
 
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7496
+IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
 DEFAULT_CLIENT_ID_BASE = 9000
 
 

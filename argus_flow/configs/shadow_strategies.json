@@ -1,0 +1,27 @@
+{
+  "_comment": "Shadow-strategy registry. Default-off: every entry must have global_enabled=false. A shadow strategy evaluates blocked-gate slices as research-only counterfactuals. It does NOT submit orders. Promotion to paper or live requires (1) sample size >= min_n, (2) profit factor >= promotion_pf_threshold sustained over rolling window, (3) ledger entry + signed approval. See ops/research/mtf_long_support_shadow_eval.py and project_real_money_boundary.md.",
+  "shadow_strategies": [
+    {
+      "name": "mtf_long_not_at_support_shadow",
+      "global_enabled": false,
+      "block_reason_filter": "MTF_BLOCKED_MTF_LONG_NOT_AT_SUPPORT",
+      "applicable_symbols": ["GBPUSD", "USDJPY", "CADJPY"],
+      "evaluator_module": "ops.research.mtf_long_support_shadow_eval",
+      "discovered_in": "ops/reports/system_audit/blocked_opportunity_forward_summary.csv (2026-05-08)",
+      "discovery_evidence": {
+        "n_resolved": 13,
+        "win_rate": 0.8462,
+        "expectancy_pips": 2.68,
+        "net_pips": 34.85
+      },
+      "min_sample_for_promotion_review": 50,
+      "promotion_pf_threshold": 1.30,
+      "kill_pf_threshold": 0.95,
+      "rolling_window_days": 14,
+      "approver": "",
+      "ledger_entry_id": "",
+      "signed_at": "",
+      "notes": "Codex audit 2026-05-08 found this slice positive on n=13. Per project_real_money_boundary.md, NEVER promote shadow-only into live without (a) min_n=50 reached, (b) PF holds >=1.30 over the rolling window, (c) ledger entry signed by approver. Disable the gate-filter at runtime ONLY if a writer here is updated AND a corresponding allocation_factors.json entry is set."
+    }
+  ]
+}

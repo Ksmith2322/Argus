@@ -267,3 +267,62 @@ def test_default_allowlist_file_is_paper_only():
     al = rm.load_allowlist()  # default path
     assert al.global_enabled is False
     assert al.strategies == ()
+
+
+# ---------------------------------------------------------------------------
+# real-money mismatch detector
+# ---------------------------------------------------------------------------
+
+def test_mismatch_detector_flags_untagged_position():
+    from helio.real_money_mismatch_daemon import scan_ibkr
+
+    class _Contract:
+        symbol = "SPY"
+
+    class _Position:
+        account = "U1234567"
+        contract = _Contract()
+        position = 3
+        avgCost = 500.0
+
+    class _IB:
+        def positions(self):
+            return [_Position()]
+
+        def trades(self):
+            return []
+
+    positions, violations = scan_ibkr(_IB(), rm.Allowlist(global_enabled=True, strategies=("forge_vix_intraday",)))
+    assert positions[0].symbol == "SPY"
+    assert violations[0].code == "REAL_POSITION_TAG_MISSING"
+
+
+def test_mismatch_detector_accepts_allowlisted_argus_real_tag():
+    from helio.real_money_mismatch_daemon import scan_ibkr
+
+    class _Contract:
+        symbol = "UVXY"
+
+    class _Position:
+        account = "U1234567"
+        contract = _Contract()
+        position = 10
+        avgCost = 20.0
+
+    class _Order:
+        orderRef = "argus-real-forge_vix_intraday-ledger-1"
+
+    class _Trade:
+        contract = _Contract()
+        order = _Order()
+
+    class _IB:
+        def positions(self):
+            return [_Position()]
+
+        def trades(self):
+            return [_Trade()]
+
+    al = rm.Allowlist(global_enabled=True, strategies=("forge_vix_intraday",), ledger_entry_id="ledger-1")
+    _, violations = scan_ibkr(_IB(), al)
+    assert violations == []

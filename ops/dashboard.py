@@ -4247,20 +4247,32 @@ async def api_tws_health():
 
 @app.get("/api/halt_status")
 async def api_halt_status():
-    """Returns whether the fleet kill-switch is engaged and the stated reason."""
-    from helio.ibkr_execution import is_fleet_halted, HALT_FLAG_PATH
-    halted, reason = is_fleet_halted()
+    """Returns whether the fleet kill-switch is engaged and the stated reason.
+
+    Backed by the reconciled halt-state reader so the dashboard panel cannot
+    drift from execution truth. Surfaces every source independently
+    (HALT.flag, FLATTEN_EOD.flag, broker_drift) so the UI can show *why*.
+    """
+    from helio.ibkr_execution import HALT_FLAG_PATH
+    from helio.halt_state import get_halt_state
+    state = get_halt_state()
     set_at = None
-    if halted and HALT_FLAG_PATH.exists():
+    if state.halt_flag_present and HALT_FLAG_PATH.exists():
         try:
             set_at = datetime.fromtimestamp(HALT_FLAG_PATH.stat().st_mtime, tz=timezone.utc).isoformat()
         except Exception:
             pass
     return JSONResponse({
-        "halted": halted,
-        "reason": reason,
+        "halted": state.halted,
+        "reason": state.reason,
         "set_at": set_at,
         "flag_path": str(HALT_FLAG_PATH),
+        "sources": list(state.sources),
+        "halt_flag_present": state.halt_flag_present,
+        "flatten_flag_present": state.flatten_flag_present,
+        "broker_drift_tripped": state.broker_drift_tripped,
+        "broker_drift_state_ts": state.broker_drift_state_ts,
+        "checked_at": state.checked_at,
     })
 
 

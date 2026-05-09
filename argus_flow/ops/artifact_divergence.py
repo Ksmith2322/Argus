@@ -151,11 +151,28 @@ def check_runner(runner: dict) -> dict:
         ):
             result["checks"].append(_check("trade_serial_match", True,
                 f"watcher observe-only; ignoring legacy state trade_count={state_trades}", INFO))
-        elif state_trades != csv_trade_serial:
-            result["checks"].append(_check("trade_serial_match", False,
-                f"state={state_trades} vs csv_last_trade_num={csv_trade_serial}", FAIL))
-        else:
+        elif state_trades == csv_trade_serial:
             result["checks"].append(_check("trade_serial_match", True, f"serial={state_trades}", INFO))
+        elif csv_trade_serial > state_trades:
+            # CSV has trades that state doesn't know about. This is the dangerous
+            # direction — local state lost track of completed trades. Real bug.
+            result["checks"].append(_check("trade_serial_match", False,
+                f"LOST_STATE: state={state_trades} < csv_last_trade_num={csv_trade_serial}", FAIL))
+        elif state_pos == "FLAT":
+            # State counter ahead of CSV while position FLAT. Two known benign
+            # causes: (a) counter increments at signal-eval not at entry (argus
+            # pairs that signal but never fill), (b) leftover counter from a
+            # prior stage. No safety issue while flat — WARN not FAIL so risk
+            # oversight does not escalate to RED on a counter-semantic gap.
+            result["checks"].append(_check("trade_serial_match", False,
+                f"COUNTER_AHEAD_WHILE_FLAT: state={state_trades} > csv_last_trade_num={csv_trade_serial} (no open position)",
+                WARN))
+        else:
+            # State counter ahead of CSV with an OPEN position — possible silent
+            # missed-write to trades.csv. Real divergence.
+            result["checks"].append(_check("trade_serial_match", False,
+                f"state={state_trades} > csv_last_trade_num={csv_trade_serial} with position={state_pos}",
+                FAIL))
 
     # Check 3: P&L consistency (instrument-specific tolerance)
     pnl_tol = runner.get("pip_tolerance", 0.1)

@@ -35,14 +35,10 @@ HALT_FLAG_PATH = Path(__file__).resolve().parents[1] / "argus_flow" / "logs" / "
 
 
 def is_fleet_halted() -> tuple[bool, str]:
-    """Returns (halted, reason). Reason is the file contents if available."""
-    if not HALT_FLAG_PATH.exists():
-        return False, ""
-    try:
-        reason = HALT_FLAG_PATH.read_text(encoding="utf-8").strip()
-    except Exception:
-        reason = "(unable to read flag file)"
-    return True, reason or "no reason provided"
+    """Returns (halted, reason) from the reconciled halt-state reader."""
+    from helio.halt_state import is_fleet_halted as _is_fleet_halted
+
+    return _is_fleet_halted()
 
 
 # FLATTEN_EOD flag — when present, runners should:

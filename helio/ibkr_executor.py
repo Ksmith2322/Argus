@@ -157,6 +157,32 @@ class IBKRExecutor:
         except Exception as exc:
             self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
 
+        # Guard 3: real-money boundary. No-op for paper connections; fail-closed
+        # for real-account connections unless this system is explicitly
+        # allowlisted and within the real-money order cap.
+        try:
+            from helio.real_money import (
+                AccountBoundaryViolationError,
+                enforce_real_money_boundary,
+                real_money_order_tag,
+            )
+            est_notional = float(quantity) * float(entry_price)
+            enforce_real_money_boundary(
+                self._ib,
+                strategy_label=self.system,
+                notional_usd=est_notional,
+            )
+            real_order_ref = real_money_order_tag(self.system)
+        except AccountBoundaryViolationError as exc:
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY: refusing {direction} {quantity} {symbol} "
+                f"system={self.system} — {exc}"
+            )
+            return None
+        except Exception as exc:
+            self._log.warning(f"real-money boundary check failed (allowing paper path): {exc}")
+            real_order_ref = ""
+
         try:
             contract = Stock(symbol, "SMART", "USD")
             self._ib.qualifyContracts(contract)
@@ -177,6 +203,10 @@ class IBKRExecutor:
             if order_type == "MKT":
                 bracket.parent.orderType = "MKT"
                 bracket.parent.lmtPrice = 0
+
+            if real_order_ref:
+                for o in bracket:
+                    o.orderRef = real_order_ref
 
             # Submit all 3 orders
             for o in bracket:
@@ -214,6 +244,31 @@ class IBKRExecutor:
 
             action = "BUY" if direction.lower() == "long" else "SELL"
             order = MarketOrder(action, quantity)
+
+            try:
+                from helio.real_money import (
+                    AccountBoundaryViolationError,
+                    enforce_real_money_boundary,
+                    real_money_order_tag,
+                )
+                price = self.get_current_price(symbol) or 0.0
+                enforce_real_money_boundary(
+                    self._ib,
+                    strategy_label=self.system,
+                    notional_usd=(float(quantity) * float(price)) if price else None,
+                )
+                tag = real_money_order_tag(self.system)
+                if tag:
+                    order.orderRef = tag
+            except AccountBoundaryViolationError as exc:
+                self._log.error(
+                    f"REAL_MONEY_BOUNDARY: refusing market {direction} {quantity} "
+                    f"{symbol} system={self.system} — {exc}"
+                )
+                return None
+            except Exception as exc:
+                self._log.warning(f"real-money boundary check failed (allowing paper path): {exc}")
+
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
 

@@ -33,7 +33,16 @@ SUSTAINED_MINUTES = 60       # ...for 60 min triggers action
 PROBE_CLIENT_ID = 184
 
 
-def _read_broker_equity() -> float | None:
+def _read_broker_equity_and_unrealized() -> tuple[float | None, float]:
+    """Returns (NetLiquidation, sum_unrealized_pnl_open_positions).
+
+    NetLiquidation already includes mark-to-market on open positions, so for the
+    drift formula we need the matching open-unrealized adjustment on the
+    expected side. Without this, profitable open trades trip the drift halt
+    even when local state and broker are in perfect agreement
+    (false-positive observed 2026-05-08: SPY+GLD+UVXY together produced
+    +$1,086 unrealized that wasn't in the realized-only expected formula).
+    """
     try:
         from ib_insync import IB
         port = int(os.getenv("IBKR_PORT", "7497"))
@@ -42,13 +51,26 @@ def _read_broker_equity() -> float | None:
         try:
             summary = ib.accountSummary()
             netliq_tag = next((t for t in summary if t.tag == "NetLiquidation"), None)
-            return float(netliq_tag.value) if netliq_tag else None
+            netliq = float(netliq_tag.value) if netliq_tag else None
+            try:
+                portfolio = ib.portfolio()
+                unrealized = sum(float(p.unrealizedPNL or 0) for p in portfolio)
+            except Exception as e:
+                print(f"  warn: portfolio read failed (treating unrealized=0): {e}")
+                unrealized = 0.0
+            return netliq, unrealized
         finally:
             try: ib.disconnect()
             except: pass
     except Exception as e:
         print(f"  warn: broker equity read failed: {e}")
-        return None
+        return None, 0.0
+
+
+def _read_broker_equity() -> float | None:
+    """Backwards-compat shim. Prefer _read_broker_equity_and_unrealized()."""
+    netliq, _ = _read_broker_equity_and_unrealized()
+    return netliq
 
 
 def _expected_equity_from_fills(reset_anchor: float, since_ts: datetime) -> tuple[float, int]:
@@ -95,7 +117,7 @@ def _save_state(d: dict) -> None:
 
 def main() -> int:
     now = datetime.now(timezone.utc)
-    broker_eq = _read_broker_equity()
+    broker_eq, open_unrealized = _read_broker_equity_and_unrealized()
     if broker_eq is None or broker_eq <= 0:
         print(f"FAIL: broker equity unavailable")
         return 1
@@ -114,7 +136,11 @@ def main() -> int:
         except Exception:
             pass
 
-    expected, n_counted = _expected_equity_from_fills(reset_anchor, since_ts)
+    expected_realized, n_counted = _expected_equity_from_fills(reset_anchor, since_ts)
+    # Include broker-reported unrealized PnL on open positions so that
+    # profitable trades-in-flight don't look like state divergence. The argus
+    # per-pair RECON_DRIFT logic still catches orphan-fill cases independently.
+    expected = expected_realized + open_unrealized
     divergence_usd = broker_eq - expected
     divergence_pct = (divergence_usd / broker_eq * 100) if broker_eq else 0
     abs_pct = abs(divergence_pct)
@@ -167,6 +193,8 @@ def main() -> int:
         "ts": now.isoformat(),
         "broker_equity_usd": broker_eq,
         "expected_equity_usd": expected,
+        "expected_realized_only_usd": expected_realized,
+        "open_unrealized_pnl_usd": round(open_unrealized, 2),
         "reset_anchor_usd": reset_anchor,
         "since_ts": since_ts.isoformat(),
         "n_trades_counted": n_counted,

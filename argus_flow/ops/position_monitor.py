@@ -234,11 +234,35 @@ def main():
             "broker_reconciliation": state.get("broker_reconciliation", ""),
         })
 
-    # Check for orphaned IBKR positions not tracked by any runner
+    # Check for orphaned IBKR positions not tracked by any runner.
+    # Scope: argus is the FX-runner family. Equity (UVXY/GLD/SPY/...) and
+    # futures positions belong to forge runners which manage their own state
+    # in-process — they are out of scope for this monitor and would otherwise
+    # produce false-positive ORPHAN alerts. FX symbols use base.quote canonical
+    # form (e.g. "GBP.USD"); equity/futures symbols are bare (e.g. "UVXY").
     tracked_symbols = {r["ib_canonical"] for r in _managed_runners()}
     for sym, pos in ibkr_positions.items():
-        if sym not in tracked_symbols and pos.get("direction") != "FLAT":
-            alerts.append(f"ORPHAN: IBKR has {pos['direction']} in {sym} — not tracked by any runner!")
+        if pos.get("direction") == "FLAT":
+            continue
+        is_fx_canonical = "." in sym
+        if not is_fx_canonical:
+            # forge-owned (equity/future). Log INFO so it shows up in the report
+            # but does not trigger CRITICAL on the argus position monitor.
+            results.append({
+                "name": f"forge_position:{sym}",
+                "runner_position": "(forge-owned)",
+                "ibkr_position": pos["direction"],
+                "alive": True,
+                "mismatch": False,
+                "severity": "INFO",
+                "state_read_error": False,
+                "heartbeat_age_s": 0,
+                "broker_state_age_s": None,
+                "broker_reconciliation": "out_of_scope_for_argus_monitor",
+            })
+            continue
+        if sym not in tracked_symbols:
+            alerts.append(f"ORPHAN: IBKR has {pos['direction']} in {sym} — not tracked by any argus FX runner!")
             has_critical = True
 
     if alerts:

@@ -53,6 +53,7 @@ class SignalEntry:
     instrument_type: str = "etf"   # "etf" / "stock" / "fx" / "future" / "micro_future"
     price_decimals: int = 2
     max_hold_bars: Optional[int] = None  # None = no time stop
+    strategy_label: str = "signal_executor"
 
 
 def submit_signal(state: dict, ib, signal: SignalEntry) -> bool:
@@ -87,6 +88,8 @@ def submit_signal(state: dict, ib, signal: SignalEntry) -> bool:
                 ib, contract, direction=signal.direction, size=signal.size,
                 stop_px=signal.stop_px, target_px=signal.target_px,
                 price_decimals=signal.price_decimals,
+                est_entry_px=(signal.stop_px + signal.target_px) / 2,
+                strategy_label=signal.strategy_label,
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED %s: %s", signal.symbol, result.entry.reject_reason)
