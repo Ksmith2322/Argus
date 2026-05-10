@@ -2358,6 +2358,28 @@ class InstrumentRunner:
             self._log.error(f"BRACKET FAILED: {exc}", exc_info=True)
             return False
 
+    def _build_exit_order(self, close_action: str, qty: int, ref_px: float, tif: str = "DAY"):
+        """Build the right exit order for this instrument type.
+
+        FX (CASH on IdealPro): wide LimitOrder + outsideRth=True. MarketOrder
+        on FX can stall around session boundaries — the symptom we saw
+        2026-05-08 (orders 296/299/303/307 timing out with "EXIT TIMEOUT" →
+        "EXIT STUCK" → "EXIT FAILED: MANUAL BROKER CHECK REQUIRED"). LMT with
+        a 5% adverse buffer fills at NBBO without sitting in the queue.
+
+        STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles itself).
+        """
+        sec_type = getattr(self.contract, "secType", "") or ""
+        if sec_type == "CASH":
+            buffer = 1.05 if close_action == "BUY" else 0.95
+            lmt = round(float(ref_px or 1.0) * buffer, 5)
+            order = LimitOrder(close_action, qty, lmt)
+            order.outsideRth = True
+        else:
+            order = MarketOrder(close_action, qty)
+        order.tif = tif
+        return order
+
     def _submit_real_exit(self, reason: str, mid: float) -> bool:
         """Cancel existing bracket orders and submit a market exit."""
         s = self.state
@@ -2377,7 +2399,8 @@ class InstrumentRunner:
             self._cancel_order_by_id(s.target_order_id, "target")
 
             close_action = "SELL" if s.position == "LONG" else "BUY"
-            order = MarketOrder(close_action, int(abs(s.position_size)))
+            ref_px = mid if mid and mid > 0 else (s.entry_price or 0)
+            order = self._build_exit_order(close_action, int(abs(s.position_size)), ref_px, tif="DAY")
             order.account = getattr(self, 'stage_account', '') or ''
             trade = ib.placeOrder(self.contract, order)
             s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
@@ -2710,13 +2733,21 @@ class InstrumentRunner:
                         f"cancelling and retrying with aggressive MKT"
                     )
                     self._cancel_order_by_id(s.exit_order_id, "exit_timeout")
-                    # Retry with a fresh market order
+                    # Retry with the right order type for this instrument
+                    # (FX => LimitOrder + outsideRth, equity/futures => MarketOrder).
+                    # Equity/futures still use IOC tif here for urgency; FX
+                    # cannot use IOC (IdealPro rejects it on FX) so the helper
+                    # downgrades CASH to DAY.
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, int(abs(s.position_size)))
+                        ref_px = s.entry_price or s.target_price or 0
+                        sec_type = getattr(self.contract, "secType", "") or ""
+                        retry_tif = "DAY" if sec_type == "CASH" else "IOC"
+                        order = self._build_exit_order(
+                            close_action, int(abs(s.position_size)), ref_px, tif=retry_tif,
+                        )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        order.tif = "IOC"  # Immediate-or-Cancel for urgency
                         trade = ib.placeOrder(self.contract, order)
                         s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
                         s.exit_submitted_ts = now.isoformat()
@@ -2735,9 +2766,11 @@ class InstrumentRunner:
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, int(abs(s.position_size)))
+                        ref_px = s.entry_price or s.target_price or 0
+                        order = self._build_exit_order(
+                            close_action, int(abs(s.position_size)), ref_px, tif="GTC",
+                        )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        order.tif = "GTC"
                         trade = ib.placeOrder(self.contract, order)
                         s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
                         s.exit_submitted_ts = now.isoformat()
