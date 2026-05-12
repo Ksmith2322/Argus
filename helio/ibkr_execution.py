@@ -94,6 +94,33 @@ _BASE_TO_USD = {
     "JPY": 0.0067,
 }
 
+# Futures contract multipliers — USD per index point. Used to convert
+# `size × price` (which would equal index_value * contracts) into actual
+# USD notional. Stocks/ETFs/FX get multiplier=1.0 (default).
+#
+# E-minis: ES=$50/pt, NQ=$20/pt, YM=$5/pt, RTY=$50/pt (full size)
+# Micros:  MES=$5/pt, MNQ=$2/pt, MYM=$0.50/pt, M2K=$5/pt
+# Rates:   ZN/ZF/ZT use $1000/pt notional but trade in 1/32 ticks; treated
+#          conservatively at 1.0 here since strategies trading them are
+#          rare. Refine if a runner needs precision on them.
+_FUTURES_MULTIPLIER_USD_PER_POINT: dict[str, float] = {
+    "MYM": 0.50,
+    "MES": 5.00,
+    "MNQ": 2.00,
+    "M2K": 5.00,
+    "YM":  5.00,
+    "ES":  50.00,
+    "NQ":  20.00,
+    "RTY": 50.00,
+}
+
+
+def _futures_multiplier(symbol: str) -> float:
+    """Return USD-per-index-point multiplier for a futures symbol, or 1.0 for
+    non-futures (stocks, ETFs, FX). 1.0 means ``size × price`` already equals
+    USD notional, which is correct for stocks/ETFs/FX."""
+    return _FUTURES_MULTIPLIER_USD_PER_POINT.get((symbol or "").upper(), 1.0)
+
 
 def _fx_usd_notional(symbol: str, size: float, price: float) -> float:
     """Estimate USD notional of an FX position. Returns 0 if symbol unparseable.
@@ -420,7 +447,13 @@ def submit_bracket(
 
     # Cluster cap pre-trade check (only when caller passes est_entry_px)
     if est_entry_px is not None and est_entry_px > 0:
-        est_notional = float(size) * float(est_entry_px)
+        # 2026-05-12: futures contracts have a multiplier (MYM=$0.50/pt,
+        # MNQ=$2/pt, etc.). Without it, `size × price` for 2 MYM at index
+        # value 49,862 reports $99K notional when the actual USD exposure
+        # is $49K. That false-positive triggered the 50%-of-NetLiq guard
+        # and silently dropped every cuebanks signal. For stocks/ETFs/FX,
+        # multiplier=1.0 and the math is unchanged.
+        est_notional = float(size) * float(est_entry_px) * _futures_multiplier(contract.symbol)
 
         # 2026-05-07: hard sanity cap independent of cluster math. Catches
         # sizing-layer bugs that produce phantom oversized orders (the
