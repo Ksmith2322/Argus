@@ -178,22 +178,32 @@ SYSTEMS = {
         "no_restart": True,
     },
     "forge_multi_orb": {
+        # KILLED 2026-05-07. Allocation 0.0 + start_all_runners.ps1 commented.
+        # no_restart belt-and-suspenders so a future fleet_monitor without
+        # --no-restart can't resurrect a thesis-exhausted strategy.
         "heartbeats": [REPO / "forge" / "logs" / "multi_orb" / "heartbeat.json"],
         "stale_threshold_s": 900,  # 15 min (evaluates every 5min during NY session)
         "process_match": "forge.multi_orb.runner",
         "restart_args": ["-m", "forge.multi_orb.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_vix_intraday": {
+        # KILLED 2026-05-12. n=61, drift -175%, IR=-4.36 vs SPY.
+        # Open UVXY position exits via existing TWS OCO bracket.
         "heartbeats": [REPO / "forge" / "logs" / "vix_intraday" / "heartbeat.json"],
         "stale_threshold_s": 1800,  # 30 min (15m bars)
         "process_match": "forge.vix_intraday.runner",
         "restart_args": ["-m", "forge.vix_intraday.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_spy_mean_rev": {
+        # KILLED 2026-04-30, finalized 2026-05-12. Negative expectancy is
+        # structural; future SPY mean-rev work should be v2 from scratch.
         "heartbeats": [REPO / "forge" / "logs" / "spy_mean_rev" / "heartbeat.json"],
         "stale_threshold_s": 900,  # 15 min (5m bars during 14-20 UTC)
         "process_match": "forge.spy_mean_rev.runner",
         "restart_args": ["-m", "forge.spy_mean_rev.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_nq_london_close": {
         "heartbeats": [REPO / "forge" / "logs" / "nq_london_close" / "heartbeat.json"],

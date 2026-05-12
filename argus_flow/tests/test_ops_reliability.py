@@ -152,6 +152,13 @@ def test_drill_record_passed_plain_log_requires_explicit_marker():
     assert ops._drill_record_passed("description says PASS requires X") is False
 
 
+def test_drill_record_passed_strips_utf8_bom_from_powershell_output():
+    bom_json = "﻿" + '{"drill": "KILL_SWITCH", "status": "PASS", "pass": true}'
+    assert ops._drill_record_passed(bom_json) is True
+    bom_warn = "﻿" + '{"status": "WARN", "pass": false}'
+    assert ops._drill_record_passed(bom_warn) is False
+
+
 def test_margin_counter_ignores_net_liquidation_balance_lines():
     count, examples = ops._count_margin_alerts(
         risk_report={},

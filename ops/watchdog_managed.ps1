@@ -344,6 +344,7 @@ $script:tradeCounts = @{}
 $script:dailySummarySent = $false
 $script:maxRestartAlertSent = $false
 $script:lastGovernanceRefresh = Get-Date "2000-01-01T00:00:00Z"
+$script:killSwitchPausedAt = $null
 
 Log "=========================================="
 Log "Argus Managed Watchdog started"
@@ -354,12 +355,26 @@ Send-Discord "Argus managed watchdog started. Monitoring watcher/paper + real la
 while ($true) {
     Start-Sleep -Seconds $checkIntervalSeconds
 
-    # Kill switch check
+    # Kill switch check.
+    # When the flag is present the fleet is intentionally being halted, so the
+    # watchdog must NOT attempt respawns. But it should stay alive — exiting
+    # leaves observability dark until watchdog_health_check notices and
+    # respawns (10min staleness threshold + 30min cooldown). Pause the loop
+    # while the flag is held and resume when it clears.
     $killFile = Join-Path "C:\Argus\repo" "KILL_SWITCH"
     if (Test-Path $killFile) {
-        Log "KILL_SWITCH detected. Watchdog exiting - fleet should already be halted."
-        Send-Discord "**KILL_SWITCH detected.** Watchdog exiting." "red"
-        exit 0
+        if (-not $script:killSwitchPausedAt) {
+            Log "KILL_SWITCH detected. Pausing watcher loop; will resume when flag clears."
+            Send-Discord "**KILL_SWITCH detected.** Watchdog pausing monitoring." "yellow"
+            $script:killSwitchPausedAt = Get-Date
+        }
+        continue
+    } elseif ($script:killSwitchPausedAt) {
+        $pausedFor = (Get-Date) - $script:killSwitchPausedAt
+        $pausedSec = [int]$pausedFor.TotalSeconds
+        Log "KILL_SWITCH cleared after ${pausedSec}s. Resuming watcher loop."
+        Send-Discord "KILL_SWITCH cleared after ${pausedSec}s. Watchdog resuming." "green"
+        $script:killSwitchPausedAt = $null
     }
     $pauseFile = Join-Path "C:\Argus\repo" "PAUSE_ENTRIES"
     if (Test-Path $pauseFile) {

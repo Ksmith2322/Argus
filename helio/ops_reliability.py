@@ -427,7 +427,13 @@ def _drill_record_passed(text: str) -> bool:
     drill doesn't accidentally clear the gate just because the substring
     ``PASS`` appears in a descriptive note. Falls back to a stricter
     substring check for plain-log evidence.
+
+    Strips a leading UTF-8 BOM before parsing — PowerShell's default
+    ``Out-File -Encoding utf8`` writes the BOM, and the kill-switch drill
+    evidence is produced by PowerShell.
     """
+    if text.startswith("﻿"):
+        text = text.lstrip("﻿")
     try:
         record = json.loads(text)
     except json.JSONDecodeError:
