@@ -316,6 +316,13 @@ def submit_bracket(
 
     Returns BracketResult. Check .entry.filled before trusting stop/target IDs.
     """
+    # Accept either case ('long'/'short' or 'LONG'/'SHORT'). cuebanks/mamba/tori
+    # all emit uppercase from their signal-detection layer; multi_orb/fomc_drift
+    # emit lowercase. Pre-2026-05-12 the uppercase callers were silently failing
+    # with IBKRExecutionError caught + swallowed inside signal_executor's
+    # try/except, with the error message going to a logger that wasn't attached
+    # to those runners' file handlers (see forge/logging_setup.py).
+    direction = (direction or "").lower()
     if direction not in ("long", "short"):
         raise IBKRExecutionError(f"bad direction: {direction!r}")
     if size <= 0:
