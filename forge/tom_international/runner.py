@@ -51,13 +51,8 @@ _SIGNAL_ONLY_MODE = False
 # Event-driven sizing: 2026-04-26 halved 100→50 to compensate for instrument expansion 3→6.
 NOTIONAL_FRACTION_MULTIPLIER = 50  # × risk_pct = fraction per instrument
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] tom_international | %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-    stream=sys.stderr,
-)
-log = logging.getLogger("tom_international.runner")
+from forge.logging_setup import setup_logging
+log = setup_logging("tom_international")
 
 
 def _load_state() -> dict:

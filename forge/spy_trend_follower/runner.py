@@ -56,12 +56,11 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 import logging
-log = logging.getLogger("spy_trend_follower")
-log.setLevel(logging.INFO)
-if not log.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(h)
+# 2026-05-12: was StreamHandler-only (no file). Replaced with setup_logging()
+# so the runner now has forge/logs/spy_trend_follower/runner.log AND
+# helio.signal_executor + helio.ibkr_execution errors flow to that file.
+from forge.logging_setup import setup_logging
+log = setup_logging("spy_trend_follower")
 
 LOG_DIR = REPO / "forge" / "logs" / "spy_trend_follower"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
