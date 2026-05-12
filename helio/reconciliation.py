@@ -45,12 +45,72 @@ SPECS = [
     ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",         True,  "CADJPY", False),
     ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",         False, "GLD",    False),
     ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",         False, "GBPUSD", False),
-    ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",         False, "NQ",     False),
+    ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",         False, "MNQ",    False),
     ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",         False, None,     False),
     ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False, None,     True),
 ]
 
 PNL_DRIFT_TOLERANCE_USD = 0.01
+
+
+def _norm_ts(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("Z", "+00:00").replace(" ", "T")
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return text
+
+
+def _norm_symbol(value: str | None) -> str:
+    symbol = str(value or "").strip().upper()
+    if symbol == "NQ":
+        return "MNQ"
+    return symbol
+
+
+def _canonical_compare_key(label: str, fill, csv_has_exit_ts: bool) -> tuple:
+    symbol = _norm_symbol(getattr(fill, "symbol", ""))
+    if csv_has_exit_ts:
+        return (_norm_ts(getattr(fill, "entry_ts", "")), _norm_ts(getattr(fill, "exit_ts", "")), symbol)
+    if label.startswith("argus_"):
+        # Argus CSV `ts` is the close timestamp. Live canonical rows carry it
+        # as exit_ts, while historical backfill rows carry it as entry_ts.
+        return (_norm_ts(getattr(fill, "exit_ts", None) or getattr(fill, "entry_ts", "")), symbol)
+    return (_norm_ts(getattr(fill, "entry_ts", "")), symbol)
+
+
+def _csv_compare_key(row: dict, csv_has_exit_ts: bool) -> tuple:
+    symbol = _norm_symbol(row.get("symbol", ""))
+    if csv_has_exit_ts:
+        return (_norm_ts(row["entry_ts"]), _norm_ts(row["exit_ts"]), symbol)
+    return (_norm_ts(row["entry_ts"]), symbol)
+
+
+def _dedupe_canonical_fills(label: str, fills: list, csv_has_exit_ts: bool) -> list:
+    """Return one canonical fill per trade-comparison key.
+
+    Historical backfills intentionally remain in canonical_fills.jsonl for
+    auditability, but reconciliation must not count a backfill twin when the
+    live row for the same trade is also present. Prefer live rows over
+    source='backfill_from_trade_csv'; otherwise keep the latest row.
+    """
+    by_key: dict[tuple, object] = {}
+    for fill in fills:
+        key = _canonical_compare_key(label, fill, csv_has_exit_ts)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = fill
+            continue
+        existing_is_backfill = getattr(existing, "source", None) == "backfill_from_trade_csv"
+        fill_is_backfill = getattr(fill, "source", None) == "backfill_from_trade_csv"
+        if existing_is_backfill and not fill_is_backfill:
+            by_key[key] = fill
+        elif existing_is_backfill == fill_is_backfill and str(getattr(fill, "ts", "")) > str(getattr(existing, "ts", "")):
+            by_key[key] = fill
+    return list(by_key.values())
 
 
 def _read_canonical_by_strategy() -> dict[str, list["Fill"]]:
@@ -121,8 +181,10 @@ def reconcile_strategy(spec: tuple, canonical_fills: list) -> dict:
     keep this module importable even if someone swaps the domain layer.
     """
     label = spec[0]
+    symbol_hint = spec[4] if len(spec) >= 5 else None
     csv_has_exit_ts = spec[5] if len(spec) >= 6 else True
     csv_rows = _read_strategy_csv(spec)
+    canonical_fills = _dedupe_canonical_fills(label, canonical_fills, csv_has_exit_ts)
 
     # Include symbol in the key. Multi-symbol strategies (e.g.
     # forge_jpy_pm_short trading USDJPY+CADJPY) can open simultaneous rows at
@@ -131,11 +193,11 @@ def reconcile_strategy(spec: tuple, canonical_fills: list) -> dict:
     # When the CSV doesn't record exit_ts, drop it from both sides so the
     # canonical's real exit_ts isn't flagged as extra.
     if csv_has_exit_ts:
-        csv_keys = {(r["entry_ts"], r["exit_ts"], r.get("symbol", "")) for r in csv_rows}
-        canonical_keys = {(f.entry_ts or "", f.exit_ts or "", f.symbol or "") for f in canonical_fills}
+        csv_keys = {_csv_compare_key(r, csv_has_exit_ts) for r in csv_rows}
+        canonical_keys = {_canonical_compare_key(label, f, csv_has_exit_ts) for f in canonical_fills}
     else:
-        csv_keys = {(r["entry_ts"], r.get("symbol", "")) for r in csv_rows}
-        canonical_keys = {(f.entry_ts or "", f.symbol or "") for f in canonical_fills}
+        csv_keys = {_csv_compare_key({**r, "symbol": r.get("symbol") or symbol_hint or ""}, csv_has_exit_ts) for r in csv_rows}
+        canonical_keys = {_canonical_compare_key(label, f, csv_has_exit_ts) for f in canonical_fills}
 
     missing_in_canonical = csv_keys - canonical_keys
     extra_in_canonical = canonical_keys - csv_keys

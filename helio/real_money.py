@@ -228,12 +228,84 @@ def enforce_real_money_boundary(
             f"allowlist_invalid: {'; '.join(problems)}"
         )
 
+    approved_capital_usd = _capital_ladder_approved_capital_usd()
+    if approved_capital_usd <= 0:
+        raise AccountBoundaryViolationError(
+            "capital_ladder_blocked: no real bot capital is currently "
+            "approved by helio.capital_ladder"
+        )
+
     if notional_usd is not None and notional_usd > REAL_MONEY_MAX_NOTIONAL_PER_ORDER:
         raise AccountBoundaryViolationError(
             f"oversize_real_order: notional=${notional_usd:,.2f} > "
             f"cap=${REAL_MONEY_MAX_NOTIONAL_PER_ORDER:,.2f} "
             f"(strategy={strategy_label})"
         )
+
+    if notional_usd is not None and notional_usd > approved_capital_usd:
+        raise AccountBoundaryViolationError(
+            f"capital_ladder_oversize: notional=${notional_usd:,.2f} > "
+            f"approved_bot_capital=${approved_capital_usd:,.2f} "
+            f"(strategy={strategy_label})"
+        )
+
+    # Aggregate gross exposure check. cluster_exposure already caps total
+    # notional at ~1.5x broker_equity, but broker_equity is the full paper
+    # account (~$1M). The ladder cap is what the BOT has earned; gross
+    # real-money notional must not exceed it. Per-order check above does
+    # not cover multiple smaller orders summing past the cap.
+    if notional_usd is not None:
+        existing_real = _existing_real_money_notional_usd(al)
+        if existing_real + notional_usd > approved_capital_usd:
+            raise AccountBoundaryViolationError(
+                f"capital_ladder_gross_oversize: existing_real=${existing_real:,.2f} + "
+                f"proposed=${notional_usd:,.2f} = ${existing_real + notional_usd:,.2f} "
+                f"> approved_bot_capital=${approved_capital_usd:,.2f} "
+                f"(strategy={strategy_label})"
+            )
+
+
+def _capital_ladder_approved_capital_usd() -> float:
+    """Return current ladder-approved bot capital, failing closed to 0.
+
+    Imported lazily to avoid making the real-money boundary depend on report
+    generation at import time.
+    """
+    try:
+        from helio.capital_ladder import approved_bot_capital_usd
+        return float(approved_bot_capital_usd())
+    except Exception:
+        return 0.0
+
+
+def _existing_real_money_notional_usd(allowlist: "Allowlist") -> float:
+    """Sum gross notional across currently open positions for strategies on
+    the real-money allowlist. Reads the same heartbeat sources cluster
+    exposure does, but filters to allowlisted strategies only — paper
+    positions don't count against the ladder cap.
+
+    Fails closed: any error returns infinity so the gross check rejects
+    rather than silently approves.
+    """
+    try:
+        from helio.cluster_exposure import _scan_open_positions
+        positions = _scan_open_positions()
+    except Exception:
+        return float("inf")
+    allowed = {s.lower() for s in allowlist.strategies}
+    total = 0.0
+    for p in positions:
+        system = (p.get("system") or "").lower()
+        candidates = {system, f"forge_{system}", f"argus_{system}"}
+        if not candidates.intersection(allowed):
+            continue
+        try:
+            entry = float(p.get("entry_px") or 0)
+            size = float(p.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        total += abs(entry * size)
+    return total
 
 
 # ---------------------------------------------------------------------------

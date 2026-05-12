@@ -21,6 +21,8 @@ ops/logs/
 *.csv
 *.json
 .pycache_verify/
+_tmp/
+pytest-cache-files-*/
 !ops/coin_pool.json
 
 # --- Runtime flag files (operational state, not source) ---

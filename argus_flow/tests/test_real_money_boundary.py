@@ -181,7 +181,7 @@ def test_real_with_strategy_not_allowlisted_rejects():
         )
 
 
-def test_real_with_oversized_notional_rejects():
+def test_real_with_oversized_notional_rejects(monkeypatch):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -190,6 +190,7 @@ def test_real_with_oversized_notional_rejects():
         ledger_entry_id="abc-1",
         approver="ksmith2322",
     )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 100_000.0)
     too_big = rm.REAL_MONEY_MAX_NOTIONAL_PER_ORDER * 2
     with pytest.raises(rm.AccountBoundaryViolationError, match="oversize_real_order"):
         rm.enforce_real_money_boundary(
@@ -200,7 +201,7 @@ def test_real_with_oversized_notional_rejects():
         )
 
 
-def test_real_within_cap_with_allowlisted_strategy_passes():
+def test_real_without_capital_ladder_approval_rejects():
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -209,6 +210,26 @@ def test_real_within_cap_with_allowlisted_strategy_passes():
         ledger_entry_id="abc-1",
         approver="ksmith2322",
     )
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_blocked"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=100.0,
+            allowlist=al,
+        )
+
+
+def test_real_within_cap_with_allowlisted_strategy_passes(monkeypatch):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 10_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 0.0)
     # No exception:
     rm.enforce_real_money_boundary(
         ib,
@@ -216,6 +237,65 @@ def test_real_within_cap_with_allowlisted_strategy_passes():
         notional_usd=rm.REAL_MONEY_MAX_NOTIONAL_PER_ORDER - 1,
         allowlist=al,
     )
+
+
+def test_real_gross_above_ladder_cap_rejects(monkeypatch):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 5_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 4_500.0)
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_gross_oversize"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=600.0,
+            allowlist=al,
+        )
+
+
+def test_real_gross_under_ladder_cap_passes(monkeypatch):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 5_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 1_000.0)
+    rm.enforce_real_money_boundary(
+        ib,
+        strategy_label="forge_vix_intraday",
+        notional_usd=500.0,
+        allowlist=al,
+    )
+
+
+def test_real_above_ladder_cap_rejects(monkeypatch):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 1_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 0.0)
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_oversize"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=1_001.0,
+            allowlist=al,
+        )
 
 
 def test_real_invalid_allowlist_rejects():

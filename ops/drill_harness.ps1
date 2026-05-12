@@ -30,6 +30,8 @@ $python = "C:\Argus\.venv\Scripts\python.exe"
 $killFile = "$repo\KILL_SWITCH"
 $haltFile = "$repo\argus_flow\logs\HALT.flag"
 $flattenFile = "$repo\argus_flow\logs\FLATTEN_EOD.flag"
+$drillEvidenceDir = "$repo\argus_flow\logs"
+$killDrillReport = "$drillEvidenceDir\kill_switch_drill.json"
 
 function Write-DrillStep { param([string]$msg, [string]$status='INFO')
     $color = switch ($status) {
@@ -61,6 +63,18 @@ function Test-RunnerAlive { param([string]$pattern, [string]$name)
         Write-DrillStep "$name NOT running" 'WARN'
         return $false
     }
+}
+
+function Write-DrillEvidence {
+    param(
+        [string]$Path,
+        [hashtable]$Payload
+    )
+    if (-not (Test-Path $drillEvidenceDir)) {
+        New-Item -ItemType Directory -Force -Path $drillEvidenceDir | Out-Null
+    }
+    $Payload | ConvertTo-Json -Depth 6 | Out-File -FilePath $Path -Encoding utf8
+    Write-DrillStep "wrote drill evidence: $Path" 'OK'
 }
 
 function Drill-Plan {
@@ -98,9 +112,21 @@ function Drill-Kill {
     Write-Host "=== KILL_SWITCH DRILL ===" -ForegroundColor Cyan
     Write-Host "Will: write KILL_SWITCH flag, wait 30s, verify runners detect, remove flag, verify recovery."
     Write-Host ""
+    $startedAt = (Get-Date).ToUniversalTime().ToString("o")
+    $detected = $false
+    $heartbeatFresh = $false
+    $sample = ""
 
     if (Test-Path $killFile) {
         Write-DrillStep "KILL_SWITCH already present - aborting drill (would mask state)" 'FAIL'
+        Write-DrillEvidence $killDrillReport @{
+            drill = "KILL_SWITCH"
+            status = "FAIL"
+            pass = $false
+            started_at = $startedAt
+            completed_at = (Get-Date).ToUniversalTime().ToString("o")
+            reason = "KILL_SWITCH already present before drill"
+        }
         return
     }
 
@@ -116,6 +142,8 @@ function Drill-Kill {
     $detectionLog = @(Get-Content "$repo\argus_flow\logs\runner_unified.log" -Tail 30 -ErrorAction SilentlyContinue |
         Where-Object { $_ -match 'KILL_SWITCH|kill[_\s-]switch' })
     if ($detectionLog.Count -gt 0) {
+        $detected = $true
+        $sample = "$($detectionLog[0])"
         Write-DrillStep "argus detected KILL_SWITCH ($($detectionLog.Count) line(s); sample: $($detectionLog[0]))" 'OK'
     } else {
         Write-DrillStep "no KILL_SWITCH detection in argus log within 30s - flag may not be checked, OR no eval cycle ran" 'WARN'
@@ -128,14 +156,41 @@ function Drill-Kill {
     Start-Sleep -Seconds 30
 
     Write-DrillStep "Step 6: Verify runners recovered (heartbeat freshness)"
-    $argusHb = "$repo\argus_flow\logs\runner_unified_heartbeat.json"
-    if (Test-Path $argusHb) {
-        $age = (Get-Date) - (Get-Item $argusHb).LastWriteTime
-        if ($age.TotalSeconds -lt 120) {
-            Write-DrillStep "argus heartbeat fresh ($([int]$age.TotalSeconds)s old)" 'OK'
-        } else {
-            Write-DrillStep "argus heartbeat STALE ($([int]$age.TotalSeconds)s old)" 'WARN'
+    # Argus uses per-pair heartbeats (usdjpy/gbpusd/cadjpy), not a unified file.
+    # Drill PASSes if ANY argus pair has refreshed its heartbeat within 120s.
+    $argusHbPaths = @(
+        "$repo\argus_flow\logs\usdjpy\heartbeat.json",
+        "$repo\argus_flow\logs\gbpusd\heartbeat.json",
+        "$repo\argus_flow\logs\cadjpy\heartbeat.json"
+    )
+    $freshHbs = @()
+    foreach ($hb in $argusHbPaths) {
+        if (Test-Path $hb) {
+            $age = (Get-Date) - (Get-Item $hb).LastWriteTime
+            if ($age.TotalSeconds -lt 120) {
+                $freshHbs += [pscustomobject]@{ path = $hb; age_s = [int]$age.TotalSeconds }
+            }
         }
+    }
+    if ($freshHbs.Count -gt 0) {
+        $heartbeatFresh = $true
+        $sample = ($freshHbs | Select-Object -First 1)
+        Write-DrillStep "argus heartbeat fresh on $($freshHbs.Count) pair(s); sample: $($sample.path) ($($sample.age_s)s old)" 'OK'
+    } else {
+        Write-DrillStep "no argus pair heartbeat refreshed within 120s of flag removal" 'WARN'
+    }
+    $status = if ($detected -and $heartbeatFresh) { "PASS" } elseif ($detected) { "WARN" } else { "FAIL" }
+    Write-DrillEvidence $killDrillReport @{
+        drill = "KILL_SWITCH"
+        status = $status
+        pass = ($status -eq "PASS")
+        started_at = $startedAt
+        completed_at = (Get-Date).ToUniversalTime().ToString("o")
+        kill_file = $killFile
+        detected = $detected
+        heartbeat_fresh = $heartbeatFresh
+        detection_sample = $sample
+        note = "PASS requires KILL_SWITCH detection in runner log and fresh heartbeat after flag removal."
     }
     Write-DrillStep "KILL drill complete." 'OK'
 }

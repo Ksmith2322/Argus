@@ -35,6 +35,7 @@ from typing import Callable, Iterable, Sequence
 # Sample-size discipline
 # ---------------------------------------------------------------------------
 
+SMOKE_N = 10          # smoke-test floor — IR with low_sample tag at this n
 CONTINUATION_N = 30   # below this, no serious metric is reported
 SERIOUS_N = 75        # below this, "conviction" claims are blocked
 CONVICTION_N = 138    # at-or-above, full grading is allowed
@@ -186,12 +187,19 @@ def sortino_ratio(
     returns: Sequence[float],
     target: float = 0.0,
     periods_per_year: int = 252,
+    min_n: int = CONTINUATION_N,
 ) -> float | InsufficientSample:
     """Annualized Sortino. ``returns`` should be per-period (per-trade or
-    per-day) returns expressed as a fraction of capital."""
-    if len(returns) < CONTINUATION_N:
-        return InsufficientSample(actual_n=len(returns), required_n=CONTINUATION_N,
-                                   note="sortino blocked below CONTINUATION_N")
+    per-day) returns expressed as a fraction of capital.
+
+    ``min_n`` defaults to ``CONTINUATION_N`` (30); callers wanting a
+    low-sample read for the smoke-test stage can pass ``SMOKE_N`` (10),
+    but must flag the result downstream so it isn't treated as a serious
+    metric.
+    """
+    if len(returns) < min_n:
+        return InsufficientSample(actual_n=len(returns), required_n=min_n,
+                                   note="sortino blocked below min_n")
     excess = [r - target for r in returns]
     dd = downside_deviation(returns, target)
     if dd <= 0:
@@ -203,18 +211,25 @@ def information_ratio(
     strategy_returns: Sequence[float],
     benchmark_returns: Sequence[float],
     periods_per_year: int = 252,
+    min_n: int = CONTINUATION_N,
 ) -> float | InsufficientSample:
     """Annualized Information Ratio: active return per unit of tracking
     error. Positive IR means the strategy adds value over the benchmark
-    on a risk-adjusted basis, *measured over the same windows*."""
+    on a risk-adjusted basis, *measured over the same windows*.
+
+    ``min_n`` defaults to ``CONTINUATION_N`` (30). Pass ``SMOKE_N`` (10)
+    only when the consumer will treat the result as a low-sample
+    indicator suitable for the capital ladder's smoke stage, not as a
+    serious promotion metric.
+    """
     if len(strategy_returns) != len(benchmark_returns):
         raise ValueError(
             f"length mismatch: strategy={len(strategy_returns)} vs "
             f"benchmark={len(benchmark_returns)}"
         )
-    if len(strategy_returns) < CONTINUATION_N:
-        return InsufficientSample(actual_n=len(strategy_returns), required_n=CONTINUATION_N,
-                                   note="IR blocked below CONTINUATION_N")
+    if len(strategy_returns) < min_n:
+        return InsufficientSample(actual_n=len(strategy_returns), required_n=min_n,
+                                   note="IR blocked below min_n")
     active = [s - b for s, b in zip(strategy_returns, benchmark_returns)]
     te = _stdev(active)
     if te <= 0:
@@ -296,6 +311,7 @@ def friction_adjusted_pnls(
 
 
 __all__ = [
+    "SMOKE_N",
     "CONTINUATION_N",
     "SERIOUS_N",
     "CONVICTION_N",

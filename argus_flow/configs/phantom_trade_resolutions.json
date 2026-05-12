@@ -1,0 +1,25 @@
+{
+  "version": "2026-05-12.v1",
+  "_policy": "Phantom annotations remain immutable. A resolution only means matching phantom rows at or before resolved_after are historical and no longer active ops blockers. Any matching row after resolved_after still blocks promotion.",
+  "resolutions": [
+    {
+      "strategy": "forge_multi_orb",
+      "source_file": "forge/logs/multi_orb/trades.csv",
+      "resolved_after": "2026-05-07T00:00:00+00:00",
+      "root_cause": "tight-stop position sizing divided risk budget into explosive QQQ share counts",
+      "evidence": [
+        "forge/multi_orb/runner.py uses helio.strategy_common.safe_position_size with sizing_floor_atr_mult=1.0",
+        "argus_flow/configs/allocation_factors.json sets forge_multi_orb to 0.0 after 2026-05-07 kill decision"
+      ]
+    },
+    {
+      "strategy": "forge_nq_london_close",
+      "source_file": "forge/logs/nq_london_close/trades.csv",
+      "resolved_after": "2026-05-07T00:00:00+00:00",
+      "root_cause": "tight-stop futures contract sizing produced a phantom MNQ/NQ contract count",
+      "evidence": [
+        "forge/nq_london_close/runner.py uses helio.strategy_common.safe_position_size with sizing_floor_atr_mult=1.0 and max_size from notional cap"
+      ]
+    }
+  ]
+}

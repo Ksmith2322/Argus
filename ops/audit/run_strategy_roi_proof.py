@@ -312,6 +312,16 @@ def _summarize_strategy(
     ir = core.information_ratio(strat_returns, aligned_bench_returns, periods_per_year=int(ppy)) \
         if strat_returns and aligned_bench_returns else \
         core.InsufficientSample(actual_n=len(strat_returns), required_n=core.CONTINUATION_N)
+    # Low-sample companion ratio. The smoke stage of the capital ladder
+    # is allowed to read this when n is in [SMOKE_N, CONTINUATION_N); any
+    # stage above smoke must still gate on the strict ``information_ratio``.
+    ir_low_sample = core.information_ratio(
+        strat_returns,
+        aligned_bench_returns,
+        periods_per_year=int(ppy),
+        min_n=core.SMOKE_N,
+    ) if strat_returns and aligned_bench_returns else \
+        core.InsufficientSample(actual_n=len(strat_returns), required_n=core.SMOKE_N)
 
     out: dict[str, Any] = {
         "strategy": name,
@@ -337,6 +347,7 @@ def _summarize_strategy(
         "friction_adj_expectancy": round(friction_expectancy, 4),
         "sortino": _serialize_metric(sortino),
         "information_ratio": _serialize_metric(ir),
+        "information_ratio_low_sample": _serialize_metric(ir_low_sample),
         "spy_n_with_data": bench_summary["n_with_spy_data"],
         "spy_coverage_pct": bench_summary["coverage_pct"],
         "mean_strategy_return": bench_summary["mean_strategy_return"],

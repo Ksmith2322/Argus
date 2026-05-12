@@ -286,6 +286,32 @@ def main() -> int:
                         )
                     except Exception as e:
                         log.warning("daily_fleet_vs_spy failed: %s", e)
+
+                # Ops reliability report — append one snapshot per day so the
+                # capital ladder's clean_ops_days streak math has authoritative
+                # input. Cheap (just reads existing report JSONs + a log tail).
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "helio.ops_reliability"],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    log.warning("helio.ops_reliability daily refresh failed: %s", e)
+
+                # Capital ladder report — re-evaluate after ops_reliability has
+                # written the latest snapshot. Output gates the real-money
+                # boundary, so a stale report = unnecessarily blocked orders.
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "helio.capital_ladder"],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    log.warning("helio.capital_ladder daily refresh failed: %s", e)
             consecutive_failures = 0
             elapsed = time.monotonic() - start
             log.info("cycle %d OK (%.2fs)", cycle, elapsed)
