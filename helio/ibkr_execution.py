@@ -122,6 +122,49 @@ def _futures_multiplier(symbol: str) -> float:
     return _FUTURES_MULTIPLIER_USD_PER_POINT.get((symbol or "").upper(), 1.0)
 
 
+# OVERSIZED_ORDER hard-sanity threshold as multiple of NetLiq anchor, by
+# asset class. Values are calibrated to allow legitimate sizing per
+# fleet_sizing.json's notional_caps_by_asset_class with ~25% buffer,
+# while still catching phantom-oversized orders (the 1,400-share QQQ /
+# 417-contract NQ pattern this guard was added to catch on 2026-05-07).
+#
+# Stocks/ETFs cap=0.3× → guard at 0.5× (67% headroom).
+# FX cap=1.0× → guard at 1.5× (50% headroom).
+# Futures cap=2.0× → guard at 2.5× (25% headroom — futures are intrinsically
+#                   large in notional but bounded by margin).
+_OVERSIZE_THRESHOLD_X = {
+    "stock":          0.5,
+    "etf":            0.5,
+    "leveraged_etf":  0.5,
+    "fx":             1.5,
+    "micro_future":   2.5,
+    "future":         2.5,
+}
+
+
+def _classify_symbol(symbol: str) -> str:
+    """Map symbol to the asset class key used by _OVERSIZE_THRESHOLD_X."""
+    sym = (symbol or "").upper()
+    if sym in _FUTURES_MULTIPLIER_USD_PER_POINT:
+        # Micro contracts (multiplier < 10) treated as micro_future, full
+        # contracts (>= 10) treated as future. Threshold is the same either
+        # way for now; split kept for future divergence.
+        return "micro_future" if _FUTURES_MULTIPLIER_USD_PER_POINT[sym] < 10 else "future"
+    if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
+        # 6-char alpha = FX pair (USDJPY, GBPUSD, etc.)
+        return "fx"
+    # Default everything else (stocks, ETFs, unknown) to stock threshold.
+    return "stock"
+
+
+def _oversize_threshold_usd(symbol: str, anchor_usd: float) -> float:
+    """USD threshold above which a single order is considered phantom-oversized
+    for this symbol. Pulls per-asset-class multiplier from
+    _OVERSIZE_THRESHOLD_X."""
+    factor = _OVERSIZE_THRESHOLD_X.get(_classify_symbol(symbol), 0.5)
+    return factor * float(anchor_usd)
+
+
 def _fx_usd_notional(symbol: str, size: float, price: float) -> float:
     """Estimate USD notional of an FX position. Returns 0 if symbol unparseable.
 
@@ -465,16 +508,19 @@ def submit_bracket(
         try:
             from helio.fleet_sizing import get_sizing_anchor_usd
             anchor = float(get_sizing_anchor_usd())
-            if anchor > 0 and est_notional > 0.5 * anchor:
+            oversize_threshold = _oversize_threshold_usd(contract.symbol, anchor)
+            if anchor > 0 and est_notional > oversize_threshold:
+                threshold_pct = (oversize_threshold / anchor) * 100.0 if anchor > 0 else 0.0
                 log.error(
                     f"OVERSIZED_ORDER_REJECTED: {direction} {size} "
                     f"{contract.symbol} notional=${est_notional:,.0f} > "
-                    f"50% of NetLiq=${anchor:,.0f} ({est_notional/anchor*100:.0f}%). "
+                    f"{threshold_pct:.0f}% of NetLiq=${anchor:,.0f} "
+                    f"({est_notional/anchor*100:.0f}%). "
                     f"Sizing-layer likely buggy; refusing to submit."
                 )
                 return BracketResult(entry=FillResult(
                     filled=False,
-                    reject_reason=f"oversized_order:{est_notional:.0f}>{0.5*anchor:.0f}"
+                    reject_reason=f"oversized_order:{est_notional:.0f}>{oversize_threshold:.0f}"
                 ))
         except Exception as exc:
             log.warning(f"hard size cap check failed (allowing trade): {exc}")
