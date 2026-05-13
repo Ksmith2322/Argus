@@ -71,7 +71,13 @@ NY_OPEN_MIN = 30
 NY_CUTOFF_HOUR = 10
 NY_CUTOFF_MIN = 30
 
-MAX_TRADES_PER_DAY = 2
+# 2026-05-13: cap originally from MambaFX human-trader rulebook (max 2/day
+# was emotional discipline for discretionary traders avoiding tilt). A
+# systematic bot doesn't tilt. Constant kept for documentation reference
+# only — NOT enforced in run_backtest or run_live. If post-cap trades
+# (#3+) prove negative expectancy, the cap may be reintroduced based on
+# EVIDENCE rather than copied from a human's rulebook.
+MAX_TRADES_PER_DAY = 2  # reference only, not enforced
 MAX_HOLD_BARS_5MIN = 12  # 60 min max on 5-min bars (safety)
 RR_CONSERVATIVE = 3.0    # 50% off at 1:3
 RR_FULL = 5.0            # trail remainder to 1:5
@@ -536,9 +542,10 @@ def run_backtest(
 
                     continue  # Don't open new trade while managing one
 
-                # --- Check daily trade cap ---
-                if daily_trade_count[day_str] >= MAX_TRADES_PER_DAY:
-                    continue
+                # 2026-05-13: removed `if daily_trade_count[day_str] >= MAX_TRADES_PER_DAY: continue`.
+                # The cap was a human-trader emotional rule, not a systematic
+                # edge constraint. Backtest now evaluates ALL valid setups so
+                # we can measure whether trades 3+ degrade or hold expectancy.
 
                 # --- Check for breakout signals ---
                 # Determine direction from bias

@@ -81,7 +81,13 @@ POINT_VALUE_MYM = 0.50
 # Session: NY 9:30-16:00 EST
 NY_OPEN_HOUR, NY_OPEN_MIN = 9, 30
 NY_CLOSE_HOUR, NY_CLOSE_MIN = 16, 0
-MAX_TRADES_PER_DAY = 2
+# 2026-05-13: cap originally from MambaFX/Cue Banks human-trader rulebook
+# (max 2 trades/day was an EMOTIONAL discipline for discretionary traders).
+# A systematic bot doesn't tilt, so the cap is kept for documentation
+# reference only — NOT enforced in run_backtest or run_live. If post-cap
+# trades (#3+) prove to be negative expectancy, the cap may be reintroduced
+# based on EVIDENCE rather than copied from a human's rulebook.
+MAX_TRADES_PER_DAY = 2  # reference only, not enforced
 MIN_RR = 5.0  # Conservative (rulebook says 1:7-1:8)
 
 # 2026-04-25: was 108 which collided with aud_asian_breakout. Realigned to
@@ -261,9 +267,10 @@ def run_backtest():
             break_tracker.register_levels(h4_sr_levels)
 
         for i in range(5, len(ny_bars)):
-            if day_trades >= MAX_TRADES_PER_DAY:
-                break
-
+            # 2026-05-13: removed `if day_trades >= MAX_TRADES_PER_DAY: break`.
+            # The cap was a human-trader emotional rule, not a systematic
+            # edge constraint. Backtest now evaluates ALL valid setups so
+            # we can measure whether trades 3+ degrade or hold expectancy.
             bar = ny_bars.iloc[i]
             bar_ts = ny_bars.index[i]
             if break_tracker is not None:
