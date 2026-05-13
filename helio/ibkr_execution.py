@@ -358,6 +358,24 @@ def _wait_for_fill(ib: IB, trade, timeout_s: float = 10.0) -> FillResult:
         )
     status = getattr(trade.orderStatus, "status", "")
     reject = getattr(trade.orderStatus, "whyHeld", "") or status
+
+    # 2026-05-13: capture the last few TradeLogEntry messages so the
+    # actual TWS error (e.g. "Error 10349: Order TIF was set to DAY based
+    # on order preset") surfaces in the reject_reason instead of just
+    # "Cancelled". Same pattern as the silent-gate logging fix —
+    # diagnose before fixing.
+    try:
+        log_msgs: list[str] = []
+        for entry in (getattr(trade, "log", None) or [])[-3:]:
+            err_code = int(getattr(entry, "errorCode", 0) or 0)
+            msg = str(getattr(entry, "message", "") or "").strip()
+            if err_code or msg:
+                log_msgs.append(f"err={err_code}:{msg[:120]}" if err_code else msg[:140])
+        if log_msgs:
+            reject = f"{reject} | {' / '.join(log_msgs)}"
+    except Exception:
+        pass
+
     return FillResult(filled=False, order_id=order_id, reject_reason=reject or "timeout")
 
 

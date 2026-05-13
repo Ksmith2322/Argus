@@ -927,8 +927,15 @@ Examples:
                    help="Run signal-only continuously (evaluate every --interval-min)")
     p.add_argument("--interval-min", type=int, default=60,
                    help="Loop interval in minutes (default: 60)")
-    p.add_argument("--equity", type=float, default=get_initial_capital_usd(),
-                   help="Model equity in USD (default: 10000)")
+    # 2026-05-13: Lazy default — calling get_initial_capital_usd() here would
+    # raise BrokerEquityUnavailableError if risk_oversight_report.json reports
+    # account_equity_usd=0.0 (which happens transiently when the risk_oversight
+    # script can't reach the broker). That caused gdx_gld to die at startup,
+    # which the watchdog interpreted as a respawn-needed event, creating an
+    # infinite restart loop. Resolve at main() instead, so the runner can at
+    # least start and log a clear error if equity is genuinely unavailable.
+    p.add_argument("--equity", type=float, default=None,
+                   help="Model equity in USD (default: read from broker via fleet_sizing)")
     p.add_argument("--start", type=str, default="2006-05-22",
                    help="Backtest start date (default: 2006-05-22, GDX inception)")
     p.add_argument("--end", type=str, default="2026-04-11",
@@ -942,6 +949,16 @@ Examples:
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+
+    # Resolve --equity lazily so a transient broker-unavailable doesn't crash
+    # the runner at startup. If still unavailable when actually needed, the
+    # downstream code will surface a clear error.
+    if args.equity is None:
+        try:
+            args.equity = get_initial_capital_usd()
+        except Exception as exc:
+            log.warning("get_initial_capital_usd() failed (%s); falling back to $10,000 model equity", exc)
+            args.equity = 10_000.0
 
     if args.dry_run and args.backtest:
         log.info("[DRY-RUN] Would run backtest from %s to %s with equity=$%s",
