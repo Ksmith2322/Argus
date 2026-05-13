@@ -908,6 +908,7 @@ def run_live():
                                     stop_px=stop_px, target_px=target_px,
                                     instrument_type="micro_future", price_decimals=0,
                                     max_hold_bars=8,  # 32 hours at 4hr bars
+                                    strategy_label="forge_tori",
                                 )
                                 if sx.submit_signal(state, ib, sig):
                                     log.info(f"LIVE {direction} {micro} entry={entry:.0f} stop={stop_px:.0f} target={target_px:.0f}")

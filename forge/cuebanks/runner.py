@@ -1019,6 +1019,7 @@ def run_live():
                                 stop_px=stop_px, target_px=target_px,
                                 instrument_type="micro_future", price_decimals=0,
                                 max_hold_bars=24,  # 2 hours at 5min
+                                strategy_label="forge_cuebanks",
                             )
                             if sx.submit_signal(state, ib, sig):
                                 log.info(f"LIVE {result['direction']} MYM entry={entry:.0f} stop={stop_px:.0f} target={target_px:.0f}")

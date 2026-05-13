@@ -1176,6 +1176,7 @@ def run_live():
                                         instrument_type="micro_future",
                                         price_decimals=0,
                                         max_hold_bars=12,  # 1 hour at 5min bars
+                                        strategy_label="forge_mamba",
                                     )
                                     submitted = sx.submit_signal(state, ib, sig)
                                     if submitted:
