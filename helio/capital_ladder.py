@@ -318,10 +318,21 @@ def stage_blockers(stage: dict[str, Any], evidence: dict[str, Any]) -> list[str]
     if not criteria:
         return []
 
+    # Defensive: any stage with non-empty criteria MUST specify
+    # min_qualified_strategies, otherwise a typo in the config silently
+    # bypasses strategy-level validation (Bug #3 from 2026-05-13 audit).
+    if "min_qualified_strategies" not in criteria:
+        stage_name = stage.get("name", "<unnamed>")
+        raise ValueError(
+            f"capital ladder stage {stage_name!r} has non-empty criteria but "
+            f"no min_qualified_strategies. Add the field explicitly (use 0 only "
+            f"if a stage truly should approve with zero qualified strategies)."
+        )
+
     blockers: list[str] = []
     qualified, failed = _qualified_strategies(evidence, criteria)
 
-    min_strats = int(criteria.get("min_qualified_strategies", 0) or 0)
+    min_strats = int(criteria["min_qualified_strategies"])
     if len(qualified) < min_strats:
         blockers.append(
             f"qualified_strategies {len(qualified)}/{min_strats}; "

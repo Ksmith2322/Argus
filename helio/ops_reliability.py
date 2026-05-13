@@ -226,6 +226,26 @@ def _count_phantom_rows(
     return count, examples, resolved_count
 
 
+def _parse_tripped_flag(value: Any) -> bool:
+    """Safely interpret a 'tripped' field that came from JSON.
+
+    Defensive against manual edits to broker_drift_state.json. ``bool("false")``
+    is True in Python (any non-empty string is truthy), so a manual edit that
+    writes a string instead of a boolean would silently re-trip the gate.
+    Handle the common cases explicitly.
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    if isinstance(value, (int, float)):
+        return bool(value)
+    # Unknown shape — fail closed (treat as tripped).
+    return True
+
+
 def _latest_ts_from_lines(lines: Iterable[str]) -> datetime | None:
     """Return the most recent parseable timestamp from a log tail.
 
@@ -608,7 +628,7 @@ def build_report(
         critical=True,
     )
     sources["broker_drift_state"] = broker_source
-    broker_tripped = bool(broker.get("tripped"))
+    broker_tripped = _parse_tripped_flag(broker.get("tripped"))
     broker_reconcile_clean = not broker_tripped and not _source_is_bad(broker_source)
     if _source_is_bad(broker_source):
         _append_incident(
@@ -749,13 +769,52 @@ def build_report(
 
     broker_reconcile_passed = canonical_clean and all_reconciled and broker_reconcile_clean
     open_p0 = sum(1 for incident in incidents if incident.get("severity") == "P0")
+
+    # Bug #1 fix (2026-05-13 audit): clean_current decouples from the 30-day
+    # rolling counts. Previously `tws_count == 0` (which is 30-day rolling)
+    # meant the streak couldn't start until every historical cascade aged
+    # out — pushing SMOKE_5K eligibility ~8 days later than necessary.
+    # Stage-promotion gates (max_tws_cascades_30d, etc.) still use the
+    # 30-day count; only the daily streak math uses today's count.
+    tws_today_count, _ = _count_watchdog_events(watchdog_lines, now, window_days=1)
+    margin_today_count, _ = _count_margin_alerts(
+        risk_report=risk,
+        risk_ts=risk_ts,
+        watchdog_lines=watchdog_lines,
+        now=now,
+        window_days=1,
+    )
+    phantom_today_count, _, _ = _count_phantom_rows(
+        phantom_rows, now, window_days=1, resolutions=resolution_rows,
+    )
+    failover_today_count, _, _ = _count_jsonl_events(CANONICAL_FAILOVER_LOG, now, window_days=1)
+    silent_failures_today = canonical_drift_count + len(drift_strategies) + failover_today_count
+    if _source_is_bad(canonical_source):
+        silent_failures_today += 1
+    if _source_is_bad(reconciliation_source):
+        silent_failures_today += 1
+
+    # Open P0 incidents whose kind is a 30-day-rolling count don't reflect
+    # CURRENT state — they reflect historical evidence still inside the
+    # rolling window. Exclude them from clean_current so the streak math
+    # measures "is today operationally clean?" not "has the window ever
+    # been dirty?". Stage gates still see the full open_p0 count.
+    _ROLLING_30D_KINDS = {
+        "tws_cascades", "margin_alerts", "phantom_fills", "canonical_failover_rows",
+    }
+    open_p0_today = sum(
+        1 for incident in incidents
+        if incident.get("severity") == "P0"
+        and incident.get("kind") not in _ROLLING_30D_KINDS
+    )
+
     clean_current = (
-        silent_failures == 0
-        and phantom_count == 0
-        and tws_count == 0
-        and margin_count == 0
+        silent_failures_today == 0
+        and phantom_today_count == 0
+        and tws_today_count == 0
+        and margin_today_count == 0
         and broker_reconcile_passed
-        and open_p0 == 0
+        and open_p0_today == 0
     )
 
     current_snapshot = {

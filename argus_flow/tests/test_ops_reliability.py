@@ -159,6 +159,85 @@ def test_drill_record_passed_strips_utf8_bom_from_powershell_output():
     assert ops._drill_record_passed(bom_warn) is False
 
 
+# ---------------------------------------------------------------------------
+# Bug 4 (2026-05-13 audit): broker_tripped string-vs-bool parse
+# ---------------------------------------------------------------------------
+
+
+def test_parse_tripped_flag_accepts_real_booleans():
+    assert ops._parse_tripped_flag(True) is True
+    assert ops._parse_tripped_flag(False) is False
+
+
+def test_parse_tripped_flag_accepts_none_as_not_tripped():
+    assert ops._parse_tripped_flag(None) is False
+
+
+def test_parse_tripped_flag_string_false_is_not_tripped():
+    # The bug: bool("false") is True in Python because non-empty strings are
+    # truthy. A manual edit writing the string "false" would silently re-trip
+    # the gate. After the fix, it's parsed as a not-tripped indicator.
+    assert ops._parse_tripped_flag("false") is False
+    assert ops._parse_tripped_flag("False") is False
+    assert ops._parse_tripped_flag("  FALSE  ") is False
+
+
+def test_parse_tripped_flag_string_true_is_tripped():
+    assert ops._parse_tripped_flag("true") is True
+    assert ops._parse_tripped_flag("True") is True
+
+
+def test_parse_tripped_flag_unknown_shape_fails_closed_to_tripped():
+    # Defensive: anything not in the recognized shapes is treated as tripped
+    # so a malformed state file errs toward blocking promotion.
+    assert ops._parse_tripped_flag({"tripped": True}) is True  # dict
+    assert ops._parse_tripped_flag(["true"]) is True  # list
+    assert ops._parse_tripped_flag("garbage") is False  # explicit string that's not "true" stays not-tripped
+
+
+def test_parse_tripped_flag_numeric():
+    assert ops._parse_tripped_flag(1) is True
+    assert ops._parse_tripped_flag(0) is False
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 (2026-05-13 audit): clean_current decoupled from 30-day rolling
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_counter_window_days_1_excludes_old_events():
+    """The streak math passes window_days=1 to count today's events only.
+    Historical events 4-5 days old should be excluded even if still inside
+    the 30-day rolling window."""
+    lines = [
+        # ~5 days ago — should appear in 30d count, NOT in 1d count
+        "2026-05-08T12:10:00Z MAX RESTARTS reached for paper session",
+        # ~4 hours ago — should appear in both
+        "2026-05-12T08:00:00Z MAX RESTARTS reached for paper session",
+    ]
+
+    count_30d, _ = ops._count_watchdog_events(lines, NOW, 30)
+    count_1d, _ = ops._count_watchdog_events(lines, NOW, 1)
+
+    assert count_30d == 2
+    assert count_1d == 1  # only the recent one
+
+
+def test_watchdog_counter_window_days_1_empty_when_no_recent_events():
+    """With only old events, window_days=1 returns zero. This is the case
+    that previously kept clean_current=False forever after a cascade burst."""
+    lines = [
+        "2026-04-14T23:48:15Z CRITICAL: IB Gateway/TWS process NOT running for 3 checks",
+        "2026-04-15T23:48:20Z CRITICAL: IB Gateway/TWS process NOT running for 3 checks",
+    ]
+
+    count_30d, _ = ops._count_watchdog_events(lines, NOW, 30)
+    count_1d, _ = ops._count_watchdog_events(lines, NOW, 1)
+
+    assert count_30d == 2
+    assert count_1d == 0  # streak can advance even though 30d count nonzero
+
+
 def test_margin_counter_ignores_net_liquidation_balance_lines():
     count, examples = ops._count_margin_alerts(
         risk_report={},

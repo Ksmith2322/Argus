@@ -182,6 +182,38 @@ def test_smoke_stage_accepts_low_sample_ir_when_flag_set():
     assert report["approved_capital_usd"] == 5_000
 
 
+def test_stage_blockers_raises_on_missing_min_qualified_strategies():
+    """Bug 3 (2026-05-13 audit): a stage with non-empty criteria but
+    no min_qualified_strategies silently defaulted to 0, bypassing all
+    strategy-level validation. The fix raises ValueError so config typos
+    surface immediately."""
+    import pytest
+
+    bad_stage = {
+        "name": "BAD_STAGE",
+        "approved_capital_usd": 1000,
+        "criteria": {
+            # min_qualified_strategies intentionally omitted
+            "min_real_fills_per_strategy": 10,
+            "min_strategy_live_ir": 0.3,
+        },
+    }
+    with pytest.raises(ValueError, match="min_qualified_strategies"):
+        cl.stage_blockers(bad_stage, {"strategies": {}, "ops": {}, "portfolio": {}})
+
+
+def test_stage_blockers_does_not_raise_for_empty_criteria():
+    """RESEARCH_FREEZE has empty criteria — that's the legitimate
+    zero-capital stage. Empty criteria must keep returning no blockers
+    (not raise)."""
+    research_freeze = {
+        "name": "RESEARCH_FREEZE",
+        "approved_capital_usd": 0,
+        "criteria": {},
+    }
+    assert cl.stage_blockers(research_freeze, {"strategies": {}, "ops": {}, "portfolio": {}}) == []
+
+
 def test_strict_stage_ignores_low_sample_ir_even_when_present():
     cfg = _config()
     s = _strategy("s1", "METALS", fills=50, days=30, ir=0.0, capacity=10_000)
