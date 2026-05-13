@@ -27,6 +27,12 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# 2026-05-13: mamba previously used datetime.now(timezone(timedelta(hours=-4)))
+# which hardcodes UTC-4 (EDT). Correct during EDT, off by 1 hour during EST.
+# Use America/New_York for DST-aware NY session math.
+_NY_TZ = ZoneInfo("America/New_York")
 from pathlib import Path
 from typing import Optional
 
@@ -1019,7 +1025,7 @@ def run_signal_loop():
 
     while True:
         try:
-            now = datetime.now(timezone(timedelta(hours=-4)))  # EST approx
+            now = datetime.now(_NY_TZ)  # DST-aware NY wall-clock
             in_window = is_ny_session(now, phase="trade")
 
             if not in_window:
@@ -1100,7 +1106,7 @@ def run_live():
 
     while True:
         try:
-            now = datetime.now(timezone(timedelta(hours=-4)))  # EST approx
+            now = datetime.now(_NY_TZ)  # DST-aware NY wall-clock
             in_window = is_ny_session(now, phase="trade")
 
             ib = None

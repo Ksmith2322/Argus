@@ -27,6 +27,14 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# 2026-05-13: NY_OPEN_HOUR / NY_CLOSE_HOUR are expressed in Eastern time
+# (NYSE session). System clock is CDT (UTC-5), so datetime.now() without
+# tz returned local CDT and the strategy treated CDT 9:30 as "NY open" —
+# one hour AFTER actual 9:30 EDT. Use America/New_York to get the
+# correct wall-clock hour regardless of where the host runs.
+_NY_TZ = ZoneInfo("America/New_York")
 from pathlib import Path
 from typing import Optional
 
@@ -801,7 +809,7 @@ def run_loop():
     signal_csv = LOG_DIR / "cuebanks_signals.csv"
 
     while True:
-        now = datetime.now()
+        now = datetime.now(_NY_TZ)
         # Check if NY session
         h, m = now.hour, now.minute
         t = h * 60 + m
@@ -932,7 +940,7 @@ def run_live():
 
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(_NY_TZ)
             h, m = now.hour, now.minute
             t = h * 60 + m
             ny_start = NY_OPEN_HOUR * 60 + NY_OPEN_MIN
