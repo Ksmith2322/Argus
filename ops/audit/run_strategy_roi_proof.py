@@ -282,9 +282,13 @@ def _summarize_strategy(
     # Per-trade returns for risk-adjusted ratios. We compute strategy
     # return as pnl / notional and compare against SPY return over the
     # same trade window (when SPY data covers the window).
+    # Bug 2 (2026-05-13 audit): also track paper/live provenance per
+    # trade so we can compute IR separately for each subset and emit
+    # paper_live_ir_delta_abs for the LIVE_10K gate.
     trade_benches = []
     strat_returns: list[float] = []
     aligned_bench_returns: list[float] = []
+    is_real_money_flags: list[bool] = []
     for r, p, nt in zip(rows, pnls, notionals):
         if nt <= 0:
             continue
@@ -299,6 +303,7 @@ def _summarize_strategy(
         if tb.spy_data_available and tb.spy_return_frac is not None:
             strat_returns.append(tb.strategy_return_frac)
             aligned_bench_returns.append(tb.spy_return_frac)
+            is_real_money_flags.append(bool(r.get("is_real_money")))
     bench_summary = bench.aggregate_benchmark(trade_benches)
 
     # Sortino on per-trade strategy returns. periods_per_year is derived
@@ -322,6 +327,58 @@ def _summarize_strategy(
         min_n=core.SMOKE_N,
     ) if strat_returns and aligned_bench_returns else \
         core.InsufficientSample(actual_n=len(strat_returns), required_n=core.SMOKE_N)
+
+    # Bug 2 (2026-05-13 audit): paper-vs-live IR delta. LIVE_10K gates on
+    # |paper_ir - live_ir| <= 0.3 to detect paper/real execution drift.
+    # Pre-fix: no automated source computed this, so LIVE_10K was
+    # mechanically unreachable. Post-fix: we partition the trade-aligned
+    # return series by is_real_money provenance and compute IR per subset
+    # at SMOKE_N=10. When a strategy is still 100% paper (current state
+    # for everything), live count = 0 and delta is vacuously 0.0; other
+    # LIVE_10K gates (min_real_fills, min_live_days) still block such
+    # strategies from advancing, so the vacuous value doesn't promote
+    # anything that isn't ready.
+    paper_strat = [s for s, f in zip(strat_returns, is_real_money_flags) if not f]
+    paper_bench = [b for b, f in zip(aligned_bench_returns, is_real_money_flags) if not f]
+    live_strat = [s for s, f in zip(strat_returns, is_real_money_flags) if f]
+    live_bench = [b for b, f in zip(aligned_bench_returns, is_real_money_flags) if f]
+    n_live_returns = len(live_strat)
+    n_paper_returns = len(paper_strat)
+
+    paper_ir: Any
+    live_ir: Any
+    paper_live_ir_delta_abs: Any
+    if n_live_returns == 0:
+        # No live trades yet — vacuous delta. min_real_fills + min_live_days
+        # gates at LIVE_10K still block these strategies from advancing.
+        paper_ir = ir  # full series is paper-only
+        live_ir = None
+        paper_live_ir_delta_abs = 0.0
+    elif n_paper_returns >= core.SMOKE_N and n_live_returns >= core.SMOKE_N:
+        paper_ir = core.information_ratio(
+            paper_strat, paper_bench, periods_per_year=int(ppy), min_n=core.SMOKE_N,
+        )
+        live_ir = core.information_ratio(
+            live_strat, live_bench, periods_per_year=int(ppy), min_n=core.SMOKE_N,
+        )
+        if isinstance(paper_ir, (int, float)) and isinstance(live_ir, (int, float)):
+            paper_live_ir_delta_abs = abs(paper_ir - live_ir)
+        else:
+            paper_live_ir_delta_abs = core.InsufficientSample(
+                actual_n=min(n_paper_returns, n_live_returns),
+                required_n=core.SMOKE_N,
+                note="paper or live IR subset returned InsufficientSample",
+            )
+    else:
+        # Live trades exist but not enough sample for a stable comparison.
+        # Mark INSUFFICIENT_SAMPLE so the LIVE_10K gate fails closed.
+        paper_ir = ir
+        live_ir = None
+        paper_live_ir_delta_abs = core.InsufficientSample(
+            actual_n=min(n_paper_returns, n_live_returns),
+            required_n=core.SMOKE_N,
+            note=f"paper={n_paper_returns} live={n_live_returns} (need >= {core.SMOKE_N} each)",
+        )
 
     out: dict[str, Any] = {
         "strategy": name,
@@ -348,6 +405,11 @@ def _summarize_strategy(
         "sortino": _serialize_metric(sortino),
         "information_ratio": _serialize_metric(ir),
         "information_ratio_low_sample": _serialize_metric(ir_low_sample),
+        "paper_information_ratio": _serialize_metric(paper_ir),
+        "live_information_ratio": _serialize_metric(live_ir) if live_ir is not None else "",
+        "paper_live_ir_delta_abs": _serialize_metric(paper_live_ir_delta_abs),
+        "n_paper_trades": n_paper_returns,
+        "n_live_trades": n_live_returns,
         "spy_n_with_data": bench_summary["n_with_spy_data"],
         "spy_coverage_pct": bench_summary["coverage_pct"],
         "mean_strategy_return": bench_summary["mean_strategy_return"],
