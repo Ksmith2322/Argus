@@ -677,6 +677,58 @@ def cancel_order_by_id(ib: IB, order_id: Optional[str]) -> bool:
     return False
 
 
+def _recover_close_fill_from_executions(
+    ib: IB,
+    contract: Contract,
+    entry_direction: str,
+    after_ts: Optional[float] = None,
+) -> Optional[FillResult]:
+    """Look up the most recent closing fill via reqExecutions.
+
+    Used when the synchronous market-close wait times out but the order may
+    actually have filled — TWS can report `Cancelled` while a separate fill
+    still made it through, or the wait window expired while the fill was
+    in-flight. Without this lookup, the runner records exit_px=None and the
+    trade silently disappears from trades.csv (the gating `if exit_px is not
+    None` filter drops it). Same recovery pattern as check_bracket_filled.
+
+    Returns None if no matching execution found. Otherwise a FillResult with
+    filled=True and fill_price/fill_ts populated from the broker's record.
+
+    after_ts: optional unix timestamp; only fills newer than this count
+    (defends against picking up the entry fill as the close).
+    """
+    ef = ExecutionFilter()
+    ef.symbol = contract.symbol
+    ef.secType = getattr(contract, "secType", "") or ""
+    try:
+        fills = ib.reqExecutions(ef)
+    except Exception as exc:
+        log.warning(f"reqExecutions failed for {contract.symbol}: {exc}")
+        return None
+    if not fills:
+        return None
+    close_side = "SLD" if entry_direction == "long" else "BOT"
+    candidates = [f for f in fills if f.execution.side == close_side]
+    if after_ts is not None:
+        def _ts(f) -> float:
+            t = f.time
+            try:
+                return t.timestamp() if hasattr(t, "timestamp") else 0.0
+            except Exception:
+                return 0.0
+        candidates = [f for f in candidates if _ts(f) >= after_ts]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda f: f.time)
+    return FillResult(
+        filled=True,
+        fill_price=float(latest.execution.price),
+        fill_ts=latest.time.isoformat() if hasattr(latest.time, "isoformat") else str(latest.time),
+        order_id=str(getattr(latest.execution, "orderId", "")) or None,
+    )
+
+
 def close_position_market(
     ib: IB,
     contract: Contract,
@@ -712,17 +764,35 @@ def close_position_market(
     order = MarketOrder(close_action, abs(size))
     if account:
         order.account = account
+    submit_ts = time.time()
     trade = ib.placeOrder(contract, order)
     fill = _wait_for_fill(ib, trade, timeout_s=timeout_s)
     if fill.filled:
         log.info(
             f"CLOSE FILLED: {close_action} {size} {contract.symbol} @ {fill.fill_price:.5f}"
         )
-    else:
-        log.error(
-            f"CLOSE NOT FILLED: {close_action} {size} {contract.symbol} "
-            f"reason={fill.reject_reason}"
+        return fill
+
+    # 2026-05-13: _wait_for_fill timed out or reported Cancelled — try to
+    # recover the actual fill from reqExecutions. TWS can report Cancelled
+    # while a fill still goes through (timing race), and the wait window
+    # can expire mid-fill. Without this fallback fomc_drift / tom_international
+    # silently lose trades (audit S7).
+    recovered = _recover_close_fill_from_executions(
+        ib, contract, entry_direction=direction, after_ts=submit_ts - 5.0,
+    )
+    if recovered is not None and recovered.filled:
+        log.warning(
+            f"CLOSE RECOVERED via reqExecutions: {close_action} {size} "
+            f"{contract.symbol} @ {recovered.fill_price:.5f} "
+            f"(wait reported: {fill.reject_reason})"
         )
+        return recovered
+
+    log.error(
+        f"CLOSE NOT FILLED: {close_action} {size} {contract.symbol} "
+        f"reason={fill.reject_reason}"
+    )
     return fill
 
 

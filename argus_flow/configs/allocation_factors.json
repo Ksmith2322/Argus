@@ -3,14 +3,16 @@
   "factors": {
     "forge_multi_orb": 0.0,
     "forge_spy_mean_rev": 0.0,
-    "forge_vix_intraday": 0.0
+    "forge_vix_intraday": 0.0,
+    "forge_nq_london_close": 0.0
   },
-  "version": "v3_2026-05-12",
-  "last_updated": "2026-05-12T13:15:00.000000+00:00",
+  "version": "v4_2026-05-13",
+  "last_updated": "2026-05-13T22:50:00.000000+00:00",
   "_kill_log": [
     "2026-04-30: forge_spy_mean_rev -> 0.0 (PF<1, structural loser, no recovery path)",
     "2026-05-07: forge_multi_orb -> 0.0 (n=161 PF=0.83 ROI=-12% real, plus 7 phantoms; tried v1 24-bar / v3 32-bar / v4 24-bar revert; sizing-formula fix shipped; thesis exhausted)",
     "2026-05-12: forge_vix_intraday -> 0.0 (n=61 pnl=-$49 drift -175% confirmed by decision engine + ROI proof FAILS_SPY_BENCHMARK IR=-4.36). 2026-05-12 15:02 UTC: UVXY orphan 283sh manually flattened @ $37.68 = +$515 realized; broker drift detector had tripped at -4.56% because the OCO bracket was NOT in TWS at runner-death time (assumption that bracket survives runner shutdown was wrong for emergency-shutdown path). Drift epoch re-anchored post-flatten.",
-    "2026-05-12: forge_spy_mean_rev rework path CLOSED — decision engine REWORK was a deferral, not a hypothesis. Negative expectancy structural; future SPY mean-rev work to start as v2 from scratch with fresh entry/exit logic, not as a rework of v1. fleet_monitor no_restart=true added."
+    "2026-05-12: forge_spy_mean_rev rework path CLOSED — decision engine REWORK was a deferral, not a hypothesis. Negative expectancy structural; future SPY mean-rev work to start as v2 from scratch with fresh entry/exit logic, not as a rework of v1. fleet_monitor no_restart=true added.",
+    "2026-05-13: forge_nq_london_close -> 0.0 (n=3 fills over 20 days = 2 valid + 1 phantom; ex-phantom net +$16; signal trigger rate 15/6356 = 0.24% with 80% of triggered signals rejected by Cancelled/flatten_eod/oversized_order paths; 5/5 phantom 417 contracts = $117M notional from sizing-formula bug. Concentration overlap with mamba/cuebanks/tori/nq_overnight already covering MNQ/YM family. Sample insufficient + phantom history + redundant venue = no recovery path to real-money."
   ]
 }

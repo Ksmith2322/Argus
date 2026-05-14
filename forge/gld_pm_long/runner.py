@@ -332,7 +332,7 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     risk_budget_usd = compute_risk_usd(strategy_label="forge_gld_pm_long")
     # 2026-05-07 audit: same sizing-formula fix as multi_orb / vix_intraday.
     # ATR-based sizing floor prevents tight-stop explosion.
-    cap_usd = max_notional_usd("etf") if plan_entry > 0 else None
+    cap_usd = max_notional_usd("etf", strategy_label="forge_gld_pm_long") if plan_entry > 0 else None
     from helio.strategy_common import safe_position_size
     pos_size, sizing_policy = safe_position_size(
         risk_usd=risk_budget_usd,
