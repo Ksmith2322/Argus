@@ -67,12 +67,145 @@ UNIVERSE = {
 }
 
 
+# Sub-$10 universe — Phase 1 research focus (2026-05-14).
+# Curated list of names that frequently trade under $10 with meaningful
+# volume. Some of these may currently trade above $10 — that's fine; the
+# scanner filters by price-at-breakout, so we only learn from setups that
+# fired while the stock was actually under our threshold. Tickers that have
+# delisted will yfinance-fail at download and skip gracefully.
+SUB10_UNIVERSE = {
+    # Biotech / pharma (high gap potential — FDA, trial data)
+    "SAVA": "biotech", "OCGN": "biotech", "ATER": "biotech", "BNGO": "biotech",
+    "ATOS": "biotech", "VSTM": "biotech", "SNGX": "biotech", "CETX": "biotech",
+    "PRTC": "biotech", "ANNX": "biotech", "ABEO": "biotech", "EYEN": "biotech",
+    "ONCT": "biotech", "IMRN": "biotech", "IBRX": "biotech", "OBSV": "biotech",
+    "MNMD": "biotech", "ETON": "biotech", "GRTS": "biotech", "JAGX": "biotech",
+    "INVO": "biotech", "KZIA": "biotech", "RGC": "biotech",
+    # Mining / resources / uranium (commodity-driven breakouts)
+    "DNN": "mining_uranium", "UUUU": "mining_uranium", "NXE": "mining_uranium",
+    "USAS": "mining", "AG": "mining_silver", "EXK": "mining_silver",
+    "GORO": "mining_gold", "NAK": "mining", "BORR": "energy_drilling",
+    # Cannabis / CPG (sector-rotation driven)
+    "SNDL": "cannabis", "TLRY": "cannabis", "ACB": "cannabis", "AGFY": "cannabis",
+    "CRON": "cannabis", "VFF": "cannabis", "OGI": "cannabis",
+    # EV / clean energy (low-priced) — momentum often catalyst-driven
+    "FCEL": "energy_fuel_cell", "BLNK": "ev_charging", "MULN": "ev",
+    "GOEV": "ev", "RIDE": "ev", "FFIE": "ev", "ASTS": "satellite",
+    "PLUG": "energy_fuel_cell",
+    # China small caps (sometimes sub-$10)
+    "VIPS": "china_ecomm", "HUYA": "china_streaming", "DOYU": "china_streaming",
+    "GOTU": "china_edtech", "IQ": "china_streaming", "BILI": "china_media",
+    # Crypto proxies (when below $10)
+    "CAN": "crypto_proxy", "BTBT": "crypto_proxy", "BTCS": "crypto_proxy",
+    "MIGI": "crypto_proxy", "HIVE": "crypto_proxy", "BITF": "crypto_proxy",
+    # Meme / momentum (low-priced runners)
+    "PROG": "meme", "BBIG": "meme", "MMAT": "meme", "GNUS": "meme",
+    "FAMI": "meme", "NEGG": "meme", "MTVR": "meme", "GREE": "meme",
+    "ANY": "meme", "IDEX": "meme", "TRKA": "meme", "GFAI": "meme",
+    # SPACs / recent IPOs (low float, big moves)
+    "AHRN": "spac", "CCIV": "spac", "SPCE": "space",
+    # Telecom / industrials (low-priced large caps)
+    "NOK": "telecom", "BB": "tech_legacy",
+    # Healthcare / diagnostics
+    "TKAT": "med_diag", "OPGN": "med_diag",
+    # Cyclicals / value names that occasionally sub-$10
+    "F": "auto", "T": "telecom_mega",
+    # ETFs that can break out as group proxies
+    "SOXS": "etf_inverse_semi", "TZA": "etf_inverse_smallcap",
+}
+
+
+# Available universe selectors for the --universe CLI flag.
+UNIVERSES = {
+    "mainline": UNIVERSE,
+    "sub10": SUB10_UNIVERSE,
+    "all": {**UNIVERSE, **SUB10_UNIVERSE},
+}
+
+
 # ── Phase 1: Download Historical Data ────────────────────────────
 
-def download_universe(symbols: list[str] | None = None, period: str = "2y"):
-    """Download daily OHLCV data for the stock universe."""
+def download_universe_batch(symbols: list[str], period: str = "2y",
+                              batch_size: int = 100, skip_fresh_hours: float = 24.0) -> tuple[int, list[str]]:
+    """Batch-download many tickers via yfinance (50-100 per call). Much faster
+    than one-at-a-time for big universes. Skips files updated within
+    skip_fresh_hours. Returns (n_success, failed_tickers)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tickers = symbols or list(UNIVERSE.keys())
+    pending = []
+    n_skipped = 0
+    for sym in symbols:
+        out_path = DATA_DIR / f"{sym}_daily.csv"
+        if out_path.exists():
+            age_h = (time.time() - out_path.stat().st_mtime) / 3600
+            if age_h < skip_fresh_hours:
+                n_skipped += 1
+                continue
+        pending.append(sym)
+    print(f"  {n_skipped} fresh files skipped, {len(pending)} to download")
+    if not pending:
+        return n_skipped, []
+
+    n_success = n_skipped
+    failed: list[str] = []
+    n_batches = (len(pending) + batch_size - 1) // batch_size
+    for bi in range(n_batches):
+        batch = pending[bi * batch_size : (bi + 1) * batch_size]
+        try:
+            df = yf.download(batch, period=period, interval="1d", progress=False,
+                             auto_adjust=True, threads=True, group_by="ticker")
+        except Exception as e:
+            print(f"  batch {bi+1}/{n_batches}: download error: {e}")
+            failed.extend(batch)
+            continue
+        for sym in batch:
+            try:
+                if isinstance(df.columns, pd.MultiIndex):
+                    if sym not in df.columns.get_level_values(0):
+                        failed.append(sym)
+                        continue
+                    sub = df[sym].copy()
+                else:
+                    sub = df.copy()
+                if sub.empty or "Close" not in sub.columns:
+                    failed.append(sym)
+                    continue
+                sub = sub.dropna(subset=["Close"])
+                if len(sub) < 60:
+                    failed.append(sym)
+                    continue
+                out_path = DATA_DIR / f"{sym}_daily.csv"
+                sub.to_csv(out_path)
+                n_success += 1
+            except Exception:
+                failed.append(sym)
+        if (bi + 1) % 5 == 0 or bi == n_batches - 1:
+            print(f"  batch {bi+1}/{n_batches} done — {n_success} OK, {len(failed)} failed")
+        time.sleep(0.5)
+    return n_success, failed
+
+
+def download_universe(symbols: list[str] | None = None, period: str = "2y",
+                       universe_name: str = "mainline"):
+    """Download daily OHLCV data for the stock universe.
+
+    universe_name selects which curated dict to download: "mainline" (legacy
+    growth/tech), "sub10" (sub-$10 actively-traded names), or "all" (union).
+    Explicit `symbols` overrides the universe selection."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if symbols is None:
+        u_dict = UNIVERSES.get(universe_name, UNIVERSE)
+        tickers = list(u_dict.keys())
+    else:
+        tickers = symbols
+
+    # Use the batch path when we have many tickers — much faster
+    if len(tickers) > 50:
+        print(f"Batch-downloading {len(tickers)} stocks ({period} history)...")
+        n_ok, failed = download_universe_batch(tickers, period=period)
+        print(f"  Done: {n_ok} OK, {len(failed)} failed")
+        if failed:
+            print(f"  Failed (first 20): {', '.join(failed[:20])}")
+        return
 
     print(f"Downloading {len(tickers)} stocks ({period} history)...")
     success = 0
@@ -118,17 +251,27 @@ def download_universe(symbols: list[str] | None = None, period: str = "2y"):
 
 # ── Phase 2: Detect Breakout Events ──────────────────────────────
 
-def detect_breakouts(min_move_pct: float = 5.0, lookback_days: int = 5):
+def detect_breakouts(min_move_pct: float = 5.0, lookback_days: int = 5,
+                      max_price_at_breakout: float | None = None,
+                      output_suffix: str = ""):
     """Scan all downloaded stocks for breakout events.
 
     A breakout = price moves >= min_move_pct within lookback_days.
     Returns list of breakout events with pre-breakout context.
+
+    max_price_at_breakout: if set, only record breakouts where the price
+    AT the breakout bar was <= this value. Used for the sub-$10 research
+    cohort — we only want to learn from setups that fired in the price
+    range we'll actually trade.
+
+    output_suffix: appended to the output CSV filename (e.g. "_sub10").
     """
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     all_breakouts = []
 
     csv_files = sorted(DATA_DIR.glob("*_daily.csv"))
-    print(f"\nScanning {len(csv_files)} stocks for breakouts (>={min_move_pct}% in {lookback_days}d)...")
+    price_filter_desc = f", price@bar<=${max_price_at_breakout:.2f}" if max_price_at_breakout else ""
+    print(f"\nScanning {len(csv_files)} stocks for breakouts (>={min_move_pct}% in {lookback_days}d{price_filter_desc})...")
 
     for csv_path in csv_files:
         sym = csv_path.stem.replace("_daily", "")
@@ -167,6 +310,21 @@ def detect_breakouts(min_move_pct: float = 5.0, lookback_days: int = 5):
             # Downside breakout
             down_move = (close[i] - min_future_low) / close[i] * 100
 
+            # Price filter: only record breakouts that fired in our target price range
+            if max_price_at_breakout is not None and close[i] > max_price_at_breakout:
+                continue
+
+            # Data-quality floor: yfinance back-adjusts prices through reverse
+            # splits, so a stock that did 1-for-50 RS will show pre-split bars
+            # at near-zero prices, producing fake 10,000%+ moves. Skip bars
+            # where the adjusted close is implausibly low for a tradable stock
+            # AND clip absurd move % (real penny moves rarely exceed 200% in
+            # a week — anything bigger is almost always a split artifact).
+            if close[i] < 0.10:
+                continue
+            if up_move > 200 or down_move > 95:
+                continue
+
             if up_move >= min_move_pct:
                 breakout = _build_breakout_record(
                     sym, "UP", dates[i], close, high, low, volume,
@@ -185,8 +343,11 @@ def detect_breakouts(min_move_pct: float = 5.0, lookback_days: int = 5):
 
     # Save all breakouts
     if all_breakouts:
-        out_path = RESULTS_DIR / "all_breakouts.csv"
+        out_path = RESULTS_DIR / f"all_breakouts{output_suffix}.csv"
         df_out = pd.DataFrame(all_breakouts)
+        # Sort by move size (descending absolute %) so biggest movers float to top
+        df_out["abs_move"] = df_out["move_pct"].abs()
+        df_out = df_out.sort_values("abs_move", ascending=False).drop(columns=["abs_move"])
         df_out.to_csv(out_path, index=False)
         print(f"  Found {len(all_breakouts)} breakout events across {len(csv_files)} stocks")
         print(f"  Saved: {out_path}")
@@ -223,13 +384,19 @@ def _build_breakout_record(sym, direction, date, close, high, low, volume,
             else:
                 break
 
+    # Look up sector in the union universe so both mainline + sub10 get tagged
+    _SECTOR_LOOKUP = {**UNIVERSE, **SUB10_UNIVERSE}
     return {
         "symbol": sym,
-        "sector": UNIVERSE.get(sym, "unknown"),
+        "sector": _SECTOR_LOOKUP.get(sym, "unknown"),
         "date": str(date.date()) if hasattr(date, 'date') else str(date)[:10],
         "direction": direction,
         "move_pct": round(move_pct, 2),
         "price": round(close[idx], 2),
+        # Hand-label after review: catalyst type (earnings | FDA | M&A |
+        # short_squeeze | sector_rotation | technical | social | unknown).
+        # Phase 3 (reverse-engineer the edge) keys off this column.
+        "catalyst_label": "",
         # Pre-breakout indicators
         "bb_width": round(bb_width[idx], 4) if idx < len(bb_width) and not np.isnan(bb_width[idx]) else 0,
         "bb_width_pctile": round(_percentile_rank(bb_width[:idx], bb_width[idx]), 2) if idx > 20 else 0,
@@ -255,12 +422,15 @@ def _build_breakout_record(sym, direction, date, close, high, low, volume,
 
 # ── Phase 3: Reverse-Engineer Patterns ────────────────────────────
 
-def analyze_breakout_patterns():
-    """Analyze pre-breakout features to find the setup fingerprint."""
+def analyze_breakout_patterns(output_suffix: str = ""):
+    """Analyze pre-breakout features to find the setup fingerprint.
+
+    output_suffix matches the suffix used by detect_breakouts (e.g. "_sub10")
+    so analyze operates on the cohort the user actually wants."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    bo_path = RESULTS_DIR / "all_breakouts.csv"
+    bo_path = RESULTS_DIR / f"all_breakouts{output_suffix}.csv"
     if not bo_path.exists():
-        print("No breakout data. Run --scan first.")
+        print(f"No breakout data at {bo_path}. Run --scan first.")
         return
 
     df = pd.read_csv(bo_path)
@@ -295,7 +465,7 @@ def analyze_breakout_patterns():
 
         stock_stats.append({
             "symbol": sym,
-            "sector": UNIVERSE.get(sym, "?"),
+            "sector": {**UNIVERSE, **SUB10_UNIVERSE}.get(sym, "?"),
             "total_breakouts": len(sym_df),
             "up": len(sym_up),
             "down": len(sym_down),
@@ -384,7 +554,7 @@ def analyze_breakout_patterns():
             print(f"  {col:15s}  breakout={bo_mean:.3f}  normal={norm_mean:.3f}  diff={diff:+.1f}%{marker}")
 
     # Save full results
-    stats_path = RESULTS_DIR / "stock_rankings.csv"
+    stats_path = RESULTS_DIR / f"stock_rankings{output_suffix}.csv"
     stats_df.to_csv(stats_path, index=False)
     print(f"\n  Rankings saved: {stats_path}")
 
@@ -401,7 +571,7 @@ def analyze_breakout_patterns():
         "up_breakouts": len(up),
         "down_breakouts": len(down),
     }
-    profile_path = RESULTS_DIR / "breakout_profile.json"
+    profile_path = RESULTS_DIR / f"breakout_profile{output_suffix}.json"
     profile_path.write_text(json.dumps(profile, indent=2, default=str))
     print(f"  Profile saved: {profile_path}")
 
@@ -454,28 +624,67 @@ def main():
     parser.add_argument("--top", type=int, default=15, help="Show top N stocks")
     parser.add_argument("--min-move", type=float, default=5.0, help="Minimum breakout move %% (default: 5)")
     parser.add_argument("--period", default="2y", help="History period (default: 2y)")
+    parser.add_argument("--universe", choices=list(UNIVERSES.keys()), default="mainline",
+                        help="Universe to scan: mainline (legacy growth/tech), sub10 (sub-$10 cohort), or all")
+    parser.add_argument("--universe-file", default=None,
+                        help="Path to a text file with one ticker per line. Overrides --universe. "
+                             "Use this for the Nasdaq Trader-derived expanded universe.")
+    parser.add_argument("--suffix", default=None,
+                        help="Output filename suffix (default: auto from --universe). "
+                             "Use a custom suffix for --universe-file runs (e.g. '_sub10_exp').")
+    parser.add_argument("--max-price", type=float, default=None,
+                        help="Only record breakouts where price-at-breakout-bar <= this value. "
+                             "Auto-set to 10.0 when --universe=sub10 or --universe-file is used.")
     args = parser.parse_args()
 
     if not args.scan and not args.analyze:
         args.scan = True
         args.analyze = True
 
+    # Determine ticker list and suffix
+    if args.universe_file:
+        from pathlib import Path as _P
+        u_path = _P(args.universe_file)
+        if not u_path.exists():
+            print(f"ERROR: --universe-file not found: {u_path}")
+            return
+        ticker_list = [t.strip().upper() for t in u_path.read_text().splitlines() if t.strip()]
+        universe_label = u_path.stem
+        suffix = args.suffix or f"_{universe_label}"
+        print(f"Loaded {len(ticker_list)} tickers from {u_path}")
+    else:
+        ticker_list = None
+        universe_label = args.universe
+        suffix = args.suffix or (f"_{args.universe}" if args.universe != "mainline" else "")
+
+    # Auto-apply $10 cap when universe is sub10-themed
+    max_price = args.max_price
+    if max_price is None and (args.universe == "sub10" or args.universe_file):
+        max_price = 10.0
+
     if args.scan:
         print(f"{'='*60}")
-        print("PHASE 1: Download Universe")
+        print(f"PHASE 1: Download Universe ({universe_label})")
         print(f"{'='*60}")
-        download_universe(period=args.period)
+        if ticker_list is not None:
+            download_universe(symbols=ticker_list, period=args.period)
+        else:
+            download_universe(period=args.period, universe_name=args.universe)
 
         print(f"\n{'='*60}")
         print("PHASE 2: Detect Breakouts")
         print(f"{'='*60}")
-        detect_breakouts(min_move_pct=args.min_move)
+        detect_breakouts(
+            min_move_pct=args.min_move,
+            max_price_at_breakout=max_price,
+            output_suffix=suffix,
+        )
 
     if args.analyze:
         print(f"\n{'='*60}")
         print("PHASE 3: Reverse-Engineer Patterns")
         print(f"{'='*60}")
-        analyze_breakout_patterns()
+        analyze_breakout_patterns(output_suffix=suffix)
 
 
 if __name__ == "__main__":
