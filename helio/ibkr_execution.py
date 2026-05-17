@@ -323,8 +323,16 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
     instrument_type:
       "stock" / "etf"   - SMART/USD routing (GLD, SPY, UVXY, GDX, etc.)
       "fx" / "forex"    - IDEALPRO cash FX (GBPUSD, USDJPY, etc.)
-      "future"          - CME/GLOBEX (NQ, ES)
-      "micro_future"    - micro contracts (MNQ, MES, MYM, M2K)
+      "future"          - exchange-specific routing (NQ/ES on CME, YM/RTY on CBOT)
+      "micro_future"    - micros (MNQ/MES on CME, MYM/M2K on CBOT)
+
+    Exchange routing (2026-05-16 fix): CME Group splits products across two
+    exchanges. NQ/MNQ (Nasdaq-100) and ES/MES (S&P-500) route to CME; YM/MYM
+    (Dow) and RTY/M2K (Russell-2000) route to CBOT. Sending a Dow/Russell
+    contract with exchange="CME" causes a SILENT order Cancellation from TWS
+    (no errorCode, no whyHeld message). This bug kept tori/cuebanks/mamba at
+    0 fills across 22+ days of MYM signals — they detected, submitted, and
+    got silently rejected with no diagnostic trail.
     """
     t = instrument_type.lower()
     if t in ("stock", "etf"):
@@ -332,10 +340,12 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
     if t in ("fx", "forex"):
         # IB FX uses concatenated pair, e.g. "EURUSD" or "USDJPY"
         return Forex(symbol)
-    if t == "future":
-        # Front-month continuous — caller should qualify to pin month
-        return Future(symbol, exchange="CME")
-    if t == "micro_future":
+    if t in ("future", "micro_future"):
+        sym_u = symbol.upper()
+        # CBOT-listed: Dow + Russell 2000 (both full-size and micros)
+        if sym_u in {"YM", "MYM", "RTY", "M2K"}:
+            return Future(symbol, exchange="CBOT")
+        # Default CME for everything else (NQ/MNQ, ES/MES, etc.)
         return Future(symbol, exchange="CME")
     raise IBKRExecutionError(f"unknown instrument_type: {instrument_type!r}")
 
