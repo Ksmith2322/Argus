@@ -350,6 +350,90 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
     raise IBKRExecutionError(f"unknown instrument_type: {instrument_type!r}")
 
 
+def _dump_unfilled_forensics(trade, order_id: Optional[str]) -> None:
+    """Persist a full forensic record of an unfilled order to disk.
+
+    Background (2026-05-16): the MYM contract-routing bug (cuebanks/mamba/tori
+    silently dead 22+ days) lived undetected because `_wait_for_fill`'s log
+    only surfaced `reject_reason=Cancelled` with no error code or whyHeld.
+    Even with the 5/13 trade.log capture (last 3 entries), TWS produced no
+    useful message — the order just came back Cancelled with empty diagnostics.
+
+    To catch the NEXT silent-failure class faster, dump every field of the
+    trade object that might explain the failure to a JSONL forensics log.
+    Each unfilled order gets one line. Grep this file when a strategy goes
+    quiet — the answer is in here even if the live logger missed it.
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        repo = _Path(__file__).resolve().parents[1]
+        forensics = repo / "argus_flow" / "logs" / "unfilled_orders.jsonl"
+        forensics.parent.mkdir(parents=True, exist_ok=True)
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id,
+        }
+        # Contract details
+        c = getattr(trade, "contract", None)
+        if c is not None:
+            record["contract"] = {
+                "symbol": getattr(c, "symbol", None),
+                "secType": getattr(c, "secType", None),
+                "exchange": getattr(c, "exchange", None),
+                "primaryExchange": getattr(c, "primaryExchange", None),
+                "currency": getattr(c, "currency", None),
+                "localSymbol": getattr(c, "localSymbol", None),
+                "lastTradeDateOrContractMonth": getattr(c, "lastTradeDateOrContractMonth", None),
+                "conId": getattr(c, "conId", None),
+            }
+        # Order details
+        o = getattr(trade, "order", None)
+        if o is not None:
+            record["order"] = {
+                "action": getattr(o, "action", None),
+                "orderType": getattr(o, "orderType", None),
+                "totalQuantity": getattr(o, "totalQuantity", None),
+                "lmtPrice": getattr(o, "lmtPrice", None),
+                "auxPrice": getattr(o, "auxPrice", None),
+                "tif": getattr(o, "tif", None),
+                "outsideRth": getattr(o, "outsideRth", None),
+                "account": getattr(o, "account", None),
+            }
+        # All orderStatus fields (every one TWS sets)
+        os_obj = getattr(trade, "orderStatus", None)
+        if os_obj is not None:
+            record["orderStatus"] = {
+                "status": getattr(os_obj, "status", None),
+                "filled": getattr(os_obj, "filled", None),
+                "remaining": getattr(os_obj, "remaining", None),
+                "avgFillPrice": getattr(os_obj, "avgFillPrice", None),
+                "permId": getattr(os_obj, "permId", None),
+                "parentId": getattr(os_obj, "parentId", None),
+                "lastFillPrice": getattr(os_obj, "lastFillPrice", None),
+                "clientId": getattr(os_obj, "clientId", None),
+                "whyHeld": getattr(os_obj, "whyHeld", None),
+                "mktCapPrice": getattr(os_obj, "mktCapPrice", None),
+            }
+        # FULL trade.log (every entry, not just last 3)
+        log_entries = []
+        for entry in (getattr(trade, "log", None) or []):
+            log_entries.append({
+                "time": entry.time.isoformat() if hasattr(getattr(entry, "time", None), "isoformat") else str(getattr(entry, "time", "")),
+                "status": getattr(entry, "status", None),
+                "message": str(getattr(entry, "message", "") or "")[:200],
+                "errorCode": int(getattr(entry, "errorCode", 0) or 0),
+            })
+        record["log"] = log_entries
+
+        with open(forensics, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record, default=str) + "\n")
+    except Exception as exc:
+        # Forensics dump must never break the order path
+        log.warning(f"_dump_unfilled_forensics failed (non-fatal): {exc}")
+
+
 def _wait_for_fill(ib: IB, trade, timeout_s: float = 10.0) -> FillResult:
     """Block up to timeout_s for a market order to fill. Returns FillResult."""
     deadline = time.time() + timeout_s
@@ -385,6 +469,12 @@ def _wait_for_fill(ib: IB, trade, timeout_s: float = 10.0) -> FillResult:
             reject = f"{reject} | {' / '.join(log_msgs)}"
     except Exception:
         pass
+
+    # 2026-05-16: dump full forensic record so the NEXT silent-failure class
+    # surfaces in minutes, not weeks. The MYM bug was invisible because the
+    # live logger only had the last 3 trade.log entries — and TWS produced
+    # no useful messages. This writes everything to a JSONL file for grep.
+    _dump_unfilled_forensics(trade, order_id)
 
     return FillResult(filled=False, order_id=order_id, reject_reason=reject or "timeout")
 
