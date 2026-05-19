@@ -42,6 +42,7 @@ from typing import Any
 
 from helio import roi_proof_core as core
 from helio import spy_benchmark as bench
+from helio import evidence_epoch as ee
 
 REPO = Path(__file__).resolve().parents[2]
 OUT_DIR = REPO / "ops" / "reports" / "system_audit"
@@ -531,12 +532,36 @@ def _roi_gap_row(stat: dict) -> dict:
     }
 
 
-def _write_outputs(per_strategy: list[dict], window: str, summary: dict, ts: str) -> None:
+def _write_outputs(
+    per_strategy: list[dict],
+    window: str,
+    summary: dict,
+    ts: str,
+    epoch: ee.EvidenceEpoch | None = None,
+) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    epoch = epoch or ee.current_epoch()
+
+    # JSON summary: the canonical stamped artifact. Downstream consumers
+    # (promotion_check, dashboard) read this; refusing on missing epoch_id
+    # or epoch_is_clean=false (without override) is the structural guard.
+    summary_payload = ee.stamp_report({
+        "ts": ts,
+        "window": window,
+        "summary": summary,
+        "per_strategy": per_strategy,
+    }, epoch=epoch)
+    (OUT_DIR / "roi_proof_summary.json").write_text(
+        json.dumps(summary_payload, indent=2, default=str),
+        encoding="utf-8",
+    )
+
     if not per_strategy:
         (OUT_DIR / "strategy_roi_proof.csv").write_text("strategy,verdict\n", encoding="utf-8")
         (OUT_DIR / "roi_proof_report.md").write_text(
-            f"# ROI Proof Report ({ts})\n\nNo strategies had post-reset trades to evaluate.\n",
+            f"# ROI Proof Report ({ts})\n\n"
+            f"Evidence epoch: **{epoch.id}** (is_clean={epoch.is_clean})\n\n"
+            f"No strategies had post-reset trades to evaluate.\n",
             encoding="utf-8",
         )
         return
@@ -583,9 +608,22 @@ def _write_outputs(per_strategy: list[dict], window: str, summary: dict, ts: str
     md_lines = [
         f"# ROI Proof Report ({ts})",
         "",
+        f"Evidence epoch: **{epoch.id}** "
+        f"(is_clean={'YES' if epoch.is_clean else 'NO — pre-reset contaminated'})",
+        f"Epoch label: _{epoch.label}_",
+        "",
         f"Window: **{window}** (post_reset cutoff: {POST_RESET.isoformat()})",
         f"Total strategies evaluated: **{summary['total_strategies']}**",
-        "",
+        "",]
+    if not epoch.is_clean:
+        md_lines += [
+            "> ⚠️  This report was computed against a contaminated epoch. "
+            "Numbers reflect the silent-bug period (CBOT routing, Error 321, "
+            "EXIT FAILED cascade, sizing-formula bug). Do NOT use for "
+            "promotion decisions — wait for the post-reset epoch.",
+            "",
+        ]
+    md_lines += [
         "## Portfolio target",
         f"- Annualized ROI target: **{summary['portfolio_target_annualized_roi']:.0%}**",
         f"- Per-strategy floors: Sortino ≥ {summary['promotion_floors']['sortino']}, "
@@ -645,15 +683,21 @@ def main(argv: list[str] | None = None) -> int:
     summary = _portfolio_summary(per_strategy)
 
     ts = datetime.now(timezone.utc).isoformat()
-    _write_outputs(per_strategy, args.window, summary, ts)
+    # Stamp every report with its evidence epoch (Codex audit 2026-05-18 X4).
+    # Downstream consumers refuse to act on unstamped or contaminated-epoch
+    # reports; this is what makes pre-reset noise structurally invisible
+    # to promotion math.
+    epoch = ee.current_epoch()
+    _write_outputs(per_strategy, args.window, summary, ts, epoch=epoch)
 
-    print(json.dumps({
+    stdout_payload = ee.stamp_report({
         "window": args.window,
         "total_strategies": len(per_strategy),
         "spy_bars_loaded": len(spy_bars),
         "summary": summary,
         "ts": ts,
-    }, indent=2, default=str))
+    }, epoch=epoch)
+    print(json.dumps(stdout_payload, indent=2, default=str))
     return 0
 
 

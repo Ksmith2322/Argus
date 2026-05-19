@@ -68,7 +68,7 @@ class IBKRExecutor:
         self.client_id = client_id
         self.system = system
         self.host = host or os.getenv("IBKR_HOST", "127.0.0.1")
-        self.port = port or int(os.getenv("IBKR_PORT", "7496"))
+        self.port = port or int(os.getenv("IBKR_PORT", "7497"))
         self.paper = paper
         self.model_equity_usd = model_equity_usd
         self._ib = IB()
@@ -139,8 +139,12 @@ class IBKRExecutor:
             if halted:
                 self._log.warning(f"FLEET_HALTED: refusing {direction} {quantity} {symbol}. Reason: {halt_reason}")
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail closed: if the halt check itself raises, we cannot tell
+            # whether a fleet-wide halt is in effect. Refuse rather than
+            # potentially trade through a HALT.flag. Codex audit 2026-05-18 X5.
+            self._log.error(f"fleet halt check failed, REFUSING entry: {exc}")
+            return None
 
         # Guard 2: cluster exposure cap
         try:
@@ -155,7 +159,11 @@ class IBKRExecutor:
                     )
                     return None
         except Exception as exc:
-            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed: cluster-cap exception means we cannot evaluate
+            # cluster exposure. Refuse rather than risk a cluster blowup.
+            # Codex audit 2026-05-18 X5 — guards must fail closed.
+            self._log.error(f"cluster cap check failed, REFUSING entry: {exc}")
+            return None
 
         # Guard 3: real-money boundary. No-op for paper connections; fail-closed
         # for real-account connections unless this system is explicitly

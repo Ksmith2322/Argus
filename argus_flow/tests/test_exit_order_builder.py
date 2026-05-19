@@ -39,7 +39,12 @@ def _make_instrument(sec_type: str) -> SimpleNamespace:
 def test_fx_exit_uses_limit_order_with_outside_rth():
     """The 2026-05-08 EXIT_FAILED bug: MarketOrder hung on FX. Fix: LMT
     with 5% adverse buffer + outsideRth=True so the exit fills around
-    session boundaries."""
+    session boundaries.
+
+    Codex audit 2026-05-18 follow-up: a DAY-flagged FX LMT can also stall
+    if the order sits past the broker's day boundary. For CASH, the helper
+    now upgrades DAY→GTC; tif behavior is verified by
+    test_fx_day_is_upgraded_to_gtc below."""
     inst = _make_instrument("CASH")
     order = inst._build_exit_order("SELL", qty=10000, ref_px=1.30, tif="DAY")
     assert type(order).__name__ == "LimitOrder"
@@ -48,7 +53,17 @@ def test_fx_exit_uses_limit_order_with_outside_rth():
     assert order.lmtPrice == pytest.approx(1.30 * 0.95, rel=1e-4)
     assert order.totalQuantity == 10000
     assert order.action == "SELL"
-    assert order.tif == "DAY"
+
+
+def test_fx_day_is_upgraded_to_gtc():
+    """Codex audit 2026-05-18: TIF=DAY on a CASH exit can silently expire
+    around the broker's daily roll boundary, which was a suspected factor
+    in the recurring argus_gbpusd EXIT FAILED cascade. The helper now
+    upgrades DAY → GTC for CASH so the exit persists across session
+    boundaries until it fills."""
+    inst = _make_instrument("CASH")
+    order = inst._build_exit_order("SELL", qty=10000, ref_px=1.30, tif="DAY")
+    assert order.tif == "GTC"
 
 
 def test_fx_exit_buy_side_uses_high_buffer():

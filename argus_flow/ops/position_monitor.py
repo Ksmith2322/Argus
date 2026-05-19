@@ -130,7 +130,7 @@ def get_ibkr_positions() -> tuple[dict, bool, str, dict | None]:
     try:
         from ib_insync import IB
         ib = IB()
-        port = int(os.getenv("IBKR_PORT", "7496"))
+        port = int(os.getenv("IBKR_PORT", "7497"))  # 2026-05-18: paper default
         ib.connect("127.0.0.1", port, clientId=85, timeout=5)
         positions = ib.positions()
         ib.disconnect()

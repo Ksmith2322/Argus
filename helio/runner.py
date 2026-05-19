@@ -298,7 +298,7 @@ def run_live(configs: list[Path]):
 
     ib = IB()
     host = os.getenv("IBKR_HOST", "127.0.0.1")
-    port = int(os.getenv("IBKR_PORT", "7496"))
+    port = int(os.getenv("IBKR_PORT", "7497"))  # 2026-05-18: paper default (was 7496 live = split-brain)
 
     log.info(f"Connecting to IBKR {host}:{port}...")
     ib.connect(host, port, clientId=200, timeout=15)

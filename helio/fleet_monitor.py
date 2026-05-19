@@ -206,10 +206,15 @@ SYSTEMS = {
         "no_restart": True,
     },
     "forge_nq_london_close": {
+        # KILLED 2026-05-13. n=3 fills/20d, 5/5 phantom 417 contracts ($117M
+        # notional from sizing-formula bug), redundant venue (mamba/cuebanks/
+        # tori/nq_overnight already cover MNQ/YM). No recovery path to real-
+        # money. no_restart=True so fleet_monitor cannot resurrect it.
         "heartbeats": [REPO / "forge" / "logs" / "nq_london_close" / "heartbeat.json"],
         "stale_threshold_s": 5400,  # 90 min (hourly cycle during London close session)
         "process_match": "forge.nq_london_close.runner",
         "restart_args": ["-m", "forge.nq_london_close.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_aud_asian_breakout": {
         "heartbeats": [REPO / "forge" / "logs" / "aud_asian_breakout" / "heartbeat.json"],

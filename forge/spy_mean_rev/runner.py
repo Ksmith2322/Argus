@@ -258,6 +258,7 @@ def _open(state: dict, df: pd.DataFrame, direction: str, ctx: dict, ib=None) -> 
                 ib, contract, direction=direction, size=shares,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_spy_mean_rev",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)

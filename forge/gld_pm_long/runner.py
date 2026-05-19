@@ -366,6 +366,7 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
                 ib, contract, direction="long", size=pos_size,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_gld_pm_long",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)

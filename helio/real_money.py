@@ -210,7 +210,7 @@ def enforce_real_money_boundary(
             f"trade on real account but allowlist.global_enabled=false"
         )
 
-    if not REAL_MONEY_ENABLED and not al.global_enabled:
+    if not REAL_MONEY_ENABLED:
         # Belt and suspenders — module-level constant must also be flipped.
         raise AccountBoundaryViolationError(
             "real_money_module_disabled: REAL_MONEY_ENABLED=False"

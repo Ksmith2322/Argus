@@ -307,6 +307,14 @@ def write_fill_typed(fill, extra: dict[str, Any] | None = None) -> None:
             "exit_reason": getattr(fill, "exit_reason", None),
             "broker_anchor_at_fill_usd": _current_anchor(),
         }
+        # 2026-05-19: propagate lineage_id from the Fill object when present.
+        # The 5/18 batch added the field to helio.domain.Fill + the runner
+        # call sites, but this writer was silently dropping it because it
+        # didn't list lineage_id in the row dict. Discovered via end-to-end
+        # smoke test (argus_flow/tests/test_entry_write_smoke.py).
+        lineage = getattr(fill, "lineage_id", None)
+        if lineage is not None:
+            row["lineage_id"] = lineage
         if extra:
             row["extra"] = extra
         CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)

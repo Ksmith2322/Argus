@@ -389,10 +389,17 @@ def would_breach_cluster_cap(
         from helio.fleet_sizing import get_sizing_anchor_usd
         anchor = float(get_sizing_anchor_usd())
     except Exception as exc:
-        log.warning(f"cluster_exposure: anchor unavailable, skipping cap check: {exc}")
-        return None
+        # Fail closed: if we can't read the anchor we cannot evaluate caps,
+        # so refuse the trade. Previously this returned None ("OK to trade"),
+        # which let entries slip through when the broker-anchor reader was
+        # itself broken. Codex audit 2026-05-18 X5 — guards must fail closed.
+        log.error(f"cluster_exposure: anchor unavailable, REFUSING trade: {exc}")
+        return "ANCHOR_UNAVAILABLE"
     if anchor <= 0:
-        return None
+        # Anchor of 0 (or negative) is nonsense — also refuse rather than
+        # let a $0 anchor effectively disable every cap.
+        log.error(f"cluster_exposure: anchor={anchor} non-positive, REFUSING trade")
+        return "ANCHOR_NON_POSITIVE"
 
     expo = compute_cluster_exposure()
     sym = symbol.upper()
@@ -465,6 +472,12 @@ def would_breach_cluster_cap(
             )
             return "MAINT_MARGIN_CAP"
     except Exception as exc:
-        log.warning(f"margin-aware check failed (allowing trade): {exc}")
+        # Fail closed: if the margin estimator raises, refuse the trade.
+        # Previously this swallowed the exception and continued ("allowing
+        # trade"), which masked broken inputs to the margin estimator and
+        # let entries through with no margin check at all. Codex audit
+        # 2026-05-18 X5 — guards must fail closed.
+        log.error(f"margin-aware check failed, REFUSING trade: {exc}")
+        return "MARGIN_CHECK_ERROR"
 
     return None

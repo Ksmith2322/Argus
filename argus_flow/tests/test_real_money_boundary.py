@@ -16,6 +16,16 @@ import pytest
 from helio import real_money as rm
 
 
+@pytest.fixture
+def real_money_module_enabled(monkeypatch):
+    """Flip the module-level REAL_MONEY_ENABLED kill-switch for the duration of
+    a test. The boundary has two kill-switches by design (allowlist.global_enabled
+    AND the module constant); tests that exercise the post-switch paths must
+    enable both. test_module_default_is_off intentionally does NOT use this."""
+    monkeypatch.setattr(rm, "REAL_MONEY_ENABLED", True)
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -166,7 +176,7 @@ def test_real_with_allowlist_disabled_rejects():
         )
 
 
-def test_real_with_strategy_not_allowlisted_rejects():
+def test_real_with_strategy_not_allowlisted_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -181,7 +191,7 @@ def test_real_with_strategy_not_allowlisted_rejects():
         )
 
 
-def test_real_with_oversized_notional_rejects(monkeypatch):
+def test_real_with_oversized_notional_rejects(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -201,7 +211,7 @@ def test_real_with_oversized_notional_rejects(monkeypatch):
         )
 
 
-def test_real_without_capital_ladder_approval_rejects():
+def test_real_without_capital_ladder_approval_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -219,7 +229,7 @@ def test_real_without_capital_ladder_approval_rejects():
         )
 
 
-def test_real_within_cap_with_allowlisted_strategy_passes(monkeypatch):
+def test_real_within_cap_with_allowlisted_strategy_passes(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -239,7 +249,7 @@ def test_real_within_cap_with_allowlisted_strategy_passes(monkeypatch):
     )
 
 
-def test_real_gross_above_ladder_cap_rejects(monkeypatch):
+def test_real_gross_above_ladder_cap_rejects(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -259,7 +269,7 @@ def test_real_gross_above_ladder_cap_rejects(monkeypatch):
         )
 
 
-def test_real_gross_under_ladder_cap_passes(monkeypatch):
+def test_real_gross_under_ladder_cap_passes(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -278,7 +288,7 @@ def test_real_gross_under_ladder_cap_passes(monkeypatch):
     )
 
 
-def test_real_above_ladder_cap_rejects(monkeypatch):
+def test_real_above_ladder_cap_rejects(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -298,7 +308,7 @@ def test_real_above_ladder_cap_rejects(monkeypatch):
         )
 
 
-def test_real_invalid_allowlist_rejects():
+def test_real_invalid_allowlist_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     # global_enabled=True but missing approver/ledger — internally invalid.
     al = rm.Allowlist(

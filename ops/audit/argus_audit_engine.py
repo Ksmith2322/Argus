@@ -1087,7 +1087,29 @@ def strategy_scorecard_md(rows: list[dict[str, Any]]) -> str:
 
 
 def killed_review_md(rows: list[dict[str, Any]]) -> str:
-    return "# Killed / Quarantined Strategy Review\n\n" + "\n".join(
+    # Stamp the evidence epoch onto the killed-strategy review (Codex
+    # audit 2026-05-18 X4). Promotion / resurrection decisions cannot use
+    # pre-reset data; the stamp is what makes that visible.
+    try:
+        from helio import evidence_epoch as _ee
+        epoch = _ee.current_epoch()
+        header = (
+            f"# Killed / Quarantined Strategy Review\n\n"
+            f"_Evidence epoch: **{epoch.id}** (is_clean="
+            f"{'YES' if epoch.is_clean else 'NO — pre-reset contaminated'})_\n\n"
+        )
+        if not epoch.is_clean:
+            header += (
+                "> ⚠️  These verdicts were computed against a contaminated "
+                "epoch. Resurrection decisions must wait for the post-reset "
+                "epoch (`post_reset_20260601`).\n\n"
+            )
+    except Exception:
+        # If the registry is unreadable, fall back to a bare header rather
+        # than crash the audit. The static config test enforces the registry
+        # presence elsewhere.
+        header = "# Killed / Quarantined Strategy Review\n\n"
+    return header + "\n".join(
         f"- `{r['strategy']}`: {r['recommendation']} because {r['kill_reason_classification']}. Resurrection, if any, is shadow/research only."
         for r in rows
     )

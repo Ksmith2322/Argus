@@ -796,9 +796,10 @@ def run_live():
         try:
             ib = None
             try:
-                ib = ibkr.connect(IBKR_CLIENT_ID)
+                # 2026-05-18: connect_with_retry covers post-TWS-restart slot-stuck window
+                ib = ibkr.connect_with_retry(IBKR_CLIENT_ID, max_attempts=5, backoff_s=60.0)
             except Exception as exc:
-                log.warning("IBKR connect failed: %s", exc)
+                log.warning("IBKR connect failed after retry: %s", exc)
 
             # Heartbeat at top of each cycle so the dashboard's stale-detector
             # doesn't false-flag tori when it's just mid-4hr-sleep (failure mode #5).

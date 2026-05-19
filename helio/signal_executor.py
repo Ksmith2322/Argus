@@ -77,9 +77,22 @@ def submit_signal(state: dict, ib, signal: SignalEntry) -> bool:
     execution_venue = "signal_only"
 
     if ib is not None:
-        contract = ibkr.make_contract(signal.symbol, signal.instrument_type)
+        # 2026-05-18: Futures need explicit front-month disambiguation
+        # because ib.qualifyContracts() silently fails on multi-expiry probes
+        # (CBOT MYM Error 321 bug). Stocks/FX qualify cleanly with the
+        # standard call. See helio.ibkr_execution.qualify_front_month_future
+        # docstring for the root-cause writeup.
+        if signal.instrument_type in ("future", "micro_future"):
+            try:
+                contract = ibkr.qualify_front_month_future(ib, signal.symbol)
+            except ibkr.IBKRExecutionError as exc:
+                log.error("FUTURES_QUALIFY_FAILED %s: %s", signal.symbol, exc)
+                return False
+        else:
+            contract = ibkr.make_contract(signal.symbol, signal.instrument_type)
         try:
-            ib.qualifyContracts(contract)
+            if signal.instrument_type not in ("future", "micro_future"):
+                ib.qualifyContracts(contract)
             existing = ibkr.query_position(ib, contract)
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION: %s qty=%s, skipping signal", signal.symbol, existing)
@@ -155,9 +168,13 @@ def check_open_positions(state: dict, ib) -> list[dict]:
             continue
 
         # Real-execution path: query IBKR for bracket fills
-        contract = ibkr.make_contract(symbol, ot["instrument_type"])
+        # 2026-05-18: futures need front-month resolution (same fix as submit path)
         try:
-            ib.qualifyContracts(contract)
+            if ot["instrument_type"] in ("future", "micro_future"):
+                contract = ibkr.qualify_front_month_future(ib, symbol)
+            else:
+                contract = ibkr.make_contract(symbol, ot["instrument_type"])
+                ib.qualifyContracts(contract)
             outcome = ibkr.check_bracket_filled(
                 ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
                 entry_direction=ot.get("direction"),

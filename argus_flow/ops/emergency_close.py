@@ -24,7 +24,8 @@ except ImportError:
 
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 7496
+# 2026-05-18: default 7497 (paper); was 7496 live — split-brain risk
+DEFAULT_PORT = 7497
 # Use high client ID to avoid conflicting with runner (which uses 1 or 2)
 EMERGENCY_CLIENT_ID = 999
 

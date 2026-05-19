@@ -174,9 +174,8 @@ def evaluate_once() -> None:
             ot = state["open_trade"]
 
             if ib is not None and ot.get("execution_venue") == "ibkr_paper":
-                contract = ibkr.make_contract("MNQ", "micro_future")
+                contract = ibkr.qualify_front_month_future(ib, "MNQ")
                 try:
-                    ib.qualifyContracts(contract)
                     outcome = ibkr.check_bracket_filled(
                         ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
                         entry_direction=ot.get("direction"),
@@ -277,9 +276,8 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     execution_venue = "signal_only"
 
     if ib is not None and not _SIGNAL_ONLY_MODE:
-        contract = ibkr.make_contract("MNQ", "micro_future")
+        contract = ibkr.qualify_front_month_future(ib, "MNQ")
         try:
-            ib.qualifyContracts(contract)
             existing = ibkr.query_position(ib, contract)
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION: MNQ qty=%s, skipping to avoid doubling", existing)
@@ -288,6 +286,7 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
                 ib, contract, direction="long", size=contracts,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_nq_overnight",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)

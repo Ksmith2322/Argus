@@ -19,7 +19,8 @@ REPO = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO / "argus_flow" / "data"
 
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
+# 2026-05-18: default 7497 (paper); was 7496 live — split-brain risk
+IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))
 DEFAULT_CLIENT_ID_BASE = 9000
 
 

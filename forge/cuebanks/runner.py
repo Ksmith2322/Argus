@@ -956,9 +956,13 @@ def run_live():
 
             ib = None
             try:
-                ib = ibkr.connect(LIVE_CLIENT_ID)
+                # 2026-05-18: connect_with_retry covers the post-TWS-restart
+                # client_id slot-stuck window (1-5 min). Without retry, this
+                # runner went silent for full sleep cycle (was 1-4 hrs) after
+                # any TWS restart caught us mid-cycle.
+                ib = ibkr.connect_with_retry(LIVE_CLIENT_ID, max_attempts=5, backoff_s=60.0)
             except Exception as exc:
-                log.warning("IBKR connect failed: %s", exc)
+                log.warning("IBKR connect failed after retry: %s", exc)
 
             try:
                 # 1. Manage open positions

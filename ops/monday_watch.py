@@ -97,6 +97,39 @@ def broker_state() -> dict:
     return out
 
 
+def halt_state() -> dict:
+    """Pull fleet halt state. The actual halt logic uses
+    `_risk/broker_drift_state.json:tripped` (not HALT.flag). Surface that
+    here so the watch reflects what the runners actually see."""
+    out = {"halted": False, "reasons": [], "drift_pct": None,
+           "drift_sustained_min": None, "halt_flag_present": False,
+           "flatten_flag_present": False}
+    halt_flag = LOGS_ARGUS / "HALT.flag"
+    flatten_flag = LOGS_ARGUS / "FLATTEN_EOD.flag"
+    drift_path = LOGS_ARGUS / "_risk" / "broker_drift_state.json"
+    if halt_flag.exists():
+        out["halt_flag_present"] = True
+        out["halted"] = True
+        try:
+            out["reasons"].append(f"HALT.flag: {halt_flag.read_text(encoding='utf-8').strip()[:120]}")
+        except Exception:
+            out["reasons"].append("HALT.flag present")
+    if flatten_flag.exists():
+        out["flatten_flag_present"] = True
+        out["halted"] = True
+        out["reasons"].append("FLATTEN_EOD.flag present")
+    drift = _load_json(drift_path)
+    if drift and drift.get("tripped"):
+        out["halted"] = True
+        out["drift_pct"] = drift.get("divergence_pct")
+        out["drift_sustained_min"] = drift.get("sustained_minutes")
+        out["reasons"].append(
+            f"broker drift tripped: divergence={drift.get('divergence_pct')}% "
+            f"sustained={drift.get('sustained_minutes')}min"
+        )
+    return out
+
+
 def today_fills() -> list[dict]:
     """Pull canonical fills from today (local 00:00 onward)."""
     fills_path = LOGS_ARGUS / "canonical_fills.jsonl"
@@ -189,6 +222,15 @@ def main() -> int:
     else:
         print(f"          open positions: 0")
 
+    # 1b. Halt state — what the runners are actually seeing
+    h = halt_state()
+    print(f"\n[FLEET HALT]  halted={h['halted']}")
+    if h["halted"]:
+        for r in h["reasons"]:
+            print(f"  ! {r}")
+    else:
+        print(f"  none")
+
     # 2. Today's fills
     fills = today_fills()
     total = sum(float(f.get("pnl_usd", 0) or 0) for f in fills)
@@ -240,7 +282,7 @@ def main() -> int:
     print(f"\n[CONCERNS]")
     if concerns:
         for c in concerns:
-            print(f"  ⚠ {c}")
+            print(f"  ! {c}")
     else:
         print(f"  none")
 

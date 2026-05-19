@@ -667,30 +667,40 @@ def _run_signal_only_loop(equity: float) -> None:
     log.info("Signal-only evaluation complete.")
 
 
-def _connect_with_backoff(ib, port: int, max_attempts: int = 12) -> bool:
+def _connect_with_backoff(ib, port: int, max_attempts: int | None = None) -> bool:
     """Connect to TWS with exponential backoff (5s -> 10s -> ... -> 300s cap).
 
-    Returns True on success, False if all attempts exhausted.
+    max_attempts=None (default) → retry forever. This is the right behavior
+    for a long-running daemon — better to patiently wait for TWS than die
+    and require a 23-hour watchdog cycle to restart (the failure mode we
+    hit 2026-05-16/17). Pass a finite max_attempts only for one-shot scripts
+    or when failure-to-connect should propagate up.
+
+    Returns True on success, False if max_attempts was set and exhausted.
     """
     delay = 5
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             ib.connect("127.0.0.1", port, clientId=IBKR_CLIENT_ID)
             log.info("Connected to IBKR on attempt %d", attempt)
             return True
         except Exception as e:
+            limit_str = f"/{max_attempts}" if max_attempts else "/inf"
             log.warning(
-                "TWS connect attempt %d/%d failed: %s. Retry in %ds...",
-                attempt, max_attempts, e, delay,
+                "TWS connect attempt %d%s failed: %s. Retry in %ds...",
+                attempt, limit_str, e, delay,
             )
             try:
                 ib.disconnect()
             except Exception:
                 pass
+            if max_attempts is not None and attempt >= max_attempts:
+                log.error("TWS connect exhausted %d attempts; giving up", max_attempts)
+                return False
             time.sleep(delay)
             delay = min(delay * 2, 300)
-    log.error("TWS connect exhausted %d attempts; giving up", max_attempts)
-    return False
 
 
 def _run_ibkr_live_loop(equity: float, port: int) -> None:

@@ -118,7 +118,11 @@ log = logging.getLogger("unified")
 
 # ── Global connection settings from .env ─────────────────────
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
-IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
+# 2026-05-18: default 7497 (paper). Previous 7496 (live) was the "port
+# split-brain" risk Codex flagged — a missing env var would silently
+# route argus FX entries to the live account. Real-money runs MUST set
+# IBKR_PORT=7496 explicitly + flip real_money_allowlist.global_enabled.
+IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))
 IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 REPO = Path(__file__).resolve().parents[1]
@@ -2231,6 +2235,8 @@ class InstrumentRunner:
         """Submit a market order for real entry. Returns True on success.
 
         Pre-trade guards (mirrors helio/ibkr_execution.py:submit_bracket):
+          0. Real-money boundary (allowlist + global flag) — 2026-05-18: was MISSING
+             until Codex audit; argus FX could submit live-account orders unchecked.
           1. Fleet kill-switch (HALT.flag)
           2. FX IdealPro minimum ($25K USD-equivalent)
           3. Cluster exposure cap (per-instrument + macro cluster + total notional)
@@ -2239,6 +2245,35 @@ class InstrumentRunner:
         ib = getattr(self, '_ib', None)
         if ib is None:
             self._log.error("REAL_ENTRY FAILED: no IB reference on runner")
+            return False
+
+        # Guard 0: real-money boundary. No-op for paper connections but
+        # absolute must-check for real connections — strategy_label fed
+        # so the boundary can attribute (allowlist matches per-strategy).
+        try:
+            from helio.real_money import (
+                enforce_real_money_boundary, AccountBoundaryViolationError,
+            )
+            from helio.ibkr_execution import _fx_usd_notional
+            est_notional = _fx_usd_notional(self.symbol, float(size), float(stop_px))
+            strategy_label = f"argus_{self.symbol.lower().replace('.', '').replace('/', '')}"
+            enforce_real_money_boundary(
+                ib,
+                strategy_label=strategy_label,
+                notional_usd=est_notional if est_notional > 0 else None,
+            )
+        except AccountBoundaryViolationError as exc:
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY refused entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
+        except Exception as exc:
+            # Fail closed: any other boundary-check error blocks the trade
+            # rather than allowing it through unchecked.
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY check raised unexpected error "
+                f"({type(exc).__name__}: {exc}); failing closed and refusing entry"
+            )
             return False
 
         # Guard 1: fleet halt
@@ -2358,16 +2393,81 @@ class InstrumentRunner:
             self._log.error(f"BRACKET FAILED: {exc}", exc_info=True)
             return False
 
+    def _dump_exit_forensics(self, order_id: str, stage: str) -> None:
+        """Capture full TWS state of a stuck exit order before we cancel/retry.
+
+        Background (2026-05-18): recurring argus_gbpusd EXIT FAILED cascade
+        (5/13, 5/15, 5/18) shows the LMT+outsideRth exit order sits pending
+        >30s without filling. Cancel-and-retry chain runs through IOC then
+        GTC, each also timing out. We've had ZERO visibility into WHAT TWS
+        was doing — runner only logs 'EXIT TIMEOUT' / 'EXIT STUCK' / 'EXIT
+        FAILED' with no order status, no whyHeld, no trade.log.
+
+        This writes the full forensic record to
+        `argus_flow/logs/unfilled_orders.jsonl` (same path as the
+        helio.ibkr_execution forensics from 2026-05-16) so each retry stage
+        captures orderStatus + trade.log at that moment.
+        """
+        if not order_id:
+            return
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            return
+        try:
+            # Locate the trade via ib.trades() (covers both open and closed)
+            target_trade = None
+            for t in ib.trades():
+                if str(getattr(t.order, 'orderId', '')) == str(order_id):
+                    target_trade = t
+                    break
+            if target_trade is None:
+                self._log.warning(
+                    f"EXIT_FORENSICS: orderId={order_id} not found in ib.trades()"
+                )
+                return
+            # Reuse the existing forensics dump from helio.ibkr_execution
+            from helio.ibkr_execution import _dump_unfilled_forensics
+            _dump_unfilled_forensics(target_trade, order_id=str(order_id))
+            # Also log a one-line summary inline so the diagnosis is in runner.log
+            os_obj = getattr(target_trade, 'orderStatus', None)
+            status = getattr(os_obj, 'status', '?') if os_obj else '?'
+            why_held = getattr(os_obj, 'whyHeld', '') if os_obj else ''
+            filled = getattr(os_obj, 'filled', 0) if os_obj else 0
+            remaining = getattr(os_obj, 'remaining', 0) if os_obj else 0
+            log_entries = getattr(target_trade, 'log', None) or []
+            last_msg = ""
+            for entry in reversed(log_entries):
+                msg = str(getattr(entry, 'message', '') or '').strip()
+                err = int(getattr(entry, 'errorCode', 0) or 0)
+                if err or msg:
+                    last_msg = f"err={err}:{msg[:120]}" if err else msg[:140]
+                    break
+            self._log.warning(
+                f"EXIT_FORENSICS stage={stage} order={order_id} status={status} "
+                f"filled={filled} remaining={remaining} whyHeld='{why_held}' "
+                f"last_log='{last_msg}'"
+            )
+        except Exception as exc:
+            self._log.warning(f"_dump_exit_forensics failed (non-fatal): {exc}")
+
     def _build_exit_order(self, close_action: str, qty: int, ref_px: float, tif: str = "DAY"):
         """Build the right exit order for this instrument type.
 
-        FX (CASH on IdealPro): wide LimitOrder + outsideRth=True. MarketOrder
-        on FX can stall around session boundaries — the symptom we saw
-        2026-05-08 (orders 296/299/303/307 timing out with "EXIT TIMEOUT" →
-        "EXIT STUCK" → "EXIT FAILED: MANUAL BROKER CHECK REQUIRED"). LMT with
-        a 5% adverse buffer fills at NBBO without sitting in the queue.
+        FX (CASH on IdealPro): wide LimitOrder + outsideRth=True + TIF=GTC.
+        MarketOrder on FX can stall around session boundaries — the symptom
+        we saw 2026-05-08 (orders 296/299/303/307 timing out with "EXIT
+        TIMEOUT" → "EXIT STUCK" → "EXIT FAILED: MANUAL BROKER CHECK
+        REQUIRED"). LMT with a 5% adverse buffer fills at NBBO without
+        sitting in the queue. TIF=GTC (overriding the DAY default for CASH)
+        avoids the speculative end-of-broker-day expiry race observed in
+        the argus_gbpusd EXIT FAILED cascade — DAY-flagged FX exits that
+        sat past the broker's daily roll boundary would silently expire.
+        Codex audit 2026-05-18 flagged this. The retry escalation already
+        ends in GTC; this change collapses the retry chain by starting
+        there for CASH.
 
-        STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles itself).
+        STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles
+        itself), TIF=DAY is the right default for these.
         """
         sec_type = getattr(self.contract, "secType", "") or ""
         if sec_type == "CASH":
@@ -2375,9 +2475,14 @@ class InstrumentRunner:
             lmt = round(float(ref_px or 1.0) * buffer, 5)
             order = LimitOrder(close_action, qty, lmt)
             order.outsideRth = True
+            # FX: force GTC unless caller explicitly asked for a non-DAY tif
+            # (e.g., last-resort retry that already specified GTC). DAY is
+            # the historical default that triggered the EXIT FAILED cascade.
+            effective_tif = "GTC" if tif == "DAY" else tif
         else:
             order = MarketOrder(close_action, qty)
-        order.tif = tif
+            effective_tif = tif
+        order.tif = effective_tif
         return order
 
     def _submit_real_exit(self, reason: str, mid: float) -> bool:
@@ -2586,6 +2691,49 @@ class InstrumentRunner:
                 f"size={size} stop={stop_px:.5f} target={target_px:.5f}"
             )
 
+            # Dual-write an ENTRY row to canonical_fills. Mirrors the EXIT
+            # dual-write in _log_trade and the submit_bracket ENTRY dual-write
+            # on the forge side — without this, the fleet ledger has no entry
+            # anchor and orphan detection can't distinguish "took the entry,
+            # still open" from "never entered". Stamps lineage_id so the row
+            # is attributable by intent (Codex X3+X7). Wrapped in try/except
+            # so a broken canonical log cannot break paper trading.
+            try:
+                from helio.canonical_fills import write_fill_typed
+                from helio.domain import Fill, make_lineage_id
+                try:
+                    import os as _os
+                    ib = getattr(self, "_ib", None)
+                    client_id = getattr(getattr(ib, "client", None), "clientId", None) if ib else None
+                    session_id = (
+                        f"c{client_id}p{_os.getpid()}" if client_id is not None
+                        else f"p{_os.getpid()}"
+                    )
+                except Exception:
+                    session_id = None
+                lineage = make_lineage_id(
+                    strategy=f"argus_{self.symbol.lower()}",
+                    session_id=session_id,
+                    entry_order_id=str(s.entry_order_id) if s.entry_order_id else None,
+                )
+                write_fill_typed(Fill(
+                    strategy=f"argus_{self.symbol.lower()}",
+                    symbol=self.symbol,
+                    direction=direction.lower(),
+                    side="ENTRY",
+                    entry_ts=now.isoformat(),
+                    exit_ts=None,
+                    entry_px=float(fill_px),
+                    exit_px=None,
+                    size=float(fill_qty),
+                    risk_usd=float(s.entry_risk_usd or 0.0),
+                    pnl_usd=None,
+                    exit_reason=None,
+                    lineage_id=lineage,
+                ))
+            except Exception:
+                pass  # never let canonical log break paper trading
+
             # Submit protective bracket orders
             ok = self._submit_bracket_orders(stop_px, target_px)
             if not ok:
@@ -2732,6 +2880,11 @@ class InstrumentRunner:
                         f"EXIT TIMEOUT: order {s.exit_order_id} pending >30s — "
                         f"cancelling and retrying with aggressive MKT"
                     )
+                    # 2026-05-18: capture forensics BEFORE cancel so we know what
+                    # TWS thinks (orderStatus.whyHeld, trade.log error codes).
+                    # Recurring argus_gbpusd EXIT FAILED cascade has no visibility
+                    # past "EXIT TIMEOUT" — this surfaces the actual TWS state.
+                    self._dump_exit_forensics(s.exit_order_id, stage="initial_timeout_30s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_timeout")
                     # Retry with the right order type for this instrument
                     # (FX => LimitOrder + outsideRth, equity/futures => MarketOrder).
@@ -2762,6 +2915,7 @@ class InstrumentRunner:
                         f"EXIT STUCK: IOC retry also failed after 60s — "
                         f"submitting GTC MKT as last resort"
                     )
+                    self._dump_exit_forensics(s.exit_order_id, stage="ioc_retry_60s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_stuck")
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
@@ -2783,6 +2937,7 @@ class InstrumentRunner:
                         f"EXIT FAILED: all retries exhausted after 120s. "
                         f"Forcing local FLAT — MANUAL BROKER CHECK REQUIRED"
                     )
+                    self._dump_exit_forensics(s.exit_order_id, stage="gtc_retry_120s_failed")
                     _write_incident(self, "EXIT_FAILED",
                                     f"All exit retries exhausted, forced local FLAT",
                                     s.position, {"direction": s.position, "qty": s.position_size})

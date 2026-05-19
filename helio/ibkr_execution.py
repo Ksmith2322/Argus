@@ -291,6 +291,55 @@ def disconnect(ib: IB) -> None:
         log.warning(f"disconnect raised (ignored): {exc}")
 
 
+def connect_with_retry(client_id: int, timeout: int = 15,
+                        max_attempts: int = 5, backoff_s: float = 60.0) -> IB:
+    """Connect to TWS with retry. Addresses the post-TWS-restart client_id
+    slot pattern (TWS Error 326): after TWS is restarted, the client_id
+    slots from the previous TWS session stay "in use" for 1-5 minutes
+    before clearing. The single-attempt `connect()` fails during that
+    window, and wake-and-sleep runners with 1-4hr cycles then go silent
+    until the next cycle.
+
+    This helper:
+      - Retries up to `max_attempts` times with `backoff_s` between
+        attempts (default: 5 × 60s = 5min total wait, which covers the
+        typical TWS-slot-clear window)
+      - Logs each attempt + the reason for failure (caught from improved
+        `connect()` diagnostics)
+      - Returns the connected IB on success, raises IBKRExecutionError
+        with all attempt history on final failure
+
+    Use this when:
+      - A runner is in a periodic-wake loop and shouldn't go silent for
+        hours after a transient connect failure
+      - Right after a TWS restart when slot recovery is expected
+
+    Don't use this when:
+      - The caller has its own outer retry loop (gdx_gld has retry-forever
+        via `_connect_with_backoff` — that's the right shape for it)
+      - The failure should propagate immediately (one-shot scripts)
+    """
+    last_exc: Exception | None = None
+    attempt_log: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return connect(client_id, timeout=timeout)
+        except IBKRExecutionError as exc:
+            last_exc = exc
+            attempt_log.append(f"attempt {attempt}/{max_attempts}: {exc}")
+            if attempt < max_attempts:
+                log.warning(
+                    f"connect_with_retry: attempt {attempt}/{max_attempts} "
+                    f"failed for client_id={client_id}, retrying in {backoff_s}s"
+                )
+                time.sleep(backoff_s)
+    # Exhausted all attempts
+    history = "; ".join(attempt_log)
+    raise IBKRExecutionError(
+        f"connect_with_retry exhausted {max_attempts} attempts for client_id={client_id}: {history}"
+    ) from last_exc
+
+
 def recover_pending_at_startup(ib: IB, strategy: str) -> list[dict]:
     """Forge-runner startup helper. Resolves any orders this strategy submitted
     in a prior process whose fills landed during the gap.
@@ -344,10 +393,84 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
         sym_u = symbol.upper()
         # CBOT-listed: Dow + Russell 2000 (both full-size and micros)
         if sym_u in {"YM", "MYM", "RTY", "M2K"}:
-            return Future(symbol, exchange="CBOT")
+            return Future(symbol, exchange="CBOT", currency="USD")
         # Default CME for everything else (NQ/MNQ, ES/MES, etc.)
-        return Future(symbol, exchange="CME")
+        return Future(symbol, exchange="CME", currency="USD")
     raise IBKRExecutionError(f"unknown instrument_type: {instrument_type!r}")
+
+
+def qualify_front_month_future(ib: IB, symbol: str, exchange: str = None,
+                                 min_days_to_expiry: int = 7) -> Contract:
+    """Resolve the front-month futures contract for a symbol.
+
+    Background (2026-05-18): `ib.qualifyContracts()` silently fails on
+    multi-expiry futures contracts when given just `Future(symbol, exchange)`
+    with no expiry hint. ib_insync sees multiple ContractDetails returned
+    (Jun/Sep/Dec quarterly contracts), can't disambiguate, and returns the
+    contract un-mutated. The resulting order has empty lastTradeDateOrContractMonth
+    + empty localSymbol + conId=0, which TWS rejects with Error 321
+    "Please enter a local symbol or an expiry". Bug discovered when
+    cuebanks/mamba/tori MYM orders cancelled on CBOT first thing 2026-05-18.
+
+    This helper enumerates all matching contracts via `reqContractDetails`,
+    filters out expiries within `min_days_to_expiry` (avoid roll-week
+    drama), sorts by expiry, and returns the front qualified contract.
+
+    Returns a fully-populated Contract (conId, localSymbol, expiry all set).
+    Raises IBKRExecutionError if no contracts found.
+    """
+    from datetime import datetime, timedelta
+    sym_u = symbol.upper()
+    if exchange is None:
+        # Default routing: CBOT for Dow/Russell, CME for everything else
+        exchange = "CBOT" if sym_u in {"YM", "MYM", "RTY", "M2K"} else "CME"
+    probe = Future(symbol, exchange=exchange, currency="USD")
+    try:
+        details = ib.reqContractDetails(probe)
+    except Exception as exc:
+        raise IBKRExecutionError(
+            f"reqContractDetails failed for {symbol}@{exchange}: {exc}"
+        ) from exc
+    if not details:
+        raise IBKRExecutionError(
+            f"no contract details returned for {symbol}@{exchange}"
+        )
+    # Filter to expiries that aren't about to roll
+    today = datetime.now()
+    candidates = []
+    for d in details:
+        c = d.contract
+        ltd = getattr(c, "lastTradeDateOrContractMonth", "")
+        if not ltd:
+            continue
+        # Format: "YYYYMMDD" or "YYYYMM"
+        try:
+            if len(ltd) >= 8:
+                exp = datetime.strptime(ltd[:8], "%Y%m%d")
+            elif len(ltd) >= 6:
+                # Month-only — assume end of month
+                exp = datetime.strptime(ltd[:6] + "28", "%Y%m%d")
+            else:
+                continue
+        except ValueError:
+            continue
+        days_out = (exp - today).days
+        if days_out < min_days_to_expiry:
+            continue
+        candidates.append((exp, c))
+    if not candidates:
+        raise IBKRExecutionError(
+            f"no front-month {symbol}@{exchange} contracts >={min_days_to_expiry}d out "
+            f"(found {len(details)} total)"
+        )
+    candidates.sort(key=lambda x: x[0])
+    front = candidates[0][1]
+    log.info(
+        f"qualify_front_month_future({symbol}@{exchange}): "
+        f"selected {front.localSymbol} expiry={front.lastTradeDateOrContractMonth} "
+        f"conId={front.conId}"
+    )
+    return front
 
 
 def _dump_unfilled_forensics(trade, order_id: Optional[str]) -> None:
@@ -543,6 +666,34 @@ def submit_bracket(
             reject_reason=f"real_money_boundary:{str(exc)[:80]}",
         ))
 
+    # Killed-strategy runtime invariant (Codex audit 2026-05-18 X6).
+    # The static-config test guarantees killed strategies have factor=0.0
+    # and no_restart=True. This is the runtime fail-safe: even if the
+    # config sync got out of step (or an operator hand-started a killed
+    # runner), the executor refuses entry. Belt-and-suspenders against
+    # resurrecting a thesis-exhausted strategy.
+    if strategy_label:
+        try:
+            from helio.roi_filter import KILLED_STRATEGY_CUTOFFS
+            if strategy_label in KILLED_STRATEGY_CUTOFFS:
+                cutoff = KILLED_STRATEGY_CUTOFFS[strategy_label]
+                log.error(
+                    f"KILLED_STRATEGY: refusing entry {direction} {size} "
+                    f"{contract.symbol} — {strategy_label} was killed on {cutoff}. "
+                    f"Remove from KILLED_STRATEGY_CUTOFFS only with operator approval."
+                )
+                return BracketResult(entry=FillResult(
+                    filled=False,
+                    reject_reason=f"killed_strategy:{strategy_label}:{cutoff}",
+                ))
+        except ImportError:
+            # If the kill registry can't be loaded, fail closed.
+            log.error(f"KILL_REGISTRY_UNREADABLE: refusing entry {strategy_label}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason="kill_registry_unreadable",
+            ))
+
     # Kill-switch — fleet-wide halt. Refuses all new entries; existing positions
     # can still exit via close_position_market.
     halted, halt_reason = is_fleet_halted()
@@ -590,8 +741,16 @@ def submit_bracket(
                 reject_reason=f"orphan_at_broker:{existing_qty:.2f}",
             ))
     except Exception as exc:
-        # Don't block on a transient query failure — but log it so we know
-        log.warning(f"pre-entry broker query failed (allowing trade): {exc}")
+        # Fail closed: a query failure here means we cannot tell whether
+        # the broker already has a position. Refusing avoids accidental
+        # doubling up. Previously this logged and continued, which let
+        # entries through when the broker query itself was the bug
+        # (Codex audit 2026-05-18 X5 — guards must fail closed).
+        log.error(f"pre-entry broker query failed, REFUSING entry: {exc}")
+        return BracketResult(entry=FillResult(
+            filled=False,
+            reject_reason=f"broker_query_failed:{type(exc).__name__}",
+        ))
 
     # FX-specific: floor at IdealPro's $25K USD-equivalent minimum lot.
     # Below that, IBKR routes as odd-lot with materially worse spread; we'd
@@ -641,7 +800,15 @@ def submit_bracket(
                     reject_reason=f"oversized_order:{est_notional:.0f}>{oversize_threshold:.0f}"
                 ))
         except Exception as exc:
-            log.warning(f"hard size cap check failed (allowing trade): {exc}")
+            # Fail closed: if the size-cap check itself raises (e.g., anchor
+            # reader broken), we cannot evaluate whether this is a phantom
+            # oversized order. Refuse rather than ship a potentially huge
+            # entry. Codex audit 2026-05-18 X5 — guards must fail closed.
+            log.error(f"hard size cap check failed, REFUSING entry: {exc}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason=f"size_cap_check_failed:{type(exc).__name__}",
+            ))
 
         try:
             from helio.cluster_exposure import would_breach_cluster_cap
@@ -657,7 +824,16 @@ def submit_bracket(
                 )
                 return BracketResult(entry=FillResult(filled=False, reject_reason=f"cluster_cap_breach:{breach}"))
         except Exception as exc:
-            log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed: cluster-cap exception means the exposure ledger
+            # is unreadable. Without it we cannot tell whether this trade
+            # would push the FX_USD / EQUITY_BETA / METALS / etc. clusters
+            # past their caps. Refuse rather than risk a cluster-blowup.
+            # Codex audit 2026-05-18 X5 — guards must fail closed.
+            log.error(f"cluster cap check failed, REFUSING entry: {exc}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason=f"cluster_cap_check_failed:{type(exc).__name__}",
+            ))
 
     entry_action = "BUY" if direction == "long" else "SELL"
     close_action = "SELL" if direction == "long" else "BUY"
@@ -717,6 +893,49 @@ def submit_bracket(
         f"ENTRY FILLED: {entry_action} {size} {contract.symbol} @ {entry_fill.fill_price:.5f} "
         f"orderId={entry_fill.order_id}"
     )
+
+    # Dual-write an ENTRY row to canonical_fills so the fleet ledger captures
+    # entries at submission time, not only on EXIT. Without this, post-mortem
+    # reconciliation cannot distinguish "took the entry, exit is still open"
+    # from "never entered" — and orphan detection has no entry-side anchor.
+    # Also stamps lineage_id so the row can be attributed by intent (Codex
+    # X3+X7) rather than only by symbol. Wrapped in try/except so a
+    # canonical-log failure cannot break a live trade.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill, make_lineage_id
+        from datetime import datetime, timezone
+        # session_id heuristic: use the IB client id + process pid so the
+        # lineage namespace flips on every runner restart. Entry-order-id
+        # comes from the just-filled order.
+        try:
+            import os as _os
+            client_id = getattr(getattr(ib, "client", None), "clientId", None)
+            session_id = f"c{client_id}p{_os.getpid()}" if client_id is not None else f"p{_os.getpid()}"
+        except Exception:
+            session_id = None
+        lineage = make_lineage_id(
+            strategy=strategy_label or "unknown",
+            session_id=session_id,
+            entry_order_id=str(entry_fill.order_id) if entry_fill.order_id else None,
+        )
+        write_fill_typed(Fill(
+            strategy=strategy_label or "unknown",
+            symbol=contract.symbol,
+            direction=direction,
+            side="ENTRY",
+            entry_ts=datetime.now(timezone.utc).isoformat(),
+            exit_ts=None,
+            entry_px=float(entry_fill.fill_price),
+            exit_px=None,
+            size=float(abs(size)),
+            risk_usd=None,
+            pnl_usd=None,
+            exit_reason=None,
+            lineage_id=lineage,
+        ))
+    except Exception as exc:
+        log.warning(f"canonical_fills ENTRY write failed (non-fatal): {exc}")
 
     # OCA group — when one bracket leg fills, the other auto-cancels.
     # Unique per bracket so concurrent brackets on different symbols don't interfere.
