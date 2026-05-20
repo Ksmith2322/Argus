@@ -78,80 +78,114 @@ SYSTEMS = {
         ],
     },
     "titan": {
+        # ARCHIVED 2026-05-20 (sunset doc). 0 ledger traffic; redundant role.
         "heartbeats": [REPO / "titan" / "logs" / "heartbeat.json"],
-        "stale_threshold_s": 4500,  # 75 min (loop is 60min + buffer)
+        "stale_threshold_s": 4500,
         "process_match": "titan.runner",
         "restart_args": ["-m", "titan.runner", "--loop", "--interval-min", "60"],
         "supports_live_flag": True,
+        "no_restart": True,
     },
     "hermes": {
+        # ARCHIVED 2026-05-20. Earnings scanner role absorbed into forge_pead.
         "heartbeats": [REPO / "hermes" / "logs" / "heartbeat.json"],
-        "stale_threshold_s": 8400,  # 140 min (loop is 120min + buffer)
+        "stale_threshold_s": 8400,
         "process_match": "hermes.runner",
         "restart_args": ["-m", "hermes.runner", "--loop", "--interval-min", "120", "--min-score", "80"],
         "supports_live_flag": True,
+        "no_restart": True,
     },
     "apollo": {
+        # ARCHIVED 2026-05-20. Universe data file (apollo/data/core_watchlist.json)
+        # is now used by forge_pead directly; apollo runner not needed.
         "heartbeats": [REPO / "apollo" / "logs" / "heartbeat.json"],
-        "stale_threshold_s": 16200,  # 270 min (loop is 240min + buffer)
+        "stale_threshold_s": 16200,
         "process_match": "apollo.runner",
         "restart_args": ["-m", "apollo.runner", "--loop", "--interval-min", "240", "--days", "14"],
         "supports_live_flag": True,
+        "no_restart": True,
     },
     "forge_gdx_gld": {
+        # SHADOW 2026-05-20 (sunset doc). Allocation 0; code retained; no_restart
+        # so fleet_monitor doesn't auto-resurrect. Will be retired into a
+        # generalized forge_coint_pairs strategy post-7/1 if pursued.
         "heartbeats": [REPO / "forge" / "logs" / "gdx_gld" / "heartbeat.json"],
-        "stale_threshold_s": 5400,  # 90 min (loop is 60min + buffer)
+        "stale_threshold_s": 5400,
         "process_match": "forge.gdx_gld_runner",
         "restart_args": ["-m", "forge.gdx_gld_runner", "--live", "--loop", "--interval-min", "60"],
+        "no_restart": True,
     },
     "forge_atlas": {
+        # ARCHIVED 2026-05-20. Architect: "keyword-rules sentiment, not regime
+        # detection." Data files retained for any downstream readers.
         "heartbeats": [REPO / "forge" / "logs" / "atlas" / "heartbeat.json"],
-        "stale_threshold_s": 600,  # 10 min (polls every 2min, 5x buffer)
+        "stale_threshold_s": 600,
         "process_match": "forge.atlas.runner",
         "restart_args": ["-m", "forge.atlas.runner", "--loop", "--interval-sec", "120"],
+        "no_restart": True,
     },
     "forge_themis": {
+        # ARCHIVED 2026-05-20. Polymarket scanner; geoblocked + 0 ledger traffic.
         "heartbeats": [REPO / "forge" / "logs" / "themis" / "heartbeat.json"],
-        "stale_threshold_s": 28800,  # 8h (polls every 6h)
+        "stale_threshold_s": 28800,
         "process_match": "forge.themis.runner",
         "restart_args": ["-m", "forge.themis.runner", "--loop", "--interval-min", "360"],
+        "no_restart": True,
     },
     "forge_mamba": {
+        # ARCHIVED 2026-05-20. YouTube-trader replica; 0 fills since 5/16 CBOT
+        # routing fix. Redundant with cuebanks/tori (all same YM/MYM factor).
         "heartbeats": [REPO / "forge" / "logs" / "mamba" / "heartbeat.json"],
-        "stale_threshold_s": 600,  # 10 min (scans every 5 min during NY, writes heartbeat each cycle)
+        "stale_threshold_s": 600,
         "process_match": "forge.mamba.runner",
         "restart_args": ["-m", "forge.mamba.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_tori": {
+        # ARCHIVED 2026-05-20. Same factor as mamba/cuebanks; 0 fills.
         "heartbeats": [REPO / "forge" / "logs" / "tori" / "heartbeat.json"],
-        "stale_threshold_s": 18000,  # 5h (scans every 4h, with buffer)
+        "stale_threshold_s": 18000,
         "process_match": "forge.tori.runner",
         "restart_args": ["-m", "forge.tori.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_cuebanks": {
+        # ARCHIVED 2026-05-20. Same factor as mamba/tori; 0 fills.
         "heartbeats": [REPO / "forge" / "logs" / "cuebanks" / "heartbeat.json"],
-        "stale_threshold_s": 600,  # 10 min (scans every 5 min during NY)
+        "stale_threshold_s": 600,
         "process_match": "forge.cuebanks.runner",
         "restart_args": ["-m", "forge.cuebanks.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_vix_revert": {
+        # ARCHIVED 2026-05-20. Short-vol scalper; same archetype as the
+        # killed forge_vix_intraday. 0 fills. The vix-carry replacement
+        # (forge_vix_carry) is in shadow research mode.
         "heartbeats": [REPO / "forge" / "logs" / "vix_revert" / "heartbeat.json"],
-        "stale_threshold_s": 7200,  # 2h (checks hourly)
+        "stale_threshold_s": 7200,
         "process_match": "forge.vix_revert_runner",
         "restart_args": ["-m", "forge.vix_revert_runner", "--loop"],
+        "no_restart": True,
     },
     "forge_rebalance": {
+        # ARCHIVED 2026-05-20 (the runner). The annual Russell-reconstitution
+        # window is the only edge here; will be rebuilt as forge_russell_recon
+        # event runner if pursued.
         "heartbeats": [REPO / "forge" / "logs" / "rebalance" / "heartbeat.json"],
-        "stale_threshold_s": 90000,  # 25h (checks daily)
+        "stale_threshold_s": 90000,
         "process_match": "forge.rebalance_runner",
         "restart_args": ["-m", "forge.rebalance_runner", "--loop"],
+        "no_restart": True,
     },
     "forge_wick_gbpusd": {
+        # ARCHIVED 2026-05-20. 0 fills post-reset. FX wick-reversal on
+        # GBPUSD competes with bank desks; weak thesis.
         "heartbeats": [REPO / "forge" / "logs" / "wick_gbpusd" / "heartbeat.json"],
-        "stale_threshold_s": 7200,  # 2h — now runs hourly via --loop mode
+        "stale_threshold_s": 7200,
         "process_match": "forge.wick_gbpusd.runner",
         "restart_args": ["-m", "forge.wick_gbpusd.runner", "--loop"],
-        "_status_note": "Fixed 2026-04-23: added --loop mode + phantom-close bug fix (entry_ts vs entry_idx)",
+        "_status_note": "Archived 2026-05-20 per sunset doc.",
+        "no_restart": True,
     },
     "forge_gld_pm_long": {
         "heartbeats": [],
@@ -217,22 +251,30 @@ SYSTEMS = {
         "no_restart": True,
     },
     "forge_aud_asian_breakout": {
+        # ARCHIVED 2026-05-20. 2 fills, both negative; capacity stress fails at 1×.
         "heartbeats": [REPO / "forge" / "logs" / "aud_asian_breakout" / "heartbeat.json"],
-        "stale_threshold_s": 5400,  # 90 min (hourly during Asian session)
+        "stale_threshold_s": 5400,
         "process_match": "forge.aud_asian_breakout.runner",
         "restart_args": ["-m", "forge.aud_asian_breakout.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_fomc_drift": {
+        # ARCHIVED 2026-05-20. 0 directional fires; Architect noted the real
+        # edge here is IV-crush (options), not directional drift. Future
+        # redesign post-7/1 if options infra is built.
         "heartbeats": [REPO / "forge" / "logs" / "fomc_drift" / "heartbeat.json"],
-        "stale_threshold_s": 7200,  # 2h — daemon writes every 1h cycle
+        "stale_threshold_s": 7200,
         "process_match": "forge.fomc_drift.runner",
         "restart_args": ["-m", "forge.fomc_drift.runner", "--loop"],
+        "no_restart": True,
     },
     "forge_tom_international": {
+        # ARCHIVED 2026-05-20. Turn-of-month event runner; 0 fires.
         "heartbeats": [REPO / "forge" / "logs" / "tom_international" / "heartbeat.json"],
-        "stale_threshold_s": 7200,  # 2h — daemon writes every 1h cycle
+        "stale_threshold_s": 7200,
         "process_match": "forge.tom_international.runner",
         "restart_args": ["-m", "forge.tom_international.runner", "--loop"],
+        "no_restart": True,
     },
     "dashboard": {
         "heartbeats": [],  # no heartbeat, check via process only

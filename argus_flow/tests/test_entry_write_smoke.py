@@ -121,6 +121,12 @@ def test_submit_bracket_writes_entry_row_to_canonical_fills(tmp_path, monkeypatc
     monkeypatch.setattr(
         ibe, "_oversize_threshold_usd", lambda _sym, _anchor: 1_000_000.0,
     )
+    # Stub get_sizing_anchor_usd — the X5 fix turned anchor-unreachable
+    # into a fail-closed refusal in the hard-size-cap check. Test needs
+    # to provide a known anchor or the entry path returns False before
+    # ever submitting the order.
+    import helio.fleet_sizing as fs
+    monkeypatch.setattr(fs, "get_sizing_anchor_usd", lambda: 30_000.0)
 
     ib = _FakeIB()
     contract = _FakeContract(symbol="TESTSYM", sec_type="STK")

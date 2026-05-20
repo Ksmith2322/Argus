@@ -2283,8 +2283,13 @@ class InstrumentRunner:
             if halted:
                 self._log.warning(f"FLEET_HALTED: refusing entry {direction} {size} {self.symbol}. Reason: {halt_reason}")
                 return False
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail closed: if we can't tell whether the fleet is halted, refuse.
+            # Codex audit X5 doctrine — guards must fail closed.
+            self._log.error(
+                f"halt check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
 
         # Guard 2: FX IdealPro min — argus only trades FX, so always check
         try:
@@ -2298,7 +2303,11 @@ class InstrumentRunner:
                 )
                 return False
         except Exception as exc:
-            self._log.warning(f"FX min check failed (allowing trade): {exc}")
+            # Fail closed (Codex X5)
+            self._log.error(
+                f"FX min check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
 
         # Guard 3: cluster exposure cap
         try:
@@ -2315,7 +2324,33 @@ class InstrumentRunner:
                     )
                     return False
         except Exception as exc:
-            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed (Codex X5)
+            self._log.error(
+                f"cluster cap check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
+
+        # Guard 4: broker-position check (2026-05-19 incident follow-up).
+        # If broker already shows a position in this instrument, that's an
+        # orphan we don't know about. Submitting a new entry would either
+        # double our exposure (if same direction) or partially offset it
+        # (if opposite, briefly creating a smaller-net position with weird
+        # P&L tracking). Refuse and let reconciliation adopt the orphan
+        # first; next signal cycle can re-evaluate.
+        broker_qty = self._read_broker_position()
+        if broker_qty is None:
+            # Broker unreachable. Fail closed.
+            self._log.error(
+                f"REAL_ENTRY ABORTED: broker position query returned None — "
+                f"cannot verify clean entry state for {direction} {size} {self.symbol}"
+            )
+            return False
+        if abs(broker_qty) > 0:
+            self._log.warning(
+                f"REAL_ENTRY ABORTED: broker already has {broker_qty} {self.symbol} — "
+                f"refusing entry {direction} {size}. Reconciliation will adopt the orphan."
+            )
+            return False
 
         try:
             action = "BUY" if direction == "long" else "SELL"
@@ -2366,8 +2401,23 @@ class InstrumentRunner:
             # opposite-direction position.
             oca_group = f"oca_{self.symbol}_{s.entry_order_id}_{int(time.time() * 1000) % 1_000_000}"
 
+            # 2026-05-20 BUGFIX: JPY-aware decimal rounding on bracket prices.
+            # Same fix as _build_exit_order. round(price, 5) on a JPY pair
+            # produces a sub-tick price that IBKR rejects with Warning 110.
+            # ib_insync Forex: contract.symbol = base (e.g. "USD"),
+            # contract.currency = quote (e.g. "JPY"), self.symbol = full
+            # pair (e.g. "USDJPY"). Check all three to be safe.
+            pair_tags = " ".join([
+                str(getattr(self, "symbol", "")),
+                str(getattr(self.contract, "symbol", "")),
+                str(getattr(self.contract, "currency", "")),
+                str(getattr(self.contract, "localSymbol", "")),
+            ]).upper()
+            is_jpy = "JPY" in pair_tags
+            price_decimals = 3 if is_jpy else 5
+
             # Stop order (protective) — OCA leg A
-            stop_order = StopOrder(close_action, abs(size), round(stop_px, 5))
+            stop_order = StopOrder(close_action, abs(size), round(stop_px, price_decimals))
             stop_order.ocaGroup = oca_group
             stop_order.ocaType = 1  # cancel all remaining orders with block
             stop_order.account = getattr(self, 'stage_account', '') or ''
@@ -2375,7 +2425,7 @@ class InstrumentRunner:
             s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
 
             # Target limit order — OCA leg B
-            limit_order = LimitOrder(close_action, abs(size), round(target_px, 5))
+            limit_order = LimitOrder(close_action, abs(size), round(target_px, price_decimals))
             limit_order.ocaGroup = oca_group
             limit_order.ocaType = 1
             limit_order.account = getattr(self, 'stage_account', '') or ''
@@ -2468,11 +2518,37 @@ class InstrumentRunner:
 
         STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles
         itself), TIF=DAY is the right default for these.
+
+        2026-05-20 BUGFIX: JPY pairs use 0.001 minimum tick size on
+        IdealPro (3 decimals), not 0.00005 like EUR/USD-class pairs
+        (5 decimals). Rounding the LMT to 5 decimals on a JPY pair
+        produces a sub-tick price that IBKR rejects with Warning 110
+        "The price does not conform to the minimum price variation for
+        this contract". Caught live 2026-05-19 18:36 UTC: CADJPY exit
+        cascaded through all 3 retry stages with lmtPrice=109.87177 /
+        109.75983 — every retry got Warning 110 and the order stayed
+        PendingSubmit. Position remained stuck until manual intervention.
         """
         sec_type = getattr(self.contract, "secType", "") or ""
         if sec_type == "CASH":
             buffer = 1.05 if close_action == "BUY" else 0.95
-            lmt = round(float(ref_px or 1.0) * buffer, 5)
+            # JPY-aware tick rounding (caught 2026-05-19 on CADJPY).
+            # JPY pairs: 3 decimals. Other FX: 5 decimals.
+            # IMPORTANT: on ib_insync Forex contracts, contract.symbol is the
+            # BASE currency (e.g. "USD" for USDJPY) and contract.currency is
+            # the QUOTE (e.g. "JPY"). The full pair lives in self.symbol on
+            # the runner OR contract.localSymbol ("USD.JPY"). Earlier draft
+            # of this fix checked contract.symbol and missed JPY pairs
+            # because contract.symbol="USD". This version checks all three.
+            pair_tags = " ".join([
+                str(getattr(self, "symbol", "")),
+                str(getattr(self.contract, "symbol", "")),
+                str(getattr(self.contract, "currency", "")),
+                str(getattr(self.contract, "localSymbol", "")),
+            ]).upper()
+            is_jpy = "JPY" in pair_tags
+            decimals = 3 if is_jpy else 5
+            lmt = round(float(ref_px or 1.0) * buffer, decimals)
             order = LimitOrder(close_action, qty, lmt)
             order.outsideRth = True
             # FX: force GTC unless caller explicitly asked for a non-DAY tif
@@ -2484,6 +2560,67 @@ class InstrumentRunner:
             effective_tif = tif
         order.tif = effective_tif
         return order
+
+    def _read_broker_position(self) -> float | None:
+        """Query the broker for this instrument's current position.
+
+        Returns the signed quantity (positive=long, negative=short, 0=flat),
+        or None if the broker is unreachable / no IB reference. Used by every
+        exit-submission path to verify intent matches reality before placing
+        an order — see the 2026-05-19 cascade-double-sell post-mortem
+        (project_2026_05_19_cadjpy_jpy_decimal_bugs.md). Without this guard,
+        a fill that races our local state update produces a duplicate exit
+        order that REVERSES the position.
+        """
+        ib = getattr(self, "_ib", None)
+        if ib is None:
+            return None
+        try:
+            our_local = str(getattr(self.contract, "localSymbol", "")).upper()
+            our_sym = str(getattr(self.contract, "symbol", "")).upper()
+            our_curr = str(getattr(self.contract, "currency", "")).upper()
+            for p in ib.positions():
+                pc = p.contract
+                if str(getattr(pc, "localSymbol", "")).upper() == our_local and our_local:
+                    return float(p.position)
+                if (str(pc.symbol).upper() == our_sym
+                    and str(getattr(pc, "currency", "")).upper() == our_curr
+                    and our_sym):
+                    return float(p.position)
+            return 0.0  # not in positions list = flat
+        except Exception as exc:
+            self._log.warning(f"broker position query failed (non-fatal): {exc}")
+            return None
+
+    def _broker_state_allows_exit(self, close_action: str, qty: int) -> tuple[bool, str]:
+        """Verify the proposed exit makes sense against broker truth.
+
+        Returns (ok, reason). Refuses the exit when:
+          - Broker shows flat — our prior exit must have filled; emitting
+            another would create a new opposite-direction position (the
+            2026-05-19 CADJPY incident).
+          - Broker direction is opposite our local belief — local state
+            drifted; reconcile before submitting more orders.
+
+        Caller should clear local state on refusal and let the next
+        reconciliation cycle handle the broker truth."""
+        broker_qty = self._read_broker_position()
+        if broker_qty is None:
+            # Broker unreachable. Don't block — let the existing fail-closed
+            # paths in submit_bracket / cluster_exposure handle it.
+            return True, "broker_unreachable_passthrough"
+        if broker_qty == 0.0:
+            return False, f"broker_flat_already (intended {close_action} {qty})"
+        if close_action == "SELL" and broker_qty < 0:
+            return False, f"broker_short_{broker_qty:.0f}_SELL_would_deepen"
+        if close_action == "BUY" and broker_qty > 0:
+            return False, f"broker_long_{broker_qty:.0f}_BUY_would_deepen"
+        # Direction matches but magnitude may differ. Caller should resize
+        # to the actual broker quantity, not the local belief. Return ok
+        # but with the magnitude info.
+        if abs(broker_qty) < qty:
+            return True, f"resize_needed_broker_has_{broker_qty:.0f}_local_thinks_{qty}"
+        return True, "ok"
 
     def _submit_real_exit(self, reason: str, mid: float) -> bool:
         """Cancel existing bracket orders and submit a market exit."""
@@ -2498,14 +2635,40 @@ class InstrumentRunner:
         if ib is None:
             self._log.error("REAL_EXIT FAILED: no IB reference on runner")
             return False
+
+        # 2026-05-19 BUGFIX: verify broker truth before submitting an exit.
+        # The cascade race observed today doubled CADJPY (LONG → SHORT)
+        # and quadrupled USDJPY (30K → 120K) because exits were submitted
+        # on stale local state. This guard short-circuits the runaway
+        # when broker shows the position is already gone.
+        close_action = "SELL" if s.position == "LONG" else "BUY"
+        ok, why = self._broker_state_allows_exit(close_action, int(qty))
+        if not ok:
+            self._log.error(
+                f"EXIT_ABORTED reason={reason} {close_action} {qty} {self.symbol}: {why}. "
+                f"Clearing local state to reconverge with broker on next cycle."
+            )
+            s.exit_pending = False
+            s.position = "FLAT"
+            s.position_size = 0
+            s.clear_trade_state()
+            s.save()
+            return False
+        if why != "ok" and "resize_needed" in why:
+            broker_qty = self._read_broker_position() or 0.0
+            new_qty = int(abs(broker_qty))
+            self._log.warning(
+                f"EXIT_RESIZE local={qty} -> broker={new_qty} reason={reason} {self.symbol}"
+            )
+            qty = new_qty
+
         try:
             # Cancel existing stop and target orders
             self._cancel_order_by_id(s.stop_order_id, "stop")
             self._cancel_order_by_id(s.target_order_id, "target")
 
-            close_action = "SELL" if s.position == "LONG" else "BUY"
             ref_px = mid if mid and mid > 0 else (s.entry_price or 0)
-            order = self._build_exit_order(close_action, int(abs(s.position_size)), ref_px, tif="DAY")
+            order = self._build_exit_order(close_action, int(qty), ref_px, tif="DAY")
             order.account = getattr(self, 'stage_account', '') or ''
             trade = ib.placeOrder(self.contract, order)
             s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
@@ -2513,7 +2676,7 @@ class InstrumentRunner:
             s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
             s.save()
             self._log.info(
-                f"REAL_EXIT SUBMITTED {close_action} {s.position_size} {self.symbol} "
+                f"REAL_EXIT SUBMITTED {close_action} {qty} {self.symbol} "
                 f"orderId={s.exit_order_id} reason={reason}"
             )
             self._pending_exit_reason = reason
@@ -2871,6 +3034,27 @@ class InstrumentRunner:
                 pass
 
         if s.exit_pending and s.exit_submitted_ts:
+            # 2026-05-19 BUGFIX: cascade race. Caught live when CADJPY's IOC
+            # retry (order 1930) filled instantly but the GTC retry fired 60s
+            # later without checking, double-selling. Same pattern bit
+            # USDJPY (30K → 60K → 120K) + GBPUSD (22K → 45K → 90K) over a
+            # 2-hour window. The execDetails callback raced our local state
+            # update. Defensive: query broker via the centralized helper
+            # before each retry. If broker is flat, our exit succeeded —
+            # clear local state and skip retrying.
+            broker_qty = self._read_broker_position()
+            if broker_qty == 0.0:
+                self._log.info(
+                    f"EXIT_RACE_RESOLVED: broker shows {self.symbol} FLAT — "
+                    f"prior exit must have filled. Clearing local state, skipping retry."
+                )
+                s.exit_pending = False
+                s.position = "FLAT"
+                s.position_size = 0
+                self._exit_retry_count = 0
+                s.save()
+                return  # exit the timeout-check entirely
+
             try:
                 submitted = datetime.fromisoformat(s.exit_submitted_ts)
                 elapsed = (now - submitted).total_seconds()

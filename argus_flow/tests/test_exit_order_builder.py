@@ -66,6 +66,131 @@ def test_fx_day_is_upgraded_to_gtc():
     assert order.tif == "GTC"
 
 
+def _make_instrument_with_symbol(sec_type: str, symbol: str) -> SimpleNamespace:
+    """Variant of _make_instrument that mimics an ib_insync Forex contract:
+    contract.symbol = base currency, contract.currency = quote, localSymbol
+    has the pair in dotted form. Also sets inst.symbol to the full pair
+    string (which matches how the runner stores it).
+
+    JPY-aware rounding must succeed regardless of which of these fields
+    is populated — that was the bug the live caught on 2026-05-19."""
+    inst = SimpleNamespace()
+    # Parse pair like "USDJPY" -> base "USD", quote "JPY", local "USD.JPY"
+    base = symbol[:3].upper() if len(symbol) == 6 else symbol.upper()
+    quote = symbol[3:].upper() if len(symbol) == 6 else ""
+    inst.contract = SimpleNamespace(
+        secType=sec_type,
+        symbol=base,
+        currency=quote,
+        localSymbol=f"{base}.{quote}" if quote else symbol,
+    )
+    inst.symbol = symbol.upper()
+    inst._log = _StubLogger()
+    inst._build_exit_order = InstrumentRunner._build_exit_order.__get__(inst, SimpleNamespace)
+    return inst
+
+
+def test_jpy_pair_exit_rounds_to_3_decimals():
+    """BUGFIX 2026-05-19: JPY pairs use 0.001 min tick on IdealPro, not
+    0.00005 like EUR-class pairs. Rounding to 5 decimals on JPY produces
+    sub-tick prices that IBKR rejects with Warning 110. Caught live on
+    CADJPY 2026-05-19 18:36 UTC — every retry got Warning 110 and order
+    stayed PendingSubmit forever."""
+    inst = _make_instrument_with_symbol("CASH", "CADJPY")
+    order = inst._build_exit_order("SELL", qty=41479, ref_px=115.65, tif="DAY")
+    # 115.65 * 0.95 = 109.8675, rounded to 3 decimals = 109.868
+    # Definitely NOT 109.87177 (5 decimals, sub-tick)
+    assert order.lmtPrice == pytest.approx(109.868, abs=1e-6), (
+        f"JPY exit price {order.lmtPrice} not rounded to 3 decimals — "
+        f"will be rejected by IBKR with Warning 110"
+    )
+    # Validate decimal count
+    str_px = f"{order.lmtPrice:.10f}".rstrip("0").rstrip(".")
+    decimals_after_dot = len(str_px.split(".")[-1]) if "." in str_px else 0
+    assert decimals_after_dot <= 3, (
+        f"JPY price has {decimals_after_dot} decimals; IdealPro min tick "
+        f"requires <= 3 decimals."
+    )
+
+
+def test_jpy_pair_buy_to_close_rounds_to_3_decimals():
+    """Same fix on the BUY side."""
+    inst = _make_instrument_with_symbol("CASH", "USDJPY")
+    order = inst._build_exit_order("BUY", qty=10000, ref_px=150.123, tif="DAY")
+    # 150.123 * 1.05 = 157.62915, rounded to 3 = 157.629
+    assert order.lmtPrice == pytest.approx(157.629, abs=1e-6)
+
+
+def test_non_jpy_pair_still_uses_5_decimals():
+    """Regression: EUR-class pairs must still use 5-decimal rounding
+    (0.00005 tick = half-pip)."""
+    inst = _make_instrument_with_symbol("CASH", "GBPUSD")
+    order = inst._build_exit_order("SELL", qty=10000, ref_px=1.27345, tif="DAY")
+    # 1.27345 * 0.95 = 1.2097775, rounded to 5 = 1.20978
+    assert order.lmtPrice == pytest.approx(1.20978, abs=1e-6)
+
+
+def test_jpy_pair_recognition_is_case_insensitive():
+    """Symbol matching should not be fragile to case."""
+    for sym in ("CADJPY", "cadjpy", "USDJPY", "EurJpy"):
+        inst = _make_instrument_with_symbol("CASH", sym)
+        order = inst._build_exit_order("SELL", qty=10000, ref_px=110.0, tif="DAY")
+        # Whatever the symbol case, JPY pairs must round to 3 decimals
+        str_px = f"{order.lmtPrice:.10f}".rstrip("0").rstrip(".")
+        decimals = len(str_px.split(".")[-1]) if "." in str_px else 0
+        assert decimals <= 3, f"{sym}: got {decimals} decimals in {order.lmtPrice}"
+
+
+def test_jpy_detected_when_only_currency_field_says_jpy():
+    """Regression: in ib_insync Forex contracts, contract.symbol is the BASE
+    currency (e.g. "USD" for USDJPY), not the pair. The original 5/20 fix
+    checked only contract.symbol and missed JPY pairs because their
+    contract.symbol was "USD", "CAD", "EUR" etc.
+
+    This test simulates the exact ib_insync Forex contract shape that
+    the bug fix initially missed: contract.symbol="USD", currency="JPY".
+    Must round to 3 decimals."""
+    inst = SimpleNamespace()
+    inst.contract = SimpleNamespace(
+        secType="CASH",
+        symbol="USD",       # base currency — NOT "USDJPY"
+        currency="JPY",     # quote currency — this is where JPY lives
+        localSymbol="USD.JPY",
+    )
+    inst.symbol = ""        # NOT set on the runner (worst case)
+    inst._log = _StubLogger()
+    inst._build_exit_order = InstrumentRunner._build_exit_order.__get__(inst, SimpleNamespace)
+
+    order = inst._build_exit_order("SELL", qty=30142, ref_px=151.02, tif="DAY")
+    # 151.02 * 0.95 = 143.469, rounded to 3 = 143.469. Not 143.46900.
+    str_px = f"{order.lmtPrice:.10f}".rstrip("0").rstrip(".")
+    decimals = len(str_px.split(".")[-1]) if "." in str_px else 0
+    assert decimals <= 3, (
+        f"JPY detection failed via contract.currency='JPY'. Got "
+        f"lmtPrice={order.lmtPrice} with {decimals} decimals. "
+        f"IBKR will reject with Warning 110."
+    )
+
+
+def test_jpy_detected_when_only_localSymbol_says_jpy():
+    """Similar regression — only localSymbol carries the .JPY tag."""
+    inst = SimpleNamespace()
+    inst.contract = SimpleNamespace(
+        secType="CASH",
+        symbol="CAD",
+        currency="",         # missing
+        localSymbol="CAD.JPY",
+    )
+    inst.symbol = ""
+    inst._log = _StubLogger()
+    inst._build_exit_order = InstrumentRunner._build_exit_order.__get__(inst, SimpleNamespace)
+
+    order = inst._build_exit_order("SELL", qty=41479, ref_px=115.53667, tif="DAY")
+    str_px = f"{order.lmtPrice:.10f}".rstrip("0").rstrip(".")
+    decimals = len(str_px.split(".")[-1]) if "." in str_px else 0
+    assert decimals <= 3
+
+
 def test_fx_exit_buy_side_uses_high_buffer():
     """Buying-to-close uses the 1.05× upper buffer so the LMT will fill
     even if the market moves against us."""

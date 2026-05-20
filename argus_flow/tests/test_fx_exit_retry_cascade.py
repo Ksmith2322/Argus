@@ -133,6 +133,32 @@ def test_cascade_branches_fx_vs_non_fx_at_retry_1():
     )
 
 
+def test_cascade_has_broker_truth_race_check():
+    """REGRESSION 2026-05-20: cascade fired a duplicate fill on CADJPY
+    because the previous IOC retry filled instantly but execDetails raced
+    the s.exit_order_id assignment. Position double-sold (LONG 41479 →
+    SHORT -82858).
+
+    Fix: cascade queries the broker before each retry. If broker shows
+    position is flat, the prior exit must have filled — clear local state
+    and exit the timeout check entirely instead of submitting another order.
+
+    This is a source-level check that the broker-truth guard is present
+    at the top of the exit-pending cascade arm."""
+    src = _read_runner_source()
+    # The guard must check broker positions and clear exit_pending on flat
+    assert "EXIT_RACE_RESOLVED" in src, (
+        "Cascade lost its broker-truth race-check guard. Without it, the "
+        "5/19 CADJPY double-sell bug recurs: cascade fires a retry while "
+        "the previous order is already filled."
+    )
+    # Must check ib.positions() (broker truth) before retry
+    assert "for p in ib.positions()" in src
+    # Must clear exit_pending + set position FLAT
+    assert "s.exit_pending = False" in src
+    assert 's.position = "FLAT"' in src
+
+
 def test_cascade_last_resort_is_gtc_and_writes_incident():
     """The 120s-exhausted arm must force FLAT AND write an EXIT_FAILED
     incident — that incident drives the manual-broker-check alert without
