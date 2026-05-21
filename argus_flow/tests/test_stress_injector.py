@@ -150,6 +150,85 @@ def test_run_one_cycle_rejects_unknown_chaos_mode():
     assert "unknown chaos mode" in str(exc.value)
 
 
+# ─── 2026-05-21 bug fixes ────────────────────────────────────────────────
+
+def test_run_one_cycle_source_has_result_helper():
+    """The fix introduces a _result() inner closure that guarantees every
+    return path includes elapsed_s. Source-level assert so a regression
+    that reverts to bare dict-returns is caught immediately."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "ops" / "stress_injector.py").read_text(encoding="utf-8")
+    idx = src.find("def run_one_cycle(")
+    assert idx >= 0
+    body = src[idx:idx + 6000]
+    assert "def _result(" in body, (
+        "run_one_cycle lost the _result() helper — early-return paths "
+        "will KeyError on elapsed_s in run_loop again"
+    )
+    # Every return in run_one_cycle should go through _result()
+    bare_dict_returns = body.count('return {"cycle_id":')
+    assert bare_dict_returns == 0, (
+        f"Found {bare_dict_returns} bare dict returns; should all use _result()"
+    )
+
+
+def test_pre_cycle_orphan_check_present():
+    """Defensive: before each cycle, the runner verifies the test
+    instrument is flat. The 4h orphan accumulation on 2026-05-21 proved
+    this was needed. Source-level assert that the check exists."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "ops" / "stress_injector.py").read_text(encoding="utf-8")
+    idx = src.find("def run_one_cycle(")
+    body = src[idx:idx + 6000]
+    assert "ORPHAN_START" in body, (
+        "Pre-cycle orphan check removed — cycles will start with leftover "
+        "positions and compound them"
+    )
+    assert "_read_broker_position(ib, symbol)" in body
+    # Should refuse to enter the cycle if existing != 0
+    assert 'return _result("ORPHAN_START_REFUSED")' in body
+
+
+def test_force_close_uses_LimitOrder_not_MarketOrder():
+    """The 2026-05-21 root cause of accumulated orphans: force-close
+    submitted MarketOrder which TWS rejected on IDEALPRO FX with
+    Error 10349 (TIF=DAY). Force-close now goes through _flatten_position
+    which uses LimitOrder + GTC + outsideRth."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "ops" / "stress_injector.py").read_text(encoding="utf-8")
+    # Find force-close section and verify it calls _flatten_position
+    assert "def _flatten_position(" in src, (
+        "_flatten_position helper missing — force-close may still use bare MarketOrder"
+    )
+    # _flatten_position uses LimitOrder + GTC + outsideRth
+    helper_idx = src.find("def _flatten_position(")
+    helper_body = src[helper_idx:helper_idx + 2500]
+    assert "LimitOrder(" in helper_body
+    assert 'tif="GTC"' in helper_body
+    assert "outsideRth = True" in helper_body
+
+
+def test_flatten_position_handles_already_flat():
+    """No-op when position is already 0 — defensive guard against
+    over-eager flatten calls."""
+    from ops.stress_injector import _flatten_position
+    # Mock: ib parameter doesn't matter because abs(broker_pos) < 0.5 returns early
+    _flatten_position(None, None, "EURUSD", 0.0, "abc")
+    _flatten_position(None, None, "EURUSD", 0.3, "abc")
+    # No exception raised = pass
+
+
+def test_run_one_cycle_imports_remain_intact():
+    """Refactor sanity: ib_insync imports inside run_one_cycle should
+    still be present (LimitOrder needed, MarketOrder optional)."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "ops" / "stress_injector.py").read_text(encoding="utf-8")
+    idx = src.find("def run_one_cycle(")
+    body = src[idx:idx + 2000]
+    assert "from ib_insync import" in body
+    assert "LimitOrder" in body
+
+
 def test_log_event_writes_jsonl_line(tmp_path, monkeypatch):
     monkeypatch.setattr(stress_injector, "LOG_PATH", tmp_path / "stress.jsonl")
     e = Event(ts="2026-05-20T12:00:00Z", cycle_id="abc", kind="TEST", payload={"x": 1})

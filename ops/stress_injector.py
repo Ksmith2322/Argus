@@ -138,6 +138,21 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
     ib = IB()
     races_detected: list[str] = []
     t0 = time.time()
+
+    def _result(outcome: str, **extra: object) -> dict:
+        """Centralized result builder — guarantees elapsed_s in every
+        return path. 2026-05-21 BUGFIX: early-return paths (NO_QUOTE,
+        RECONNECT_FAILED, ENTRY_TIMEOUT, ORPHAN_START) previously omitted
+        elapsed_s and caused run_loop to KeyError. Always include it now."""
+        out = {
+            "cycle_id": cycle_id,
+            "outcome": outcome,
+            "races_detected": list(races_detected),
+            "elapsed_s": time.time() - t0,
+        }
+        out.update(extra)
+        return out
+
     try:
         ib.connect("127.0.0.1", 7497, clientId=STRESS_CLIENT_ID, timeout=10)
         _log_event(Event(_now(), cycle_id, "CONNECTED", {"client_id": STRESS_CLIENT_ID}))
@@ -145,12 +160,29 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
         contract = Forex(symbol)
         ib.qualifyContracts(contract)
 
+        # 2026-05-21 BUGFIX: defensive pre-cycle orphan check. Before each
+        # cycle, verify the test instrument is flat. The 4h run on
+        # 2026-05-21 accumulated up to 9000 long / 8000 short of EURUSD
+        # because the force-close path silently failed with Error 10349
+        # (MarketOrder + TIF=DAY rejected on FX) AND because the chaos
+        # cancel race produced a real unexpected position that compounded
+        # cycle over cycle. Refusing to enter a cycle with an existing
+        # orphan stops the bleeding.
+        existing = _read_broker_position(ib, symbol)
+        if abs(existing) > 0.5:
+            _log_event(Event(_now(), cycle_id, "ORPHAN_START",
+                             {"existing_position": existing}))
+            races_detected.append("PRE_CYCLE_ORPHAN")
+            # Try to clean up before bailing out
+            _flatten_position(ib, contract, symbol, existing, cycle_id)
+            return _result("ORPHAN_START_REFUSED")
+
         # Get current mid
         ticker = ib.reqTickers(contract)[0]
         mid = (ticker.bid + ticker.ask) / 2 if (ticker.bid and ticker.ask) else float(ticker.marketPrice() or 0)
         if mid <= 0:
             _log_event(Event(_now(), cycle_id, "NO_QUOTE", {"ticker": str(ticker)}))
-            return {"cycle_id": cycle_id, "outcome": "NO_QUOTE", "races_detected": []}
+            return _result("NO_QUOTE")
 
         # Wide-LMT entry at touch; 5 pip stop + 5 pip target on each side
         pip = spec["pip"]
@@ -191,8 +223,8 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
                 _log_event(Event(_now(), cycle_id, "RECONNECTED", {}))
             except Exception as e:
                 _log_event(Event(_now(), cycle_id, "RECONNECT_FAILED", {"error": str(e)}))
-                return {"cycle_id": cycle_id, "outcome": "RECONNECT_FAILED",
-                        "races_detected": ["RECONNECT_FAILED"]}
+                races_detected.append("RECONNECT_FAILED")
+                return _result("RECONNECT_FAILED")
 
         # Wait for fill, up to 30s
         filled = False
@@ -220,7 +252,7 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
                 filled = True
             else:
                 _log_event(Event(_now(), cycle_id, "ENTRY_TIMEOUT", {"broker_pos": broker_pos}))
-                return {"cycle_id": cycle_id, "outcome": "ENTRY_TIMEOUT", "races_detected": races_detected}
+                return _result("ENTRY_TIMEOUT")
 
         # Now submit the exit OCO bracket and watch lifecycle
         exit_side = "SELL" if side == "BUY" else "BUY"
@@ -250,24 +282,22 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
                                  {"race": "BOTH_BRACKET_LEGS_FILLED",
                                   "broker_pos": broker_pos}))
 
-        # Cleanup: if still open, force-close
+        # Cleanup: if still open, force-close.
+        # 2026-05-21 BUGFIX: the original force-close used `MarketOrder` which
+        # hits Error 10349 on IDEALPRO FX (TIF=DAY rejected) — same bug class
+        # as the entry-path and exit-path fixes. Silent failure here is what
+        # caused EURUSD positions to accumulate up to 9000 units over a 4h
+        # run. Now uses the same LimitOrder + GTC + outsideRth + wide-buffer
+        # pattern that runner_unified._build_exit_order uses for FX exits.
         broker_pos = _read_broker_position(ib, symbol)
         if abs(broker_pos) >= qty * 0.5:
-            close_side = "SELL" if broker_pos > 0 else "BUY"
-            ib.placeOrder(contract, MarketOrder(close_side, abs(int(broker_pos))))
-            ib.sleep(3)
-            _log_event(Event(_now(), cycle_id, "FORCE_CLOSED",
-                             {"broker_pos_before": broker_pos}))
+            _flatten_position(ib, contract, symbol, broker_pos, cycle_id)
 
         elapsed = time.time() - t0
         _log_event(Event(_now(), cycle_id, "CYCLE_END",
-                         {"elapsed_s": elapsed, "races": races_detected}))
-        return {
-            "cycle_id": cycle_id,
-            "outcome": outcome,
-            "races_detected": races_detected,
-            "elapsed_s": elapsed,
-        }
+                         {"elapsed_s": elapsed, "races": races_detected,
+                          "outcome": outcome}))
+        return _result(outcome)
     finally:
         try:
             ib.disconnect()
@@ -283,6 +313,56 @@ def _read_broker_position(ib, symbol: str) -> float:
         if getattr(c, "symbol", "") == spec["base"] and getattr(c, "currency", "") == spec["quote"]:
             return float(p.position)
     return 0.0
+
+
+def _flatten_position(ib, contract, symbol: str, broker_pos: float, cycle_id: str) -> None:
+    """Force-flatten a position using the LimitOrder + GTC + outsideRth pattern
+    that bypasses Error 10349. Mirrors runner_unified._build_exit_order's
+    FX-safe submission path.
+
+    2026-05-21: bare MarketOrder(side, qty) was silently failing with
+    Error 10349 (TIF=DAY rejected on IDEALPRO FX), causing orphan positions
+    to compound across cycles. This helper centralizes the safe pattern."""
+    from ib_insync import LimitOrder
+
+    if abs(broker_pos) < 0.5:
+        return  # already flat
+
+    close_side = "SELL" if broker_pos > 0 else "BUY"
+    qty = abs(int(round(broker_pos)))
+
+    # Wide LMT toward fill direction with 5% buffer; broker fills at NBBO
+    ticker = ib.reqTickers(contract)[0]
+    bid = float(getattr(ticker, "bid", 0) or 0)
+    ask = float(getattr(ticker, "ask", 0) or 0)
+    ref = (bid + ask) / 2 if (bid and ask) else float(getattr(ticker, "marketPrice", lambda: 1.0)() or 1.0)
+    if ref <= 0:
+        ref = 1.0  # last-resort
+
+    buffer = 1.05 if close_side == "BUY" else 0.95
+    spec = TEST_INSTRUMENTS[symbol]
+    decimals = 3 if "JPY" in (spec.get("quote", "") + spec.get("base", "")).upper() else 5
+    lmt = round(ref * buffer, decimals)
+
+    order = LimitOrder(close_side, qty, lmt, tif="GTC")
+    order.outsideRth = True
+    trade = ib.placeOrder(contract, order)
+
+    # Wait up to 8s for fill
+    for _ in range(16):
+        ib.sleep(0.5)
+        if trade.orderStatus.status == "Filled":
+            break
+
+    _log_event(Event(_now(), cycle_id, "FORCE_CLOSED", {
+        "broker_pos_before": broker_pos,
+        "close_side": close_side,
+        "qty": qty,
+        "lmt": lmt,
+        "status": trade.orderStatus.status,
+        "filled": trade.orderStatus.filled,
+        "avg_fill": trade.orderStatus.avgFillPrice,
+    }))
 
 
 # ─── loop runner ──────────────────────────────────────────────────────────
