@@ -69,13 +69,29 @@ def test_all_archived_strategies_have_zero_allocation():
 
 
 def test_argus_fx_pairs_are_archived():
-    """The 3 argus FX strategies must be in the archived list with factor=0."""
+    """The 3 argus FX strategies must be in the archived list with factor=0,
+    EXCEPT argus_usdjpy which may be temporarily activated during the
+    pre-5/31-reset exercise window (commit bc92b27, 2026-05-21). The
+    exercise window allows USDJPY to fire real fills so the activity-
+    multiplication toolkit (paper_stress + recorder + invariants) gets
+    real data to chew on. The 5/31 reset runbook returns it to 0.0
+    along with the rest of the archived fleet."""
     factors = _load_factors().get("factors", {})
-    for pair in ("argus_gbpusd", "argus_usdjpy", "argus_cadjpy"):
+    for pair in ("argus_gbpusd", "argus_cadjpy"):
         assert pair in factors, f"{pair} missing from allocation_factors"
         assert float(factors[pair]) == 0.0, (
             f"{pair} has factor={factors[pair]} — must be 0.0 per sunset doc"
         )
+    # argus_usdjpy: allow up to 0.5 during pre-reset exercise; assert
+    # not above 0.5 (which would exceed the documented exercise budget)
+    # and not negative.
+    assert "argus_usdjpy" in factors, "argus_usdjpy missing from allocation_factors"
+    usdjpy = float(factors["argus_usdjpy"])
+    assert 0.0 <= usdjpy <= 0.5, (
+        f"argus_usdjpy factor={usdjpy} outside exercise-window bounds "
+        f"[0.0, 0.5]. Either revert to 0.0 OR raise the bound here with "
+        f"explicit operator note in the commit."
+    )
 
 
 def test_fleet_monitor_no_restart_on_archived_strategies():

@@ -2381,7 +2381,37 @@ class InstrumentRunner:
             if qty <= 0:
                 self._log.warning(f"REAL_ENTRY ABORTED: rounded size={qty} (was {size}); skipping")
                 return False
-            order = MarketOrder(action, qty)
+
+            # 2026-05-21 BUGFIX: FX entries must use LimitOrder + TIF=GTC,
+            # not MarketOrder which defaults to TIF=DAY and triggers
+            # Error 10349 ("Order TIF was set to DAY based on order preset").
+            # Same bug class as the 2026-05-19 exit-path fix
+            # (_build_exit_order) and the 2026-05-20 flatten_eod_executor
+            # fix; the entry path in _submit_real_entry was missed in both
+            # sweeps. Caught by the golden-trace recorder on the first
+            # live entry after activation (USDJPY orderId=13, 2026-05-21
+            # 18:05Z). TWS auto-retried the rejected order which masked
+            # the bug but the trace caught the rejection -> retry pattern.
+            # Pattern matches _build_exit_order: wide LMT (5% buffer)
+            # with JPY-aware decimals, GTC TIF, outsideRth.
+            is_cash = getattr(self.contract, "secType", "") == "CASH"
+            if is_cash:
+                ref_px = self._get_mid() or float(stop_px) or 1.0
+                buffer = 1.05 if action == "BUY" else 0.95
+                pair_tags = " ".join([
+                    str(getattr(self, "symbol", "")),
+                    str(getattr(self.contract, "symbol", "")),
+                    str(getattr(self.contract, "currency", "")),
+                    str(getattr(self.contract, "localSymbol", "")),
+                ]).upper()
+                is_jpy = "JPY" in pair_tags
+                decimals = 3 if is_jpy else 5
+                lmt = round(float(ref_px) * buffer, decimals)
+                order = LimitOrder(action, qty, lmt)
+                order.outsideRth = True
+                order.tif = "GTC"
+            else:
+                order = MarketOrder(action, qty)
             order.account = getattr(self, 'stage_account', '') or ''
             trade = ib.placeOrder(self.contract, order)
             s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
