@@ -2431,11 +2431,24 @@ class InstrumentRunner:
             else:
                 order = MarketOrder(action, qty)
             order.account = getattr(self, 'stage_account', '') or ''
-            trade = ib.placeOrder(self.contract, order)
-            s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
-            s.entry_pending = True
-            s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
-            s.save()
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder so any inbound execDetails for this order finds
+            # state populated. See _pre_allocate_order_id for full reasoning.
+            entry_pre_id = self._pre_allocate_order_id(ib)
+            if entry_pre_id is not None:
+                order.orderId = entry_pre_id
+                s.entry_order_id = str(entry_pre_id)
+                s.entry_pending = True
+                s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
+                trade = ib.placeOrder(self.contract, order)
+            else:
+                # Fallback: post-placeOrder write (legacy pattern with race)
+                trade = ib.placeOrder(self.contract, order)
+                s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
+                s.entry_pending = True
+                s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
 
             # 2026-05-20 BUGFIX: persist pending-entry to the crash-recovery
             # queue. helio.pending_fills exists and is wired into forge's
@@ -2516,8 +2529,16 @@ class InstrumentRunner:
             stop_order.ocaGroup = oca_group
             stop_order.ocaType = 1  # cancel all remaining orders with block
             stop_order.account = getattr(self, 'stage_account', '') or ''
-            stop_trade = ib.placeOrder(self.contract, stop_order)
-            s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder. See _pre_allocate_order_id.
+            stop_pre_id = self._pre_allocate_order_id(ib)
+            if stop_pre_id is not None:
+                stop_order.orderId = stop_pre_id
+                s.stop_order_id = str(stop_pre_id)
+                stop_trade = ib.placeOrder(self.contract, stop_order)
+            else:
+                stop_trade = ib.placeOrder(self.contract, stop_order)
+                s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
 
             # Target limit order — OCA leg B
             # 2026-05-20 BUGFIX: half-armed-bracket race. If the target
@@ -2533,8 +2554,16 @@ class InstrumentRunner:
                 limit_order.ocaGroup = oca_group
                 limit_order.ocaType = 1
                 limit_order.account = getattr(self, 'stage_account', '') or ''
-                target_trade = ib.placeOrder(self.contract, limit_order)
-                s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+                # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+                # placeOrder. See _pre_allocate_order_id.
+                tgt_pre_id = self._pre_allocate_order_id(ib)
+                if tgt_pre_id is not None:
+                    limit_order.orderId = tgt_pre_id
+                    s.target_order_id = str(tgt_pre_id)
+                    target_trade = ib.placeOrder(self.contract, limit_order)
+                else:
+                    target_trade = ib.placeOrder(self.contract, limit_order)
+                    s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
             except Exception as target_exc:
                 self._log.error(
                     f"BRACKET HALF-ARMED: target placeOrder failed ({target_exc}); "
@@ -2675,6 +2704,36 @@ class InstrumentRunner:
         order.tif = effective_tif
         return order
 
+    def _pre_allocate_order_id(self, ib) -> int | None:
+        """Pre-allocate an orderId from ib_insync's client BEFORE placeOrder.
+
+        2026-05-21: eliminates the placeOrder -> state-write race. The
+        original pattern was:
+
+            trade = ib.placeOrder(contract, order)
+            s.entry_order_id = str(trade.order.orderId)
+            s.save()
+
+        Between placeOrder returning and s.save() completing, ib_insync's
+        event loop could process incoming TWS messages — including an
+        execDetails for this very order. The fill handler would look up
+        state by order_id and find it missing. By pre-allocating the
+        orderId, setting it on the order object, and writing state
+        BEFORE placeOrder, the race window is eliminated.
+
+        Returns the pre-allocated int orderId on success, or None if
+        ib.client.getReqId() isn't available — caller should fall back
+        to the post-placeOrder pattern in that case.
+        """
+        try:
+            return int(ib.client.getReqId())
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._log.warning(
+                f"pre_allocate_order_id failed ({exc}); "
+                f"falling back to post-placeOrder pattern (race window present)"
+            )
+            return None
+
     def _read_broker_position(self) -> float | None:
         """Query the broker for this instrument's current position.
 
@@ -2790,11 +2849,22 @@ class InstrumentRunner:
             ref_px = mid if mid and mid > 0 else (s.entry_price or 0)
             order = self._build_exit_order(close_action, int(qty), ref_px, tif="DAY")
             order.account = getattr(self, 'stage_account', '') or ''
-            trade = ib.placeOrder(self.contract, order)
-            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-            s.exit_pending = True
-            s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
-            s.save()
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder. See _pre_allocate_order_id.
+            exit_pre_id = self._pre_allocate_order_id(ib)
+            if exit_pre_id is not None:
+                order.orderId = exit_pre_id
+                s.exit_order_id = str(exit_pre_id)
+                s.exit_pending = True
+                s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
+                trade = ib.placeOrder(self.contract, order)
+            else:
+                trade = ib.placeOrder(self.contract, order)
+                s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                s.exit_pending = True
+                s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
             self._log.info(
                 f"REAL_EXIT SUBMITTED {close_action} {qty} {self.symbol} "
                 f"orderId={s.exit_order_id} reason={reason}"
@@ -3309,10 +3379,20 @@ class InstrumentRunner:
                             close_action, int(abs(s.position_size)), ref_px, tif=retry_tif,
                         )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        trade = ib.placeOrder(self.contract, order)
-                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-                        s.exit_submitted_ts = now.isoformat()
-                        s.save()
+                        # 2026-05-21 BUGFIX: pre-allocate orderId. See
+                        # _pre_allocate_order_id.
+                        retry_pre_id = self._pre_allocate_order_id(ib)
+                        if retry_pre_id is not None:
+                            order.orderId = retry_pre_id
+                            s.exit_order_id = str(retry_pre_id)
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
+                            trade = ib.placeOrder(self.contract, order)
+                        else:
+                            trade = ib.placeOrder(self.contract, order)
+                            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
                         self._exit_retry_count = 1
                         self._log.info(
                             f"EXIT RETRY (IOC MKT) orderId={s.exit_order_id}"
@@ -3348,10 +3428,20 @@ class InstrumentRunner:
                             close_action, int(abs(s.position_size)), ref_px, tif="GTC",
                         )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        trade = ib.placeOrder(self.contract, order)
-                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-                        s.exit_submitted_ts = now.isoformat()
-                        s.save()
+                        # 2026-05-21 BUGFIX: pre-allocate orderId. See
+                        # _pre_allocate_order_id.
+                        gtc_pre_id = self._pre_allocate_order_id(ib)
+                        if gtc_pre_id is not None:
+                            order.orderId = gtc_pre_id
+                            s.exit_order_id = str(gtc_pre_id)
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
+                            trade = ib.placeOrder(self.contract, order)
+                        else:
+                            trade = ib.placeOrder(self.contract, order)
+                            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
                         self._exit_retry_count = 2
                         self._log.info(f"EXIT RETRY (GTC MKT) orderId={s.exit_order_id}")
                 elif elapsed > 120 and exit_retry_count >= 2:
