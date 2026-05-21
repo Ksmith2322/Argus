@@ -254,14 +254,30 @@ def run_one_cycle(symbol: str, qty: int, side: str | None = None,
                 _log_event(Event(_now(), cycle_id, "ENTRY_TIMEOUT", {"broker_pos": broker_pos}))
                 return _result("ENTRY_TIMEOUT")
 
-        # Now submit the exit OCO bracket and watch lifecycle
+        # Now submit the exit OCA bracket and watch lifecycle.
+        # 2026-05-21 BUGFIX: previously the two legs were independent
+        # LimitOrders with no ocaGroup, so when one filled the other
+        # stayed live in the broker's book as a stray order. Now both
+        # legs share an ocaGroup with ocaType=1 (cancel-all-on-fill) —
+        # matches the pattern in runner_unified._submit_bracket_orders.
+        # NB: the "stop" leg is a LIMIT not a STOP order. For a BUY
+        # entry, SELL @ stop_px below mid is actually a MARKETABLE
+        # LIMIT (fills instantly at NBBO). This is functional for the
+        # stress harness but a real strategy would use StopOrder for
+        # proper stop semantics. Out of scope for this fix.
+        oca_group = f"stress_{cycle_id}"
         exit_side = "SELL" if side == "BUY" else "BUY"
         stop_order = LimitOrder(exit_side, qty, stop_px, tif="GTC", outsideRth=True)
+        stop_order.ocaGroup = oca_group
+        stop_order.ocaType = 1
         tgt_order = LimitOrder(exit_side, qty, tgt_px, tif="GTC", outsideRth=True)
+        tgt_order.ocaGroup = oca_group
+        tgt_order.ocaType = 1
         ib.placeOrder(contract, stop_order)
         ib.placeOrder(contract, tgt_order)
         _log_event(Event(_now(), cycle_id, "BRACKET_SUBMITTED",
-                         {"stop_px": stop_px, "tgt_px": tgt_px}))
+                         {"stop_px": stop_px, "tgt_px": tgt_px,
+                          "oca_group": oca_group}))
 
         # Watch up to 5 minutes for exit
         outcome = "BRACKET_OPEN_AT_TIMEOUT"

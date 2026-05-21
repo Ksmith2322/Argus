@@ -229,6 +229,26 @@ def test_run_one_cycle_imports_remain_intact():
     assert "LimitOrder" in body
 
 
+def test_bracket_uses_oca_group():
+    """2026-05-21: the bracket stop/target must share an ocaGroup with
+    ocaType=1 so that when one leg fills, the other is auto-cancelled
+    by the broker. Previously they were independent LimitOrders, which
+    left a stray order in the book when the other leg filled."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "ops" / "stress_injector.py").read_text(encoding="utf-8")
+    # Bracket submission section
+    idx = src.find("Now submit the exit OCA bracket")
+    assert idx >= 0, "bracket submission section not found"
+    body = src[idx:idx + 2500]
+    assert "oca_group = f\"stress_{cycle_id}\"" in body, (
+        "OCA group label missing — cycles need unique OCA identifiers"
+    )
+    assert "stop_order.ocaGroup = oca_group" in body
+    assert "stop_order.ocaType = 1" in body
+    assert "tgt_order.ocaGroup = oca_group" in body
+    assert "tgt_order.ocaType = 1" in body
+
+
 def test_log_event_writes_jsonl_line(tmp_path, monkeypatch):
     monkeypatch.setattr(stress_injector, "LOG_PATH", tmp_path / "stress.jsonl")
     e = Event(ts="2026-05-20T12:00:00Z", cycle_id="abc", kind="TEST", payload={"x": 1})
