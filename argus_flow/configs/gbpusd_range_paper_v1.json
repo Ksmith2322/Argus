@@ -22,6 +22,8 @@
     ],
     "sequencing_gap_minutes": 10
   },
+  "paper_stress_multiplier": 1.0,
+  "_paper_stress_note": "2026-05-21: knob wired but default 1.0 (no-op) because allocation=0. Operator can flip to 0.5 when activating GBPUSD trading; halves range_pct_min to ~0.00025, expected 2-4x signal rate vs baseline.",
   "risk": {
     "stop_pips": 15,
     "target_pips": 50,

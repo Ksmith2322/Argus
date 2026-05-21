@@ -155,7 +155,10 @@ def test_chaos_delay_realtime_mode_actually_sleeps():
         chaos=[ChaosTransform(kind="delay_ms", target_idx=1, delay_ms=150)],
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
-    assert elapsed_ms >= 140  # 150 with small tolerance
+    # Windows time.sleep precision is ±15ms in practice; tolerance has
+    # to accommodate that. The 150ms request should never finish faster
+    # than ~130ms in normal conditions.
+    assert elapsed_ms >= 130
     assert elapsed_ms < 600   # but not absurd
 
 

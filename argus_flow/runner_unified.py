@@ -1100,9 +1100,27 @@ def _in_session(hour: int, start: int, end: int) -> bool:
 
 
 def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
-    """FX trigger: range_pct + range_accel + vol_z + session + blocked hours."""
+    """FX trigger: range_pct + range_accel + vol_z + session + blocked hours.
+
+    2026-05-21: paper_stress_multiplier wired here for range_accel strategies
+    (GBPUSD). Mirrors the MTF-side wiring in InstrumentRunner.__init__ so the
+    full FX trio (USDJPY mtf, CADJPY mtf, GBPUSD range_accel) responds to the
+    same activity-multiplication knob. The multiplier only scales the barrier
+    threshold (range_pct_min) — the dist thresholds route direction, not
+    whether to enter, so they're left alone."""
     trigger = cfg.get("trigger", {})
-    if features["range_pct"] < trigger.get("range_pct_min", 0.0012):
+    stress_mult = cfg.get("paper_stress_multiplier", 1.0)
+    base_range_pct_min = trigger.get("range_pct_min", 0.0012)
+    if stress_mult != 1.0:
+        from helio.paper_stress import apply as _stress_apply
+        symbol_for_log = cfg.get("symbol") or "fx"
+        eff_range_pct_min = _stress_apply(
+            base_range_pct_min, stress_mult,
+            strategy=f"argus_{symbol_for_log}", knob="range_pct_min",
+        )
+    else:
+        eff_range_pct_min = base_range_pct_min
+    if features["range_pct"] < eff_range_pct_min:
         return None
     if features["range_accel"] <= trigger.get("range_accel_min", 0.0):
         return None
