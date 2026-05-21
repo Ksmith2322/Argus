@@ -61,6 +61,10 @@ def fx_notional_per_unit_usd(
     return 1.0
 
 
+RAW_SIZE_RATIO_WARN = 2.0   # ratio at which we log a FX_SIZE_OVERSIZED warning
+RAW_SIZE_RATIO_REFUSE = 50.0  # extreme upper bound — refuse to size at all
+
+
 def fx_units_for_risk(
     *,
     equity_usd: float,
@@ -72,7 +76,21 @@ def fx_units_for_risk(
     quote_price: float | None = None,
     usd_jpy_price: float | None = None,
 ) -> int:
-    """Size FX units so stop-loss risk is approximately equity * risk_pct."""
+    """Size FX units so stop-loss risk is approximately equity * risk_pct.
+
+    2026-05-21: added RAW_SIZE_RATIO sanity gate. When the configured
+    (risk_pct, stop_pips) combination demands more notional than the
+    account can support, downstream NOTIONAL_CAP catches it — but the
+    operator only sees the post-cap effective risk and can't tell how
+    badly the strategy was structurally undersized. This gate surfaces:
+      - the raw notional ratio (raw_notional / equity)
+      - the intended risk amount vs the effective risk after cap
+      - the diagnosis (tighten stop OR lower risk_pct)
+
+    Behavior unchanged: same return value as before, only adds log.
+    Extreme cases (ratio >= RAW_SIZE_RATIO_REFUSE) refuse to size and
+    return 0 — defense against runaway formulas producing 1000x ratios.
+    """
 
     if equity_usd <= 0 or risk_pct <= 0 or stop_pips <= 0:
         return 0
@@ -87,6 +105,36 @@ def fx_units_for_risk(
 
     risk_amount = equity_usd * risk_pct
     raw_units = risk_amount / (stop_pips * pip_value)
+
+    # ── RAW_SIZE_RATIO sanity gate ──
+    notional_per_unit = fx_notional_per_unit_usd(
+        symbol, quote_price=quote_price, usd_jpy_price=usd_jpy_price,
+    )
+    if notional_per_unit > 0 and equity_usd > 0:
+        raw_notional = raw_units * notional_per_unit
+        notional_ratio = raw_notional / equity_usd
+        if notional_ratio >= RAW_SIZE_RATIO_REFUSE:
+            _log.error(
+                f"FX_SIZE_REFUSED ratio={notional_ratio:.1f}x exceeds {RAW_SIZE_RATIO_REFUSE}x "
+                f"symbol={symbol} raw_units={raw_units:.0f} raw_notional=${raw_notional:.0f} "
+                f"equity=${equity_usd:.0f}. Formula produced a notional far beyond any "
+                f"reasonable account-leverage ceiling — strategy parameters are broken. "
+                f"Refusing to size."
+            )
+            return 0
+        if notional_ratio > RAW_SIZE_RATIO_WARN:
+            # Effective risk after notional cap (cap = equity at 1.0x ratio)
+            effective_risk = risk_amount / notional_ratio
+            _log.warning(
+                f"FX_SIZE_OVERSIZED symbol={symbol} ratio={notional_ratio:.1f}x "
+                f"raw_units={raw_units:.0f} raw_notional=${raw_notional:.0f} "
+                f"equity=${equity_usd:.0f} intended_risk=${risk_amount:.2f} "
+                f"effective_risk_after_cap=${effective_risk:.2f}. "
+                f"Strategy params (risk_pct={risk_pct:.4f}, stop_pips={stop_pips}) demand "
+                f"more capital than account has. Tighten stop OR lower risk_pct to bring "
+                f"raw_notional within ~1x equity."
+            )
+
     sized = int(raw_units // min_units) * min_units
     if sized < min_units:
         _log.warning(
