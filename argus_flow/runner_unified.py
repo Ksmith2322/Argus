@@ -1521,9 +1521,9 @@ class InstrumentRunner:
         unavailable — keeps Argus safe even if the central config breaks.
         """
         try:
-            from helio.fleet_sizing import get_effective_risk_pct
+            from helio.fleet_sizing import get_allocation_factor, get_effective_risk_pct
             label = f"argus_{self.symbol.lower()}"
-            return float(get_effective_risk_pct(label)["risk_pct"])
+            return float(get_effective_risk_pct(label)["risk_pct"]) * float(get_allocation_factor(label))
         except Exception:
             return self.risk_pct
 
@@ -1531,7 +1531,14 @@ class InstrumentRunner:
         equity_usd = self._get_account_equity()
         # Resolve tier-based risk_pct each call so Argus auto-promotes as
         # measured live performance earns it (matches Forge tier behavior).
-        effective_risk = self._effective_risk_pct() or self.risk_pct
+        effective_risk = self._effective_risk_pct()
+        if effective_risk <= 0:
+            self._log.warning(
+                "ALLOCATION_BLOCK: effective_risk_pct<=0 symbol=%s stage=%s",
+                self.symbol,
+                self.deployment_stage,
+            )
+            return 0.0, 0.0, "allocation_factor_zero"
         if equity_usd < 100:
             self._log.warning(f"LOW_EQUITY_DEBUG: equity={equity_usd} stage={self.deployment_stage} model={self.risk_policy.get('model_start_equity_usd')} risk_pct={effective_risk}")
 
@@ -4801,6 +4808,12 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         size, risk_usd, policy = inst._resolve_position_size(mid, stop_px)
         equity = inst._get_account_equity()
         if size <= 0:
+            if policy == "allocation_factor_zero":
+                log.warning(
+                    f"  Sizing disabled {inst.label}: allocation_factor_zero "
+                    f"(reconcile/exit management allowed)"
+                )
+                continue
             log.critical(
                 f"FATAL SIZING: [{inst.label}] dry-run size=0 | equity=${equity:,.2f} "
                 f"risk_pct={inst.risk_pct} policy={policy} "
