@@ -51,6 +51,12 @@ ALLOWED_DIRECT_PLACEORDER = {
     "ops/close_orphan_usdjpy.py",
     "ops/flatten_eod_executor.py",
     "ops/flatten_orphan.py",
+    # Paper-only stress harness — 4 import-time safety locks (IBKR_PORT
+    # 7497 + REAL_MONEY_ENABLED env + STRESS_INJECT_OK + helio.real_money
+    # constant). Locks tested in test_stress_injector.py. Adding here
+    # because the placeOrder calls bypass the central executor BUT the
+    # locks make it categorically paper-only.
+    "ops/stress_injector.py",
     # ── Known tech-debt below: TODO migrate to submit_bracket path ──
     # These runners bypass the central executor; add real_money boundary
     # before they go live. Tracked in fix-by-5/31 queue.

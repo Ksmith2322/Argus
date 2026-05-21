@@ -255,11 +255,19 @@ def backtest(period: str = "5y", verbose: bool = False,
                 prior_close=prior_close,
                 atr_at_entry=atr_at_entry,
             )
+            from helio.paper_stress import apply as _stress_apply
+            _stress_mult = PARAMS.get("paper_stress_multiplier", 1.0)
             decision = evaluate_pead_signal(
                 cand,
-                surprise_pct_min=PARAMS["surprise_pct_min"],
-                volume_ratio_min=PARAMS["volume_ratio_min"],
-                gap_pct_min=PARAMS["gap_pct_min"],
+                surprise_pct_min=_stress_apply(
+                    PARAMS["surprise_pct_min"], _stress_mult,
+                    strategy="forge_pead", knob="surprise_pct_min"),
+                volume_ratio_min=_stress_apply(
+                    PARAMS["volume_ratio_min"], _stress_mult,
+                    strategy="forge_pead", knob="volume_ratio_min"),
+                gap_pct_min=_stress_apply(
+                    PARAMS["gap_pct_min"], _stress_mult,
+                    strategy="forge_pead", knob="gap_pct_min"),
             )
             if decision.action != "ENTER_LONG":
                 continue

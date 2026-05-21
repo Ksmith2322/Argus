@@ -1336,15 +1336,27 @@ class InstrumentRunner:
         mtf_cfg = config.get("mtf", {})
         if mtf_cfg.get("enabled") and config.get("strategy") == "mtf_trend":
             from argus_flow.strategies.mtf_engine import MTFStrategyEngine
+            from helio.paper_stress import apply as _stress_apply
+            _stress_mult = mtf_cfg.get("paper_stress_multiplier", 1.0)
+            _trend_eff = _stress_apply(
+                mtf_cfg.get("min_trend_strength", 0.5),
+                _stress_mult,
+                strategy=f"argus_{self.symbol}", knob="min_trend_strength",
+            )
+            _conf_eff = _stress_apply(
+                mtf_cfg.get("min_confidence", 0.5),
+                _stress_mult,
+                strategy=f"argus_{self.symbol}", knob="min_confidence",
+            )
             self._mtf_strategy = MTFStrategyEngine(
                 symbol=self.symbol,
                 pip_size=self.pip_size,
                 trend_ema_fast=mtf_cfg.get("trend_ema_fast", 8),
                 trend_ema_slow=mtf_cfg.get("trend_ema_slow", 21),
                 rsi_period=mtf_cfg.get("rsi_period", 14),
-                min_trend_strength=mtf_cfg.get("min_trend_strength", 0.5),
+                min_trend_strength=_trend_eff,
             )
-            self._mtf_min_confidence = mtf_cfg.get("min_confidence", 0.5)
+            self._mtf_min_confidence = _conf_eff
             self._log.info(f"MTF Trend Strategy enabled (4H/1H/5M, min_conf={self._mtf_min_confidence})")
             # AI Overlay — adaptive ensemble voter layer on top of MTF signals
             from argus_flow.strategies.ai_overlay import AdaptiveOverlay
@@ -2376,6 +2388,34 @@ class InstrumentRunner:
             s.entry_pending = True
             s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
             s.save()
+
+            # 2026-05-20 BUGFIX: persist pending-entry to the crash-recovery
+            # queue. helio.pending_fills exists and is wired into forge's
+            # submit_bracket, but argus's _submit_real_entry was never
+            # connected — argus_flow/logs/_pending_fills.jsonl was 0 bytes.
+            # Without this, a runner crash during the 60s pending window
+            # falls back to synthetic-stop orphan adoption (the path that's
+            # been producing 2-5× wider stops on every adopted entry).
+            try:
+                from helio.pending_fills import write_pending
+                client_id = int(getattr(getattr(ib, 'client', None), 'clientId', 0) or 0)
+                est_entry_px = self._get_mid() or float(stop_px) or 1.0
+                write_pending(
+                    client_id=client_id,
+                    order_id=s.entry_order_id,
+                    strategy=f"argus_{self.symbol.lower().replace('.', '').replace('/', '')}",
+                    symbol=self.symbol,
+                    direction=direction,
+                    size=float(qty),
+                    est_entry_px=float(est_entry_px),
+                    stop_px=float(stop_px),
+                    target_px=float(target_px),
+                )
+            except Exception as exc:
+                # Don't block the trade on a queue-write failure — the
+                # queue is a crash-recovery backstop, not a guard
+                self._log.warning(f"pending_fills write failed (non-fatal): {exc}")
+
             self._log.info(
                 f"REAL_ENTRY SUBMITTED {action} {size} {self.symbol} "
                 f"orderId={s.entry_order_id} stop={stop_px} target={target_px}"
@@ -2432,12 +2472,31 @@ class InstrumentRunner:
             s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
 
             # Target limit order — OCA leg B
-            limit_order = LimitOrder(close_action, abs(size), round(target_px, price_decimals))
-            limit_order.ocaGroup = oca_group
-            limit_order.ocaType = 1
-            limit_order.account = getattr(self, 'stage_account', '') or ''
-            target_trade = ib.placeOrder(self.contract, limit_order)
-            s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+            # 2026-05-20 BUGFIX: half-armed-bracket race. If the target
+            # placeOrder throws (Error 110 price-decimal, throttle, network
+            # blip), the stop is already LIVE at the broker but this
+            # function returns False — caller then issues an emergency MKT
+            # exit ALONGSIDE the live OCA stop, producing a LONG→SHORT
+            # cascade similar to the 5/19 incident. Fix: wrap target
+            # placement in inner try; on failure, explicitly cancel the
+            # already-live stop before propagating the error.
+            try:
+                limit_order = LimitOrder(close_action, abs(size), round(target_px, price_decimals))
+                limit_order.ocaGroup = oca_group
+                limit_order.ocaType = 1
+                limit_order.account = getattr(self, 'stage_account', '') or ''
+                target_trade = ib.placeOrder(self.contract, limit_order)
+                s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+            except Exception as target_exc:
+                self._log.error(
+                    f"BRACKET HALF-ARMED: target placeOrder failed ({target_exc}); "
+                    f"cancelling already-live stop {s.stop_order_id} to avoid "
+                    f"stop-alone + emergency-MKT cascade."
+                )
+                self._cancel_order_by_id(s.stop_order_id, "bracket_target_failed")
+                s.stop_order_id = ""
+                s.save()
+                return False
 
             s.save()
             self._log.info(
@@ -2613,9 +2672,15 @@ class InstrumentRunner:
         reconciliation cycle handle the broker truth."""
         broker_qty = self._read_broker_position()
         if broker_qty is None:
-            # Broker unreachable. Don't block — let the existing fail-closed
-            # paths in submit_bracket / cluster_exposure handle it.
-            return True, "broker_unreachable_passthrough"
+            # 2026-05-20 BUGFIX: fail CLOSED on broker-unreachable. The
+            # previous "passthrough" was itself fail-open — comment claimed
+            # downstream submit_bracket / cluster_exposure would catch it,
+            # but _submit_real_exit calls ib.placeOrder directly, bypassing
+            # those layers entirely. A network blip during a cascade retry
+            # would silently produce a duplicate exit — exactly the 5/19
+            # catastrophe caused by network failure instead of order race.
+            # Better to under-trade for one cycle than double-exit.
+            return False, "broker_unreachable_fail_closed"
         if broker_qty == 0.0:
             return False, f"broker_flat_already (intended {close_action} {qty})"
         if close_action == "SELL" and broker_qty < 0:
@@ -2748,7 +2813,41 @@ class InstrumentRunner:
         2026-05-04: introduced after Friday's argus FX restart cycle left
         orphan positions that argus didn't know about, blocking entries
         via RECON_DRIFT permanently.
+
+        2026-05-20 BUGFIX: sanity-check broker_qty + broker_avg_cost. On
+        5/19 IBKR's position-update stream delivered two corrupted snapshots
+        (position=-1.0 avgCost=-202.13) — an odd-lot arithmetic glitch.
+        The runner blindly adopted both, submitted real LimitOrder against
+        negative prices, and one filled at 115.54 with odd-lot warning.
+        Reject obviously-bad values rather than acting on them.
         """
+        # Sanity checks — refuse to adopt corrupted values
+        if broker_avg_cost <= 0:
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_avg_cost={broker_avg_cost} "
+                f"for {self.symbol} (non-positive). IBKR position-update "
+                f"glitch. Local state unchanged; next reconcile will retry."
+            )
+            return
+        if abs(broker_qty) < 1:
+            # FX min lot is 1000; futures min is 1 contract. Anything below
+            # 1 unit is an odd-lot arithmetic artifact, not a real position.
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_qty={broker_qty} for "
+                f"{self.symbol} (sub-lot). Likely IBKR odd-lot glitch. "
+                f"Local state unchanged."
+            )
+            return
+        # Sanity: avg_cost must be within ±20% of last known mid
+        last_mid = self._get_mid() or 0.0
+        if last_mid > 0 and abs(broker_avg_cost - last_mid) / last_mid > 0.20:
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_avg_cost={broker_avg_cost} "
+                f"diverges >20% from last_mid={last_mid} for {self.symbol}. "
+                f"Likely IBKR position-update glitch."
+            )
+            return
+
         s = self.state
         s.position = broker_dir.upper()
         s.entry_price = broker_avg_cost
@@ -2860,6 +2959,19 @@ class InstrumentRunner:
                 f"ENTRY FILLED {direction.upper()} @ {fill_px:.5f} "
                 f"size={size} stop={stop_px:.5f} target={target_px:.5f}"
             )
+
+            # 2026-05-20 BUGFIX: clear from the pending-fills queue now that
+            # we've confirmed the fill. Paired with write_pending in
+            # _submit_real_entry. Without this clear, the queue accumulates
+            # already-filled entries and reconcile_pending sees them as
+            # "still pending" on next runner restart, producing spurious
+            # ADOPTED ORPHAN events.
+            try:
+                from helio.pending_fills import clear_pending
+                if s.entry_order_id:
+                    clear_pending(order_id=s.entry_order_id)
+            except Exception as exc:
+                self._log.warning(f"pending_fills clear failed (non-fatal): {exc}")
 
             # Dual-write an ENTRY row to canonical_fills. Mirrors the EXIT
             # dual-write in _log_trade and the submit_bracket ENTRY dual-write
@@ -3028,9 +3140,47 @@ class InstrumentRunner:
         """Cancel stuck orders after timeout. Entry: 60s, Exit: 30s."""
         s = self.state
         if s.entry_pending and s.entry_submitted_ts:
+            # 2026-05-20 BUGFIX: ENTRY-side broker-truth check. Mirror of the
+            # exit-side fix from 5/19. The 60s entry timeout was firing AFTER
+            # the order had already filled but the execDetails callback hadn't
+            # yet arrived (instant-fill races on FX), causing the runner to:
+            #   1. Issue a cancel (which fails: order already filled at broker)
+            #   2. Clear local state INCLUDING _pending_stop_px/_pending_target_px
+            #   3. Later adopt via reconciliation as orphan with SYNTHETIC stops
+            #      (2-5× wider than the strategy designed)
+            # Observed 24× across 5/19+5/20. Every FX entry hit this path.
+            # The fix: query broker FIRST. If position exists, the order
+            # filled — adopt it with the strategy-intended stops still in
+            # memory at self._pending_stop_px / self._pending_target_px.
             try:
                 submitted = datetime.fromisoformat(s.entry_submitted_ts)
                 if (now - submitted).total_seconds() > 60:
+                    broker_qty = self._read_broker_position()
+                    if broker_qty is not None and abs(broker_qty) > 0:
+                        # Order filled — execDetails callback was lost. Don't
+                        # cancel-and-clear; adopt the position with the
+                        # strategy-intended stop/target stashed on self.
+                        direction = "long" if broker_qty > 0 else "short"
+                        pending_stop = getattr(self, '_pending_stop_px', 0.0)
+                        pending_target = getattr(self, '_pending_target_px', 0.0)
+                        self._log.warning(
+                            f"ENTRY_RACE_RESOLVED: broker has {broker_qty} {self.symbol} — "
+                            f"prior entry must have filled. Adopting with intended "
+                            f"stop={pending_stop} target={pending_target}."
+                        )
+                        s.position = direction.upper()
+                        s.position_size = abs(broker_qty)
+                        s.entry_price = self._get_mid() or s.entry_price or 0.0
+                        s.entry_time = now
+                        s.entry_pending = False
+                        s.stop_price = pending_stop or s.stop_price
+                        s.target_price = pending_target or s.target_price
+                        s.save()
+                        # Submit protective brackets at the intended levels
+                        if pending_stop and pending_target:
+                            self._submit_bracket_orders(pending_stop, pending_target)
+                        return
+                    # No broker position → genuine timeout, real cancel + clear
                     self._log.warning(
                         f"ENTRY TIMEOUT: order {s.entry_order_id} pending >60s — cancelling"
                     )
@@ -3077,6 +3227,25 @@ class InstrumentRunner:
                     # past "EXIT TIMEOUT" — this surfaces the actual TWS state.
                     self._dump_exit_forensics(s.exit_order_id, stage="initial_timeout_30s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_timeout")
+                    # 2026-05-20 BUGFIX: re-check broker AFTER the cancel
+                    # sleep. _cancel_order_by_id sleeps 2s and returns
+                    # "confirmed" if the order is no longer in openTrades —
+                    # but a fill during that 2s window ALSO removes it from
+                    # openTrades. Without this re-check, we'd submit a
+                    # duplicate exit on a position that's already closed.
+                    broker_qty = self._read_broker_position()
+                    if broker_qty == 0.0:
+                        self._log.info(
+                            f"EXIT_FILLED_DURING_CANCEL: broker shows {self.symbol} "
+                            f"FLAT after cancel — prior exit filled in 2s sleep window. "
+                            f"Skipping IOC retry."
+                        )
+                        s.exit_pending = False
+                        s.position = "FLAT"
+                        s.position_size = 0
+                        self._exit_retry_count = 0
+                        s.save()
+                        return
                     # Retry with the right order type for this instrument
                     # (FX => LimitOrder + outsideRth, equity/futures => MarketOrder).
                     # Equity/futures still use IOC tif here for urgency; FX
@@ -3108,6 +3277,21 @@ class InstrumentRunner:
                     )
                     self._dump_exit_forensics(s.exit_order_id, stage="ioc_retry_60s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_stuck")
+                    # 2026-05-20 BUGFIX: same fill-during-cancel re-check as
+                    # the 30s arm above.
+                    broker_qty = self._read_broker_position()
+                    if broker_qty == 0.0:
+                        self._log.info(
+                            f"EXIT_FILLED_DURING_CANCEL: broker shows {self.symbol} "
+                            f"FLAT after cancel — IOC retry must have filled in 2s "
+                            f"sleep window. Skipping GTC retry."
+                        )
+                        s.exit_pending = False
+                        s.position = "FLAT"
+                        s.position_size = 0
+                        self._exit_retry_count = 0
+                        s.save()
+                        return
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
@@ -4728,6 +4912,18 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     # -- Wire IB reference and fill callback for real execution --------
     for inst in instruments:
         inst._ib = ib
+
+    # -- Optional golden-trace recorder (opt-in via GOLDEN_TRACE_PATH env)
+    # Captures every broker event to JSONL so live incidents can be
+    # converted into deterministic regression tests via helio.trace_replay.
+    _trace_path = os.environ.get("GOLDEN_TRACE_PATH", "").strip()
+    if _trace_path:
+        try:
+            from helio.event_recorder import attach_recorder
+            _trace_recorder = attach_recorder(ib, _trace_path)
+            log.warning(f"GOLDEN_TRACE_RECORDER attached -> {_trace_path}")
+        except Exception as e:
+            log.warning(f"GOLDEN_TRACE_RECORDER failed to attach: {e}")
 
     def _route_fill_to_runner(trade, fill):
         """Route IB fill events to the correct InstrumentRunner."""

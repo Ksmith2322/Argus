@@ -192,17 +192,21 @@ def test_resize_signaled_when_local_thinks_bigger_than_broker():
 
 
 def test_passes_through_when_broker_unreachable():
-    """Don't BLOCK on transient broker-query failure — that would make every
-    cap check fail open. The cluster_exposure layer already fails closed on
-    its own; this helper just signals 'pass through'."""
+    """2026-05-20 BUGFIX (operational audit): broker-unreachable now fails
+    CLOSED. The original passthrough was itself fail-open inside the
+    cascade-retry path — _submit_real_exit calls ib.placeOrder directly
+    (bypassing submit_bracket/cluster_exposure fail-closed layers), so
+    a network blip silently produced duplicate exits. Better to under-
+    trade one cycle than double-exit."""
     inst = _make_runner_stub(
         symbol_pair="CADJPY", local="CAD.JPY", base="CAD", quote="JPY",
         broker_positions=[],
     )
     inst._ib = None  # unreachable
     ok, reason = inst._broker_state_allows_exit("SELL", 41479)
-    assert ok is True
-    assert "unreachable" in reason or "passthrough" in reason
+    assert ok is False
+    assert "unreachable" in reason
+    assert "fail_closed" in reason
 
 
 # ── End-to-end behaviour via _submit_real_exit (source-level check) ───────

@@ -77,17 +77,39 @@ def main(force: bool = False) -> int:
             # FX: use wide LMT with outsideRth so it fills in extended hours
             # STK/ETF/FUT: use MARKET (RTH only — should be RTH if FLATTEN was triggered intraday)
             if sec_type == "CASH":
+                # Re-qualify contract — positions() returns contracts without
+                # exchange set, which causes IBKR Error 321 on LimitOrder.
+                # Same fix as emergency_close.py from 2026-05-19.
+                try:
+                    qualified = ib.qualifyContracts(p.contract)
+                    contract = qualified[0] if qualified else p.contract
+                except Exception:
+                    contract = p.contract
+                # 2026-05-20 BUGFIX: JPY-aware decimal rounding. Same fix as
+                # runner_unified._build_exit_order from 5/19 — JPY pairs need
+                # 3 decimals (0.001 tick) on IdealPro, not 5. Without this,
+                # any flatten on USDJPY/CADJPY/EURJPY position gets rejected
+                # with Warning 110 silently — emergency tool fails when most
+                # needed. Untouched here until this audit caught it.
+                pair_tags = " ".join([
+                    str(getattr(contract, "symbol", "")),
+                    str(getattr(contract, "currency", "")),
+                    str(getattr(contract, "localSymbol", "")),
+                ]).upper()
+                is_jpy = "JPY" in pair_tags
+                decimals = 3 if is_jpy else 5
                 # Estimate price from avgCost (close enough for wide LMT)
                 ref = float(p.avgCost) if p.avgCost else 1.0
                 # Wide LMT: pay up to 5% adverse. Broker fills at NBBO not the limit.
-                lmt = round(ref * (1.05 if close_action == "BUY" else 0.95), 5)
+                lmt = round(ref * (1.05 if close_action == "BUY" else 0.95), decimals)
                 order = LimitOrder(close_action, size, lmt)
                 order.outsideRth = True
-                order.tif = "DAY"
+                order.tif = "GTC"  # GTC so it survives broker daily roll, matches runner_unified fix
             else:
+                contract = p.contract
                 order = MarketOrder(close_action, size)
 
-            trade = ib.placeOrder(p.contract, order)
+            trade = ib.placeOrder(contract, order)
             for _ in range(WAIT_FILL_S * 2):
                 ib.sleep(0.5)
                 if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):

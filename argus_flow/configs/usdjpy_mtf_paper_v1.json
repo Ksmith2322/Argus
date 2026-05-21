@@ -16,7 +16,8 @@
     "trend_ema_slow": 21,
     "rsi_period": 14,
     "min_trend_strength": 3.0,
-    "min_confidence": 0.5
+    "min_confidence": 0.5,
+    "paper_stress_multiplier": 0.5
   },
   "trigger": {
     "range_pct_min": 0.0,

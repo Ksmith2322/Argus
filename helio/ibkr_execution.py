@@ -267,12 +267,16 @@ def connect(client_id: int, timeout: int = 15) -> IB:
     """Connect to TWS/gateway. Caller must call disconnect() when done.
 
     Each runner must use a unique client_id (forge range: 100-199).
+
+    If env var GOLDEN_TRACE_PATH is set, a golden-trace recorder is
+    attached to the returned IB instance for forensic capture. Failure
+    to attach is logged but does NOT raise — recording must never take
+    down a strategy.
     """
     ib = IB()
     try:
         log.info(f"Connecting to IBKR {IBKR_HOST}:{IBKR_PORT} client_id={client_id}")
         ib.connect(IBKR_HOST, IBKR_PORT, clientId=client_id, timeout=timeout)
-        return ib
     except Exception as exc:
         # Include exception type + repr so empty-message failures (TimeoutError,
         # asyncio CancelledError, etc.) still surface a diagnosable trace.
@@ -280,6 +284,12 @@ def connect(client_id: int, timeout: int = 15) -> IB:
         # for hours with no clue why — see 2026-05-08 investigation.
         msg = f"connect failed: {type(exc).__name__}: {exc!r} (host={IBKR_HOST} port={IBKR_PORT} client_id={client_id})"
         raise IBKRExecutionError(msg) from exc
+    try:
+        from helio.event_recorder import attach_via_env
+        attach_via_env(ib)  # no-op if GOLDEN_TRACE_PATH not set
+    except Exception as exc:
+        log.warning(f"golden-trace recorder attach failed (continuing): {exc}")
+    return ib
 
 
 def disconnect(ib: IB) -> None:

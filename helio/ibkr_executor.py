@@ -188,8 +188,18 @@ class IBKRExecutor:
             )
             return None
         except Exception as exc:
-            self._log.warning(f"real-money boundary check failed (allowing paper path): {exc}")
-            real_order_ref = ""
+            # 2026-05-20 BUGFIX: fail CLOSED on any unexpected error. The
+            # previous "allowing paper path" behaviour silently let orders
+            # through if enforce_real_money_boundary itself raised (ImportError
+            # after refactor, allowlist file unreadable, AccountValidationError
+            # typo). If port is ever switched to 7496 with this code path
+            # active, that would submit live-account orders unchecked. Codex
+            # X5 doctrine applied — guards must fail closed.
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY: REFUSING {direction} {quantity} {symbol} — "
+                f"unexpected error in boundary check: {type(exc).__name__}: {exc}"
+            )
+            return None
 
         try:
             contract = Stock(symbol, "SMART", "USD")
@@ -275,7 +285,12 @@ class IBKRExecutor:
                 )
                 return None
             except Exception as exc:
-                self._log.warning(f"real-money boundary check failed (allowing paper path): {exc}")
+                # 2026-05-20 BUGFIX: fail CLOSED — see submit_bracket above
+                self._log.error(
+                    f"REAL_MONEY_BOUNDARY: REFUSING market {direction} {quantity} "
+                    f"{symbol} — unexpected error: {type(exc).__name__}: {exc}"
+                )
+                return None
 
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
