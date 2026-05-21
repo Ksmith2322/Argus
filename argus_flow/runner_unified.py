@@ -3152,14 +3152,38 @@ class InstrumentRunner:
 
         # ── Stop fill ──
         if order_id == s.stop_order_id and s.position != "FLAT":
-            # Stop filled — cancel the target order
+            # 2026-05-21 BUGFIX: partial-fill state-ordering race. Previously
+            # ANY stop fill (even partial) triggered _finalize_real_exit
+            # which clears trade state — but OCA-cancels the target leg,
+            # leaving the remaining position OPEN with no bracket protection.
+            # Now: broker-truth check before finalizing. If broker still has
+            # position, this was partial — log and wait. _check_bracket_health
+            # will re-arm a bracket on the remaining qty within 60s.
+            broker_pos = self._read_broker_position()
+            if broker_pos is not None and abs(broker_pos) > 0.5:
+                self._log.warning(
+                    f"PARTIAL_STOP_FILL: stop filled qty={fill_qty} but broker "
+                    f"shows {self.symbol} pos={broker_pos} (still open). "
+                    f"Waiting for closure. bracket_health will re-arm protection."
+                )
+                return
+            # Stop filled fully — cancel the target order
             self._cancel_order_by_id(s.target_order_id, "target")
             self._finalize_real_exit(fill_px, "stop", now)
             return
 
         # ── Target fill ──
         if order_id == s.target_order_id and s.position != "FLAT":
-            # Target filled — cancel the stop order
+            # 2026-05-21 BUGFIX: same partial-fill race as stop above.
+            broker_pos = self._read_broker_position()
+            if broker_pos is not None and abs(broker_pos) > 0.5:
+                self._log.warning(
+                    f"PARTIAL_TARGET_FILL: target filled qty={fill_qty} but broker "
+                    f"shows {self.symbol} pos={broker_pos} (still open). "
+                    f"Waiting for closure. bracket_health will re-arm protection."
+                )
+                return
+            # Target filled fully — cancel the stop order
             self._cancel_order_by_id(s.stop_order_id, "stop")
             self._finalize_real_exit(fill_px, "target", now)
             return
