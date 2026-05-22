@@ -1383,7 +1383,11 @@ class InstrumentRunner:
                 pip_size=self.pip_size,
                 state_dir=log_dir,
             )
-            self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
+            _ai_disabled_at_boot = os.environ.get("ARGUS_DISABLE_AI_OVERLAY", "").strip() in ("1", "true", "yes")
+            if _ai_disabled_at_boot:
+                self._log.warning("AI Overlay DISABLED via ARGUS_DISABLE_AI_OVERLAY env (signals pass MTF directly)")
+            else:
+                self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
             # LLM reasoning moved to nightly analysis (ops/nightly_analysis.py)
             # Real-time LLM gating disabled — adds latency, governor is better
             self._llm_reasoner = None
@@ -3660,7 +3664,14 @@ class InstrumentRunner:
                 self._log.info(f"MTF SIGNAL: {direction} {mtf_signal.reason}")
 
                 # ── AI Overlay gate ──────────────────────────────
-                if self._ai_overlay is not None and direction is not None:
+                # 2026-05-22: env-var bypass. The overlay was calibrated
+                # against tighter MTF candidates; once paper_stress_multiplier
+                # loosens MTF thresholds the overlay rejects most candidates
+                # (3-of-3 SKIPs observed 2026-05-22). Set
+                # ARGUS_DISABLE_AI_OVERLAY=1 to short-circuit during the
+                # exercise window; re-enable + retune post-5/31 reset.
+                _ai_disabled = os.environ.get("ARGUS_DISABLE_AI_OVERLAY", "").strip() in ("1", "true", "yes")
+                if self._ai_overlay is not None and direction is not None and not _ai_disabled:
                     from argus_flow.strategies.ai_overlay import MarketState
                     ai_state = MarketState(
                         price=mid,
