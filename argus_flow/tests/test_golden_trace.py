@@ -103,6 +103,39 @@ def test_recorder_captures_order_status_event(tmp_path):
     assert matching[0]["data"]["status"] == "Filled"
 
 
+def test_recorder_captures_update_portfolio_event(tmp_path):
+    """2026-05-21: updatePortfolioEvent is the P&L timeline source.
+    Verify the recorder subscribes and writes a usable record."""
+    ib = _make_ib_stub()
+    # Add the updatePortfolioEvent slot to the stub
+    ib.updatePortfolioEvent = _FakeEventSlot()
+    rec = event_recorder.attach_recorder(ib, tmp_path / "trace.jsonl")
+    try:
+        item = SimpleNamespace(
+            contract=SimpleNamespace(symbol="USD", currency="JPY", localSymbol="USD.JPY"),
+            position=29362.0,
+            marketPrice=158.95,
+            marketValue=29387.40,
+            averageCost=158.969,
+            unrealizedPNL=-5.50,
+            realizedPNL=0.0,
+            account="DUP472829",
+        )
+        ib.updatePortfolioEvent.fire(item)
+    finally:
+        rec.close()
+    events = [json.loads(l) for l in
+              (tmp_path / "trace.jsonl").read_text(encoding="utf-8").strip().splitlines()]
+    matching = [e for e in events if e["event"] == "updatePortfolio"]
+    assert len(matching) == 1
+    data = matching[0]["data"]
+    assert data["symbol"] == "USD"
+    assert data["position"] == 29362.0
+    assert data["unrealized_pnl"] == -5.50
+    assert data["market_price"] == 158.95
+    assert data["avg_cost"] == 158.969
+
+
 def test_recorder_captures_exec_details(tmp_path):
     ib = _make_ib_stub()
     rec = event_recorder.attach_recorder(ib, tmp_path / "trace.jsonl")

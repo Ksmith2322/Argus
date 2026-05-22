@@ -295,6 +295,33 @@ def test_event_slot_supports_unsubscribe():
     assert log == [("first",)]
 
 
+def test_dispatcher_handles_update_portfolio_event():
+    """2026-05-21: dispatcher must route updatePortfolio events to
+    the target's updatePortfolioEvent slot and pass a reconstructed
+    PortfolioItem object."""
+    target = make_target()
+    sub = RecordingSubscriber()
+    subscribe_recording(target, sub)
+    events = [{"event": "updatePortfolio",
+               "data": {"symbol": "USD", "currency": "JPY",
+                        "local_symbol": "USD.JPY",
+                        "position": 29362.0, "market_price": 158.95,
+                        "unrealized_pnl": -5.50, "avg_cost": 158.969}}]
+    records = EventDispatcher(target).dispatch(events, mode="instant")
+    assert all(r.fired for r in records)
+    # RecordingSubscriber should have captured (symbol, position, unrealized_pnl)
+    calls = [c for c in sub.calls if c[0] == "updatePortfolio"]
+    assert len(calls) == 1
+    assert calls[0][1] == ("USD", 29362.0, -5.50)
+
+
+def test_make_target_includes_update_portfolio_slot():
+    """make_target must include updatePortfolioEvent so subscribers can
+    wire to it. Regression guard: don't drop the slot from the factory."""
+    target = make_target()
+    assert hasattr(target, "updatePortfolioEvent")
+
+
 def test_event_slot_supports_multiple_subscribers():
     target = make_target()
     log_a, log_b = [], []

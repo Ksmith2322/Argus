@@ -162,6 +162,26 @@ class EventRecorder:
     def _on_connected(self) -> None:
         self._write("connected", {})
 
+    def _on_update_portfolio(self, item) -> None:
+        """2026-05-21: P&L timeline events. IBKR fires updatePortfolio
+        every ~3 minutes per held instrument with current market price,
+        market value, and unrealized P&L. Useful for drawdown detection
+        and per-trade P&L reconstruction; not high-frequency enough to
+        overwhelm trace_inspect."""
+        contract = getattr(item, "contract", None)
+        self._write("updatePortfolio", {
+            "symbol": getattr(contract, "symbol", None) if contract else None,
+            "currency": getattr(contract, "currency", None) if contract else None,
+            "local_symbol": getattr(contract, "localSymbol", None) if contract else None,
+            "position": getattr(item, "position", None),
+            "market_price": getattr(item, "marketPrice", None),
+            "market_value": getattr(item, "marketValue", None),
+            "avg_cost": getattr(item, "averageCost", None),
+            "unrealized_pnl": getattr(item, "unrealizedPNL", None),
+            "realized_pnl": getattr(item, "realizedPNL", None),
+            "account": getattr(item, "account", None),
+        })
+
     # ── attach / close ───────────────────────────────────────────────────
     def _attach(self) -> None:
         wirings = [
@@ -172,6 +192,7 @@ class EventRecorder:
             (getattr(self.ib, "newOrderEvent", None), self._on_new_order),
             (getattr(self.ib, "disconnectedEvent", None), self._on_disconnected),
             (getattr(self.ib, "connectedEvent", None), self._on_connected),
+            (getattr(self.ib, "updatePortfolioEvent", None), self._on_update_portfolio),
         ]
         for slot, handler in wirings:
             if slot is None:

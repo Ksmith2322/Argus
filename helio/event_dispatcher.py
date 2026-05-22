@@ -128,6 +128,27 @@ def _reconstruct_position(data: dict) -> SimpleNamespace:
     )
 
 
+def _reconstruct_portfolio_item(data: dict) -> SimpleNamespace:
+    """ib_insync's PortfolioItem is a NamedTuple-ish with contract, position,
+    marketPrice, marketValue, averageCost, unrealizedPNL, realizedPNL,
+    account. Reconstruct from a trace data dict."""
+    contract = SimpleNamespace(
+        symbol=data.get("symbol", ""),
+        currency=data.get("currency", ""),
+        localSymbol=data.get("local_symbol", ""),
+    )
+    return SimpleNamespace(
+        contract=contract,
+        position=data.get("position", 0),
+        marketPrice=data.get("market_price", 0),
+        marketValue=data.get("market_value", 0),
+        averageCost=data.get("avg_cost", 0),
+        unrealizedPNL=data.get("unrealized_pnl", 0),
+        realizedPNL=data.get("realized_pnl", 0),
+        account=data.get("account", ""),
+    )
+
+
 # ─── dispatcher ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -224,6 +245,12 @@ class EventDispatcher:
                 if slot is None:
                     return DispatchRecord(index, kind, False, "no connectedEvent slot")
                 slot.fire() if hasattr(slot, "fire") else slot()
+            elif kind == "updatePortfolio":
+                slot = getattr(self.target, "updatePortfolioEvent", None)
+                if slot is None:
+                    return DispatchRecord(index, kind, False, "no updatePortfolioEvent slot")
+                item = _reconstruct_portfolio_item(data)
+                slot.fire(item) if hasattr(slot, "fire") else slot(item)
             else:
                 return DispatchRecord(index, kind or "?", False, f"unhandled event kind {kind!r}")
             return DispatchRecord(index, kind, True)
@@ -275,6 +302,13 @@ class RecordingSubscriber:
     def on_connected(self):
         self.calls.append(("connected", (), {}))
 
+    def on_update_portfolio(self, item):
+        self.calls.append(("updatePortfolio",
+                           (getattr(item.contract, "symbol", None),
+                            getattr(item, "position", None),
+                            getattr(item, "unrealizedPNL", None)),
+                           {}))
+
 
 # ─── helper: build a target with ib_insync-style event slots ──────────────
 
@@ -307,6 +341,7 @@ def make_target() -> SimpleNamespace:
         newOrderEvent=_DispatcherEventSlot(),
         disconnectedEvent=_DispatcherEventSlot(),
         connectedEvent=_DispatcherEventSlot(),
+        updatePortfolioEvent=_DispatcherEventSlot(),
     )
 
 
@@ -319,3 +354,4 @@ def subscribe_recording(target: SimpleNamespace, sub: RecordingSubscriber) -> No
     target.newOrderEvent += sub.on_new_order
     target.disconnectedEvent += sub.on_disconnected
     target.connectedEvent += sub.on_connected
+    target.updatePortfolioEvent += sub.on_update_portfolio
