@@ -5088,11 +5088,26 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
             log.warning(f"GOLDEN_TRACE_RECORDER failed to attach: {e}")
 
     def _route_fill_to_runner(trade, fill):
-        """Route IB fill events to the correct InstrumentRunner."""
+        """Route IB fill events to the correct InstrumentRunner.
+
+        2026-05-22 BUGFIX: filter was `execution_mode != "real"` which
+        skipped paper-stage instruments. But paper-stage runners submit
+        real broker orders (to the paper account) and receive real
+        execDetails — they just don't risk real money. With the wrong
+        filter, every argus paper fill since 4/23 was silently dropped:
+          - _on_fill never invoked
+          - No 'FILL RECEIVED' log line
+          - No canonical_fills.jsonl write
+          - Drift detector accumulated unattributed P&L
+        Caught by investigating the 5/22 drift trip — runner thought
+        realized=-$799, broker showed -$1,223; the $424 gap was all the
+        unlogged argus exits. The runner body uses ("real", "paper") in
+        5 other places; this dispatcher just hadn't been updated. The
+        "observe" mode still doesn't submit orders so still skipped."""
         trade_symbol = getattr(trade.contract, 'symbol', '') or ''
         trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
         for inst in instruments:
-            if inst.execution_mode != "real":
+            if inst.execution_mode not in ("real", "paper"):
                 continue
             inst_key = _runner_to_ib_key(inst)
             if trade_key == inst_key or trade_symbol == inst.symbol:
@@ -5105,14 +5120,20 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     ib.execDetailsEvent += _route_fill_to_runner
 
     def _route_order_status_to_runner(trade):
-        """Route IB order status events (Rejected/Cancelled) to correct runner."""
+        """Route IB order status events (Rejected/Cancelled) to correct runner.
+
+        2026-05-22 BUGFIX: same dispatcher gate as _route_fill_to_runner —
+        paper-stage instruments also need to receive Rejected/Cancelled
+        order status events to clear their state. Previously only "real"
+        runners received them; argus paper would have stale entry_pending
+        flags after a rejection. Same root cause."""
         status_str = getattr(trade.orderStatus, 'status', '') if trade.orderStatus else ''
         if status_str not in ('Rejected', 'Cancelled'):
             return
         trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
         order_id = str(getattr(trade.order, 'orderId', ''))
         for inst in instruments:
-            if inst.execution_mode != "real":
+            if inst.execution_mode not in ("real", "paper"):
                 continue
             inst_key = _runner_to_ib_key(inst)
             if trade_key != inst_key:
