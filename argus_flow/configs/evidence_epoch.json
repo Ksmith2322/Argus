@@ -1,6 +1,6 @@
 {
   "_comment": "Evidence epoch registry (Codex audit 2026-05-18 X4). Every ROI report MUST name the epoch it was computed against, so contamination from older periods cannot silently mix into promotion math. The current_epoch_id selects which epoch is 'in effect'; any consumer that wants pre-reset data must explicitly request it by id. Until the 5/31 reset, current_epoch_id is the pre-freeze epoch; ops/maintenance/epoch_reset.py advances it post-reset.",
-  "current_epoch_id": "pre_freeze_20260418",
+  "current_epoch_id": "post_reset_20260522",
   "epochs": [
     {
       "id": "pre_freeze_20260418",
@@ -8,7 +8,7 @@
       "ends_at": "2026-05-31T23:59:59+00:00",
       "label": "Pre-freeze evidence (contaminated)",
       "is_clean": false,
-      "contamination_notes": "Silent bugs only diagnosed/fixed in 5/14-5/18 window: CBOT routing (22 days of zero-fill on cuebanks/mamba/tori), Error 321 multi-expiry futures, EXIT FAILED cascade on argus FX (5/8 + 5/15 — left 184K GBPUSD + 42K CADJPY orphans), sizing-formula bug producing phantom 417-contract NQ trades. Pre-fix data is not usable for promotion math.",
+      "contamination_notes": "Silent bugs only diagnosed/fixed in 5/14-5/18 window: CBOT routing (22 days of zero-fill on cuebanks/mamba/tori), Error 321 multi-expiry futures, EXIT FAILED cascade on argus FX (5/8 + 5/15 \u2014 left 184K GBPUSD + 42K CADJPY orphans), sizing-formula bug producing phantom 417-contract NQ trades. Pre-fix data is not usable for promotion math.",
       "exclude_strategies": [
         "forge_spy_mean_rev",
         "forge_multi_orb",
@@ -28,6 +28,12 @@
       "contamination_notes": "",
       "exclude_strategies": [],
       "phantom_trades": []
+    },
+    {
+      "id": "post_reset_20260522",
+      "started_at": "2026-05-22T23:14:53.156216+00:00",
+      "is_clean": true,
+      "reason": "Reset cutover brought forward from 5/31 to 5/22; paper reset to 250K + dispatcher fix + AI overlay off batched into single epoch boundary"
     }
   ]
 }
