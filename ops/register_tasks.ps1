@@ -97,6 +97,21 @@ $tasks = @(
         Script = "C:\Argus\repo\ops\watchdog_managed.ps1"
         Schedule = "ONSTART"
         Description = "Runner watchdog - auto-restart on crash"
+    },
+    @{
+        Name = "ArgusGateMonitor"
+        Script = "C:\Argus\repo\ops\run_gate_monitor.ps1"
+        Schedule = "DAILY"
+        Time = "23:30"
+        Description = "Daily disciplined-gate snapshot + persistent-FAIL alerts"
+    },
+    @{
+        Name = "ArgusWeeklyGateReview"
+        Script = "C:\Argus\repo\ops\run_weekly_review.ps1"
+        Schedule = "WEEKLY"
+        Time = "07:00"
+        Day = "SAT"
+        Description = "Saturday weekly gate review markdown report"
     }
 )
 
