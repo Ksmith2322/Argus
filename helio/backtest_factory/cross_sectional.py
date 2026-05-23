@@ -72,6 +72,7 @@ def run_xs_momentum(
     slippage_bps: float = 0.0,
     absolute_filter: bool = False,
     safe_ticker: str | None = None,
+    short_bottom_k: int = 0,
 ) -> XSMomentumResult:
     """Run 12-1 momentum on the universe, monthly rebalance.
 
@@ -87,6 +88,13 @@ def run_xs_momentum(
         allocate to this safe asset instead (typically a bond ETF). If
         None, the harness sits in cash (no positions) when the universe
         fails absolute momentum.
+
+    short_bottom_k: When > 0, also SHORT the bottom-K tickers by relative
+        momentum each period (long-short / market-neutral mode). The
+        emitted trade for a short has direction="SHORT" and pnl_pct is
+        computed inverted (entry - exit) / entry. Combining top_k longs
+        + short_bottom_k shorts mimics the AQR market-neutral momentum
+        factor.
     """
     # Auto-include safe_ticker in the load list so the dual-momentum
     # fallback branch can find its data. It is NOT included in ranking.
@@ -102,6 +110,7 @@ def run_xs_momentum(
     trades = []
     held_positions: Dict[str, pd.Timestamp] = {}  # ticker -> entry_dt
     held_entry_prices: Dict[str, float] = {}
+    held_directions: Dict[str, str] = {}  # ticker -> "LONG" or "SHORT"
 
     for i, rebal in enumerate(rebal_dates):
         # Close prior positions (entry was at previous rebal_date)
@@ -113,7 +122,11 @@ def run_xs_momentum(
                     entry_px = held_entry_prices[t]
                 except (KeyError, IndexError):
                     continue
-                gross = (exit_px - entry_px) / entry_px * 100.0
+                direction = held_directions.get(t, "LONG")
+                if direction == "LONG":
+                    gross = (exit_px - entry_px) / entry_px * 100.0
+                else:  # SHORT — profit when price falls
+                    gross = (entry_px - exit_px) / entry_px * 100.0
                 pnl_pct = gross - (slippage_bps / 100.0)
                 bars_held = int((pd.Timestamp(exit_dt) - pd.Timestamp(entry_dt)).days)
                 trades.append({
@@ -125,11 +138,12 @@ def run_xs_momentum(
                     "pnl_pct": round(pnl_pct, 4),
                     "gross_pnl_pct": round(gross, 4),
                     "bars_held": bars_held,
-                    "direction": "LONG",
+                    "direction": direction,
                     "exit_reason": "rebalance",
                 })
             held_positions.clear()
             held_entry_prices.clear()
+            held_directions.clear()
 
         # Compute 12-1 momentum at this rebalance: price (skip_recent_days) / price (lookback_days)
         # We need closes.iloc[rebal_idx - skip_recent_days] / closes.iloc[rebal_idx - lookback_days] - 1
@@ -150,10 +164,22 @@ def run_xs_momentum(
             # If no tickers pass and a safe asset is named, allocate there
             if not winners and safe_ticker is not None and safe_ticker in closes.columns:
                 winners = [safe_ticker]
+        # Pick shorts (bottom-K by relative momentum) for long-short mode
+        shorts: list[str] = []
+        if short_bottom_k > 0:
+            shorts = rank_mom.sort_values(ascending=True).head(short_bottom_k).index.tolist()
+            # Don't short tickers we're already long
+            shorts = [s for s in shorts if s not in winners]
         # Open positions at this rebal_date
         for t in winners:
             entry_px = float(closes.at[rebal, t])
             held_positions[t] = rebal
             held_entry_prices[t] = entry_px
+            held_directions[t] = "LONG"
+        for t in shorts:
+            entry_px = float(closes.at[rebal, t])
+            held_positions[t] = rebal
+            held_entry_prices[t] = entry_px
+            held_directions[t] = "SHORT"
 
     return XSMomentumResult(n_trades=len(trades), trades=trades)
