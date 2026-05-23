@@ -1,0 +1,49 @@
+{
+  "_comment": "Factory v3 — the candidate specs that survived both walk-forward AND bootstrap PF CI gate (lower bound >= 1.20). These are NOT promoted to paper yet; they're the input to the next decision: do we activate any of them in the post-reset paper window? Per project_2026_05_20 memo the CI lower bound is what real-money sizing should reflect, not the point estimate. Generated 2026-05-22 from factory_v2_bootstrap_20260522.json.",
+  "version": "3.0.0",
+  "created": "2026-05-22",
+  "bootstrap_source": "argus_flow/data/backtest_results/factory_v2_bootstrap_20260522.json",
+  "promotion_floor": 1.20,
+  "confidence": 0.95,
+  "n_resamples": 5000,
+  "min_n": 30,
+  "_candidates_summary": [
+    {"spec": "donchian_10_breakout", "ticker": "SPY", "n": 100, "pf_ci": [1.36, 3.32], "cagr": 6.9},
+    {"spec": "donchian_10_breakout", "ticker": "DIA", "n":  94, "pf_ci": [1.26, 2.99], "cagr": 5.5},
+    {"spec": "donchian_55_breakout_turtle", "ticker": "QQQ", "n":  46, "pf_ci": [1.30, 4.66], "cagr": 7.3},
+    {"spec": "donchian_55_breakout_gated", "ticker": "QQQ", "n":  43, "pf_ci": [1.31, 4.94], "cagr": 7.5},
+    {"spec": "rsi2_oversold_connors", "ticker": "GLD", "n":  62, "pf_ci": [1.29, 5.69], "cagr": 4.4}
+  ],
+  "specs": [
+    {
+      "name": "donchian_10_breakout",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 10},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 30},
+      "_notes": "Passes bootstrap on SPY (CI[1.36,3.32]) and DIA (CI[1.26,2.99]). Fails on QQQ/GLD/EFA/EEM/IWM/TLT. Edge is broad-equity short-term momentum continuation."
+    },
+    {
+      "name": "donchian_55_breakout_turtle",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100},
+      "_notes": "Passes bootstrap ONLY on QQQ (CI[1.30,4.66]). Classic Turtle param. QQQ-specific edge — likely captures the tech megacap trending behavior."
+    },
+    {
+      "name": "donchian_55_breakout_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100},
+      "_notes": "Passes bootstrap ONLY on QQQ (CI[1.31,4.94]). Trend-gate variant of donchian_55. Marginal improvement over ungated on QQQ. Pick ONE if activating to avoid double-counting."
+    },
+    {
+      "name": "rsi2_oversold_connors",
+      "timeframe": "1d",
+      "entry": {"kind": "rsi_oversold", "n": 2, "threshold": 10.0},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "hold_period", "bars": 5},
+      "_notes": "Passes bootstrap ONLY on GLD (CI[1.29,5.69]). Connors-style RSI(2) + 200-SMA trend filter mean-reversion. Different edge family than donchian — uncorrelated by construction."
+    }
+  ]
+}

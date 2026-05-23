@@ -1,0 +1,49 @@
+{
+  "_comment": "Factory v4 — adds VOLUME CONFIRMATION as a regime gate to the donchian/sma_cross primitives that failed period stability in v2/v3. Hypothesis: a breakout WITH volume surge is more likely to be a real edge (not noise-driven false signal) and should be more regime-robust than the same entry alone. Tested on 20y data with 10bps slippage and period-stability split.",
+  "version": "4.0.0",
+  "created": "2026-05-22",
+  "specs": [
+    {
+      "name": "donchian_20_vol_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 20},
+      "regime_filter": {"kind": "volume_z_above", "n": 20, "threshold": 1.5},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "donchian_55_vol_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "regime_filter": {"kind": "volume_z_above", "n": 20, "threshold": 1.5},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100}
+    },
+    {
+      "name": "donchian_20_obv_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 20},
+      "regime_filter": {"kind": "obv_above_sma", "n": 20},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "donchian_55_obv_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "regime_filter": {"kind": "obv_above_sma", "n": 50},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100}
+    },
+    {
+      "name": "sma_cross_vol_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "sma_cross", "fast": 20, "slow": 50},
+      "regime_filter": {"kind": "volume_z_above", "n": 20, "threshold": 1.0},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "macd_cross_obv_confirmed",
+      "timeframe": "1d",
+      "entry": {"kind": "macd_cross", "fast": 12, "slow": 26, "signal": 9},
+      "regime_filter": {"kind": "obv_above_sma", "n": 20},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 40}
+    }
+  ]
+}

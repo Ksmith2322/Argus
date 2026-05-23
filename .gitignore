@@ -5,6 +5,7 @@
 !data/eth_usd_1m.csv
 !data/sol_usd_1m.csv
 !ops/coin_pool.json
+!helio/backtest_factory/configs/*.json
 # --- Argus Flow (Cascade/IBKR) ---
 # --- Backtest artifacts ---
 # --- Candle data (keep in repo for PC2 sync) ---

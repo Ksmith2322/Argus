@@ -39,12 +39,18 @@ def test_committed_registry_has_post_reset_epoch_clean():
     assert post.phantom_trades == ()
 
 
-def test_current_epoch_is_pre_freeze_today():
-    """Before 5/31 reset, current epoch must point at the pre-freeze record
-    (which is is_clean=False). epoch_reset.py will advance this after reset."""
+def test_current_epoch_matches_registry_pointer():
+    """The current epoch returned must be exactly the one named by
+    `current_epoch_id` in the registry. After the 2026-05-22 cutover
+    this points at post_reset_20260522 (is_clean=true); before the
+    cutover it pointed at pre_freeze_20260418 (is_clean=false). Either
+    way they must agree — that's the invariant we actually care about."""
+    data = ee.load_registry()
     cur = ee.current_epoch()
-    assert cur.id == "pre_freeze_20260418"
-    assert cur.is_clean is False
+    assert cur.id == data["current_epoch_id"]
+    expected = ee.get_epoch(data["current_epoch_id"])
+    assert cur.id == expected.id
+    assert cur.is_clean == expected.is_clean
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

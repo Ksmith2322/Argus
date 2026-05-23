@@ -87,6 +87,10 @@ class MockInstrument:
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.state = MockState(log_dir / "state.json", position)
+        # `cfg` is consumed by runner_unified.reconcile_instruments to
+        # classify argus (FX) vs forge (equities/futures) ownership of
+        # non-tracked broker positions. Mocked instruments are all FX.
+        self.cfg = {"instrument_type": "forex"}
         self._reconciliation = None
         self._reconciliation_detail = ""
         self._broker_position = "FLAT"

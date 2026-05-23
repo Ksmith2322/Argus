@@ -50,8 +50,13 @@ def test_run_strategy_roi_proof_emits_summary_json(tmp_path, monkeypatch):
     data = json.loads(summary_path.read_text(encoding="utf-8"))
     assert "epoch_id" in data, "summary must include epoch_id"
     assert "epoch_is_clean" in data, "summary must include epoch_is_clean"
-    # Pre-freeze epoch ships is_clean=False — confirm the stamp picks it up
-    assert data["epoch_is_clean"] is False
+    # The stamp must agree with the registry's current epoch — whichever
+    # one it is (pre-freeze or post-reset). We check internal consistency,
+    # not a hard-coded epoch state that drifts as cutovers land.
+    from helio import evidence_epoch as ee
+    cur = ee.current_epoch()
+    assert data["epoch_id"] == cur.id
+    assert data["epoch_is_clean"] == cur.is_clean
 
 
 def test_run_strategy_roi_proof_md_warns_on_contaminated_epoch(tmp_path, monkeypatch):
@@ -95,15 +100,26 @@ def test_killed_review_md_includes_epoch_stamp():
 
 def test_promotion_check_refuses_real_promotion_on_contaminated_epoch(monkeypatch):
     """READY_FOR_REAL must downgrade to COLLECTING when the current epoch
-    is unclean. Codex X4 — pre-reset evidence cannot drive capital."""
-    from helio import promotion_check as pc
+    is unclean. Codex X4 — pre-reset evidence cannot drive capital.
 
-    # Synthetic config + trades that would otherwise promote
+    We explicitly force the current epoch to a contaminated record so the
+    test is independent of whichever epoch the registry currently points
+    at (pre-freeze before the cutover, post-reset after)."""
+    from helio import promotion_check as pc
+    from helio import evidence_epoch as _ee
+
+    # Pin current_epoch to the contaminated pre-freeze record for this test
+    contaminated = _ee.get_epoch("pre_freeze_20260418")
+    assert contaminated.is_clean is False, (
+        "Test invariant: pre_freeze_20260418 must remain is_clean=False"
+    )
+    monkeypatch.setattr(_ee, "current_epoch", lambda: contaminated)
+
+    # Synthetic trades that would otherwise promote
     trades_n = pc.PAPER_MIN_TRADES + 5
     trades = [{"pnl_pct": "0.02"} for _ in range(trades_n)]
 
     def _fake_check(config_path: Path) -> dict:
-        # Replicate the paper-stage path but with our trade set.
         result = {
             "symbol": "GBPUSD", "family": "argus", "config": str(config_path),
             "stage": "paper", "trades": len(trades), "signals": 0,
@@ -113,7 +129,6 @@ def test_promotion_check_refuses_real_promotion_on_contaminated_epoch(monkeypatc
         pf = result["pf"]
         if len(trades) >= pc.PAPER_MIN_TRADES and pf >= 1.3:
             try:
-                from helio import evidence_epoch as _ee
                 epoch = _ee.current_epoch()
                 if not epoch.is_clean:
                     result["verdict"] = "COLLECTING"
@@ -128,11 +143,7 @@ def test_promotion_check_refuses_real_promotion_on_contaminated_epoch(monkeypatc
             result["verdict"] = "READY_FOR_REAL"
         return result
 
-    # The real check_runner reads from disk; here we just invoke the
-    # promotion-decision arm we patched into the function.
     result = _fake_check(Path("synthetic.json"))
-    # All wins so pf is huge (1 win / 0 losses → 99.0); paper-min trades met.
-    # Since the pre-freeze epoch is is_clean=False, verdict must be COLLECTING.
     assert result["verdict"] == "COLLECTING", (
         f"Expected COLLECTING under contaminated epoch, got {result['verdict']!r}. "
         f"blockers={result['blockers']}"

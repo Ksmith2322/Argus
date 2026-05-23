@@ -142,7 +142,22 @@ class TestGetFullProfile(unittest.TestCase):
 # position_rules: should_enter_post_er
 # ═══════════════════════════════════════════════════════════════
 
-class TestShouldEnterPostErGapGate(unittest.TestCase):
+class _PostErLogicTestBase(unittest.TestCase):
+    """Shared setUp: disable the SCOPE_APOLLO_VALIDATED_FILTER overlay so
+    these tests exercise the underlying gap/surprise/direction logic.
+    The scope filter (added 2026-04-20) narrows live apollo to a tiny
+    validated universe; tests below validate the rules the live overlay
+    sits on top of."""
+
+    def setUp(self):
+        self._prev_scope_filter = pr.SCOPE_APOLLO_VALIDATED_FILTER
+        pr.SCOPE_APOLLO_VALIDATED_FILTER = False
+
+    def tearDown(self):
+        pr.SCOPE_APOLLO_VALIDATED_FILTER = self._prev_scope_filter
+
+
+class TestShouldEnterPostErGapGate(_PostErLogicTestBase):
     """The 6% gap floor is the PROVEN edge boundary per 110-stock backtest.
     Below 6% = breakeven or negative. Changing this gate without re-running
     the backtest invalidates the strategy."""
@@ -167,7 +182,7 @@ class TestShouldEnterPostErGapGate(unittest.TestCase):
         self.assertIsNone(plan)
 
 
-class TestPostErDirectionLogic(unittest.TestCase):
+class TestPostErDirectionLogic(_PostErLogicTestBase):
     def test_strong_beat_big_gap_very_strong_bucket(self):
         """8%+ gap + beat -> 'VERY_STRONG' reason + long."""
         plan = pr.should_enter_post_er(gap_pct=9.0, surprise_pct=5.0)
@@ -195,7 +210,7 @@ class TestPostErDirectionLogic(unittest.TestCase):
         self.assertIn("VOLUME_CONFIRMED", plan.reason)
 
 
-class TestPostErPlanSizing(unittest.TestCase):
+class TestPostErPlanSizing(_PostErLogicTestBase):
     """Stop% and max_hold scale with gap magnitude."""
 
     def test_moderate_gap_uses_4pct_stop(self):
@@ -240,7 +255,7 @@ class TestExitRules(unittest.TestCase):
             self.assertIn(required, names)
 
 
-class TestFormatPostErPlan(unittest.TestCase):
+class TestFormatPostErPlan(_PostErLogicTestBase):
     def test_format_contains_all_plan_fields(self):
         plan = pr.should_enter_post_er(gap_pct=8.0, surprise_pct=4.0)
         plan.symbol = "NVDA"

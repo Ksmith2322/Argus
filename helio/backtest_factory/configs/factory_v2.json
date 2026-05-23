@@ -1,0 +1,93 @@
+{
+  "_comment": "Backtest factory v2 spec library. Builds on v1 by (a) adding 2 new entry primitives (macd_cross + zscore_revert), (b) using regime_filter to add trend gates on existing primitives, and (c) testing turtle-style donchian parameter sweep. Hypothesis: a regime gate (close > SMA(200)) should improve trend-following PFs by killing whipsaws in bear/chop regimes. The screen is judged by whether ANY spec passes the OOS WF gate on multiple tickers.",
+  "version": "2.0.0",
+  "created": "2026-05-22",
+  "specs": [
+    {
+      "name": "donchian_20_breakout",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 20},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "donchian_20_breakout_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 20},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "donchian_55_breakout_turtle",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100}
+    },
+    {
+      "name": "donchian_55_breakout_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 55},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 6.0, "max_hold_bars": 100}
+    },
+    {
+      "name": "donchian_10_breakout",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 10},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 30}
+    },
+    {
+      "name": "sma_20_50_cross_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "sma_cross", "fast": 20, "slow": 50},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "ema_12_26_cross_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "ema_cross", "fast": 12, "slow": 26},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 40}
+    },
+    {
+      "name": "macd_cross",
+      "timeframe": "1d",
+      "entry": {"kind": "macd_cross", "fast": 12, "slow": 26, "signal": 9},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 40}
+    },
+    {
+      "name": "macd_cross_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "macd_cross", "fast": 12, "slow": 26, "signal": 9},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 40}
+    },
+    {
+      "name": "rsi14_oversold_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "rsi_oversold", "n": 14, "threshold": 30.0},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 20}
+    },
+    {
+      "name": "rsi2_oversold_connors",
+      "timeframe": "1d",
+      "entry": {"kind": "rsi_oversold", "n": 2, "threshold": 10.0},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "hold_period", "bars": 5}
+    },
+    {
+      "name": "zscore_revert_20",
+      "timeframe": "1d",
+      "entry": {"kind": "zscore_revert", "n": 20, "lower_thresh": -2.0, "mid_thresh": 0.0},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 2.0, "max_hold_bars": 10}
+    },
+    {
+      "name": "zscore_revert_20_gated",
+      "timeframe": "1d",
+      "entry": {"kind": "zscore_revert", "n": 20, "lower_thresh": -2.0, "mid_thresh": 0.0},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 2.0, "max_hold_bars": 10}
+    }
+  ]
+}

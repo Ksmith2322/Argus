@@ -1956,7 +1956,13 @@ def _build_paper_model_summary() -> dict:
     """Build a clearly labeled hypothetical validation account model."""
     deployment = _load_deployment_registry()
     policy = deployment.get("risk_policy", {}) if isinstance(deployment.get("risk_policy", {}), dict) else {}
-    start_equity = float(policy.get("model_start_equity_usd", PAPER_MODEL_START_USD) or PAPER_MODEL_START_USD)
+    # `model_start_equity_usd` may be a number OR the sentinel string
+    # "fleet_anchor" meaning "use the live broker anchor". Coerce the
+    # sentinel before float() to avoid ValueError in the 200-response path.
+    raw_start = policy.get("model_start_equity_usd", PAPER_MODEL_START_USD)
+    if isinstance(raw_start, str):
+        raw_start = PAPER_MODEL_START_USD
+    start_equity = float(raw_start or PAPER_MODEL_START_USD)
     base_risk_pct = float(policy.get("base_risk_pct", PAPER_MODEL_BASE_RISK_PCT) or PAPER_MODEL_BASE_RISK_PCT)
     cap_risk_pct = float(policy.get("earned_cap_pct", PAPER_MODEL_CAP_RISK_PCT) or PAPER_MODEL_CAP_RISK_PCT)
     manual_step_up_required = bool(policy.get("manual_step_up_required", False))

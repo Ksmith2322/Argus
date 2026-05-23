@@ -1,0 +1,48 @@
+{
+  "_comment": "Factory v5 — calendar/event entry kinds. Hypothesis: event-driven edges (FOMC drift, post-FOMC reversal, pre-FOMC accumulation) have a MECHANISM tied to monetary-policy uncertainty release that should be more regime-robust than technical edges. Tested against the same disciplined gates: 20y bootstrap PF CI >= 1.20 + period stability H1 vs H2.",
+  "version": "5.0.0",
+  "created": "2026-05-22",
+  "specs": [
+    {
+      "name": "pre_fomc_5d",
+      "_thesis": "Lucca-Moench: SPY drifts up 5 trading days before FOMC announcements (2015 NY Fed paper). Enter exactly 5 days before, exit at FOMC day close.",
+      "timeframe": "1d",
+      "entry": {"kind": "before_event", "event_set": "FOMC", "n_min": 5, "n_max": 5},
+      "exit": {"kind": "hold_period", "bars": 5}
+    },
+    {
+      "name": "pre_fomc_3d",
+      "timeframe": "1d",
+      "entry": {"kind": "before_event", "event_set": "FOMC", "n_min": 3, "n_max": 3},
+      "exit": {"kind": "hold_period", "bars": 3}
+    },
+    {
+      "name": "pre_fomc_7d",
+      "timeframe": "1d",
+      "entry": {"kind": "before_event", "event_set": "FOMC", "n_min": 7, "n_max": 7},
+      "exit": {"kind": "hold_period", "bars": 7}
+    },
+    {
+      "name": "pre_fomc_window_2to5d",
+      "_thesis": "Enter ANY time we are 2-5 days before next FOMC. Position-management gates re-entry so we get one trade per cycle.",
+      "timeframe": "1d",
+      "entry": {"kind": "before_event", "event_set": "FOMC", "n_min": 2, "n_max": 5},
+      "exit": {"kind": "hold_period", "bars": 3}
+    },
+    {
+      "name": "post_fomc_drift_5d",
+      "_thesis": "Post-announcement reaction continues for ~5 days after FOMC. Enter day after, exit 5 days later.",
+      "timeframe": "1d",
+      "entry": {"kind": "after_event", "event_set": "FOMC", "n_min": 1, "n_max": 1},
+      "exit": {"kind": "hold_period", "bars": 5}
+    },
+    {
+      "name": "pre_fomc_5d_trend_gated",
+      "_thesis": "Only take pre-FOMC drift when in a bullish regime (close>SMA200).",
+      "timeframe": "1d",
+      "entry": {"kind": "before_event", "event_set": "FOMC", "n_min": 5, "n_max": 5},
+      "regime_filter": {"kind": "above_sma", "n": 200},
+      "exit": {"kind": "hold_period", "bars": 5}
+    }
+  ]
+}

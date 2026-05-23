@@ -31,12 +31,15 @@ if str(_REPO) not in sys.path:
 #   - /api/stage_action           — POST only
 #   - /api/stream, /api/ibkr_stream — may be Server-Sent Events
 #   - /api/events                  — may be SSE
+#   - /api/strategy_drilldown      — requires a `strategy` query param (no
+#                                    sensible default; covered by per-endpoint tests)
 _SKIP_ENDPOINTS = {
     "/api/runner_chart/{symbol}",
     "/api/stage_action",
     "/api/stream",
     "/api/ibkr_stream",
     "/api/events",  # SSE
+    "/api/strategy_drilldown",
 }
 
 
