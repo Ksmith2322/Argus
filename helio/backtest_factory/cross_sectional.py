@@ -70,13 +70,31 @@ def run_xs_momentum(
     skip_recent_days: int = 21,
     top_k: int = 2,
     slippage_bps: float = 0.0,
+    absolute_filter: bool = False,
+    safe_ticker: str | None = None,
 ) -> XSMomentumResult:
     """Run 12-1 momentum on the universe, monthly rebalance.
 
     top_k: number of tickers to hold long each period.
+
+    absolute_filter: Antonacci-style dual momentum. If True, only enter
+        tickers whose absolute momentum (return over lookback) is > 0. If
+        a ticker would be in the top_k by relative momentum but has
+        negative absolute momentum, skip it (potentially holding fewer than
+        top_k positions, or going entirely to `safe_ticker` if specified).
+
+    safe_ticker: When absolute_filter=True and no tickers pass the filter,
+        allocate to this safe asset instead (typically a bond ETF). If
+        None, the harness sits in cash (no positions) when the universe
+        fails absolute momentum.
     """
-    closes = _load_universe_closes(tickers, data_dir, suffix)
-    n_universe = closes.shape[1]
+    # Auto-include safe_ticker in the load list so the dual-momentum
+    # fallback branch can find its data. It is NOT included in ranking.
+    load_list = list(tickers)
+    if safe_ticker and safe_ticker not in load_list:
+        load_list.append(safe_ticker)
+    closes = _load_universe_closes(load_list, data_dir, suffix)
+    n_universe = len(tickers)  # ranking universe excludes safe_ticker
     if top_k > n_universe:
         raise ValueError(f"top_k ({top_k}) > universe size ({n_universe})")
 
@@ -122,8 +140,16 @@ def run_xs_momentum(
         recent_px = closes.iloc[rebal_pos - skip_recent_days]
         old_px = closes.iloc[rebal_pos - lookback_days]
         mom = (recent_px / old_px) - 1.0
-        # Rank: top-K winners (long)
-        winners = mom.sort_values(ascending=False).head(top_k).index.tolist()
+        # Restrict ranking to the ranking universe (excludes safe_ticker
+        # which is loaded separately as a fallback asset).
+        rank_mom = mom.loc[[t for t in tickers if t in mom.index]]
+        winners = rank_mom.sort_values(ascending=False).head(top_k).index.tolist()
+        # Dual-momentum filter: drop tickers with negative absolute momentum.
+        if absolute_filter:
+            winners = [t for t in winners if rank_mom.get(t, -1.0) > 0.0]
+            # If no tickers pass and a safe asset is named, allocate there
+            if not winners and safe_ticker is not None and safe_ticker in closes.columns:
+                winners = [safe_ticker]
         # Open positions at this rebal_date
         for t in winners:
             entry_px = float(closes.at[rebal, t])

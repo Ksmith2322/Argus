@@ -164,6 +164,51 @@ def test_xs_momentum_trade_dates_match_rebalance_schedule(tmp_path):
         assert t["exit_dt"] in month_starts, f"exit {t['exit_dt']} not a month-start"
 
 
+def test_dual_momentum_drops_negative_momentum_winners(tmp_path):
+    """absolute_filter=True: if the top-ranked ticker has negative absolute
+    momentum (price 252-21 days ago > price 5 days ago), it should be SKIPPED
+    even if it's the highest of a universe of negatives."""
+    dates = pd.date_range(start="2023-01-02", periods=400, freq="B")
+    n = len(dates)
+    # All tickers in decline; AAA declines least but still negative
+    _write_csv(tmp_path, "AAA", dates, [200.0 - i * 0.05 for i in range(n)])
+    _write_csv(tmp_path, "BBB", dates, [200.0 - i * 0.10 for i in range(n)])
+    _write_csv(tmp_path, "CCC", dates, [200.0 - i * 0.15 for i in range(n)])
+    _write_csv(tmp_path, "DDD", dates, [200.0 - i * 0.20 for i in range(n)])
+
+    # Without absolute filter, AAA would be picked (least negative mom)
+    plain = run_xs_momentum(["AAA","BBB","CCC","DDD"], data_dir=tmp_path,
+                            lookback_days=63, skip_recent_days=5, top_k=1)
+    plain_tickers = {t["ticker"] for t in plain.trades}
+    assert plain_tickers == {"AAA"}, f"plain xs should pick AAA, got {plain_tickers}"
+
+    # With absolute filter, AAA is dropped (negative absolute momentum) → no trades
+    dual = run_xs_momentum(["AAA","BBB","CCC","DDD"], data_dir=tmp_path,
+                           lookback_days=63, skip_recent_days=5, top_k=1,
+                           absolute_filter=True)
+    assert dual.n_trades == 0, (
+        f"dual_momentum should hold no positions when all assets are negative; "
+        f"got {dual.n_trades} trades on {set(t['ticker'] for t in dual.trades)}"
+    )
+
+
+def test_dual_momentum_with_safe_ticker_rotates_to_bonds_in_drawdown(tmp_path):
+    """When the universe is in drawdown and a safe ticker is given, dual_momentum
+    rotates to the safe asset instead of sitting in cash."""
+    dates = pd.date_range(start="2023-01-02", periods=400, freq="B")
+    n = len(dates)
+    # All equity-style assets decline; SAFE (treasury) rises
+    _write_csv(tmp_path, "AAA", dates, [200.0 - i * 0.05 for i in range(n)])
+    _write_csv(tmp_path, "BBB", dates, [200.0 - i * 0.10 for i in range(n)])
+    _write_csv(tmp_path, "SAFE", dates, [100.0 + i * 0.01 for i in range(n)])
+
+    dual = run_xs_momentum(["AAA","BBB"], data_dir=tmp_path,
+                           lookback_days=63, skip_recent_days=5, top_k=1,
+                           absolute_filter=True, safe_ticker="SAFE")
+    tickers = {t["ticker"] for t in dual.trades}
+    assert tickers == {"SAFE"}, f"expected all positions in SAFE, got {tickers}"
+
+
 def test_xs_momentum_trades_have_required_fields(tmp_path):
     """Every emitted trade must have the schema bootstrap_profit_factor expects."""
     dates = pd.date_range(start="2023-01-02", periods=400, freq="B")
