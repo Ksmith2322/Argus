@@ -60,6 +60,7 @@ pytest-cache-files-*/
 secrets/
 venv/
 
-# Backtest factory spec configs (whitelist overrides *.json above)
+# Whitelists that must come AFTER *.json above to take effect
+!argus_flow/configs/*.json
 !helio/backtest_factory/configs/*.json
 ﻿# --- Python ---

@@ -1,0 +1,68 @@
+{
+  "_comment": "Per-strategy disciplined-gate baseline. Each strategy's CI lower bound from the offline disciplined gate (promotion_panel 5 layers: 20y bootstrap + 10bp slippage + block bootstrap + period stability + multi-testing). Live monitoring compares the strategy's ROLLING live PF against this baseline. Source: project_2026_05_22_backtest_factory_findings.md. Update this file when the gate is re-run against fresh evidence.",
+  "version": "2026-05-23.v1",
+  "generated_from": "promotion_panel applied to 20y backtests + archived live trades",
+  "promotion_floor": 1.20,
+  "alert_thresholds": {
+    "warning_pct_of_ci_lower": 0.85,
+    "fail_pct_of_ci_lower": 0.70,
+    "min_n_for_status": 20
+  },
+  "strategies": {
+    "forge_xs_momentum": {
+      "verdict": "PASS_DISCIPLINED_GATE",
+      "n_backtest": 98,
+      "point_pf": 3.30,
+      "ci_95_lower": 1.86,
+      "ci_95_upper": 6.30,
+      "max_dd_pct": 26.6,
+      "config": "broad-8 + 252-21 + top-2 (post 5/22 swap)",
+      "p_value": 0.0015,
+      "notes": "Strongest config tested. Passes 8/8 layers including block bootstrap. Edge concentrates in moderate-high VIX (>=20) regimes per 5/23 audit."
+    },
+    "forge_spy_trend_follower": {
+      "verdict": "MARGINAL_PASS",
+      "n_backtest": 10,
+      "point_pf": 12.0,
+      "ci_95_lower": 2.67,
+      "ci_95_upper": 739.0,
+      "max_dd_pct": 34.1,
+      "config": "SPY SMA 50/200 regime",
+      "p_value": 0.0,
+      "notes": "Passes 7/8 layers. H1 fails on n=5 sub-sample (sparsity, not regime). Role: defensive beta proxy not alpha. 0.614 correlation with xs_momentum."
+    },
+    "forge_gld_pm_long": {
+      "verdict": "FAIL",
+      "n_backtest": 522,
+      "point_pf": 1.32,
+      "ci_95_lower": 1.08,
+      "ci_95_upper": 1.60,
+      "max_dd_pct": null,
+      "config": "GLD 1h hours 18-20 UTC, ATR 0.5/1.0 max_hold=4",
+      "p_value": null,
+      "notes": "Fails at 5bp slippage. 522 trades / 2y cadence → slippage drag destroys edge. Live evidence still useful for re-evaluation as n accumulates."
+    },
+    "forge_nq_overnight": {
+      "verdict": "FAIL",
+      "n_backtest": 713,
+      "point_pf": 0.885,
+      "ci_95_lower": 0.73,
+      "ci_95_upper": 1.07,
+      "max_dd_pct": null,
+      "config": "NQ=F 1h hours 20-00 UTC, ATR 0.5/1.0 max_hold=4",
+      "p_value": null,
+      "notes": "Net loser at 3bp slippage. 713 trades / 2y. Don't promote to real money. Monitor live: if rolling PF >= 1.0 persistently, re-evaluate."
+    },
+    "forge_pead": {
+      "verdict": "FAIL",
+      "n_backtest": 68,
+      "point_pf": 2.33,
+      "ci_95_lower": 1.17,
+      "ci_95_upper": 4.19,
+      "max_dd_pct": null,
+      "config": "Apollo 16 curated, 5y, 1.5 ATR stop, hold_days=20",
+      "p_value": null,
+      "notes": "CI lower 1.17 — literally 0.03 below 1.20 floor. Point PF looks great but n too small. Non-curated SPX-50 also fails (CI lower 1.07). Edge IS real, sample IS too small."
+    }
+  }
+}

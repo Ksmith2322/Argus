@@ -2732,6 +2732,29 @@ async def api_stage_history():
         return JSONResponse({"events": [], "count": 0, "error": str(e)})
 
 
+@app.get("/api/cohort_gate_status")
+async def api_cohort_gate_status():
+    """Live disciplined-gate status per cohort strategy.
+
+    For each strategy in argus_flow/configs/promotion_gate_baseline.json,
+    compares the rolling live PF (last 30 trades and last 90 days) to the
+    offline disciplined-gate CI lower bound. Returns per-strategy verdict:
+    PASS_GATE / WARNING / FAIL / INSUFFICIENT_N / NO_BASELINE.
+
+    Computes on-demand; no caching. Cheap (~50ms for the full cohort).
+    """
+    try:
+        from helio.live_gate_monitor import evaluate_cohort
+        report = evaluate_cohort()
+        return JSONResponse(report)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": "baseline config not found",
+                              "detail": str(e)}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": "evaluation failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/governance_health")
 async def api_governance_health():
     """Governance report freshness — shows what's blocking transitions."""
