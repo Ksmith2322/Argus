@@ -7,7 +7,7 @@
     "forge_nq_london_close": 0.0,
     "forge_vix_carry": 0.0,
     "forge_pead": 0.5,
-    "forge_xs_momentum": 0.5,
+    "forge_xs_momentum": 1.0,
     "forge_aud_asian_breakout": 0.0,
     "forge_wick_gbpusd": 0.0,
     "forge_jpy_pm_short": 0.0,
@@ -30,10 +30,10 @@
     "forge_coint_pairs": 0.0,
     "forge_gld_pm_long": 0.5,
     "forge_nq_overnight": 0.5,
-    "forge_spy_trend_follower": 0.5
+    "forge_spy_trend_follower": 0.0
   },
-  "version": "2026-05-22.v11_post_reset_early_cutover",
-  "last_updated": "2026-05-20T15:00:00.000000+00:00",
+  "version": "2026-05-23.v12_concentrate_on_xs_momentum",
+  "last_updated": "2026-05-23T16:00:00.000000+00:00",
   "_kill_log": [
     "2026-04-30: forge_spy_mean_rev -> 0.0 (PF<1, structural loser, no recovery path)",
     "2026-05-07: forge_multi_orb -> 0.0 (n=161 PF=0.83 ROI=-12% real, plus 7 phantoms; tried v1 24-bar / v3 32-bar / v4 24-bar revert; sizing-formula fix shipped; thesis exhausted)",
@@ -46,5 +46,6 @@
     "2026-05-20: forge_coint_pairs -> 0.0 (RESEARCH_ONLY birth-state). Architect #5 candidate. 5y backtest with 8 default pairs (KO/PEP, XOM/CVX, HD/LOW, GLD/SLV, EWZ/EWW, TLT/IEF, V/MA, MSFT/GOOGL): n=184 trades, WR=62%, PF=0.91, total -40.9%. Parameter sweep across entry z={2,2.5,3} and stop z={3,4} \u2014 NO variant produces positive return. Failures: GLD/SLV decoupled fundamentally (gold inflation-hedge vs silver industrial), XOM/CVX had idiosyncratic 2022-2024 events. Tight-win (3.4%) / wide-loss (-6.2%) profile needs >65% WR to break even; 62% isn't enough. Code retained as template; allocation locked. 2 of 4 architect-recommended new strategies have now failed backtests (vix_carry + coint_pairs); 2 of 4 passed (pead + xs_momentum).",
     "2026-05-20: SUNSET BATCH \u2014 16 strategies set to 0.0 per project_2026_05_31_sunset_decisions.md. (a) 3 argus FX pairs (gbpusd/usdjpy/cadjpy) \u2014 silent + risk-vs-notional cap conflict. (b) 3 YM YouTube replicas (mamba/tori/cuebanks) \u2014 same factor, 0 fills post-CBOT-fix. (c) 4 other dark forge strategies (aud_asian_breakout/wick_gbpusd/jpy_pm_short/vix_revert). (d) event-driven 0-fire pair (fomc_drift/tom_international). (e) forge_rebalance runner archived (annual event will be rebuilt as forge_russell_recon if pursued). (f) gdx_gld \u2192 SHADOW (allocation 0 but kept as code). (g) 6 Greek scanners (apollo/hermes/titan/atlas/themis + ares already archived) \u2014 apollo's universe data file is now used directly by forge_pead, so the scanner runner itself is redundant. Surviving post-reset roster: forge_gld_pm_long, forge_nq_overnight (probation), forge_pead (paper-candidate post-reset), forge_xs_momentum (paper-candidate post-reset), forge_spy_trend_follower (passive beta benchmark). 4-6 actually-traded strategies vs the prior 22."
   ],
-  "_2026-05-22_change": "Reset cutover brought forward from 5/31. Activated 5-strategy survivor cohort at 0.5x. argus_usdjpy returned to 0.0."
+  "_2026-05-22_change": "Reset cutover brought forward from 5/31. Activated 5-strategy survivor cohort at 0.5x. argus_usdjpy returned to 0.0.",
+  "_2026-05-23_change": "Concentrate-on-winner reweight per allocation analysis. forge_spy_trend_follower 0.5 -> 0.0 (correlates 0.614 with xs_momentum, redundant beta). forge_xs_momentum 0.5 -> 1.0 (only candidate passing the disciplined gate 8/8 layers). Projected forward CAGR roughly doubles (5% -> 10%) at the cost of higher single-strategy drawdown (-13% -> -27%). Full analysis: argus_flow/logs/allocation_analysis_20260523.md + memory project_2026_05_22_backtest_factory_findings.md."
 }
