@@ -367,6 +367,34 @@ def test_hour_of_day_handles_tz_aware_index():
     assert len(result.trades) >= 1
 
 
+def test_nfp_calendar_first_friday_of_month():
+    """NFP releases on first Friday of each month per BLS schedule."""
+    from helio.backtest_factory.calendar_data import (
+        _first_friday_of_month, get_event_dates,
+    )
+    # May 2024 first Friday is May 3
+    assert _first_friday_of_month(2024, 5) == pd.Timestamp("2024-05-03")
+    # June 2024 first Friday is June 7
+    assert _first_friday_of_month(2024, 6) == pd.Timestamp("2024-06-07")
+    # Sanity: every NFP date is a Friday
+    for d in get_event_dates("NFP")[:50]:
+        assert d.weekday() == 4, f"NFP date {d} is not a Friday"
+
+
+def test_nfp_calendar_count_consistent():
+    """NFP date list should be 12 per year * year span."""
+    from helio.backtest_factory.calendar_data import get_event_dates
+    nfp = get_event_dates("NFP")
+    # Default range 2006-2027 inclusive = 22 years = 264 months
+    assert len(nfp) == 264
+
+
+def test_unknown_event_set_raises():
+    from helio.backtest_factory.calendar_data import get_event_dates
+    with pytest.raises(ValueError, match="unknown event_set"):
+        get_event_dates("BOGUS")
+
+
 def test_hour_of_day_rejects_missing_hours_field():
     df = _hourly_ohlc(100)
     bad_spec = {

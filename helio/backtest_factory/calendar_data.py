@@ -86,11 +86,33 @@ FOMC_DATES_RAW = [
 ]
 
 
+def _first_friday_of_month(year: int, month: int) -> pd.Timestamp:
+    """Compute the first Friday of (year, month). Used for NFP releases —
+    Bureau of Labor Statistics has released the Employment Situation Report
+    on the first Friday of each month for decades."""
+    d = pd.Timestamp(year=year, month=month, day=1)
+    # weekday(): Mon=0 ... Fri=4 ... Sun=6
+    offset_to_friday = (4 - d.weekday()) % 7
+    return d + pd.Timedelta(days=offset_to_friday)
+
+
+def _nfp_dates_in_range(start_year: int = 2006, end_year: int = 2027) -> list[pd.Timestamp]:
+    """Generate NFP release dates (first Friday of each month) for the
+    given year range. Covers the 20y window the factory backtests use."""
+    dates = []
+    for y in range(start_year, end_year + 1):
+        for m in range(1, 13):
+            dates.append(_first_friday_of_month(y, m))
+    return dates
+
+
 def get_event_dates(event_set: str) -> list[pd.Timestamp]:
     """Return the list of pd.Timestamps for the named event set."""
     if event_set.upper() == "FOMC":
         return [pd.Timestamp(d) for d in FOMC_DATES_RAW]
-    raise ValueError(f"unknown event_set: {event_set!r}. Known: FOMC")
+    if event_set.upper() == "NFP":
+        return _nfp_dates_in_range()
+    raise ValueError(f"unknown event_set: {event_set!r}. Known: FOMC, NFP")
 
 
 def bars_until_next_event(
