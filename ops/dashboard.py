@@ -9546,6 +9546,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- RECOMMENDED ACTIONS — cross-panel synthesis, what to actually do now -->
 <div id="recommended-actions-panel" style="margin-bottom:14px;"></div>
 
+<!-- COHORT GATE STATUS — live vs disciplined-gate baseline per strategy -->
+<div id="cohort-gate-panel" style="margin-bottom:14px;"></div>
+
 <!-- 24H CHANGES — what moved last 24h (PnL/PF/n/verdict deltas) -->
 <div id="changes-24h-panel" style="margin-bottom:14px;"></div>
 
@@ -10385,6 +10388,80 @@ function loadRecommendedActions() {
 }
 loadRecommendedActions();
 setInterval(loadRecommendedActions, 60000);
+
+// ─── COHORT GATE STATUS PANEL ──────────────────────────────────────
+// Surfaces /api/cohort_gate_status. For each active strategy, shows the
+// disciplined-gate verdict (PASS_GATE / WARNING / FAIL / INSUFFICIENT_N)
+// alongside its baseline CI lower bound and current rolling live PF.
+// Lives between RECOMMENDED ACTIONS and 24H CHANGES (synthesis layer).
+const GATE_VERDICT_COLORS = {
+  PASS_GATE:        {bg:'#0d3320', border:'#00e676', label:'PASS'},
+  MARGINAL_PASS:    {bg:'#1f2a14', border:'#a5c34a', label:'MARGINAL'},
+  WARNING:          {bg:'#3a2a0d', border:'#ffaa00', label:'WARNING'},
+  FAIL:             {bg:'#3a1b1b', border:'#ff5252', label:'FAIL'},
+  INSUFFICIENT_N:   {bg:'#0a1224', border:'#1e2a42', label:'NO N'},
+  NO_BASELINE:      {bg:'#1f1f1f', border:'#5a6a8a', label:'NO BASELINE'},
+};
+
+function loadCohortGate() {
+  fetch('/api/cohort_gate_status').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('cohort-gate-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">COHORT GATE STATUS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const strategies = data.strategies || [];
+    if (strategies.length === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    const counts = data.verdict_counts || {};
+    const countParts = [];
+    if (counts.PASS_GATE)        countParts.push('<span style="color:#00e676;">' + counts.PASS_GATE + ' pass</span>');
+    if (counts.MARGINAL_PASS)    countParts.push('<span style="color:#a5c34a;">' + counts.MARGINAL_PASS + ' marginal</span>');
+    if (counts.WARNING)          countParts.push('<span style="color:#ffaa00;">' + counts.WARNING + ' warn</span>');
+    if (counts.FAIL)             countParts.push('<span style="color:#ff5252;">' + counts.FAIL + ' fail</span>');
+    if (counts.INSUFFICIENT_N)   countParts.push('<span style="color:#7b8ab8;">' + counts.INSUFFICIENT_N + ' n/a</span>');
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">COHORT GATE STATUS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">live PF vs disciplined-gate CI lower</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + countParts.join(' · ') + '</div></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">';
+    for (const s of strategies) {
+      const v = GATE_VERDICT_COLORS[s.verdict] || GATE_VERDICT_COLORS.NO_BASELINE;
+      const pf = s.live_pf_30trades;
+      const pfStr = (pf === null || pf === undefined) ? '—' : Number(pf).toFixed(2);
+      const ciLo = s.baseline_ci_lower;
+      const ciLoStr = (ciLo === null || ciLo === undefined) ? '—' : Number(ciLo).toFixed(2);
+      const n = s.n_live_trades || 0;
+      const pctStr = (s.pct_of_ci_lower === null || s.pct_of_ci_lower === undefined) ? '—' : (Number(s.pct_of_ci_lower) * 100).toFixed(0) + '%';
+      // Strip "forge_" prefix for compactness
+      const displayName = s.strategy.replace(/^forge_/, '');
+      html += '<div style="background:' + v.bg + ';border:1px solid ' + v.border + ';border-radius:5px;padding:8px 10px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.82em;">' + displayName + '</span>'
+        + '<span style="color:' + v.border + ';font-size:0.7em;font-weight:bold;letter-spacing:1px;">' + v.label + '</span>'
+        + '</div>'
+        + '<div style="font-size:0.7em;color:#7b8ab8;line-height:1.5;">'
+        + '<div><span style="color:#9da8c7;">live PF (n=' + n + '):</span> <span style="color:#e0e0e0;font-weight:bold;">' + pfStr + '</span></div>'
+        + '<div><span style="color:#9da8c7;">baseline CI lower:</span> <span style="color:#e0e0e0;">' + ciLoStr + '</span></div>'
+        + '<div><span style="color:#9da8c7;">live/baseline:</span> <span style="color:#e0e0e0;">' + pctStr + '</span></div>'
+        + '</div></div>';
+    }
+    html += '</div>';
+    html += '<div style="margin-top:10px;font-size:0.68em;color:#7b8ab8;border-top:1px solid #1e2a42;padding-top:6px;">'
+      + 'Thresholds: live_pf &gt;= 0.85 × CI lower = PASS · 0.70–0.85 = WARNING · &lt; 0.70 = FAIL · n &lt; 20 = no-call. '
+      + 'Source: <code>/api/cohort_gate_status</code> · baseline <code>promotion_gate_baseline.json</code>.'
+      + '</div>';
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('cohort gate error:', e);});
+}
+loadCohortGate();
+setInterval(loadCohortGate, 60000);
 
 // ─── 24H CHANGES PANEL ─────────────────────────────────────────────
 // Diffs the two most-recent operational_maturity snapshots and shows
@@ -17539,7 +17616,8 @@ PANEL_IDS_ALL = [
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
     # Decision / fleet panels
-    "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
+    "recommended-actions-panel", "cohort-gate-panel",
+    "changes-24h-panel", "active-bleeders-panel",
     "tom-outcome-panel", "decision-history-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
@@ -17560,6 +17638,7 @@ VIEW_ALLOWLISTS = {
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
         "maturity-summary-banner", "recommended-actions-panel",
+        "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
         "fleet-health", "open-positions-panel",
     },
@@ -17567,7 +17646,8 @@ VIEW_ALLOWLISTS = {
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
-        "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
+        "recommended-actions-panel", "cohort-gate-panel",
+        "changes-24h-panel", "active-bleeders-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
         "efficiency-panel", "fleet-health", "open-positions-panel",
     },
