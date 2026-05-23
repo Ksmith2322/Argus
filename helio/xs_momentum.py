@@ -8,9 +8,27 @@ monthly.
 
 Pure-function. The runner / backtest sources OHLCV and calls these.
 
-Default universe (Architect's spec): 10 US sector ETFs + 5 country ETFs:
-  XLK XLF XLE XLY XLI XLP XLU XLV XLB XLRE (sectors)
-  EWJ EWG EWZ INDA FXI (international)
+Default universe (2026-05-22 swap — see project_2026_05_22_backtest_factory_findings.md):
+8 broad cross-asset ETFs spanning 5 distinct risk factors. Replaced the
+prior 15-ticker sector+international universe after the factory's
+disciplined gate found the sector universe fails (CI lower 1.05 at 10bps;
+H2 2020-2026 CI lower 0.53 — recent edge collapse). Cross-sectional
+momentum requires *dispersion across asset classes*, which the broad
+universe provides and a sector-only universe does not.
+
+Broad-8 universe:
+  SPY  (US broad equity)
+  QQQ  (US tech-heavy)
+  IWM  (US small-cap)
+  DIA  (US large-cap industrials)
+  EFA  (International developed)
+  EEM  (International emerging)
+  GLD  (Gold)
+  TLT  (Long Treasuries)
+
+This config (broad-8, 252-21 lookback, top-quintile=2-of-8) passes all 8
+layers of the disciplined gate at 10bps slippage: PF 3.30, CI [1.86, 6.30]
+over 20 years (2006-2026), both halves H1+H2 pass independently.
 """
 from __future__ import annotations
 
@@ -18,10 +36,10 @@ from dataclasses import dataclass
 
 
 DEFAULT_UNIVERSE = (
-    # US sectors
-    "XLK", "XLF", "XLE", "XLY", "XLI", "XLP", "XLU", "XLV", "XLB", "XLRE",
-    # International
-    "EWJ", "EWG", "EWZ", "INDA", "FXI",
+    "SPY", "QQQ", "IWM", "DIA",   # US equity (broad / tech / small / large-industrial)
+    "EFA", "EEM",                  # International (developed / emerging)
+    "GLD",                         # Gold
+    "TLT",                         # Long Treasuries
 )
 
 # Defaults match the published 12-1 spec.

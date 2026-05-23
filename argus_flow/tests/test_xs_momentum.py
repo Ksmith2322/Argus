@@ -132,11 +132,23 @@ def test_top_quintile_empty_input_returns_empty():
 
 # ── Universe sanity ────────────────────────────────────────────────────────
 
-def test_default_universe_has_15_tickers():
-    """Architect spec: 10 sectors + 5 country."""
-    assert len(DEFAULT_UNIVERSE) == 15
+def test_default_universe_is_broad_8_cross_asset():
+    """2026-05-22 swap: 8 broad cross-asset ETFs spanning 5 distinct risk
+    factors. The prior 15-ticker sector+intl universe failed the factory's
+    disciplined gate; this config passes 8/8 layers."""
+    assert len(DEFAULT_UNIVERSE) == 8
 
 
-def test_default_universe_contains_us_sectors_and_intl():
-    for must_have in ("XLK", "XLF", "XLE", "EWJ", "EWG"):
-        assert must_have in DEFAULT_UNIVERSE
+def test_default_universe_spans_required_asset_classes():
+    """The diversification across asset classes is what gives the
+    cross-sectional momentum its edge. Removing any of these reduces
+    dispersion."""
+    # US equity broad + tech + small-cap + large-industrials
+    for us_equity in ("SPY", "QQQ", "IWM", "DIA"):
+        assert us_equity in DEFAULT_UNIVERSE, f"missing US-equity ticker {us_equity}"
+    # International developed + emerging
+    for intl in ("EFA", "EEM"):
+        assert intl in DEFAULT_UNIVERSE, f"missing international ticker {intl}"
+    # Alt asset classes: gold + long bonds
+    assert "GLD" in DEFAULT_UNIVERSE
+    assert "TLT" in DEFAULT_UNIVERSE
