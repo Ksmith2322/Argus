@@ -30,8 +30,19 @@ import pandas as pd
 
 _REPO = Path(__file__).resolve().parents[1]
 DATA_YFINANCE_DIR = _REPO / "helio" / "data_yfinance"
+DATA_YFINANCE_HOURLY_DIR = _REPO / "helio" / "data_yfinance_1h"
 
 DEFAULT_BETWEEN_TICKER_SLEEP_S = 1.0
+
+# yfinance interval-specific history caps
+YF_INTERVAL_MAX_DAYS = {
+    "1d": 365 * 50,   # effectively unlimited
+    "1h": 720,        # yfinance hard caps 1h at ~730 days
+    "30m": 60,
+    "15m": 60,
+    "5m": 60,
+    "1m": 7,
+}
 
 
 class YFinanceError(RuntimeError):
@@ -167,6 +178,82 @@ def fetch_to_cache(
         rows_total=len(combined),
         cache_path=path,
         incremental=(existing is not None and len(existing) > 0),
+        elapsed_s=time.perf_counter() - t0,
+    )
+
+
+def fetch_intraday_to_cache(
+    ticker: str,
+    *,
+    interval: str = "1h",
+    days_back: int = 720,
+    refresh: bool = False,
+) -> YFFetchResult:
+    """Pull intraday bars for `ticker` to a separate hourly CSV cache.
+
+    interval is one of yfinance's intraday intervals (1h, 30m, 15m, ...).
+    days_back is capped at the yfinance maximum for the chosen interval
+    (1h: 730 days; 5m/15m/30m: 60 days; 1m: 7 days).
+
+    Output: helio/data_yfinance_1h/<TICKER>_<interval>.csv with the same
+    OHLCV schema as the daily cache (Date, Open, High, Low, Close, Volume).
+    The Date column carries the bar timestamp (UTC, hour-granular).
+    """
+    t0 = time.perf_counter()
+    if interval not in YF_INTERVAL_MAX_DAYS:
+        raise YFinanceError(f"unsupported interval {interval!r}; "
+                            f"supported: {list(YF_INTERVAL_MAX_DAYS)}")
+    cap = YF_INTERVAL_MAX_DAYS[interval]
+    if days_back > cap:
+        days_back = cap
+
+    safe = ticker.upper().replace("/", "_").replace("=", "_").replace("^", "_")
+    path = DATA_YFINANCE_HOURLY_DIR / f"{safe}_{interval}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists() and not refresh:
+        try:
+            existing = pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
+            return YFFetchResult(
+                ticker=ticker, rows_fetched=0, rows_total=len(existing),
+                cache_path=path, incremental=True,
+                elapsed_s=time.perf_counter() - t0,
+            )
+        except Exception:
+            pass  # fall through to refetch
+
+    today = date.today()
+    end_dt = today
+    start_dt = today - timedelta(days=days_back)
+
+    yf = _import_yfinance()
+    try:
+        df = yf.download(
+            ticker, start=start_dt.isoformat(), end=end_dt.isoformat(),
+            interval=interval, progress=False, threads=False, auto_adjust=False,
+        )
+    except Exception as e:
+        raise YFinanceError(f"yf.download intraday failed for {ticker}: {e}") from e
+    if df is None or df.empty:
+        raise YFinanceError(f"yfinance returned empty intraday frame for {ticker}")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+    df = df[keep].copy()
+    # Intraday timestamps: yfinance returns tz-aware (often US/Eastern). Convert to UTC.
+    if isinstance(df.index, pd.DatetimeIndex):
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+    df.index.name = "Date"
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df.sort_index()
+
+    df.to_csv(path, index=True, index_label="Date")
+    return YFFetchResult(
+        ticker=ticker, rows_fetched=len(df), rows_total=len(df),
+        cache_path=path, incremental=False,
         elapsed_s=time.perf_counter() - t0,
     )
 

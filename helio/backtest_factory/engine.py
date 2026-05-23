@@ -200,6 +200,24 @@ def _entry_signal(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.Series:
         o = P.obv(df["Close"], df["Volume"])
         sma_o = o.rolling(window=n, min_periods=n).mean()
         return (o > sma_o).fillna(False)
+    if kind == "hour_of_day":
+        # Intraday entry: fires at top of specific UTC hours. The bar's
+        # index timestamp must be a DatetimeIndex with hour info.
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("hour_of_day entry requires DatetimeIndex")
+        target_hours = cfg.get("hours_utc") or cfg.get("hours")
+        if not target_hours:
+            raise ValueError("hour_of_day entry requires 'hours_utc' list")
+        # Normalize to set of ints
+        target_set = {int(h) for h in target_hours}
+        idx = df.index
+        if idx.tz is not None:
+            # Convert to UTC then strip tz to compare hour
+            idx_utc = idx.tz_convert("UTC")
+            hours = idx_utc.hour
+        else:
+            hours = idx.hour
+        return pd.Series([h in target_set for h in hours], index=df.index, dtype=bool)
     if kind == "before_event":
         # Calendar entry: fires when the next named-event date is between
         # `n_min` and `n_max` trading bars away. Used for "buy N days

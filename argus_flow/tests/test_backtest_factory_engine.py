@@ -318,6 +318,66 @@ def test_regime_filter_passes_through_when_true():
         assert t["entry_dt"] >= rising_starts
 
 
+# ─── hour_of_day entry kind ──────────────────────────────────────────
+
+def _hourly_ohlc(n_bars: int, start: str = "2024-01-02T00:00:00") -> pd.DataFrame:
+    idx = pd.date_range(start=start, periods=n_bars, freq="1h")
+    closes = [100.0 + np.sin(i / 5) * 2 + i * 0.01 for i in range(n_bars)]
+    return pd.DataFrame({
+        "Open": closes, "High": [c + 0.3 for c in closes],
+        "Low": [c - 0.3 for c in closes], "Close": closes,
+        "Volume": [1_000_000] * n_bars,
+    }, index=idx)
+
+
+def test_hour_of_day_entry_fires_only_on_target_hours():
+    """hour_of_day must produce entries only when the bar's UTC hour matches."""
+    df = _hourly_ohlc(200, start="2024-01-02T00:00:00")
+    spec = {
+        "name": "hod_test",
+        "entry": {"kind": "hour_of_day", "hours_utc": [13, 14]},
+        "exit": {"kind": "hold_period", "bars": 2},
+    }
+    result = run_spec(spec, df)
+    assert len(result.trades) >= 1
+    for t in result.trades:
+        entry_hour = pd.Timestamp(t["entry_dt"]).hour
+        assert entry_hour in (13, 14), f"entry at unexpected hour {entry_hour}"
+
+
+def test_hour_of_day_handles_tz_aware_index():
+    """If df.index is tz-aware (US/Eastern, UTC, etc.), the hour comparison
+    is done against UTC after conversion."""
+    n = 100
+    idx = pd.date_range(start="2024-01-02T08:00:00", periods=n, freq="1h",
+                        tz="America/New_York")
+    closes = [100.0 + i * 0.01 for i in range(n)]
+    df = pd.DataFrame({
+        "Open": closes, "High": [c + 0.3 for c in closes],
+        "Low": [c - 0.3 for c in closes], "Close": closes,
+        "Volume": [1_000_000] * n,
+    }, index=idx)
+    spec = {
+        "name": "hod_tz",
+        "entry": {"kind": "hour_of_day", "hours_utc": [13]},  # 13 UTC = 8 ET in winter
+        "exit": {"kind": "hold_period", "bars": 1},
+    }
+    result = run_spec(spec, df)
+    # Should have at least one entry — 8am ET converted to 13 UTC (DST aside)
+    assert len(result.trades) >= 1
+
+
+def test_hour_of_day_rejects_missing_hours_field():
+    df = _hourly_ohlc(100)
+    bad_spec = {
+        "name": "bad",
+        "entry": {"kind": "hour_of_day"},
+        "exit": {"kind": "hold_period", "bars": 1},
+    }
+    with pytest.raises(ValueError, match="hours_utc"):
+        run_spec(bad_spec, df)
+
+
 def test_walk_forward_rejects_insufficient_bars():
     df = _ohlc([100.0] * 80)
     spec = {"name": "x",
