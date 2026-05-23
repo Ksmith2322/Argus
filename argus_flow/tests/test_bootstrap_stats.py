@@ -8,6 +8,7 @@ import pytest
 from helio.bootstrap_stats import (
     wilson_ci,
     bootstrap_profit_factor,
+    block_bootstrap_profit_factor,
     bootstrap_cagr,
     _profit_factor,
 )
@@ -192,3 +193,64 @@ def test_xs_momentum_ci_interpretation():
         f"Unexpected CI lower bound {r.ci_lower:.3f}. Expected 1.2-1.4 "
         f"(thin margin above the promotion floor)."
     )
+
+
+# ── Block bootstrap ────────────────────────────────────────────────────────
+
+def test_block_bootstrap_deterministic_with_seed():
+    """Same seed must give same CI bounds."""
+    pnls = [1.0, -0.5, 1.5, 2.0, -0.3, 0.8] * 10
+    r1 = block_bootstrap_profit_factor(pnls, block_size=5, n_resamples=1000, seed=42)
+    r2 = block_bootstrap_profit_factor(pnls, block_size=5, n_resamples=1000, seed=42)
+    assert r1.ci_lower == r2.ci_lower
+    assert r1.ci_upper == r2.ci_upper
+
+
+def test_block_bootstrap_widens_ci_vs_iid_on_clustered_returns():
+    """On a series with autocorrelated wins (every 5-trade block is mostly
+    winners or mostly losers), block bootstrap should produce a WIDER CI
+    than IID bootstrap because it preserves the clustering structure."""
+    import random as _r
+    rng = _r.Random(123)
+    # 200 trades in 40 blocks of 5; each block is either "win regime"
+    # (~80% wins) or "loss regime" (~20% wins)
+    pnls = []
+    for block in range(40):
+        win_prob = 0.8 if block % 2 == 0 else 0.2
+        for _ in range(5):
+            pnls.append(1.0 if rng.random() < win_prob else -1.0)
+    iid = bootstrap_profit_factor(pnls, n_resamples=3000, seed=42)
+    blk = block_bootstrap_profit_factor(pnls, block_size=5, n_resamples=3000, seed=42)
+    iid_width = iid.ci_upper - iid.ci_lower
+    blk_width = blk.ci_upper - blk.ci_lower
+    # Block bootstrap should be at least as wide (and typically wider) on
+    # this clustered structure.
+    assert blk_width >= iid_width * 0.95, (
+        f"Block CI width {blk_width:.3f} should match or exceed IID {iid_width:.3f} "
+        f"on autocorrelated data — block bootstrap is meant to be more conservative."
+    )
+
+
+def test_block_bootstrap_falls_back_to_iid_when_block_exceeds_n():
+    """If block_size >= n, the moving-block approach degenerates. Module
+    falls back to IID bootstrap rather than emitting garbage."""
+    pnls = [1.0, -0.5, 1.5, 2.0, -0.3]  # n=5
+    blk = block_bootstrap_profit_factor(pnls, block_size=10, n_resamples=1000, seed=42)
+    iid = bootstrap_profit_factor(pnls, n_resamples=1000, seed=42)
+    assert blk.ci_lower == iid.ci_lower
+    assert blk.ci_upper == iid.ci_upper
+
+
+def test_block_bootstrap_empty_input_safe():
+    r = block_bootstrap_profit_factor([], block_size=5, n_resamples=100, seed=42)
+    assert r.n_sample == 0
+    assert r.point == 0.0
+
+
+def test_block_bootstrap_preserves_point_estimate():
+    """The point estimate (PF of the full sample) should always match the
+    direct calculation regardless of bootstrap method."""
+    pnls = [2.0, -1.0, 3.0, -0.5, 1.0]
+    expected_pf = _profit_factor(pnls)
+    r = block_bootstrap_profit_factor(pnls, block_size=2, n_resamples=1000, seed=42)
+    assert r.point == pytest.approx(expected_pf)

@@ -141,6 +141,70 @@ def bootstrap_profit_factor(
     )
 
 
+def block_bootstrap_profit_factor(
+    pnls: list[float],
+    *,
+    block_size: int = 5,
+    n_resamples: int = 5000,
+    confidence: float = 0.95,
+    seed: int | None = 42,
+) -> BootstrapResult:
+    """Bootstrap PF CI using moving-block resampling.
+
+    IID bootstrap (bootstrap_profit_factor) assumes each trade is
+    independent. That's wrong for momentum / trend-following strategies
+    where wins and losses cluster in regime blocks (5+ wins in a row
+    during a sustained trend; 3 losses in a row during a regime change).
+
+    Moving-block bootstrap resamples consecutive runs of `block_size`
+    trades, preserving the within-block correlation structure. This
+    typically WIDENS the CI vs IID — a more honest read.
+
+    Recommended block_size: ~sqrt(n) to ~n^(1/3). For n=200 that's
+    7-15 bars. Default 5 is a reasonable mid-range default; for known
+    high-autocorrelation strategies, use larger blocks.
+
+    See Politis & Romano (1994) for the moving-block bootstrap method.
+    """
+    if not pnls or block_size < 1:
+        return BootstrapResult(0.0, 0.0, 0.0, 0.0, 0, 0, confidence)
+    rng = random.Random(seed)
+    n = len(pnls)
+    if block_size >= n:
+        # Block size exceeds sample — fall back to IID
+        return bootstrap_profit_factor(
+            pnls, n_resamples=n_resamples, confidence=confidence, seed=seed,
+        )
+    point = _profit_factor(pnls)
+    # Number of blocks to glue together to reach length n
+    n_blocks = (n + block_size - 1) // block_size
+    samples: list[float] = []
+    for _ in range(n_resamples):
+        resample: list[float] = []
+        for _b in range(n_blocks):
+            start = rng.randrange(n - block_size + 1)
+            resample.extend(pnls[start:start + block_size])
+        resample = resample[:n]  # trim to exactly n
+        pf = _profit_factor(resample)
+        if math.isfinite(pf):
+            samples.append(pf)
+    if not samples:
+        return BootstrapResult(point, point, point, point, n_resamples, n, confidence)
+    samples.sort()
+    alpha = (1 - confidence) / 2
+    lo_idx = max(0, int(len(samples) * alpha))
+    hi_idx = min(len(samples) - 1, int(len(samples) * (1 - alpha)))
+    return BootstrapResult(
+        point=point,
+        mean=sum(samples) / len(samples),
+        ci_lower=samples[lo_idx],
+        ci_upper=samples[hi_idx],
+        n_resamples=n_resamples,
+        n_sample=n,
+        confidence=confidence,
+    )
+
+
 def bootstrap_cagr(
     pnls_pct: list[float],
     *,
