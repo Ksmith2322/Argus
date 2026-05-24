@@ -45,7 +45,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-newey-west", action="store_true",
                         help="Disable Newey-West HAC errors (use plain OLS)")
     parser.add_argument("--rf-annual", type=float, default=0.045,
-                        help="Annual risk-free rate for excess-return calc")
+                        help="Annual risk-free rate for excess-return calc (ETF-proxy mode only)")
+    parser.add_argument("--no-kf", action="store_true",
+                        help="Skip Ken French regression (ETF-proxy only)")
     args = parser.parse_args(argv)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -93,6 +95,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"extended regression failed: {exc}")
         return 1
 
+    # Re-run against real Ken French factors (sanity check on ETF proxy)
+    result_kf_classic = None
+    result_kf_extended = None
+    if not args.no_kf:
+        try:
+            print()
+            print("[step 2c] regression against Ken French 4-factor (real F-F)...")
+            result_kf_classic = regress_returns_against_factors(
+                monthly,
+                label="forge_xs_momentum vs Ken French 4-factor",
+                rf_annual=args.rf_annual,
+                use_newey_west=not args.no_newey_west,
+                include_cross_asset=False,
+                source="kf",
+            )
+        except Exception as exc:
+            print(f"KF 4-factor regression failed: {exc}")
+        try:
+            print()
+            print("[step 2d] regression against Ken French 4-factor + ETF cross-asset...")
+            result_kf_extended = regress_returns_against_factors(
+                monthly,
+                label="forge_xs_momentum vs KF 4-factor + ETF cross-asset",
+                rf_annual=args.rf_annual,
+                use_newey_west=not args.no_newey_west,
+                include_cross_asset=True,
+                source="kf",
+            )
+        except Exception as exc:
+            print(f"KF 8-factor regression failed: {exc}")
+
     text_classic = render_report(result_classic)
     text_extended = render_report(result_extended)
     print()
@@ -100,6 +133,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     print()
     print(text_extended)
     text_report = text_classic + "\n\n" + text_extended
+    if result_kf_classic is not None:
+        text_kf_classic = render_report(result_kf_classic)
+        print()
+        print(text_kf_classic)
+        text_report += "\n\n" + text_kf_classic
+    if result_kf_extended is not None:
+        text_kf_extended = render_report(result_kf_extended)
+        print()
+        print(text_kf_extended)
+        text_report += "\n\n" + text_kf_extended
     result = result_extended  # extended is the more honest decomp for this strategy
 
     # Persist
@@ -120,8 +163,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             "first_entry": bt.get("first_entry"),
             "last_exit": bt.get("last_exit"),
         },
-        "decomposition_classic_4factor": result_classic.to_dict(),
-        "decomposition_extended_8factor": result_extended.to_dict(),
+        "decomposition_classic_4factor_etf_proxy": result_classic.to_dict(),
+        "decomposition_extended_8factor_etf_proxy": result_extended.to_dict(),
+        "decomposition_classic_4factor_kf": (
+            result_kf_classic.to_dict() if result_kf_classic else None),
+        "decomposition_extended_8factor_kf": (
+            result_kf_extended.to_dict() if result_kf_extended else None),
         "report_text": text_report,
     }
     json_path.write_text(json.dumps(payload, indent=2, default=str),

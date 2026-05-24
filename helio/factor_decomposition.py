@@ -130,7 +130,8 @@ def _fetch_monthly_closes(tickers: list[str], start: str, end: str) -> pd.DataFr
 
 def build_factor_panel(start: str, end: str,
                         rf_annual: float = DEFAULT_RF_ANNUAL,
-                        include_cross_asset: bool = False) -> pd.DataFrame:
+                        include_cross_asset: bool = False,
+                        source: str = "etf_proxy") -> pd.DataFrame:
     """Returns a DataFrame indexed by month-end with columns:
        MKT_RF, SMB, HML, MOM (and DUR, GOLD, INTL_DEV, INTL_EM if
        include_cross_asset=True). All as monthly fractions.
@@ -139,7 +140,23 @@ def build_factor_panel(start: str, end: str,
     For cross-asset strategies (xs_momentum on broad-8 universe etc.),
     pass include_cross_asset=True to add bond/gold/international
     factors — otherwise the regression will mistake cross-asset
-    rotation for unexplained alpha."""
+    rotation for unexplained alpha.
+
+    source="etf_proxy" (default) builds from yfinance ETFs (SPY/IWM/
+    IWD/IWF/MTUM/TLT/GLD/EFA/EEM). Convenient but imperfect.
+
+    source="kf" uses Ken French's published daily factors (MKT_RF/SMB/
+    HML/MOM/RF), compounded to monthly. More accurate; required for
+    load-bearing decisions. include_cross_asset is only meaningful
+    when source="etf_proxy" — Ken French doesn't publish DUR/GOLD/INTL
+    factors, so when source="kf" the cross-asset extras come from
+    yfinance regardless (the KF 4-factor model is supplemented with
+    the same ETF-proxy cross-asset terms)."""
+    if source == "kf":
+        return _build_factor_panel_kf(
+            start, end, rf_annual=rf_annual,
+            include_cross_asset=include_cross_asset,
+        )
     if include_cross_asset:
         tickers = sorted({v for v in FACTOR_TICKERS.values()})
     else:
@@ -162,6 +179,52 @@ def build_factor_panel(start: str, end: str,
     return panel.dropna()
 
 
+def _build_factor_panel_kf(start: str, end: str,
+                            *,
+                            rf_annual: float = DEFAULT_RF_ANNUAL,
+                            include_cross_asset: bool = False) -> pd.DataFrame:
+    """Build the factor panel from Ken French's published monthly factors.
+    Cross-asset extras (DUR/GOLD/INTL_DEV/INTL_EM) still come from
+    yfinance ETF proxies since French doesn't publish them."""
+    from helio.fama_french_data import load_factors_monthly
+    kf = load_factors_monthly()
+    # Filter to window
+    start_dt = pd.Timestamp(start).normalize()
+    end_dt = pd.Timestamp(end).normalize()
+    kf = kf[(kf.index >= start_dt) & (kf.index <= end_dt)]
+    if kf.empty:
+        raise ValueError(
+            f"Ken French data has no rows in window {start} - {end}. "
+            f"Check that the cached files cover this date range."
+        )
+    # rf_annual parameter is ignored when source='kf' — we use French's
+    # actual RF (the 1-month T-bill rate column from his data).
+    panel = pd.DataFrame(index=kf.index)
+    panel["MKT_RF"] = kf["MKT_RF"]
+    panel["SMB"] = kf["SMB"]
+    panel["HML"] = kf["HML"]
+    panel["MOM"] = kf["MOM"]
+    panel["_RF"] = kf["RF"]  # carry through so the regressor can subtract correctly
+
+    if include_cross_asset:
+        skip = {"SPY"}  # SPY already implicit via MKT_RF; need other cross-asset
+        ca_tickers = sorted({v for v in FACTOR_TICKERS.values()
+                              if v not in skip and v in {"TLT", "GLD", "EFA",
+                                                         "EEM", "IWM"}})
+        # Always include SPY too as the subtraction reference
+        ca_tickers = sorted(set(ca_tickers) | {"SPY"})
+        monthly_close = _fetch_monthly_closes(ca_tickers, start, end)
+        rets = monthly_close.pct_change().dropna()
+        # Reindex to KF panel
+        rets.index = rets.index.normalize()
+        rets = rets.reindex(panel.index, method="nearest", tolerance=pd.Timedelta("5D"))
+        panel["DUR"] = rets["TLT"] - rets["SPY"]
+        panel["GOLD"] = rets["GLD"] - rets["SPY"]
+        panel["INTL_DEV"] = rets["EFA"] - rets["SPY"]
+        panel["INTL_EM"] = rets["EEM"] - rets["SPY"]
+    return panel.dropna()
+
+
 # ─── regression ────────────────────────────────────────────────────────
 
 def regress_returns_against_factors(
@@ -171,6 +234,7 @@ def regress_returns_against_factors(
     rf_annual: float = DEFAULT_RF_ANNUAL,
     use_newey_west: bool = True,
     include_cross_asset: bool = False,
+    source: str = "etf_proxy",
 ) -> FactorDecompositionResult:
     """Run OLS portfolio_excess ~ MKT_RF + SMB + HML + MOM.
 
@@ -197,12 +261,14 @@ def regress_returns_against_factors(
     end = f"{end_year_int:04d}-{end_month_int:02d}-01"
 
     panel = build_factor_panel(start=start, end=end, rf_annual=rf_annual,
-                                  include_cross_asset=include_cross_asset)
+                                  include_cross_asset=include_cross_asset,
+                                  source=source)
+    # Use KF's per-month RF when available (more accurate than a static
+    # rf_annual); otherwise fall back to the rf_annual approximation.
+    has_kf_rf = "_RF" in panel.columns
     # Index by YYYY-MM string for easy join
     panel.index = panel.index.strftime("%Y-%m")
-    # MKT_RF (the excess market return) goes in as factor; for the
-    # portfolio side we also subtract rf_monthly to get excess return.
-    rf_monthly = (1.0 + rf_annual) ** (1 / 12) - 1.0
+    rf_monthly_static = (1.0 + rf_annual) ** (1 / 12) - 1.0
 
     factor_names = ["MKT_RF", "SMB", "HML", "MOM"]
     if include_cross_asset:
@@ -212,7 +278,9 @@ def regress_returns_against_factors(
     for m in months_sorted:
         if m not in panel.index:
             continue
-        port_excess = float(portfolio_monthly[m]) - rf_monthly
+        rf_for_month = (float(panel.loc[m, "_RF"]) if has_kf_rf
+                          else rf_monthly_static)
+        port_excess = float(portfolio_monthly[m]) - rf_for_month
         row = {"month": m, "port_excess": port_excess}
         for fn in factor_names:
             row[fn] = panel.loc[m, fn]
