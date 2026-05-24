@@ -423,6 +423,71 @@ Operator items:
 
 ---
 
+## 2.15. Kill the still-running KILLED-strategy processes (new — 2026-05-24)
+
+Fleet snapshot caught that 4 KILLED strategies still have live runners
+(< 5h heartbeat age):
+- forge_gdx_gld (0.01h)
+- forge_nq_overnight (1.0h)
+- forge_spy_trend_follower (1.5h)
+- forge_pead (4.4h)
+
+Plus 12 more with stale heartbeats from ~5/22 23:00 UTC (~43h ago)
+that haven't shut down cleanly:
+  forge_atlas / aud_asian_breakout / cuebanks / fomc_drift /
+  jpy_pm_short / mamba / nq_london_close / rebalance / themis /
+  tom_international / tori / vix_revert / wick_gbpusd
+
+These can't trade (allocation=0 + KILLED_STRATEGY_CUTOFFS blocks
+submit_bracket at the runtime invariant) but they're:
+- Consuming TWS client_id slots (IBKR per-account limit applies)
+- Producing log noise that masks real signals
+- Holding heartbeat files that make capacity_stress include them
+  as "current positions" if they have stale state.json
+
+Run this in **PowerShell** to find and stop them:
+
+```powershell
+# List killed-strategy python processes
+Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'python.exe' -and (
+        $_.CommandLine -match 'forge\.(gdx_gld|nq_overnight|spy_trend_follower|pead|atlas|aud_asian_breakout|cuebanks|fomc_drift|jpy_pm_short|mamba|nq_london_close|rebalance|themis|tom_international|tori|vix_revert|wick_gbpusd|spy_mean_rev|multi_orb|vix_intraday|vix_carry|coint_pairs)\.runner'
+    )
+} | Select-Object ProcessId, CommandLine | Format-List
+
+# Then kill each by PID (review before running):
+# Stop-Process -Id <pid> -Force
+```
+
+After stopping, re-run `python -m ops.audit.run_fleet_snapshot` to
+confirm only ACTIVE + PENDING_OPT_IN runners are still heartbeating.
+
+---
+
+## 2.18. Fleet snapshot single-command report (new — 2026-05-24)
+
+`python -m ops.audit.run_fleet_snapshot` produces a comprehensive
+single-shot report combining:
+- Roster classification (calls run_roster_state)
+- allocation_factors snapshot + recent kill_log
+- capacity_stress per-strategy max_safe_multiplier
+- heartbeat age per runner
+- canonical_fills counts since the current epoch
+- xs_momentum current top-2 picks (live yfinance query)
+- preflight verdict per ACTIVE strategy
+
+Output:
+- stdout: human-readable markdown
+- `ops/reports/system_audit/fleet_snapshot.md`: persisted MD
+- `ops/reports/system_audit/fleet_snapshot.json`: machine-readable
+
+Use this as the FIRST thing to read when sitting down to audit —
+captures the live state in one place.
+
+Flags: `--json` for JSON output, `--skip-yfinance` for offline mode.
+
+---
+
 ## 2.2. Roster is now formally classified — 2 ACTIVE / 28 KILLED (new — 2026-05-24)
 
 Per your direction ("make sure the poor performers are killed, archive
