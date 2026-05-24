@@ -196,6 +196,39 @@ Operator items:
 
 ---
 
+## 2.3. Clear phantom positions from killed strategies (new — 2026-05-24)
+
+The cluster_exposure scan finds two phantom positions consuming cluster
+cap that should be at $0:
+
+- `forge_nq_overnight`: open_trade @ 29529 × 1 MNQ from 2026-05-22
+  19:55 UTC (the signal-only phantom from the 5/22 connect-fail —
+  diagnosed earlier tonight)
+- `forge_spy_mean_rev`: open_trade @ 718.39 × 1 SPY from 2026-04-30
+  (ancient state from the original kill date)
+
+Both strategies are in `KILLED_STRATEGY_CUTOFFS` (kill registry updated
+this commit). The state files still hold open_trade dicts, which
+`helio.cluster_exposure._scan_open_positions()` picks up and reports
+as active exposure.
+
+Run the detector:
+```
+python -m ops.audit.run_orphan_phantom_check
+```
+
+Remediation (operator):
+1. Confirm broker is actually flat for MNQ and SPY (check TWS Positions tab)
+2. If broker IS flat → state is stale; clear it with the one-liner
+   the audit prints (sets `open_trade=null` in state.json)
+3. If broker HAS the position → run `python -m emergency_close --symbol MNQ`
+   etc. to actually flatten before clearing state. NEVER clear state
+   without verifying broker, or you create an unmanaged position.
+4. Re-run `python -m ops.audit.run_capacity_stress` to confirm cluster
+   cap freed.
+
+---
+
 ## 2.35. Capacity headroom constraint — cluster caps bind at 1× (new — 2026-05-24)
 
 Capacity stress re-run with the surviving roster + $250K anchor reveals

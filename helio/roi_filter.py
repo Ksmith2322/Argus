@@ -46,6 +46,12 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     "forge_multi_orb": "2026-05-07",
     "forge_vix_intraday": "2026-05-12",
     "forge_nq_london_close": "2026-05-13",
+    # 2026-05-23 rigor sprint: both failed the disciplined gate at
+    # REALISTIC slippage (PEAD CI lower 1.025 @ 40bps; NQ overnight
+    # CI lower 0.526 @ 7bps). Source:
+    # ops/audit/run_slippage_recalibration.py + commit ac45592.
+    "forge_pead": "2026-05-23",
+    "forge_nq_overnight": "2026-05-23",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

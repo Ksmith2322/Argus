@@ -31,6 +31,16 @@ KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
     "forge_multi_orb":        ("QQQ", "MES"),
     "forge_vix_intraday":     ("UVXY", "VIX"),
     "forge_nq_london_close":  ("MNQ", "NQ"),
+    # 2026-05-23 rigor sprint killer:
+    "forge_nq_overnight":     ("MNQ", "NQ"),
+    # PEAD's 16-name Apollo watchlist — broadest set so orphan
+    # detection covers any of them. The watchlist source is
+    # apollo/data/core_watchlist.json.
+    "forge_pead":             (
+        "AAPL", "AMD", "AMZN", "ARM", "GILD", "GOOGL", "INTC",
+        "KLAC", "LRCX", "MRNA", "MU", "PEP", "PLTR", "REGN",
+        "SOFI", "TMO", "TSM", "WMT",
+    ),
 }
 
 
