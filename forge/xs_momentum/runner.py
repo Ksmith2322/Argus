@@ -295,6 +295,11 @@ def _append_trade(row: dict) -> None:
 
 
 def _write_heartbeat(state: dict, last_rebalance: dict | None) -> None:
+    try:
+        from helio.strategy_common import git_sha as _git_sha
+        git_sha = _git_sha(REPO)
+    except Exception:
+        git_sha = "unknown"
     HEARTBEAT_PATH.write_text(json.dumps({
         "system": "xs_momentum",
         "family": "forge",
@@ -304,6 +309,7 @@ def _write_heartbeat(state: dict, last_rebalance: dict | None) -> None:
         "current_picks": state.get("current_picks", {}),
         "last_rebalance": last_rebalance,
         "version": PARAMS["version"],
+        "git_sha": git_sha,
     }, indent=2, default=str))
 
 

@@ -107,10 +107,20 @@ def _heartbeats() -> list[dict]:
                 "age_hours": None,
             })
             continue
+        # Read the heartbeat to extract git_sha for restart-verification
+        # ("is the runner up on the expected commit?")
+        hb_git_sha = None
+        try:
+            import json as _json
+            data = _json.loads(hb.read_text(encoding="utf-8"))
+            hb_git_sha = data.get("git_sha")
+        except Exception:
+            pass
         rows.append({
             "strategy": f"forge_{sub.name}",
             "heartbeat_ts": mtime.isoformat(),
             "age_hours": round(age_hours, 2),
+            "heartbeat_git_sha": hb_git_sha,
         })
     return rows
 
@@ -206,13 +216,46 @@ def _preflight() -> list[dict]:
     return rows
 
 
+def _restart_status(heartbeats: list[dict]) -> dict:
+    """For each active strategy heartbeat, compare its embedded git_sha
+    against HEAD. Strategies running on an old SHA need a restart to
+    pick up the latest code."""
+    try:
+        from helio.strategy_common import git_sha as _git_sha
+        head_sha = _git_sha(REPO)
+    except Exception as exc:
+        return {"error": str(exc), "head_sha": None, "rows": []}
+    rows: list[dict] = []
+    for hb in heartbeats or []:
+        runner_sha = hb.get("heartbeat_git_sha")
+        if runner_sha is None or runner_sha == "MISSING":
+            rows.append({
+                "strategy": hb.get("strategy"),
+                "heartbeat_git_sha": None,
+                "head_sha": head_sha,
+                "restart_needed": None,
+                "note": "no git_sha in heartbeat (runner predates restart-verify)",
+            })
+            continue
+        match = (runner_sha == head_sha)
+        rows.append({
+            "strategy": hb.get("strategy"),
+            "heartbeat_git_sha": runner_sha,
+            "head_sha": head_sha,
+            "restart_needed": not match,
+        })
+    return {"head_sha": head_sha, "rows": rows}
+
+
 def build_snapshot() -> dict:
+    heartbeats = _heartbeats()
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "roster": _roster(),
         "allocation_factors": _allocation_factors(),
         "capacity": _capacity(),
-        "heartbeats": _heartbeats(),
+        "heartbeats": heartbeats,
+        "restart_status": _restart_status(heartbeats),
         "canonical_fills_since_epoch": _canonical_fills_since_epoch(),
         "xs_momentum_picks": _xs_momentum_picks(),
         "preflight": _preflight(),

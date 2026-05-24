@@ -299,11 +299,12 @@ def test_halt_flag_absent_red_when_file_present(monkeypatch, tmp_path):
 
 # ─── evaluate_strategy integration ───────────────────────────────────
 
-def test_evaluate_strategy_returns_12_checks():
-    """Every call to evaluate_strategy must produce exactly 12 check
-    results — this is the disciplined card spec, not a flexible list."""
+def test_evaluate_strategy_returns_13_checks():
+    """Every call to evaluate_strategy must produce exactly 13 check
+    results: the 12 promotion-grade points + evidence_quality (added
+    2026-05-24 per Codex gap #5)."""
     p = evaluate_strategy("forge_does_not_exist")
-    assert len(p.checks) == 12
+    assert len(p.checks) == 13
 
 
 def test_evaluate_strategy_verdict_is_blocked_when_any_red():
@@ -320,4 +321,4 @@ def test_evaluate_strategy_to_dict_serializable():
     json.dumps(d)  # should not raise
     assert d["strategy"] == "forge_does_not_exist"
     assert d["verdict"] == "BLOCKED"
-    assert len(d["checks"]) == 12
+    assert len(d["checks"]) == 13

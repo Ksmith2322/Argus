@@ -114,6 +114,11 @@ def _append_trade(row: dict) -> None:
 
 
 def _write_heartbeat(state: dict, action: str) -> None:
+    try:
+        from helio.strategy_common import git_sha as _git_sha
+        git_sha = _git_sha(REPO)
+    except Exception:
+        git_sha = "unknown"
     HEARTBEAT_PATH.write_text(json.dumps({
         "system": "tom_spy",
         "family": "forge",
@@ -123,6 +128,7 @@ def _write_heartbeat(state: dict, action: str) -> None:
         "open_trade": state.get("open_trade"),
         "last_action": action,
         "version": PARAMS["version"],
+        "git_sha": git_sha,
     }, indent=2, default=str))
 
 
