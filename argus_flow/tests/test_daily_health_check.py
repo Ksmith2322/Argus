@@ -129,12 +129,32 @@ def test_run_roster_state_error_treated_as_error(monkeypatch):
 
 # ─── evaluate() aggregation ──────────────────────────────────────────
 
+def test_run_data_feed_check_surfaces_fallback(monkeypatch):
+    import ops.daily_health_check as dhc
+    from forge.xs_momentum import runner as xsm
+
+    monkeypatch.setattr(xsm, "data_diagnostics", lambda period="2y": {
+        "strategy": "forge_xs_momentum",
+        "status": "YELLOW",
+        "fallback_tickers": ["SPY"],
+        "stale_tickers": [],
+        "missing_tickers": [],
+    })
+
+    result = dhc._run_data_feed_check()
+    assert result["status"] == "YELLOW"
+    assert result["checks"][0]["fallback_tickers"] == ["SPY"]
+    assert "fallback=['SPY']" in dhc._one_liner(result)
+
+
 def test_evaluate_returns_red_when_any_component_red(monkeypatch):
     import ops.daily_health_check as dhc
     monkeypatch.setattr(dhc, "_run_auto_pause", lambda: {
         "component": "auto_pause", "status": "GREEN", "alert_tier_counts": {}})
     monkeypatch.setattr(dhc, "_run_orphan_check", lambda: {
         "component": "orphan_phantom", "status": "RED", "phantoms": [{}]})
+    monkeypatch.setattr(dhc, "_run_data_feed_check", lambda: {
+        "component": "data_feed", "status": "GREEN", "checks": []})
     monkeypatch.setattr(dhc, "_run_preflight", lambda: {
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
@@ -153,6 +173,8 @@ def test_evaluate_returns_yellow_when_only_yellow(monkeypatch):
         "alert_tier_counts": {"WARNING": 1}})
     monkeypatch.setattr(dhc, "_run_orphan_check", lambda: {
         "component": "orphan_phantom", "status": "GREEN", "phantoms": []})
+    monkeypatch.setattr(dhc, "_run_data_feed_check", lambda: {
+        "component": "data_feed", "status": "GREEN", "checks": []})
     monkeypatch.setattr(dhc, "_run_preflight", lambda: {
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
@@ -171,6 +193,8 @@ def test_evaluate_returns_green_when_all_green(monkeypatch):
         "alert_tier_counts": {"OK": 5}})
     monkeypatch.setattr(dhc, "_run_orphan_check", lambda: {
         "component": "orphan_phantom", "status": "GREEN", "phantoms": []})
+    monkeypatch.setattr(dhc, "_run_data_feed_check", lambda: {
+        "component": "data_feed", "status": "GREEN", "checks": []})
     monkeypatch.setattr(dhc, "_run_preflight", lambda: {
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
@@ -189,6 +213,8 @@ def test_evaluate_error_treated_as_red(monkeypatch):
         "component": "auto_pause", "status": "ERROR", "error": "boom"})
     monkeypatch.setattr(dhc, "_run_orphan_check", lambda: {
         "component": "orphan_phantom", "status": "GREEN", "phantoms": []})
+    monkeypatch.setattr(dhc, "_run_data_feed_check", lambda: {
+        "component": "data_feed", "status": "GREEN", "checks": []})
     monkeypatch.setattr(dhc, "_run_preflight", lambda: {
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
@@ -209,6 +235,8 @@ def test_evaluate_skips_discord_when_all_green(monkeypatch):
         "alert_tier_counts": {}})
     monkeypatch.setattr(dhc, "_run_orphan_check", lambda: {
         "component": "orphan_phantom", "status": "GREEN", "phantoms": []})
+    monkeypatch.setattr(dhc, "_run_data_feed_check", lambda: {
+        "component": "data_feed", "status": "GREEN", "checks": []})
     monkeypatch.setattr(dhc, "_run_preflight", lambda: {
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {

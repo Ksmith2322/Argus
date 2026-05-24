@@ -13,7 +13,9 @@ Solution (opt-in, non-invasive): a thin wrapper that:
      known good cache even if older than fresh_seconds. Log the fallback.
 
 Cache location: `<repo>/forge/data/.yfinance_cache/<ticker>_<interval>_<period>.parquet`
-Parquet is compact + fast; pandas supports it natively.
+with a pickle fallback at the same path stem when no parquet engine is
+installed. Parquet is compact + fast, but the fallback keeps production
+from losing its last-known-good cache because pyarrow/fastparquet is absent.
 
 Usage (opt-in — no runners auto-switch):
     from helio.yfinance_cache import download_cached
@@ -44,31 +46,49 @@ def _cache_path(ticker: str, interval: str, period: str) -> Path:
     return CACHE_DIR / f"{safe_ticker}_{interval}_{period}.parquet"
 
 
+def _fallback_cache_path(path: Path) -> Path:
+    return path.with_suffix(".pkl")
+
+
 def _read_cache(path: Path) -> Optional[pd.DataFrame]:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        return df
-    except Exception:
-        return None
+    candidates = [path, _fallback_cache_path(path)]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            if candidate.suffix == ".parquet":
+                df = pd.read_parquet(candidate)
+            else:
+                df = pd.read_pickle(candidate)
+            if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            return df
+        except Exception:
+            continue
+    return None
 
 
 def _write_cache(path: Path, df: pd.DataFrame) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path, index=True, compression="snappy")
+        return
+    except Exception:
+        pass
+    try:
+        df.to_pickle(_fallback_cache_path(path))
     except Exception:
         pass  # cache write failure is non-fatal
 
 
 def _cache_age_seconds(path: Path) -> float:
-    try:
-        return time.time() - os.path.getmtime(path)
-    except OSError:
-        return float("inf")
+    ages = []
+    for candidate in (path, _fallback_cache_path(path)):
+        try:
+            ages.append(time.time() - os.path.getmtime(candidate))
+        except OSError:
+            continue
+    return min(ages) if ages else float("inf")
 
 
 def download_cached(

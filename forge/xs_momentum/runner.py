@@ -66,6 +66,8 @@ PARAMS = {
     "eval_minute_utc": 30,
 }
 
+MAX_DAILY_DATA_AGE_DAYS = 5
+
 
 # ── Data ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +145,7 @@ def _fetch_history(tickers: list[str], period: str = "10y") -> pd.DataFrame:
     """
     cols = {}
     errors: dict[str, str] = {}
+    source_by_ticker: dict[str, str] = {}
     try:
         out = yf.download(tickers, period=period, interval="1d",
                           progress=False, auto_adjust=False,
@@ -153,10 +156,13 @@ def _fetch_history(tickers: list[str], period: str = "10y") -> pd.DataFrame:
 
     for ticker in tickers:
         series = _close_series_from_yf(out, ticker)
+        source = "yfinance" if series is not None and not series.empty else ""
         if series is None or series.empty:
             series = _cached_daily_close(ticker, period)
+            source = "csv_cache" if series is not None and not series.empty else ""
         if series is not None and not series.empty:
             cols[ticker] = series
+            source_by_ticker[ticker] = source
         else:
             errors[ticker] = "missing close data"
 
@@ -171,7 +177,80 @@ def _fetch_history(tickers: list[str], period: str = "10y") -> pd.DataFrame:
                     len(missing), len(tickers), ",".join(missing))
     df = pd.DataFrame(cols).dropna(how="all")
     df.index = pd.to_datetime(df.index, utc=True)
+    df.attrs["source_by_ticker"] = source_by_ticker
+    df.attrs["missing_tickers"] = missing
+    df.attrs["errors"] = errors
     return df
+
+
+def data_diagnostics(period: str = "2y") -> dict:
+    """Health-check the strategy's market-data path.
+
+    GREEN means the current universe has fresh yfinance data. YELLOW means
+    the strategy can still rank, but only by using fallback cache or with a
+    partial universe. RED means the usable bars are stale or unavailable.
+    """
+    universe = list(PARAMS["universe"])
+    try:
+        closes = _fetch_history(universe, period=period)
+    except Exception as exc:
+        return {
+            "strategy": STRATEGY_LABEL,
+            "status": "RED",
+            "error": str(exc),
+            "period": period,
+        }
+    if closes.empty:
+        return {
+            "strategy": STRATEGY_LABEL,
+            "status": "RED",
+            "error": "empty_history",
+            "period": period,
+        }
+
+    now = pd.Timestamp.now(tz="UTC")
+    latest_by_ticker: dict[str, str] = {}
+    age_days_by_ticker: dict[str, float] = {}
+    stale_tickers: list[str] = []
+    for ticker in closes.columns:
+        series = closes[ticker].dropna()
+        if series.empty:
+            continue
+        latest = pd.to_datetime(series.index[-1], utc=True)
+        age_days = max(0.0, (now - latest).total_seconds() / 86400.0)
+        latest_by_ticker[ticker] = latest.isoformat()
+        age_days_by_ticker[ticker] = round(age_days, 2)
+        if age_days > MAX_DAILY_DATA_AGE_DAYS:
+            stale_tickers.append(ticker)
+
+    source_by_ticker = closes.attrs.get("source_by_ticker", {}) or {}
+    missing = list(closes.attrs.get("missing_tickers", []) or [])
+    fallback = sorted([
+        ticker for ticker, source in source_by_ticker.items()
+        if source != "yfinance"
+    ])
+
+    if stale_tickers or not latest_by_ticker:
+        status = "RED"
+    elif missing or fallback:
+        status = "YELLOW"
+    else:
+        status = "GREEN"
+
+    return {
+        "strategy": STRATEGY_LABEL,
+        "status": status,
+        "period": period,
+        "max_allowed_age_days": MAX_DAILY_DATA_AGE_DAYS,
+        "n_tickers_requested": len(universe),
+        "n_tickers_available": len(latest_by_ticker),
+        "source_by_ticker": source_by_ticker,
+        "latest_by_ticker": latest_by_ticker,
+        "age_days_by_ticker": age_days_by_ticker,
+        "fallback_tickers": fallback,
+        "missing_tickers": missing,
+        "stale_tickers": sorted(stale_tickers),
+    }
 
 
 # ── State ─────────────────────────────────────────────────────────────────
@@ -884,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         picks = select_top_quintile(ranked, fraction=PARAMS["top_quintile_fraction"])
         print(json.dumps({
             "as_of": str(closes.index[-1]) if len(closes) else None,
+            "data_diagnostics": data_diagnostics(period="2y"),
             "ranking": [{"ticker": s.ticker, "score": round(s.score * 100, 2)} for s in ranked],
             "picks": [{"ticker": p.ticker, "score": round(p.score * 100, 2)} for p in picks],
         }, indent=2, default=str))

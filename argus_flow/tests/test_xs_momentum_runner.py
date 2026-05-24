@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from forge.xs_momentum import runner as xsm
 
 
@@ -110,3 +112,33 @@ def test_evaluate_noops_when_not_due(monkeypatch, tmp_path):
 
     summary = xsm.evaluate_once()
     assert summary["action"] == "noop"
+
+
+def test_fetch_history_records_csv_cache_fallback(monkeypatch, tmp_path):
+    data_dir = tmp_path / "helio" / "data_yfinance"
+    data_dir.mkdir(parents=True)
+    (data_dir / "SPY_daily.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-05-20,100,101,99,100,1000\n"
+        "2026-05-21,101,102,100,101,1000\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(xsm, "REPO", tmp_path)
+    monkeypatch.setattr(xsm.yf, "download", lambda *a, **kw: pd.DataFrame())
+
+    closes = xsm._fetch_history(["SPY"], period="2y")
+    assert list(closes.columns) == ["SPY"]
+    assert closes.attrs["source_by_ticker"] == {"SPY": "csv_cache"}
+
+
+def test_data_diagnostics_red_when_bars_are_stale(monkeypatch):
+    idx = pd.to_datetime(["2020-01-02"], utc=True)
+    closes = pd.DataFrame({"SPY": [100.0]}, index=idx)
+    closes.attrs["source_by_ticker"] = {"SPY": "csv_cache"}
+    closes.attrs["missing_tickers"] = []
+    monkeypatch.setattr(xsm, "_fetch_history", lambda *a, **kw: closes)
+
+    result = xsm.data_diagnostics(period="2y")
+    assert result["status"] == "RED"
+    assert result["stale_tickers"] == ["SPY"]

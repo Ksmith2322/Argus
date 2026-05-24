@@ -157,6 +157,37 @@ def _run_preflight() -> dict:
                 "status": "ERROR"}
 
 
+def _run_data_feed_check() -> dict:
+    """Check active strategy data freshness/source."""
+    try:
+        checks = []
+        try:
+            from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+            active = set(ACTIVE_ROSTER)
+        except Exception:
+            active = set()
+
+        if "forge_xs_momentum" in active:
+            from forge.xs_momentum import runner as xsm
+            checks.append(xsm.data_diagnostics(period="2y"))
+
+        statuses = {c.get("status") for c in checks}
+        if "RED" in statuses or "ERROR" in statuses:
+            status = "RED"
+        elif "YELLOW" in statuses:
+            status = "YELLOW"
+        else:
+            status = "GREEN"
+        return {
+            "component": "data_feed",
+            "checks": checks,
+            "status": status,
+        }
+    except Exception as exc:
+        return {"component": "data_feed", "error": str(exc),
+                "status": "ERROR"}
+
+
 def _run_roster_state() -> dict:
     """Run the roster-classification audit. RED if any strategy is in
     LIMBO or ABANDONED status (meaning the kill registry + allocation
@@ -230,6 +261,22 @@ def _one_liner(report: dict) -> str:
     if component == "preflight":
         return (f"worst: {report.get('worst_verdict', '?')}; "
                 f"{[s.get('strategy') + '=' + s.get('verdict', '?') for s in report.get('strategies', [])]}")
+    if component == "data_feed":
+        checks = report.get("checks", [])
+        if not checks:
+            return "no active external-feed strategies"
+        parts = []
+        for check in checks:
+            if check.get("error"):
+                parts.append(f"{check.get('strategy', '?')} error={check.get('error')}")
+            else:
+                parts.append(
+                    f"{check.get('strategy', '?')}={check.get('status', '?')} "
+                    f"fallback={check.get('fallback_tickers', [])} "
+                    f"stale={check.get('stale_tickers', [])} "
+                    f"missing={check.get('missing_tickers', [])}"
+                )
+        return "; ".join(parts)
     if component == "flag_check":
         flags = []
         if report.get("halt_flag"): flags.append("HALT.flag")
@@ -252,6 +299,7 @@ def evaluate(post_discord: bool = True) -> dict:
     reports = [
         _run_auto_pause(),
         _run_orphan_check(),
+        _run_data_feed_check(),
         _run_preflight(),
         _run_roster_state(),
         _run_flag_check(),
