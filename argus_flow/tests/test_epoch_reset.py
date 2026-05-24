@@ -166,6 +166,119 @@ def test_execute_reset_idempotent_second_run_safe(fake_repo):
 # Counter reset preserves non-counter fields
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Killed-strategy state clearing (added 2026-05-24 after diagnosing that
+# the 5/22 reset left a forge_spy_mean_rev phantom from 4/30 visible all
+# the way through 5/24 — epoch_reset wasn't clearing open_trade on
+# killed strategies)
+# ---------------------------------------------------------------------------
+
+def test_clear_killed_state_clears_open_trade(tmp_path):
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "open_trade": {"entry_px": 100.0, "size": 1},
+        "trade_count": 5,
+    }), encoding="utf-8")
+    result = er._clear_killed_state(sp)
+    assert result["cleared"] is True
+    assert "open_trade" in result["fields"]
+    assert result["pre"]["open_trade"]["entry_px"] == 100.0
+    # State on disk: open_trade is now None, trade_count untouched
+    after = json.loads(sp.read_text())
+    assert after["open_trade"] is None
+    assert after["trade_count"] == 5  # untouched
+
+
+def test_clear_killed_state_handles_multi_field_runners(tmp_path):
+    """xs_momentum-style runners use current_picks dict, not open_trade."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "current_picks": {"SPY": {"qty": 100}, "QQQ": {"qty": 50}},
+        "open_positions": {"PLTR": {"qty": 10}},
+        "trade_count": 7,
+    }), encoding="utf-8")
+    result = er._clear_killed_state(sp)
+    assert result["cleared"] is True
+    assert "current_picks" in result["fields"]
+    assert "open_positions" in result["fields"]
+    after = json.loads(sp.read_text())
+    assert after["current_picks"] == {}
+    assert after["open_positions"] == {}
+    assert after["trade_count"] == 7  # untouched
+
+
+def test_clear_killed_state_idempotent_when_already_empty(tmp_path):
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "open_trade": None, "current_picks": {}, "trade_count": 0,
+    }), encoding="utf-8")
+    result = er._clear_killed_state(sp)
+    assert result["cleared"] is False
+    assert result["reason"] == "already_empty"
+
+
+def test_clear_killed_state_missing_file_no_crash(tmp_path):
+    result = er._clear_killed_state(tmp_path / "does_not_exist.json")
+    assert result["cleared"] is False
+    assert result["reason"] == "missing"
+
+
+def test_plan_includes_killed_state_clears_for_phantom_strategies(
+    fake_repo, monkeypatch,
+):
+    """plan_reset must list killed strategies whose state.json has phantom
+    position data."""
+    # Set up a phantom forge_spy_mean_rev state file (it's killed via
+    # KILLED_STRATEGY_CUTOFFS already)
+    sp = fake_repo / "forge" / "logs" / "spy_mean_rev"
+    sp.mkdir(parents=True, exist_ok=True)
+    (sp / "state.json").write_text(json.dumps({
+        "open_trade": {"entry_px": 718.39, "size": 1},
+        "trade_count": 12,
+    }), encoding="utf-8")
+
+    plan = er.plan_reset("TEST")
+    killed_srcs = [m["src"] for m in plan["killed_state_clears"]]
+    assert "forge/logs/spy_mean_rev/state.json" in killed_srcs
+
+
+def test_plan_excludes_killed_strategies_without_phantoms(fake_repo):
+    """No state.json or empty open_trade → no clear move planned."""
+    plan = er.plan_reset("TEST")
+    # No state file was created for spy_mean_rev in this test → no clear
+    killed_srcs = [m["src"] for m in plan["killed_state_clears"]]
+    assert all("spy_mean_rev" not in s for s in killed_srcs)
+
+
+def test_execute_reset_clears_killed_phantom(fake_repo):
+    """Full execute path: phantom state.open_trade gets cleared."""
+    sp = fake_repo / "forge" / "logs" / "spy_mean_rev"
+    sp.mkdir(parents=True, exist_ok=True)
+    (sp / "state.json").write_text(json.dumps({
+        "open_trade": {"entry_px": 718.39, "size": 1, "entry_ts": "2026-04-30T19:55:00Z"},
+        "trade_count": 12,
+    }), encoding="utf-8")
+
+    er.execute_reset("TEST")
+    after = json.loads((sp / "state.json").read_text())
+    assert after["open_trade"] is None
+    assert after["trade_count"] == 12  # untouched (not the counter-reset list)
+
+
+def test_execute_reset_does_not_clear_active_strategy_state(fake_repo):
+    """Active (non-killed) strategies' open_trade must NOT be touched."""
+    sp = fake_repo / "forge" / "logs" / "gld_pm_long"
+    (sp / "state.json").write_text(json.dumps({
+        "open_trade": {"entry_px": 200.0, "size": 50},
+        "trade_count": 3,
+    }), encoding="utf-8")
+    er.execute_reset("TEST")
+    after = json.loads((sp / "state.json").read_text())
+    # gld_pm_long is NOT in KILLED_STRATEGY_CUTOFFS → state untouched
+    assert after["open_trade"] == {"entry_px": 200.0, "size": 50}
+    assert after["trade_count"] == 3
+
+
 def test_counter_reset_preserves_non_counter_fields(tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({

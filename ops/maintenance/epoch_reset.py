@@ -69,6 +69,24 @@ COUNTER_RESETS: tuple[tuple[str, ...], ...] = (
 )
 
 
+# Position-state fields to clear on every KILLED strategy's state.json
+# during the epoch reset. Without this step, phantom open_trade entries
+# survive across resets and inflate cluster_exposure (the 5/22 reset
+# left a forge_spy_mean_rev phantom from 4/30 visible all the way
+# through 5/24 — this fixes that class of bug).
+#
+# SAFETY: clearing state.open_trade without verifying the broker is flat
+# would create an unmanaged position. The reset assumes:
+#   (a) the strategy is in KILLED_STRATEGY_CUTOFFS (caller pre-checked)
+#   (b) operator ran emergency_close.py for any real broker positions
+#       BEFORE invoking the reset
+# A pre-snapshot of the cleared values goes into the archive manifest
+# so a post-mortem can always recover what was there.
+POSITION_FIELDS_TO_CLEAR: tuple[str, ...] = (
+    "open_trade", "open_trades", "open_positions", "current_picks",
+)
+
+
 # Files that MUST exist clean (empty / not present) at start of the new
 # epoch. The script will rewrite each as an empty file with a header.
 CLEAN_TEMPLATES: tuple[tuple[str, str], ...] = (
@@ -147,6 +165,39 @@ def _plan_template_rewrites(target: str) -> list[PlannedMove]:
     return moves
 
 
+def _plan_killed_state_clears(target: str) -> list[PlannedMove]:
+    """For every strategy in KILLED_STRATEGY_CUTOFFS, plan a clear of
+    state.open_trade / open_trades / open_positions / current_picks.
+    Skip strategies whose state.json doesn't exist or whose fields are
+    already empty (idempotent)."""
+    moves: list[PlannedMove] = []
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS
+    except Exception:
+        return moves
+    for strategy in sorted(KILLED_STRATEGY_CUTOFFS):
+        short = strategy.replace("forge_", "")
+        rel = f"forge/logs/{short}/state.json"
+        path = REPO / rel
+        if not path.exists():
+            continue
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        has_phantom = any(
+            isinstance(state.get(k), dict) and state.get(k)
+            for k in POSITION_FIELDS_TO_CLEAR
+        )
+        if not has_phantom:
+            continue
+        moves.append(PlannedMove(
+            src=rel, dst=rel, kind="killed_state_clear",
+            note=f"clear position fields for killed strategy {strategy}",
+        ))
+    return moves
+
+
 def _verify_absent_required() -> list[str]:
     """Return any required-absent files that are currently present."""
     bad: list[str] = []
@@ -162,6 +213,7 @@ def plan_reset(target: str) -> dict:
     archive_moves = _plan_archive_moves(target)
     counter_moves = _plan_counter_resets(target)
     template_moves = _plan_template_rewrites(target)
+    killed_clear_moves = _plan_killed_state_clears(target)
     blockers = _verify_absent_required()
     return {
         "target": target,
@@ -169,9 +221,11 @@ def plan_reset(target: str) -> dict:
         "n_archive_moves": len(archive_moves),
         "n_counter_resets": len(counter_moves),
         "n_template_rewrites": len(template_moves),
+        "n_killed_state_clears": len(killed_clear_moves),
         "archive_moves": [asdict(m) for m in archive_moves],
         "counter_resets": [asdict(m) for m in counter_moves],
         "template_rewrites": [asdict(m) for m in template_moves],
+        "killed_state_clears": [asdict(m) for m in killed_clear_moves],
         "blockers_present": blockers,
         "ready_to_execute": not blockers,
     }
@@ -229,6 +283,38 @@ def _do_template_rewrites(plan: dict) -> list[dict]:
     return log
 
 
+def _clear_killed_state(state_path: Path) -> dict:
+    """Clear position-state fields in a killed strategy's state.json.
+    Returns a snapshot of pre-cleared values for the archive manifest."""
+    if not state_path.exists():
+        return {"cleared": False, "reason": "missing"}
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"cleared": False, "reason": f"unreadable:{exc}"}
+    pre: dict = {}
+    cleared: list[str] = []
+    for k in POSITION_FIELDS_TO_CLEAR:
+        if k in raw and isinstance(raw[k], dict) and raw[k]:
+            pre[k] = raw[k]
+            raw[k] = None if k == "open_trade" else {}
+            cleared.append(k)
+    if not cleared:
+        return {"cleared": False, "reason": "already_empty"}
+    state_path.write_text(
+        json.dumps(raw, indent=2, default=str), encoding="utf-8"
+    )
+    return {"cleared": True, "fields": cleared, "pre": pre}
+
+
+def _do_killed_state_clears(plan: dict) -> list[dict]:
+    log: list[dict] = []
+    for m in plan.get("killed_state_clears") or []:
+        result = _clear_killed_state(REPO / m["src"])
+        log.append({"kind": "killed_state_cleared", "src": m["src"], **result})
+    return log
+
+
 def _write_manifest(target: str, manifest: list[dict]) -> None:
     archive = _archive_root(target)
     archive.mkdir(parents=True, exist_ok=True)
@@ -258,6 +344,7 @@ def execute_reset(target: str, plan: Optional[dict] = None) -> dict:
     events.extend(_do_archive(plan, target))
     events.extend(_do_counter_resets(plan))
     events.extend(_do_template_rewrites(plan))
+    events.extend(_do_killed_state_clears(plan))
     _write_manifest(target, events)
     return {"status": "executed", "target": target, "events": events}
 

@@ -196,6 +196,36 @@ Operator items:
 
 ---
 
+## 2.25. epoch_reset now clears killed-strategy phantoms (new — 2026-05-24)
+
+Discovered tonight that the 5/22 reset DID NOT clear `state.open_trade`
+on killed strategies — that's why forge_spy_mean_rev's phantom from
+4/30 was still visible in cluster_exposure on 5/24. The 5/31 reset
+would have repeated the bug.
+
+FIXED in this commit. `ops.maintenance.epoch_reset` now:
+- Plans a `killed_state_clears` move for every strategy in
+  `KILLED_STRATEGY_CUTOFFS` whose state.json has non-empty
+  `open_trade` / `open_trades` / `open_positions` / `current_picks`
+- Executes the clear (with pre-snapshot to archive manifest for
+  rollback)
+- Active (non-killed) strategy state files are NEVER touched
+- 8 new tests pin this behavior
+
+Dry-run today against current state correctly identifies both
+phantoms: `forge_nq_overnight` (5/22 19:55 UTC) + `forge_spy_mean_rev`
+(4/30). When you next run `python -m ops.maintenance.epoch_reset
+--target <date> --execute`, those will be cleared.
+
+SAFETY REQUIREMENT (unchanged): before running the reset, operator
+must verify broker is actually flat for any killed-strategy symbol
+(use `python -m ops.audit.run_orphan_phantom_check` to find candidates,
+then check TWS Positions tab). The reset does not reconcile against
+the broker; if a real position exists, the reset will create an
+unmanaged record. emergency_close.py FIRST if needed.
+
+---
+
 ## 2.3. Clear phantom positions from killed strategies (new — 2026-05-24)
 
 The cluster_exposure scan finds two phantom positions consuming cluster
