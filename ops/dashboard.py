@@ -483,7 +483,7 @@ def read_queue_status(skip_pc2: bool = False) -> dict:
 
 # --- PC2 status (cached SSH, refreshes every 60s) ---
 _pc2_cache: dict = {"ts": 0, "data": None}
-PC2_SSH = 'ksmith2322@yahoo.com@192.168.1.98'
+PC2_SSH = 'ksmith2322@yahoo.com@192.168.1.101'
 PC2_CACHE_TTL = 60  # seconds
 
 

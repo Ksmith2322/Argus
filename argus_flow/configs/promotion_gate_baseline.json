@@ -1,6 +1,7 @@
 {
-  "_comment": "Per-strategy disciplined-gate baseline. Each strategy's CI lower bound from the offline disciplined gate (promotion_panel 5 layers: 20y bootstrap + 10bp slippage + block bootstrap + period stability + multi-testing). Live monitoring compares the strategy's ROLLING live PF against this baseline. Source: project_2026_05_22_backtest_factory_findings.md. Update this file when the gate is re-run against fresh evidence.",
-  "version": "2026-05-23.v1",
+  "_comment": "Per-strategy disciplined-gate baseline. Each strategy's CI lower bound from the offline disciplined gate (promotion_panel 5 layers: 20y bootstrap + per-strategy slippage + block bootstrap + period stability + multi-testing). Live monitoring compares the strategy's ROLLING live PF against this baseline. Source: project_2026_05_22_backtest_factory_findings.md + 2026-05-23 audit Agent 2 slippage recalibration. Update this file when the gate is re-run against fresh evidence.",
+  "version": "2026-05-23.v2",
+  "_slippage_methodology": "slippage_bps_used is the bps figure that produced the published CI bounds. _slippage_bps_realistic is Agent 2's recalibration based on actual venue/instrument characteristics; until the gate is re-run at the realistic value, treat the published CI as an upper bound on edge.",
   "generated_from": "promotion_panel applied to 20y backtests + archived live trades",
   "promotion_floor": 1.20,
   "alert_thresholds": {
@@ -18,7 +19,9 @@
       "max_dd_pct": 26.6,
       "config": "broad-8 + 252-21 + top-2 (post 5/22 swap)",
       "p_value": 0.0015,
-      "notes": "Strongest config tested. Passes 8/8 layers including block bootstrap. Edge concentrates in moderate-high VIX (>=20) regimes per 5/23 audit."
+      "slippage_bps_used": 10,
+      "_slippage_bps_realistic": 10,
+      "notes": "Strongest config tested. Passes 8/8 layers including block bootstrap. Edge concentrates in moderate-high VIX (>=20) regimes per 5/23 audit. Monthly cadence on broad ETFs (SPY/QQQ/IWM/DIA/EFA/EEM/GLD/TLT) — 10bps slippage realistic at retail size."
     },
     "forge_spy_trend_follower": {
       "verdict": "MARGINAL_PASS",
@@ -29,7 +32,9 @@
       "max_dd_pct": 34.1,
       "config": "SPY SMA 50/200 regime",
       "p_value": 0.0,
-      "notes": "Passes 7/8 layers. H1 fails on n=5 sub-sample (sparsity, not regime). Role: defensive beta proxy not alpha. 0.614 correlation with xs_momentum."
+      "slippage_bps_used": 10,
+      "_slippage_bps_realistic": 5,
+      "notes": "Passes 7/8 layers. H1 fails on n=5 sub-sample (sparsity, not regime). Role: defensive beta proxy not alpha. 0.614 correlation with xs_momentum. SPY is the tightest US ETF; 5bps is more realistic than the 10bps used — actual CI lower bound likely slightly higher than 2.67."
     },
     "forge_gld_pm_long": {
       "verdict": "FAIL",
@@ -40,7 +45,9 @@
       "max_dd_pct": null,
       "config": "GLD 1h hours 18-20 UTC, ATR 0.5/1.0 max_hold=4",
       "p_value": null,
-      "notes": "Fails at 5bp slippage. 522 trades / 2y cadence → slippage drag destroys edge. Live evidence still useful for re-evaluation as n accumulates."
+      "slippage_bps_used": 5,
+      "_slippage_bps_realistic": 5,
+      "notes": "Fails at 5bp slippage (the realistic figure for GLD intraday). 522 trades / 2y cadence → slippage drag destroys edge. Live evidence still useful for re-evaluation as n accumulates."
     },
     "forge_nq_overnight": {
       "verdict": "FAIL",
@@ -51,7 +58,9 @@
       "max_dd_pct": null,
       "config": "NQ=F 1h hours 20-00 UTC, ATR 0.5/1.0 max_hold=4",
       "p_value": null,
-      "notes": "Net loser at 3bp slippage. 713 trades / 2y. Don't promote to real money. Monitor live: if rolling PF >= 1.0 persistently, re-evaluate."
+      "slippage_bps_used": 3,
+      "_slippage_bps_realistic": 7,
+      "notes": "Net loser even at 3bp slippage. 713 trades / 2y. Don't promote to real money. Agent 2 5/23 audit: realistic overnight NQ/MNQ slippage is closer to 5-10bps because of widening into ETH session and the higher spread paid on MNQ vs full NQ — re-run at 7bps would push CI lower further below 1.0. Monitor live: if rolling PF >= 1.0 persistently across 50+ trades, re-evaluate."
     },
     "forge_pead": {
       "verdict": "FAIL",
@@ -62,7 +71,9 @@
       "max_dd_pct": null,
       "config": "Apollo 16 curated, 5y, 1.5 ATR stop, hold_days=20",
       "p_value": null,
-      "notes": "CI lower 1.17 — literally 0.03 below 1.20 floor. Point PF looks great but n too small. Non-curated SPX-50 also fails (CI lower 1.07). Edge IS real, sample IS too small."
+      "slippage_bps_used": 10,
+      "_slippage_bps_realistic": 40,
+      "notes": "CI lower 1.17 — literally 0.03 below 1.20 floor at 10bps. Agent 2 5/23 audit: PEAD entries hit earnings-week wide spreads + occasional gap-fill chasing; realistic slippage is 30-50bps. Re-run at 40bps would push CI lower significantly below 1.0. Non-curated SPX-50 also fails (CI lower 1.07 at 10bps). Edge IS real in spec, sample IS too small AND realistic execution drag may eliminate it. ACTION: re-run promotion_panel at 40bps before claiming edge."
     }
   }
 }

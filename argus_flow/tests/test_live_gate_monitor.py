@@ -178,6 +178,43 @@ def test_evaluate_strategy_no_trades_file(monkeypatch, tmp_path):
     assert "no trades file" in st.notes.lower()
 
 
+def test_load_trades_returns_source_label_live(monkeypatch, tmp_path):
+    """When live trades.csv exists, _load_trades_csv returns source='live'."""
+    from helio import live_gate_monitor as m
+    monkeypatch.setitem(m.STRATEGY_LOG_DIRS, "forge_xt", tmp_path)
+    pd.DataFrame({"ts": ["2026-05-22T12:00:00Z"], "pnl_pct": [1.5]}).to_csv(
+        tmp_path / "trades.csv", index=False)
+    df, source = m._load_trades_csv("forge_xt")
+    assert source == "live"
+    assert df is not None and len(df) == 1
+
+
+def test_load_trades_silent_archive_fallback_disabled_by_default(
+    monkeypatch, tmp_path
+):
+    """CRITICAL REGRESSION GUARD: when no live trades.csv exists, the
+    DEFAULT must NOT silently return pre-reset archive data. This bug
+    caused the live_gate_monitor to label April 2026 archived trades as
+    'live PF' after the 5/22 reset emptied canonical_fills."""
+    from helio import live_gate_monitor as m
+    monkeypatch.setitem(m.STRATEGY_LOG_DIRS, "forge_xt", tmp_path / "live")
+    # Create an archive in the expected layout
+    archive_dir = tmp_path / "archive" / "pre_reset_99999999" / "forge" / "logs" / "xt"
+    archive_dir.mkdir(parents=True)
+    pd.DataFrame({"ts": ["2026-04-01T12:00:00Z"], "pnl_pct": [99.0]}).to_csv(
+        archive_dir / "trades.csv", index=False)
+    monkeypatch.setattr(m, "ARCHIVE_ROOT", tmp_path / "archive")
+    # DEFAULT: fallback_archive=False → must return (None, "none")
+    df, source = m._load_trades_csv("forge_xt")
+    assert df is None
+    assert source == "none"
+    # EXPLICIT opt-in: fallback_archive=True returns archive with labeled source
+    df, source = m._load_trades_csv("forge_xt", fallback_archive=True)
+    assert df is not None
+    assert source == "pre_reset_archive"
+    assert df["pnl_pct"].iloc[0] == 99.0
+
+
 # ─── evaluate_cohort + write_report ─────────────────────────────────
 
 def test_evaluate_cohort_against_committed_baseline():

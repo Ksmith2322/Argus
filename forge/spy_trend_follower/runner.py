@@ -333,9 +333,24 @@ def _execute_action(action: str, last_close: float) -> None:
     """Live IBKR submission. Only LIVE mode."""
     try:
         from helio import ibkr_execution as ibkr
-        from helio.fleet_sizing import get_sizing_anchor_usd
+        from helio.fleet_sizing import get_sizing_anchor_usd, get_allocation_factor
     except ImportError as e:
         log.error(f"helio imports failed: {e}")
+        return
+
+    # 2026-05-23: respect allocation_factor before computing notional. Previously
+    # the runner hardcoded PARAMS["allocation_pct_of_anchor"] (30%) regardless
+    # of allocation_factors.json. With the strategy at allocation 0.0 (deallocated
+    # per allocation analysis), flipping to --live would have deployed $75K of SPY
+    # on a $250K account silently.
+    try:
+        alloc_factor = float(get_allocation_factor("forge_spy_trend_follower"))
+    except Exception as e:
+        log.error(f"could not read allocation_factor: {e} — refusing to trade (fail-closed)")
+        return
+    if alloc_factor <= 0.0:
+        log.info(f"[ALLOC-GATE] action={action} blocked: allocation_factor={alloc_factor} "
+                 f"(strategy deallocated; no order submitted)")
         return
 
     try:
@@ -344,15 +359,18 @@ def _execute_action(action: str, last_close: float) -> None:
         log.error(f"could not read sizing anchor: {e}")
         return
 
-    notional = anchor * PARAMS["allocation_pct_of_anchor"]
+    effective_pct = PARAMS["allocation_pct_of_anchor"] * alloc_factor
+    notional = anchor * effective_pct
     shares = int(notional / last_close)
     if shares < 1:
         log.warning(f"computed shares={shares} from notional ${notional:.0f} "
-                    f"@ ${last_close:.2f} — too small to trade")
+                    f"@ ${last_close:.2f} (alloc_factor={alloc_factor}) — too small to trade")
         return
 
     log.info(f"[LIVE] {action}: {shares} shares SPY @ ~${last_close:.2f} "
-             f"(notional ${shares*last_close:.0f}, {PARAMS['allocation_pct_of_anchor']*100:.0f}% of ${anchor:.0f})")
+             f"(notional ${shares*last_close:.0f}, "
+             f"{effective_pct*100:.1f}% of ${anchor:.0f} "
+             f"[base {PARAMS['allocation_pct_of_anchor']*100:.0f}% × alloc_factor {alloc_factor:.2f}])")
 
     try:
         ib = ibkr.connect(IBKR_CLIENT_ID)

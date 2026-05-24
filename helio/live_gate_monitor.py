@@ -68,6 +68,10 @@ class GateMonitorStatus:
     backtest_point_pf: Optional[float] = None
     backtest_n: Optional[int] = None
     config: str = ""
+    # Data provenance — was the rolling-PF computed from LIVE trades or did
+    # we fall back to a pre-reset archive (contaminated epoch)? Default
+    # "none" = no trades found at all.
+    trade_source: str = "none"   # "live" | "pre_reset_archive" | "none"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -81,24 +85,38 @@ def load_baseline(path: Path = BASELINE_PATH) -> dict:
 
 
 def _load_trades_csv(strategy: str, *,
-                     fallback_archive: bool = True) -> Optional[pd.DataFrame]:
-    """Load trades.csv for `strategy`. Prefer post-reset (live) file; fall
-    back to pre-reset archived file if no post-reset trades exist yet.
+                     fallback_archive: bool = False
+                     ) -> tuple[Optional[pd.DataFrame], str]:
+    """Load trades.csv for `strategy`. Returns (df, source_label).
 
-    Returns DataFrame with columns including 'ts' (entry timestamp) and
-    'pnl_pct_of_fleet' or 'pnl_pct' (per-trade percent return).
+    source_label:
+        "live"               — read from forge/logs/<strategy>/trades.csv
+        "pre_reset_archive"  — fell back to argus_flow/logs/_archive/pre_reset_*
+        "none"               — no file found anywhere
+
+    DEFAULT BEHAVIOR (fallback_archive=False, changed 2026-05-23 PM):
+        Returns archive data ONLY when fallback_archive=True is explicitly
+        passed. The prior default silently returned pre-reset archive data
+        when no live file existed, which caused the disciplined-gate monitor
+        to label April 2026 archived trades as "live PF" after the 5/22
+        reset emptied canonical_fills. The 30-day clean evidence window
+        starts fresh; we DO NOT mix pre-reset evidence into post-reset
+        verdicts. Caller must opt in to archive lookup explicitly.
     """
     log_dir = STRATEGY_LOG_DIRS.get(strategy)
     if log_dir is None:
-        return None
+        return (None, "none")
     primary = log_dir / "trades.csv"
     if primary.exists():
-        df = pd.read_csv(primary)
-        if len(df) > 0:
-            return df
+        try:
+            df = pd.read_csv(primary)
+            if len(df) > 0:
+                return (df, "live")
+        except Exception:
+            pass
     if not fallback_archive:
-        return None
-    # Look for the most recent archive of this strategy
+        return (None, "none")
+    # Explicit opt-in: walk the pre-reset archives
     name = strategy.replace("forge_", "")
     archives = sorted(ARCHIVE_ROOT.glob(f"pre_reset_*/forge/logs/{name}/trades.csv"),
                       reverse=True)
@@ -106,10 +124,10 @@ def _load_trades_csv(strategy: str, *,
         try:
             df = pd.read_csv(archive)
             if len(df) > 0:
-                return df
+                return (df, "pre_reset_archive")
         except Exception:
             continue
-    return None
+    return (None, "none")
 
 
 def _compute_pf(pnls: list[float]) -> Optional[float]:
@@ -171,10 +189,16 @@ def evaluate_strategy(
         backtest_n=spec.get("n_backtest"),
         config=spec.get("config", ""),
     )
-    df = _load_trades_csv(strategy)
+    df, source = _load_trades_csv(strategy)
+    status.trade_source = source
     if df is None or len(df) == 0:
         status.notes = "no trades file found (live or archive)"
         return status
+    if source == "pre_reset_archive":
+        # Explicit warning when we used archive data — caller chose to opt in.
+        status.notes = ("WARNING: using pre_reset_archive data, NOT live. "
+                        "Post-reset evidence epoch may be contaminated by "
+                        "earlier-cohort verdicts.")
 
     # Identify pnl column — gld_pm_long uses pnl_pct_of_fleet, others use pnl_pct
     pnl_col = None

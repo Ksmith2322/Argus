@@ -2,7 +2,7 @@
 # Usage: .\ops\status_all.ps1
 param()
 $ErrorActionPreference = "Stop"
-$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.101"
 $repoRoot = "C:\Argus\repo"
 $logsDir = "$repoRoot\ops\logs"
 

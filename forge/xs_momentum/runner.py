@@ -26,7 +26,11 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
-from helio.fleet_sizing import max_notional_usd
+from helio.fleet_sizing import (
+    get_allocation_factor,
+    get_sizing_anchor_usd,
+    max_notional_usd,
+)
 from helio import ibkr_execution as ibkr
 from helio.xs_momentum import (
     DEFAULT_UNIVERSE,
@@ -35,6 +39,7 @@ from helio.xs_momentum import (
     rank_universe_by_momentum, select_top_quintile,
 )
 
+STRATEGY_LABEL = "forge_xs_momentum"
 IBKR_CLIENT_ID = 121
 _SIGNAL_ONLY_MODE = False
 
@@ -66,7 +71,12 @@ PARAMS = {
 
 def _fetch_history(tickers: list[str], period: str = "10y") -> pd.DataFrame:
     """Download daily closes for the universe. Returns a DataFrame indexed
-    by date, columns = tickers."""
+    by date, columns = tickers.
+
+    auto_adjust=False because the published promotion_gate baseline
+    (CI=[1.86, 6.30] from project_2026_05_22_backtest_factory_findings.md)
+    was computed at this setting. Switching to True would silently shift
+    live PF vs baseline. See the convention block in helio/yfinance_data.py."""
     out = yf.download(tickers, period=period, interval="1d",
                       progress=False, auto_adjust=False, group_by="ticker")
     cols = {}
@@ -283,6 +293,389 @@ def _count_per_ticker(trades: list[dict]) -> dict:
     return out
 
 
+# ── Live execution ────────────────────────────────────────────────────────
+
+def _is_rebalance_due(state: dict, now_utc: datetime) -> bool:
+    """First wake-cycle of a new calendar month → rebalance. Constrained
+    to the first 7 days of the month so a fresh state on day 20 does not
+    accidentally fire a mid-month rebalance — month-end weekends/holidays
+    can slide rebalance up to Mon-Tue of the new month, but never past the
+    first week. Caller can use --force to bypass."""
+    if now_utc.weekday() >= 5:
+        return False
+    if now_utc.day > 7:
+        return False
+    current_month_key = now_utc.strftime("%Y-%m")
+    last_rebalance_month = state.get("last_rebalance_month", "")
+    return current_month_key != last_rebalance_month
+
+
+def _current_picks(state: dict) -> dict[str, dict]:
+    picks = state.get("current_picks") or {}
+    if not isinstance(picks, dict):
+        return {}
+    return picks
+
+
+def _submit_market_order(
+    ib,
+    contract,
+    action: str,          # "BUY" or "SELL"
+    qty: int,
+    *,
+    est_px: float,
+    timeout_s: float = 30.0,
+):
+    """Plain market-order submit + wait-for-fill. Used by xs_momentum's
+    monthly rebalance — no protective brackets (positions hold until next
+    rebalance flips them out of the top quintile)."""
+    from ib_insync import MarketOrder
+    try:
+        from helio.real_money import (
+            enforce_real_money_boundary,
+            AccountBoundaryViolationError,
+        )
+        est_notional = abs(qty) * float(est_px) if est_px and qty else None
+        enforce_real_money_boundary(
+            ib,
+            strategy_label=STRATEGY_LABEL,
+            notional_usd=est_notional,
+        )
+    except AccountBoundaryViolationError as exc:
+        log.error("REAL_MONEY_BOUNDARY refusing %s %d %s: %s",
+                  action, qty, contract.symbol, exc)
+        return None
+
+    halted, reason = ibkr.is_fleet_halted()
+    if halted:
+        log.warning("FLEET_HALTED, refusing %s %d %s: %s",
+                    action, qty, contract.symbol, reason)
+        return None
+
+    if not ibkr.is_market_open(contract):
+        log.warning("MARKET_CLOSED, refusing %s %d %s",
+                    action, qty, contract.symbol)
+        return None
+
+    order = MarketOrder(action, abs(qty))
+    trade = ib.placeOrder(contract, order)
+    fill = ibkr._wait_for_fill(ib, trade, timeout_s=timeout_s)
+    if not fill.filled:
+        log.error("MARKET %s %d %s FAILED: %s",
+                  action, qty, contract.symbol, fill.reject_reason)
+        return None
+    log.info("MARKET %s %d %s @ %.4f", action, qty,
+             contract.symbol, fill.fill_price)
+    return fill
+
+
+def _write_canonical_entry(ticker: str, qty: int, fill_px: float,
+                            score: float, anchor_at_fill: float) -> None:
+    try:
+        from helio.canonical_fills import write_fill
+        write_fill(
+            strategy=STRATEGY_LABEL,
+            symbol=ticker,
+            direction="long",
+            side="ENTRY",
+            entry_ts=datetime.now(timezone.utc).isoformat(),
+            entry_px=float(fill_px),
+            size=int(qty),
+            extra={
+                "momentum_score": round(float(score), 6),
+                "anchor_at_fill_usd": round(float(anchor_at_fill), 2),
+            },
+        )
+    except Exception as exc:
+        log.warning("canonical ENTRY write failed for %s (non-fatal): %s",
+                    ticker, exc)
+
+
+def _write_canonical_exit(ticker: str, qty: int, fill_px: float,
+                           entry_px: float, entry_ts: str,
+                           pnl_usd: float, reason: str) -> None:
+    try:
+        from helio.canonical_fills import write_fill
+        write_fill(
+            strategy=STRATEGY_LABEL,
+            symbol=ticker,
+            direction="long",
+            side="EXIT",
+            entry_ts=entry_ts,
+            exit_ts=datetime.now(timezone.utc).isoformat(),
+            entry_px=float(entry_px),
+            exit_px=float(fill_px),
+            size=int(qty),
+            pnl_usd=round(float(pnl_usd), 2),
+            exit_reason=reason,
+        )
+    except Exception as exc:
+        log.warning("canonical EXIT write failed for %s (non-fatal): %s",
+                    ticker, exc)
+
+
+def evaluate_once(force: bool = False) -> dict:
+    """Single rebalance cycle. Returns a summary dict (used by --evaluate and
+    --loop). When force=False (default), no-ops if it's not the first wake of
+    a new calendar month."""
+    summary = {"action": "noop", "reason": "",
+                "now": datetime.now(timezone.utc).isoformat()}
+    state = _load_state()
+    state.setdefault("runtime_start", time.time())
+    now_utc = datetime.now(timezone.utc)
+
+    if not force and not _is_rebalance_due(state, now_utc):
+        summary["reason"] = f"not_due (last_rebalance_month={state.get('last_rebalance_month', '')})"
+        _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
+        log.info("xs_momentum eval skipped: %s", summary["reason"])
+        return summary
+
+    # Fail-closed on allocation_factor
+    try:
+        alloc_factor = float(get_allocation_factor(STRATEGY_LABEL))
+    except Exception as exc:
+        log.error("could not read allocation_factor: %s — refusing to trade", exc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"alloc_read_failed:{exc}"
+        return summary
+    if alloc_factor <= 0.0:
+        log.info("[ALLOC-GATE] allocation_factor=%.3f — strategy deallocated, "
+                  "no rebalance", alloc_factor)
+        summary["action"] = "blocked"
+        summary["reason"] = f"alloc_factor={alloc_factor}"
+        _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
+        return summary
+
+    universe = list(PARAMS["universe"])
+    try:
+        closes = _fetch_history(universe, period="3y")
+    except Exception as exc:
+        log.error("history fetch failed: %s", exc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"history_fetch:{exc}"
+        return summary
+    if closes.empty:
+        summary["action"] = "blocked"
+        summary["reason"] = "no_history"
+        return summary
+
+    per_asset = {t: closes[t].dropna().tolist()
+                  for t in universe if t in closes.columns}
+    ranked = rank_universe_by_momentum(
+        per_asset,
+        long_lookback=PARAMS["long_lookback"],
+        short_lookback=PARAMS["short_lookback"],
+    )
+    if not ranked:
+        summary["action"] = "blocked"
+        summary["reason"] = "ranking_empty"
+        return summary
+
+    picks = select_top_quintile(ranked,
+                                 fraction=PARAMS["top_quintile_fraction"])
+    pick_tickers = {p.ticker for p in picks}
+    score_by_ticker = {p.ticker: float(p.score) for p in picks}
+    last_px = {t: float(closes[t].dropna().iloc[-1])
+                for t in universe if t in closes.columns}
+
+    log.info("xs_momentum picks (effective alloc %.2f×): %s",
+             alloc_factor, sorted(pick_tickers))
+
+    current = _current_picks(state)
+    to_sell = [t for t in current if t not in pick_tickers]
+    to_buy = [t for t in pick_tickers if t not in current]
+
+    if not to_sell and not to_buy:
+        log.info("xs_momentum: holdings already match top picks, no orders")
+        summary["action"] = "no_change"
+        summary["reason"] = "already_optimal"
+        state["last_rebalance_month"] = now_utc.strftime("%Y-%m")
+        state["last_rebalance"] = {
+            "ts": now_utc.isoformat(),
+            "picks": sorted(pick_tickers),
+            "no_change": True,
+        }
+        _save_state(state)
+        _write_heartbeat(state, last_rebalance=state["last_rebalance"])
+        return summary
+
+    if _SIGNAL_ONLY_MODE:
+        log.info("SIGNAL-ONLY: would SELL %s, BUY %s", to_sell, to_buy)
+        summary["action"] = "signal_only"
+        summary["reason"] = "signal_only_mode"
+        summary["would_sell"] = to_sell
+        summary["would_buy"] = to_buy
+        return summary
+
+    try:
+        ib = ibkr.connect_with_retry(IBKR_CLIENT_ID, max_attempts=3)
+    except Exception as exc:
+        log.error("IBKR connect failed: %s — aborting rebalance", exc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"ibkr_connect:{exc}"
+        return summary
+
+    try:
+        anchor = get_sizing_anchor_usd()
+        capital_total = anchor * alloc_factor
+        per_pick_usd_cap = max_notional_usd("etf",
+                                              strategy_label=STRATEGY_LABEL) or 0.0
+        per_pick_usd = capital_total * float(PARAMS["per_pick_fraction"])
+        if per_pick_usd_cap > 0:
+            per_pick_usd = min(per_pick_usd, per_pick_usd_cap)
+        log.info("xs_momentum capital: anchor=%.2f alloc_factor=%.2f "
+                  "per_pick_usd=%.2f (cap=%.2f)",
+                  anchor, alloc_factor, per_pick_usd, per_pick_usd_cap)
+
+        sells = []
+        for ticker in to_sell:
+            holding = current.get(ticker) or {}
+            qty = int(holding.get("qty") or 0)
+            if qty <= 0:
+                log.warning("EXIT skipped for %s: state shows qty<=0 (%s)",
+                              ticker, qty)
+                continue
+            contract = ibkr.make_contract(ticker, "etf")
+            try:
+                ib.qualifyContracts(contract)
+            except Exception as exc:
+                log.error("qualifyContracts(%s) failed: %s", ticker, exc)
+                continue
+            est_px = last_px.get(ticker) or float(holding.get("entry_px") or 0.0)
+            fill = _submit_market_order(ib, contract, "SELL", qty,
+                                          est_px=est_px)
+            if fill is None:
+                continue
+            entry_px = float(holding.get("entry_px") or 0.0)
+            pnl_usd = (fill.fill_price - entry_px) * qty
+            _append_trade({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "side": "EXIT",
+                "ticker": ticker,
+                "px": round(fill.fill_price, 4),
+                "qty": qty,
+                "momentum_score": "",
+                "pnl_usd": round(pnl_usd, 2),
+                "pnl_pct": round((fill.fill_price / entry_px - 1.0) * 100, 4)
+                              if entry_px > 0 else "",
+                "session_id": state.get("session_id", ""),
+                "config_version": PARAMS["version"],
+            })
+            _write_canonical_exit(
+                ticker=ticker, qty=qty, fill_px=fill.fill_price,
+                entry_px=entry_px, entry_ts=str(holding.get("entry_ts") or ""),
+                pnl_usd=pnl_usd, reason="rebalance_drop",
+            )
+            current.pop(ticker, None)
+            state["trade_count"] = int(state.get("trade_count", 0)) + 1
+            sells.append({"ticker": ticker, "qty": qty,
+                          "exit_px": fill.fill_price, "pnl_usd": pnl_usd})
+
+        buys = []
+        for ticker in to_buy:
+            est_px = last_px.get(ticker)
+            if not est_px or est_px <= 0:
+                log.warning("ENTRY skipped for %s: no estimated price", ticker)
+                continue
+            qty = int(per_pick_usd // est_px)
+            if qty < 1:
+                log.warning("ENTRY skipped for %s: per_pick_usd=%.2f / est_px=%.2f → qty<1",
+                              ticker, per_pick_usd, est_px)
+                continue
+            contract = ibkr.make_contract(ticker, "etf")
+            try:
+                ib.qualifyContracts(contract)
+            except Exception as exc:
+                log.error("qualifyContracts(%s) failed: %s", ticker, exc)
+                continue
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION %s qty=%.0f — skipping entry",
+                              ticker, existing)
+                continue
+            fill = _submit_market_order(ib, contract, "BUY", qty,
+                                          est_px=est_px)
+            if fill is None:
+                continue
+            current[ticker] = {
+                "entry_ts": datetime.now(timezone.utc).isoformat(),
+                "entry_px": float(fill.fill_price),
+                "qty": int(qty),
+                "momentum_score": score_by_ticker.get(ticker, 0.0),
+            }
+            state["trade_count"] = int(state.get("trade_count", 0)) + 1
+            _append_trade({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "side": "ENTRY",
+                "ticker": ticker,
+                "px": round(fill.fill_price, 4),
+                "qty": qty,
+                "momentum_score": round(score_by_ticker.get(ticker, 0.0), 6),
+                "pnl_usd": "",
+                "pnl_pct": "",
+                "session_id": state.get("session_id", ""),
+                "config_version": PARAMS["version"],
+            })
+            _write_canonical_entry(
+                ticker=ticker, qty=qty, fill_px=fill.fill_price,
+                score=score_by_ticker.get(ticker, 0.0),
+                anchor_at_fill=anchor,
+            )
+            buys.append({"ticker": ticker, "qty": qty,
+                          "entry_px": fill.fill_price})
+
+        state["current_picks"] = current
+        state["last_rebalance_month"] = now_utc.strftime("%Y-%m")
+        state["last_rebalance"] = {
+            "ts": now_utc.isoformat(),
+            "picks": sorted(pick_tickers),
+            "sells": sells,
+            "buys": buys,
+            "alloc_factor": alloc_factor,
+            "per_pick_usd": round(per_pick_usd, 2),
+        }
+        _save_state(state)
+        _write_heartbeat(state, last_rebalance=state["last_rebalance"])
+
+        summary["action"] = "rebalanced"
+        summary["sells"] = sells
+        summary["buys"] = buys
+        summary["picks"] = sorted(pick_tickers)
+        return summary
+    finally:
+        try:
+            ibkr.disconnect(ib)
+        except Exception:
+            pass
+
+
+def loop_mode() -> None:
+    """Daily wake at eval_hour_utc:eval_minute_utc. Skips if not first
+    wake of the month."""
+    log.info("xs_momentum --loop started: daily wake at %02d:%02d UTC",
+             PARAMS["eval_hour_utc"], PARAMS["eval_minute_utc"])
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            fire = now.replace(hour=PARAMS["eval_hour_utc"],
+                                minute=PARAMS["eval_minute_utc"],
+                                second=15, microsecond=0)
+            if fire <= now:
+                fire += timedelta(days=1)
+            sleep_s = max(5.0, (fire - now).total_seconds())
+            log.info("xs_momentum next wake at %s UTC (sleep %.0fs)",
+                     fire.isoformat(), sleep_s)
+            time.sleep(sleep_s)
+            try:
+                evaluate_once()
+            except Exception as exc:
+                log.error("evaluate_once failed: %s", exc, exc_info=True)
+                time.sleep(120)
+        except KeyboardInterrupt:
+            log.info("xs_momentum loop stopped by user")
+            return
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -290,12 +683,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--period", default="10y")
     parser.add_argument("--check", action="store_true")
-    parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--evaluate", action="store_true",
+                          help="One rebalance cycle (no-op if not month-start)")
+    parser.add_argument("--force", action="store_true",
+                          help="With --evaluate: rebalance even if not month-start")
+    parser.add_argument("--loop", action="store_true",
+                          help="Daemon: daily wake, rebalance only on first wake of month")
     parser.add_argument("--signal-only", action="store_true")
     args = parser.parse_args(argv)
 
     global _SIGNAL_ONLY_MODE
     _SIGNAL_ONLY_MODE = bool(args.signal_only)
+    if _SIGNAL_ONLY_MODE:
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
 
     if args.backtest:
         stats = backtest(period=args.period)
@@ -320,6 +720,15 @@ def main(argv: list[str] | None = None) -> int:
             "ranking": [{"ticker": s.ticker, "score": round(s.score * 100, 2)} for s in ranked],
             "picks": [{"ticker": p.ticker, "score": round(p.score * 100, 2)} for p in picks],
         }, indent=2, default=str))
+        return 0
+
+    if args.evaluate:
+        summary = evaluate_once(force=args.force)
+        print(json.dumps(summary, indent=2, default=str))
+        return 0
+
+    if args.loop:
+        loop_mode()
         return 0
 
     parser.print_help()

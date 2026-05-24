@@ -19,12 +19,17 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _load_webhook_url() -> str:
+    # Precedence (highest first): env var → secrets/discord.env → .env
+    # The secrets/ path is .gitignored so operators can rotate the webhook
+    # without touching tracked files. .env is kept for back-compat during
+    # the migration; remove once all 30 consumers also read from secrets/.
     url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if url:
         return url
-    env_path = REPO / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
+    for candidate in (REPO / "secrets" / "discord.env", REPO / ".env"):
+        if not candidate.exists():
+            continue
+        for line in candidate.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line.startswith("DISCORD_WEBHOOK_URL=") and not line.startswith("#"):
                 val = line.split("=", 1)[1].strip().strip('"').strip("'")

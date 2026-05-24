@@ -173,7 +173,32 @@ def evaluate_once() -> None:
         if state.get("open_trade"):
             ot = state["open_trade"]
 
-            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+            # 2026-05-23 self-heal: stale signal_only open_trade from a prior
+            # connect-fail wake should NOT block real entries forever. If we
+            # now have a real IBKR connection and broker confirms flat,
+            # clear the phantom state so the signal evaluator can run.
+            if (ib is not None
+                and ot.get("execution_venue") == "signal_only"):
+                try:
+                    contract_check = ibkr.qualify_front_month_future(ib, "MNQ")
+                    broker_qty = ibkr.query_position(ib, contract_check)
+                except Exception as exc:
+                    log.warning("self-heal broker-position check failed: %s", exc)
+                    broker_qty = None
+                if broker_qty == 0:
+                    log.warning(
+                        "STALE_SIGNAL_ONLY: clearing phantom open_trade "
+                        "(entry_ts=%s, signal-only entry never had real "
+                        "broker position) so live signals can resume",
+                        ot.get("entry_ts"),
+                    )
+                    state["open_trade"] = None
+                    _save_state(state)
+                    ot = None  # fall through to signal evaluation below
+
+            if ot is None:
+                pass
+            elif ib is not None and ot.get("execution_venue") == "ibkr_paper":
                 contract = ibkr.qualify_front_month_future(ib, "MNQ")
                 try:
                     outcome = ibkr.check_bracket_filled(

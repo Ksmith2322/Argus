@@ -16,6 +16,32 @@ yfinance characteristics for our use case:
     - Returns OHLCV DataFrame with Date index
 
 Free, no API key, already in the venv (yfinance 1.2.0).
+
+─────────────────────────────────────────────────────────────────────────
+auto_adjust convention (Argus repo-wide, 2026-05-23):
+
+This module + `helio.yfinance_cache` both default to `auto_adjust=False`
+so their on-disk caches are RAW market closes (the price you would
+actually have transacted at). The promotion_gate baselines and the
+backtest factory all consume from these caches, so they're all aligned.
+
+When a *live runner* calls `yf.download` directly:
+  - Intraday / futures / FX → auto_adjust is irrelevant (no splits/divs
+    at 1h granularity for stocks; futures+FX have no divs).
+  - Daily equity/ETF strategies where the dividend itself IS part of
+    the return (cross-asset rotation, monthly cadence, dividend-heavy
+    ETFs like TLT, IEF, VEA) → use auto_adjust=True so the dividend
+    cash flow is reflected in the trailing-return calculation. Document
+    the choice at the call site.
+  - Daily equity/ETF regime indicators (SMA, ATR, RSI) → auto_adjust=True
+    avoids ex-dividend discontinuities fooling the indicator. Document.
+
+If a strategy's backtest CI bounds in promotion_gate_baseline.json were
+computed at one setting and its live runner uses the other, the live PF
+will diverge from the baseline and live_gate_monitor will throw spurious
+WARNING/FAIL verdicts. Keep the live runner consistent with whatever
+auto_adjust setting was used to produce its committed baseline.
+─────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 

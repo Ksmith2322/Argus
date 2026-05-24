@@ -5,7 +5,7 @@ param(
     [string]$RunId = ""
 )
 
-$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.101"
 $LOCAL_DIR = "C:\Argus\repo\ops\logs\pc2"
 
 if (!(Test-Path $LOCAL_DIR)) {

@@ -642,7 +642,7 @@ Rules:
 # TWO-MACHINE SETUP
 
   PC1 (WINDOWS-5RCTEK3): runner_unified.py 24/7, dev work
-  PC2 (DESKTOP-17CJMUP / 192.168.1.98): offloaded backtest jobs
+  PC2 (DESKTOP-17CJMUP / 192.168.1.101): offloaded backtest jobs
 
   Coupling risks (acknowledged):
     - ops/logs/ local to each machine (NOT in git, NOT canonical)
