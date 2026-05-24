@@ -106,6 +106,43 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### Momentum crash filter on xs_momentum — REJECTED (the filter hurts)
+
+Tested whether adding a Daniel-Moskowitz "Momentum Crashes" regime
+filter (skip rebalance when SPY 6mo return < 0 AND realized vol in top
+25%) would reduce xs_momentum's max DD.
+
+**Counter-intuitive result: the filter HURTS, not helps.**
+
+  Metric        Unfiltered    Filtered    Delta
+  PF            3.79          2.97        -0.82
+  Win rate      62.5%         57.5%       -5.0pts
+  Max DD        22.39%        36.36%      +13.97pts WORSE
+  Excluded:     0             8 trades
+  avg pnl of excluded:                    +9.60% (winners!)
+
+WHY THE FILTER FAILS
+
+The classical Daniel-Moskowitz finding is for single-asset-class
+momentum (US stock cross-sectional). For xs_momentum's broad-8
+universe (SPY/QQQ/IWM/DIA/EFA/EEM/**GLD/TLT**), the cross-sectional
+rank logic NATURALLY rotates INTO safe-haven assets (GLD, TLT)
+during bear + high-vol regimes — and those rotations are where the
+biggest upside concentration happens. The universe IS the regime
+filter.
+
+A regime filter that goes to cash during these conditions throws
+away the strategy's adaptive defensive behavior. The excluded trades
+in this backtest averaged +9.60% — they were exactly the winning
+defensive rotations into GLD/TLT during March 2020, late 2022, etc.
+
+NO ACTION. xs_momentum stays without the regime filter. The current
+DD profile is the strategy's natural floor at this universe.
+
+Audit re-runnable: `python -m ops.audit.run_xs_momentum_crash_filter`.
+
+---
+
 ### Dual-momentum trend-following on broad-8 — FAIL with nuance
 
 Tested per-asset absolute-momentum trend-following (Antonacci-style)
