@@ -2755,6 +2755,78 @@ async def api_cohort_gate_status():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/roster_state")
+async def api_roster_state():
+    """Roster classification — every strategy bucketed into ACTIVE /
+    KILLED / PENDING_OPT_IN / LIMBO / ABANDONED. Single source of
+    truth for 'what's the actual state of the fleet right now'.
+
+    Composes allocation_factors + KILLED_STRATEGY_CUTOFFS + the
+    ACTIVE_ROSTER test pin + runner-file inventory.
+
+    Cheap (~10ms); no caching."""
+    try:
+        from ops.audit.run_roster_state import classify_all
+        rows = classify_all()
+        counts: dict = {}
+        for r in rows:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        return JSONResponse({
+            "verdict_counts": counts,
+            "strategies": rows,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "roster_state failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/real_money_preflight")
+async def api_real_money_preflight():
+    """12-point real-money preflight per ACTIVE strategy.
+
+    Returns one StrategyPreflight per strategy in test_sunset_roster.ACTIVE_ROSTER.
+    Each entry has verdict (READY_FOR_REAL / BLOCKED_PENDING_REVIEW / BLOCKED)
+    + per-check GREEN/YELLOW/RED breakdown.
+
+    Computes on-demand; ~100ms (incl. capacity_stress.json read + heartbeat
+    stat calls). No mutations — diagnosis only."""
+    try:
+        from helio.real_money_preflight import evaluate_strategy
+        try:
+            from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+            strategies = sorted(ACTIVE_ROSTER)
+        except Exception:
+            strategies = []
+        results = []
+        for s in strategies:
+            try:
+                p = evaluate_strategy(s)
+                results.append(p.to_dict())
+            except Exception as exc:
+                results.append({"strategy": s, "error": str(exc)})
+        return JSONResponse({"strategies": results})
+    except Exception as e:
+        return JSONResponse({"error": "preflight failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/fleet_snapshot")
+async def api_fleet_snapshot():
+    """Composite fleet snapshot — roster + allocation + capacity + heartbeats
+    + canonical_fills + xs_momentum picks + preflight. Same content as
+    `python -m ops.audit.run_fleet_snapshot --json`.
+
+    More expensive (~3-5s if xs_momentum picks live yfinance fetch is
+    included). Pass ?skip_yf=1 to skip the yfinance query."""
+    try:
+        from ops.audit.run_fleet_snapshot import build_snapshot
+        snapshot = build_snapshot()
+        return JSONResponse(snapshot)
+    except Exception as e:
+        return JSONResponse({"error": "fleet_snapshot failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/governance_health")
 async def api_governance_health():
     """Governance report freshness — shows what's blocking transitions."""
