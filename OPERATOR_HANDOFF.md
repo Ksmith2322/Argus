@@ -196,6 +196,46 @@ Operator items:
 
 ---
 
+## 2.4. Run the real-money preflight before any allocation flip (new — 2026-05-24)
+
+The 12-point real-money preflight is now executable. Run before any
+decision to flip a strategy onto real money:
+
+```
+python -m ops.real_money_preflight --save
+```
+
+Current state (as of this commit):
+- **forge_xs_momentum**: BLOCKED — 7 GREEN / 2 YELLOW / 3 RED. Closest
+  to ready. Needs: 20+ live trades post-reset, real_money_allowlist
+  flipped, capacity stress re-run.
+- **forge_gld_pm_long**: BLOCKED — 6 GREEN / 2 YELLOW / 4 RED. Has a
+  STRUCTURAL block (disciplined-gate FAIL at 5bp slippage, CI lower
+  1.08 < 1.20 floor). Won't clear without strategy redesign.
+
+Output:
+- `ops/reports/system_audit/real_money_preflight.md` (markdown)
+- `ops/reports/system_audit/real_money_preflight_<UTC>.json` (machine-readable)
+
+Each strategy gets per-check GREEN/YELLOW/RED across:
+  1. in_active_roster
+  2. allocation_factor_positive
+  3. disciplined_gate_passes (at realistic slippage)
+  4. live_evidence_n (≥ 20 by default)
+  5. live_pf_band (live verdict ≠ FAIL/WARNING)
+  6. trade_source_is_live (not pre-reset archive)
+  7. capacity_headroom_2x
+  8. real_money_allowlist
+  9. evidence_epoch_clean
+  10. killed_strategy_invariant
+  11. heartbeat_fresh (≤ 24h)
+  12. halt_flag_absent
+
+Exit codes: 0 if all READY_FOR_REAL, 1 if any BLOCKED_PENDING_REVIEW
+(YELLOWs only), 2 if any BLOCKED (REDs).
+
+---
+
 ## 2.5. Register the daily auto-pause cron (new — 2026-05-24)
 
 The auto-pause loop alerts when a strategy's live PF crosses the FAIL
