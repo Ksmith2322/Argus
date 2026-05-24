@@ -1125,6 +1125,106 @@ def close_position_market(
     return fill
 
 
+def submit_market_with_boundary(
+    ib: IB,
+    contract: Contract,
+    action: str,            # "BUY" or "SELL"
+    size: int,
+    *,
+    strategy_label: str,
+    est_px: float,
+    timeout_s: float = 30.0,
+) -> Optional[FillResult]:
+    """Plain market-order submission gated by the same safety chain as
+    submit_bracket() — without requiring stop/target brackets.
+
+    Used by calendar-cadence strategies (forge_xs_momentum monthly
+    rebalance, forge_tom_spy / forge_nov_spy event-window holds) whose
+    exit is calendar-based, not price-stop-based. Centralises the
+    real-money boundary + halt + flatten + market-open checks so the
+    static safety-invariant test passes (only this helper + a small
+    allowlist call ib.placeOrder directly).
+
+    Returns:
+      FillResult with filled=True on success
+      FillResult with filled=False + reject_reason on guard failure
+      None on REAL_MONEY_BOUNDARY refusal (logged as ERROR)
+    """
+    # 1. Real-money boundary — must come first so a forbidden order can
+    #    be refused before any broker round-trip.
+    try:
+        from helio.real_money import (
+            enforce_real_money_boundary,
+            AccountBoundaryViolationError,
+        )
+        est_notional = abs(size) * float(est_px) if est_px and size else None
+        enforce_real_money_boundary(
+            ib, strategy_label=strategy_label, notional_usd=est_notional,
+        )
+    except AccountBoundaryViolationError as exc:
+        log.error(
+            f"REAL_MONEY_BOUNDARY: refusing {action} {size} {contract.symbol} "
+            f"strategy={strategy_label} — {exc}"
+        )
+        return None
+
+    # 2. Killed-strategy runtime invariant.
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS
+        if strategy_label in KILLED_STRATEGY_CUTOFFS:
+            cutoff = KILLED_STRATEGY_CUTOFFS[strategy_label]
+            log.error(
+                f"KILLED_STRATEGY: refusing {action} {size} {contract.symbol} "
+                f"— {strategy_label} killed on {cutoff}"
+            )
+            return FillResult(filled=False,
+                                reject_reason=f"killed_strategy:{strategy_label}:{cutoff}")
+    except ImportError:
+        log.error(f"KILL_REGISTRY_UNREADABLE: refusing {strategy_label}")
+        return FillResult(filled=False, reject_reason="kill_registry_unreadable")
+
+    # 3. Fleet-wide halt.
+    halted, halt_reason = is_fleet_halted()
+    if halted:
+        log.warning(
+            f"FLEET_HALTED: refusing {action} {size} {contract.symbol}. "
+            f"Reason: {halt_reason}"
+        )
+        return FillResult(filled=False,
+                            reject_reason=f"fleet_halted:{halt_reason[:64]}")
+
+    # 4. Emergency flatten flag.
+    flatten_active, flatten_reason = is_flatten_active()
+    if flatten_active:
+        log.warning(
+            f"FLATTEN_EOD active: refusing {action} {size} {contract.symbol}"
+        )
+        return FillResult(filled=False,
+                            reject_reason=f"flatten_eod:{flatten_reason[:64]}")
+
+    # 5. Market open check.
+    if not is_market_open(contract):
+        log.warning(
+            f"MARKET_CLOSED: refusing {action} {size} {contract.symbol}"
+        )
+        return FillResult(filled=False, reject_reason="market_closed")
+
+    # 6. All guards passed — submit.
+    order = MarketOrder(action, abs(size))
+    trade = ib.placeOrder(contract, order)
+    fill = _wait_for_fill(ib, trade, timeout_s=timeout_s)
+    if fill.filled:
+        log.info(
+            f"MARKET {action} {size} {contract.symbol} @ {fill.fill_price:.4f}"
+        )
+    else:
+        log.error(
+            f"MARKET {action} {size} {contract.symbol} FAILED: "
+            f"{fill.reject_reason}"
+        )
+    return fill
+
+
 def check_bracket_filled(
     ib: IB,
     contract: Contract,

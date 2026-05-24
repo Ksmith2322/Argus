@@ -57,6 +57,9 @@ ALLOWED_DIRECT_PLACEORDER = {
     # because the placeOrder calls bypass the central executor BUT the
     # locks make it categorically paper-only.
     "ops/stress_injector.py",
+    # Static-analysis tool that mentions `ib.placeOrder(...)` in its
+    # docstring; doesn't actually call placeOrder.
+    "ops/audit/order_lifecycle_audit.py",
     # ── Known tech-debt below: TODO migrate to submit_bracket path ──
     # These runners bypass the central executor; add real_money boundary
     # before they go live. Tracked in fix-by-5/31 queue.

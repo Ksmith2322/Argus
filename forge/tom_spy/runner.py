@@ -165,40 +165,18 @@ def is_tom_exit_day(today: date) -> bool:
 
 def _submit_market(ib, contract, action: str, qty: int, *, est_px: float,
                     timeout_s: float = 30.0):
-    """Plain market order with real-money boundary check + halt check +
-    market-open check. Mirrors the helper used in xs_momentum runner."""
-    from ib_insync import MarketOrder
-    try:
-        from helio.real_money import (
-            enforce_real_money_boundary,
-            AccountBoundaryViolationError,
-        )
-        est_notional = abs(qty) * float(est_px) if est_px and qty else None
-        enforce_real_money_boundary(
-            ib, strategy_label=STRATEGY_LABEL, notional_usd=est_notional,
-        )
-    except AccountBoundaryViolationError as exc:
-        log.error("REAL_MONEY_BOUNDARY refusing %s %d %s: %s",
-                  action, qty, contract.symbol, exc)
+    """Thin wrapper around helio.ibkr_execution.submit_market_with_boundary.
+    Kept as a per-strategy shim so call sites stay short. The actual
+    real-money boundary + halt + flatten + market-open checks live in
+    the central helper (static-safety-invariant compliant)."""
+    fill = ibkr.submit_market_with_boundary(
+        ib, contract, action, qty,
+        strategy_label=STRATEGY_LABEL,
+        est_px=est_px,
+        timeout_s=timeout_s,
+    )
+    if fill is None or not fill.filled:
         return None
-    halted, reason = ibkr.is_fleet_halted()
-    if halted:
-        log.warning("FLEET_HALTED refusing %s %d %s: %s",
-                    action, qty, contract.symbol, reason)
-        return None
-    if not ibkr.is_market_open(contract):
-        log.warning("MARKET_CLOSED refusing %s %d %s",
-                    action, qty, contract.symbol)
-        return None
-    order = MarketOrder(action, abs(qty))
-    trade = ib.placeOrder(contract, order)
-    fill = ibkr._wait_for_fill(ib, trade, timeout_s=timeout_s)
-    if not fill.filled:
-        log.error("MARKET %s %d %s FAILED: %s",
-                  action, qty, contract.symbol, fill.reject_reason)
-        return None
-    log.info("MARKET %s %d %s @ %.4f", action, qty,
-             contract.symbol, fill.fill_price)
     return fill
 
 

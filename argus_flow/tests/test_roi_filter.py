@@ -59,9 +59,9 @@ def test_backfill_null_anchor_excluded():
 def test_epoch_boundary_excludes_pre_epoch():
     rows = [
         {"ts": "2026-04-25T10:00:00+00:00", "strategy": "forge_nq_overnight",
-         "symbol": "MNQ", "size": 1, "pnl_usd": 50.0},
-        {"ts": "2026-06-02T10:00:00+00:00", "strategy": "forge_nq_overnight",
-         "symbol": "MNQ", "size": 1, "pnl_usd": 75.0},
+         "symbol": "SPY", "size": 1, "pnl_usd": 50.0},
+        {"ts": "2026-06-02T10:00:00+00:00", "strategy": "forge_xs_momentum",
+         "symbol": "SPY", "size": 1, "pnl_usd": 75.0},
     ]
     kept, stats = rf.filter_fills(rows, epoch_start="2026-06-01")
     assert len(kept) == 1
