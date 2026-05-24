@@ -14,31 +14,63 @@ by criticality.
 ## 0. New candidate: forge_tom_spy (2026-05-24 — needs your call)
 
 The new-strategy hunt produced its first candidate: classical turn-of-month
-(TOM) effect on SPY. Backtest-only at this point (no live runner yet).
+(TOM) effect on SPY. **Live runner is now built**; operator needs to
+decide whether to (1) add to ACTIVE_ROSTER and (2) flip allocation_factor
+above 0.0.
 
-20-year disciplined-gate result:
-- PF point estimate **1.90**, CI lower **1.215** at 10bps slippage
-- WR 64.2%, n=240 trades
-- CAGR 7.26%, max DD 13.87% (vs SPY buy-and-hold 11.37%/30%+)
-- PARTIAL_PASS verdict (6/9 layers — H1/H2 sub-sample CIs dip below
-  the 1.20 floor independently, but the point PF in H1 (1.717) and H2
-  (1.721) are virtually identical → effect IS persistent across decades)
+### Evidence stack
 
-Cross-decade OOS validation:
-- pre-2006: PF 1.59 (n=155)
-- 2006-2016: PF 1.68 (n=120)
-- 2016-2026: PF 1.76 (n=124) — the effect is actually STRONGER in modern data
+**20-year disciplined gate** (n=240):
+- PF 1.90, IID CI lower 1.215 at 10bps slippage — passes 1.20 floor
+- Block bootstrap (b=3,5,8): all pass
+- Period-stability sub-samples fail individually (n=120 each) but point
+  PFs are 1.717 / 1.721 — effect is consistent, just sample-limited
+- **PARTIAL_PASS (6/9 layers)**
 
-Operator decision: do you want to add this to the roster?
-- Recommended: add `forge_tom_spy` at 0.3× allocation as a third
-  diversifying strategy (TOM is only in-market 33% of trading days,
-  reducing concentration risk).
-- A live runner needs to be built (separate batch — daily-cadence
-  market orders on SPY, no brackets). Until then, allocation should
-  stay at 0.0× even if you decide to add it to the active roster pin.
+**Cross-decade OOS**:
+- pre-2006: PF 1.59 / 2006-2016: PF 1.68 / 2016-2026: **PF 1.76**
+- The "TOM was arbitraged out post-2000" literature claim is contradicted
+  by SPY data
 
-Full report: `ops/reports/system_audit/tom_spy_evaluation.md`. Re-run
-anytime: `python -m ops.audit.run_tom_spy_evaluation`.
+**Cohort risk audit** (`ops/reports/system_audit/cohort_risk_audit.md`):
+- tom_spy ↔ xs_momentum correlation: **0.03** (essentially uncorrelated
+  despite both trading SPY direction — different time-of-month exposure)
+- Adding tom_spy at 0.3× to current portfolio: max DD 17.11% → **14.08%**
+  (−18%), vol 10.78% → 9.11% (−15%), Sharpe 0.54 → 0.58
+- Cost: 0.45%/yr CAGR reduction
+
+### How to activate
+
+1. Edit `argus_flow/tests/test_sunset_roster.py`: add `"forge_tom_spy"`
+   to `ACTIVE_ROSTER`. The test_active_roster_is_exactly_xs_momentum_and_gld_pm_long
+   pin will fail until you do this — by design, so re-activation requires
+   a deliberate test edit.
+2. Edit `argus_flow/configs/allocation_factors.json`: add
+   `"forge_tom_spy": 0.3` to `factors` and a `_kill_log` line noting
+   the recalibration source.
+3. Run `python -m forge.tom_spy.runner --check` to confirm today's
+   action (should print `is_tom_entry_day` and `is_tom_exit_day` flags).
+4. Launch the daemon:
+   ```powershell
+   $env:IBKR_PORT = '7497'
+   Start-Process -FilePath 'C:\Argus\.venv\Scripts\python.exe' `
+     -ArgumentList '-m','forge.tom_spy.runner','--loop' `
+     -WorkingDirectory 'C:\Argus\repo' -WindowStyle Hidden
+   ```
+5. The runner is calendar-aware; first action will be the next entry
+   day (likely the 4th-to-last weekday of either May or June 2026 —
+   `--check` will tell you).
+
+### Russell reconstitution candidate — NULL RESULT
+
+Also tested IWM around the annual late-June Russell rebalance Friday.
+Across 16 years (2010-2025), no window reaches conventional significance:
+- pre5_to_friday: mean +1.03%, t=+1.45 (best targeted window, ns)
+- full_20day: mean +1.82%, t=+1.88 (most cumulative)
+
+The Russell recon edge requires targeted add/delete trades (specific
+predicted stocks), not a broad IWM bet. That's a much bigger data
+project. Report at `ops/reports/system_audit/russell_recon_research.md`.
 
 ---
 
