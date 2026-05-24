@@ -27,20 +27,44 @@ from typing import Iterable
 #
 # This list should be maintained alongside helio.roi_filter.KILLED_STRATEGY_CUTOFFS.
 KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
+    # Tier 1 explicit kills
     "forge_spy_mean_rev":     ("SPY",),
     "forge_multi_orb":        ("QQQ", "MES"),
     "forge_vix_intraday":     ("UVXY", "VIX"),
     "forge_nq_london_close":  ("MNQ", "NQ"),
     # 2026-05-23 rigor sprint killer:
     "forge_nq_overnight":     ("MNQ", "NQ"),
-    # PEAD's 16-name Apollo watchlist — broadest set so orphan
-    # detection covers any of them. The watchlist source is
-    # apollo/data/core_watchlist.json.
+    "forge_spy_trend_follower": ("SPY",),
+    # PEAD's 18-name Apollo watchlist (forge_pead 5/19 + Apollo core)
     "forge_pead":             (
         "AAPL", "AMD", "AMZN", "ARM", "GILD", "GOOGL", "INTC",
         "KLAC", "LRCX", "MRNA", "MU", "PEP", "PLTR", "REGN",
         "SOFI", "TMO", "TSM", "WMT",
     ),
+    # 2026-05-20 sunset batch — formalized into kill registry 2026-05-24
+    "forge_vix_carry":        ("SVXY", "VIX"),
+    "forge_coint_pairs":      ("KO", "PEP", "XOM", "CVX", "HD", "LOW",
+                                  "GLD", "SLV", "EWZ", "EWW", "TLT", "IEF",
+                                  "V", "MA", "MSFT", "GOOGL"),
+    "forge_aud_asian_breakout": ("AUDUSD",),
+    "forge_cuebanks":         ("YM", "MYM"),
+    "forge_mamba":            ("YM", "MYM", "NQ", "MNQ"),
+    "forge_tori":             ("YM", "MYM"),
+    "forge_jpy_pm_short":     ("USDJPY",),
+    "forge_wick_gbpusd":      ("GBPUSD",),
+    "forge_vix_revert":       ("UVXY", "VIX"),
+    "forge_fomc_drift":       ("SPY",),
+    "forge_tom_international": ("EEM", "EWJ", "VGK", "EFA", "FXI", "INDA"),
+    "forge_rebalance":        ("SPY",),
+    "forge_atlas":            ("SPY",),  # regime classifier; SPY proxy
+    "forge_themis":           ("SPY",),
+    "forge_gdx_gld":          ("GDX", "GLD"),
+    "apollo":                  (),  # scanner; no direct positions
+    "hermes":                  (),  # scanner
+    "titan":                   (),  # scanner
+    "argus_gbpusd":           ("GBPUSD",),
+    "argus_usdjpy":           ("USDJPY",),
+    "argus_cadjpy":           ("CADJPY",),
 }
 
 

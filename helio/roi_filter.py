@@ -42,16 +42,48 @@ PHANTOM_TRADES: list[dict] = [
 # Killed strategy → effective kill date. Rows from these strategies AFTER
 # their kill date are quarantined.
 KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
+    # Tier 1 explicit kills (each documented in allocation_factors._kill_log)
     "forge_spy_mean_rev": "2026-04-30",
     "forge_multi_orb": "2026-05-07",
     "forge_vix_intraday": "2026-05-12",
     "forge_nq_london_close": "2026-05-13",
-    # 2026-05-23 rigor sprint: both failed the disciplined gate at
-    # REALISTIC slippage (PEAD CI lower 1.025 @ 40bps; NQ overnight
-    # CI lower 0.526 @ 7bps). Source:
-    # ops/audit/run_slippage_recalibration.py + commit ac45592.
-    "forge_pead": "2026-05-23",
-    "forge_nq_overnight": "2026-05-23",
+    # 2026-05-20 sunset batch — formalized into kill registry on 2026-05-24
+    # per operator instruction ("make sure the poor performers are killed").
+    # Each strategy was already at allocation=0.0 from 2026-05-20 but lacked
+    # the kill-registry entry that triggers the submit_bracket runtime
+    # invariant. Project memory:
+    # project_2026_05_19_new_edge_candidates + project_2026_05_20_*
+    # If any of these are revived in the future, the operator must
+    # remove them from this dict (and document the reason).
+    "forge_vix_carry":           "2026-05-19",  # backtest -3.07% CAGR / -33% DD / PF 1.01 across 6 variants
+    "forge_coint_pairs":         "2026-05-20",  # 0/4 architect candidates; PF 0.91 across 8 pairs
+    "forge_aud_asian_breakout":  "2026-05-20",  # no edge in production
+    "forge_cuebanks":            "2026-05-20",  # YM YouTube replica, 0 fills post-CBOT fix
+    "forge_mamba":               "2026-05-20",  # YM YouTube replica
+    "forge_tori":                "2026-05-20",  # YM YouTube replica
+    "forge_jpy_pm_short":        "2026-05-20",  # FX, no edge in production
+    "forge_wick_gbpusd":         "2026-05-20",
+    "forge_vix_revert":          "2026-05-20",
+    "forge_fomc_drift":          "2026-05-20",  # resurrection denied 2026-05-24 (CI lower 0.526 @ 7bps post-QE)
+    "forge_tom_international":   "2026-05-20",  # event-driven 0-fire pair
+    "forge_rebalance":           "2026-05-20",  # annual event archived
+    "forge_atlas":                "2026-05-20",  # Greek scanner archived (regime classifier)
+    "forge_themis":               "2026-05-20",  # Greek scanner archived
+    "forge_gdx_gld":              "2026-05-20",  # shadow strategy, no allocation
+    "apollo":                     "2026-05-20",  # Greek scanner; data file used by forge_pead directly
+    "hermes":                     "2026-05-20",  # earnings scanner; role absorbed into forge_pead
+    "titan":                      "2026-05-20",  # Greek scanner archived
+    "argus_gbpusd":               "2026-05-20",  # FX cap-vs-risk conflict, silent
+    "argus_usdjpy":               "2026-05-20",
+    "argus_cadjpy":               "2026-05-20",
+    # 2026-05-23 rigor sprint: failed disciplined gate at REALISTIC slippage
+    # (PEAD CI lower 1.025 @ 40bps; NQ overnight CI lower 0.526 @ 7bps).
+    # Source: ops/audit/run_slippage_recalibration.py + commit ac45592.
+    "forge_pead":                "2026-05-23",
+    "forge_nq_overnight":        "2026-05-23",
+    # 2026-05-23 concentrate-on-winner reweight: 0.614 correlation with
+    # xs_momentum, redundant beta. Could be revived as a benchmark.
+    "forge_spy_trend_follower":  "2026-05-23",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

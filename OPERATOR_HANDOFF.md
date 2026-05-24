@@ -423,6 +423,54 @@ Operator items:
 
 ---
 
+## 2.2. Roster is now formally classified — 2 ACTIVE / 28 KILLED (new — 2026-05-24)
+
+Per your direction ("make sure the poor performers are killed, archive
+in a month or so if no revival"), every strategy that was at
+allocation=0.0 but NOT in the formal kill registry has been moved into
+`KILLED_STRATEGY_CUTOFFS`. This closes a real safety gap: previously
+those LIMBO strategies could have been started by an accidental runner
+launch and the runtime invariant wouldn't have refused entries.
+
+CURRENT STATE (run `python -m ops.audit.run_roster_state`):
+
+  ACTIVE:           forge_xs_momentum (1.0×) + forge_gld_pm_long (0.5×)
+  PENDING_OPT_IN:   forge_tom_spy (built, awaiting your call)
+                    forge_nov_spy (built, awaiting your call)
+  KILLED:           28 strategies (every other entry in
+                    allocation_factors.json, plus the 3 argus FX pairs +
+                    apollo + hermes + titan Greek scanners)
+  LIMBO:            0
+  ABANDONED:        0
+
+The kill is enforced at 3 layers:
+  1. allocation_factor = 0.0 (capital layer)
+  2. helio.roi_filter.KILLED_STRATEGY_CUTOFFS (runtime invariant —
+     submit_bracket refuses entries from these strategies)
+  3. helio.fleet_monitor.SYSTEMS no_restart=True (process layer — fleet
+     monitor doesn't auto-restart a dead runner)
+
+REVIVAL PROCESS (when you want to bring one back in a month)
+
+Each killed strategy is removed by:
+  1. Edit helio/roi_filter.KILLED_STRATEGY_CUTOFFS — remove the entry
+  2. Add a kill-log line in allocation_factors.json explaining the
+     revival rationale + the disciplined-gate evidence supporting it
+  3. Flip allocation_factor > 0
+  4. If runner exists, restart it
+
+The kill registry test enforces these layers stay aligned (so a partial
+revert can't accidentally resurrect a killed strategy).
+
+NEW AUDIT SCRIPT
+
+`python -m ops.audit.run_roster_state` runs anytime + reports
+classification per strategy + flags LIMBO / ABANDONED entries.
+Returns exit code 0 if clean, 1 if drift is detected. Suitable for
+the daily health check chain if you want it added.
+
+---
+
 ## 2.25. epoch_reset now clears killed-strategy phantoms (new — 2026-05-24)
 
 Discovered tonight that the 5/22 reset DID NOT clear `state.open_trade`

@@ -37,33 +37,46 @@ def test_submit_bracket_source_refuses_killed_strategy():
 # ── 2. Exposure detection ──────────────────────────────────────────────────
 
 def test_find_orphans_returns_empty_when_no_killed_exposure():
+    """Positions only in symbols NOT claimed by any killed strategy → no
+    orphans. Note that as the kill registry grows, more symbols become
+    'claimed'; use a clearly-untouched ticker (FOO_TEST) for this test."""
     from helio.killed_strategy_invariant import find_killed_strategy_orphans
 
     positions = {
-        "GLD": {"direction": "LONG", "qty": 100},
-        "USDJPY": {"direction": "LONG", "qty": 50_000},
+        "FOO_TEST": {"direction": "LONG", "qty": 100},
     }
-    orphans = find_killed_strategy_orphans(positions, active_strategy_symbols={"GLD"})
+    orphans = find_killed_strategy_orphans(
+        positions, active_strategy_symbols={"FOO_TEST"},
+    )
     assert orphans == []
 
 
 def test_find_orphans_flags_killed_strategy_position():
+    """A position in a symbol claimed by AT LEAST ONE killed strategy
+    must be flagged. Multiple killed strategies can claim the same
+    symbol (e.g., UVXY → forge_vix_intraday + forge_vix_revert) — the
+    test asserts forge_vix_intraday is in the list, not exact count."""
     from helio.killed_strategy_invariant import find_killed_strategy_orphans
 
     positions = {
-        "UVXY": {"direction": "LONG", "qty": 283},  # forge_vix_intraday is killed
+        "UVXY": {"direction": "LONG", "qty": 283},
     }
     orphans = find_killed_strategy_orphans(positions, active_strategy_symbols=())
-    assert len(orphans) == 1
-    o = orphans[0]
-    assert o["strategy"] == "forge_vix_intraday"
-    assert o["symbol"] == "UVXY"
-    assert o["direction"] == "LONG"
-    assert o["qty"] == 283
-    assert o["has_unwind_ticket"] is False
+    assert len(orphans) >= 1
+    strategies = {o["strategy"] for o in orphans}
+    assert "forge_vix_intraday" in strategies
+    target = next(o for o in orphans
+                    if o["strategy"] == "forge_vix_intraday")
+    assert target["symbol"] == "UVXY"
+    assert target["direction"] == "LONG"
+    assert target["qty"] == 283
+    assert target["has_unwind_ticket"] is False
 
 
 def test_find_orphans_respects_active_unwind_ticket():
+    """An unwind ticket for ONE killed-strategy mapping doesn't affect
+    other killed strategies that also claim the symbol — each is
+    evaluated independently."""
     from helio.killed_strategy_invariant import find_killed_strategy_orphans
 
     positions = {
@@ -82,8 +95,10 @@ def test_find_orphans_respects_active_unwind_ticket():
     orphans = find_killed_strategy_orphans(
         positions, active_strategy_symbols=(), tickets=tickets, now=now,
     )
-    assert len(orphans) == 1
-    assert orphans[0]["has_unwind_ticket"] is True
+    # forge_vix_intraday's orphan now has a ticket
+    target = next(o for o in orphans
+                    if o["strategy"] == "forge_vix_intraday")
+    assert target["has_unwind_ticket"] is True
 
 
 def test_find_orphans_ignores_expired_ticket():
