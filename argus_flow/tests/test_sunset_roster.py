@@ -151,3 +151,32 @@ def test_post_reset_target_roster_size():
         f"Surviving fleet has {len(SURVIVING_FLEET)} strategies. The "
         f"sunset doc target is 4-6. Update the doc + this test if changing."
     )
+
+
+# 2026-05-23 rigor sprint: PEAD and NQ overnight failed the disciplined
+# gate at realistic slippage (PEAD 1.025 @ 40bps, NQ 0.526 @ 7bps), so
+# both were flipped to 0.0×. The ACTIVE roster (factor > 0) is now just
+# the two strategies that survive realistic execution costs.
+ACTIVE_ROSTER = {"forge_xs_momentum", "forge_gld_pm_long"}
+
+
+def test_active_roster_is_exactly_xs_momentum_and_gld_pm_long():
+    """Pin the post-slippage-recalibration active roster. Any future
+    re-activation of PEAD or NQ overnight requires a deliberate
+    operator decision (and a new line in _kill_log explaining what
+    changed about the edge). Other strategies can be added only after
+    they pass the disciplined gate at realistic slippage."""
+    factors = _load_factors().get("factors", {})
+    active = {k for k, v in factors.items() if float(v) > 0.0}
+    extras = active - ACTIVE_ROSTER
+    missing = ACTIVE_ROSTER - active
+    assert not extras, (
+        f"Unexpected strategies with allocation > 0: {extras}. "
+        f"To re-activate a sunset strategy, add it to ACTIVE_ROSTER here "
+        f"AND append a justification line to allocation_factors._kill_log."
+    )
+    assert not missing, (
+        f"Expected active strategies missing or zeroed: {missing}. "
+        f"To deactivate, remove from ACTIVE_ROSTER here AND append a "
+        f"justification line to allocation_factors._kill_log."
+    )

@@ -420,7 +420,14 @@ def scan() -> None:
     print(f"  Would trigger: {'LONG' if last_ts.hour in PARAMS['signal_hours_utc'] else 'no'}")
 
 
-def backtest(period: str = "2y") -> None:
+def backtest(period: str = "2y", return_trades: bool = False):
+    """Run the NQ overnight backtest.
+
+    When return_trades=False (default), prints summary stats and returns None
+    (back-compat). When return_trades=True, returns a list of trade dicts each
+    with date/hour/entry/exit/pnl_pts/pnl_atr/pnl_pct for downstream analysis
+    (e.g. slippage recalibration via promotion_panel).
+    """
     df = yf.download("NQ=F", period=period, interval="1h", progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -451,8 +458,14 @@ def backtest(period: str = "2y") -> None:
         if exit_px is None:
             exit_idx = min(i + PARAMS["hold_bars"], len(df) - 1)
             exit_px = C[exit_idx]
-        trades.append({"date": df.index[i], "hour": int(df.index[i].hour), "entry": entry, "exit": exit_px, "pnl_pts": exit_px - entry, "pnl_atr": (exit_px - entry) / a})
+        pnl_pct = (exit_px / entry - 1.0) * 100.0 if entry > 0 else 0.0
+        trades.append({"date": df.index[i], "hour": int(df.index[i].hour),
+                        "entry": entry, "exit": exit_px,
+                        "pnl_pts": exit_px - entry, "pnl_atr": (exit_px - entry) / a,
+                        "pnl_pct": pnl_pct})
         open_until = exit_idx
+    if return_trades:
+        return trades
     td = pd.DataFrame(trades)
     if td.empty:
         print("No trades.")

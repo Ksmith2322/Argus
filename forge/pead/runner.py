@@ -174,7 +174,8 @@ def _write_heartbeat(state: dict, last_scan: dict | None) -> None:
 # ── Backtest ───────────────────────────────────────────────────────────────
 
 def backtest(period: str = "5y", verbose: bool = False,
-             universe: list[str] | None = None) -> dict:
+             universe: list[str] | None = None,
+             return_trades: bool = False) -> dict:
     """Simulate PEAD across the universe's full earnings history.
 
     For each ticker:
@@ -346,7 +347,7 @@ def backtest(period: str = "5y", verbose: bool = False,
     except Exception:
         cagr = 0.0
 
-    return {
+    result = {
         "universe_size": len(universe),
         "trades": len(trades),
         "win_rate": round(wr, 3),
@@ -360,6 +361,9 @@ def backtest(period: str = "5y", verbose: bool = False,
         "per_ticker_trades": per_ticker,
         "exit_reason_breakdown": _count_reasons(trades),
     }
+    if return_trades:
+        result["trades_detail"] = trades
+    return result
 
 
 def _count_reasons(trades: list[dict]) -> dict:

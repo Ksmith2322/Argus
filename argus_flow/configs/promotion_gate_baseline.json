@@ -1,7 +1,7 @@
 {
-  "_comment": "Per-strategy disciplined-gate baseline. Each strategy's CI lower bound from the offline disciplined gate (promotion_panel 5 layers: 20y bootstrap + per-strategy slippage + block bootstrap + period stability + multi-testing). Live monitoring compares the strategy's ROLLING live PF against this baseline. Source: project_2026_05_22_backtest_factory_findings.md + 2026-05-23 audit Agent 2 slippage recalibration. Update this file when the gate is re-run against fresh evidence.",
-  "version": "2026-05-23.v2",
-  "_slippage_methodology": "slippage_bps_used is the bps figure that produced the published CI bounds. _slippage_bps_realistic is Agent 2's recalibration based on actual venue/instrument characteristics; until the gate is re-run at the realistic value, treat the published CI as an upper bound on edge.",
+  "_comment": "Per-strategy disciplined-gate baseline. Each strategy's CI lower bound from the offline disciplined gate (promotion_panel 5 layers: 20y bootstrap + per-strategy slippage + block bootstrap + period stability + multi-testing). Live monitoring compares the strategy's ROLLING live PF against this baseline. Source: project_2026_05_22_backtest_factory_findings.md + 2026-05-23 rigor sprint (ops/audit/run_slippage_recalibration.py).",
+  "version": "2026-05-23.v3",
+  "_slippage_methodology": "slippage_bps_used is the bps figure that produced the published_ci_95_lower_at_used. _slippage_bps_realistic is the Agent 2 calibration. recalibrated_ci_95_lower_at_realistic is the bootstrap CI lower bound when the panel is rerun at the realistic level. Sourced from ops/reports/system_audit/slippage_recalibration_*.json.",
   "generated_from": "promotion_panel applied to 20y backtests + archived live trades",
   "promotion_floor": 1.20,
   "alert_thresholds": {
@@ -51,7 +51,7 @@
     },
     "forge_nq_overnight": {
       "verdict": "FAIL",
-      "n_backtest": 713,
+      "n_backtest": 698,
       "point_pf": 0.885,
       "ci_95_lower": 0.73,
       "ci_95_upper": 1.07,
@@ -60,20 +60,26 @@
       "p_value": null,
       "slippage_bps_used": 3,
       "_slippage_bps_realistic": 7,
-      "notes": "Net loser even at 3bp slippage. 713 trades / 2y. Don't promote to real money. Agent 2 5/23 audit: realistic overnight NQ/MNQ slippage is closer to 5-10bps because of widening into ETH session and the higher spread paid on MNQ vs full NQ — re-run at 7bps would push CI lower further below 1.0. Monitor live: if rolling PF >= 1.0 persistently across 50+ trades, re-evaluate."
+      "published_ci_95_lower_at_used": 0.73,
+      "recalibrated_ci_95_lower_at_realistic": 0.526,
+      "recalibration_source": "ops/audit/run_slippage_recalibration.py 2026-05-23",
+      "notes": "Net loser even at 3bp slippage. 2026-05-23 recalibration at realistic 7bps: IID CI lower drops from 0.73 → 0.526. Edge does NOT exist at honest execution costs; this is a money-loser with 95% confidence. RECOMMEND: allocation_factor → 0.0. Don't continue to deploy capital here for 'evidence collection' — the disciplined gate has already answered."
     },
     "forge_pead": {
       "verdict": "FAIL",
-      "n_backtest": 68,
-      "point_pf": 2.33,
-      "ci_95_lower": 1.17,
-      "ci_95_upper": 4.19,
+      "n_backtest": 69,
+      "point_pf": 2.30,
+      "ci_95_lower": 1.10,
+      "ci_95_upper": 3.30,
       "max_dd_pct": null,
       "config": "Apollo 16 curated, 5y, 1.5 ATR stop, hold_days=20",
       "p_value": null,
       "slippage_bps_used": 10,
       "_slippage_bps_realistic": 40,
-      "notes": "CI lower 1.17 — literally 0.03 below 1.20 floor at 10bps. Agent 2 5/23 audit: PEAD entries hit earnings-week wide spreads + occasional gap-fill chasing; realistic slippage is 30-50bps. Re-run at 40bps would push CI lower significantly below 1.0. Non-curated SPX-50 also fails (CI lower 1.07 at 10bps). Edge IS real in spec, sample IS too small AND realistic execution drag may eliminate it. ACTION: re-run promotion_panel at 40bps before claiming edge."
+      "published_ci_95_lower_at_used": 1.10,
+      "recalibrated_ci_95_lower_at_realistic": 1.025,
+      "recalibration_source": "ops/audit/run_slippage_recalibration.py 2026-05-23",
+      "notes": "2026-05-23 recalibration: at realistic 40bps slippage (PEAD entries hit earnings-week wide spreads + gap-fill chasing), curated-universe IID CI lower drops to 1.025 — essentially breakeven, 17.5% below the 1.20 promotion floor. Non-curated SPX-30 universe was already CI lower 1.06 at 10bps; at 40bps it would be ~0.96 = net loser. Apollo's universe selection induces survivorship bias on top. RECOMMEND: allocation_factor → 0.0. Edge in spec, but no edge in execution-adjusted reality."
     }
   }
 }
