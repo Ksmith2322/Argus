@@ -731,7 +731,15 @@ def loop_mode() -> None:
             sleep_s = max(5.0, (fire - now).total_seconds())
             log.info("xs_momentum next wake at %s UTC (sleep %.0fs)",
                      fire.isoformat(), sleep_s)
-            time.sleep(sleep_s)
+            state = _load_state()
+            _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
+            remaining = sleep_s
+            while remaining > 0:
+                chunk = min(300.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+                state = _load_state()
+                _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
             try:
                 evaluate_once()
             except Exception as exc:
