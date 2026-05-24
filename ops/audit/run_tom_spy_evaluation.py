@@ -120,7 +120,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     json_path.write_text(json.dumps(payload, indent=2, default=str),
                           encoding="utf-8")
 
-    md_path = OUT_DIR / "tom_spy_evaluation.md"
+    md_path = OUT_DIR / f"tom_evaluation_{args.ticker.lower()}.md"
     md_lines: list[str] = []
     md_lines.append("# forge_tom_spy disciplined-gate evaluation")
     md_lines.append("")

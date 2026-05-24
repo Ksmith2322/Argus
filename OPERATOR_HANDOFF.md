@@ -106,6 +106,45 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### TOM on IWM — dead (opposite of SPY where TOM is alive)
+
+Re-ran the TOM (4/3) backtest on IWM (Russell 2000 small-cap) to test
+whether small-cap liquidity constraints preserve TOM edge that broad-
+market arbitrage might have cleaned up. Result is the OPPOSITE of
+naive intuition: TOM is alive on SPY but DEAD on IWM.
+
+  Ticker  PF    CI lower @ 10bp  Layers   Verdict
+  SPY     1.90  1.215            6/9      PARTIAL_PASS
+  IWM     1.50  0.994            0/9      FAIL
+
+Cross-decade OOS on IWM shows steady decay:
+  pre-2006: PF 1.89 (alive)
+  2006-2016: PF 1.49 (weakening)
+  2016-2026: PF 1.31 (almost dead, CI lower 0.81)
+
+The classical literature claim "TOM stronger on small-caps" is NOT
+supported in modern data. Likely mechanism: IWM (started 2000)
+democratized small-cap access right at the peak of algorithmic
+arbitrage. Pre-IWM, small-cap access had high friction; with IWM,
+algos fully arbitraged the calendar effect.
+
+NO ACTION
+
+IWM TOM is not a viable candidate. forge_tom_spy stays SPY-only.
+
+Combined calendar-anomaly picture from this session:
+- TOM SPY: PARTIAL_PASS, ready to ship (operator opt-in pending)
+- TOM IWM: FAIL
+- November SPY: MARGINAL_PASS, ready (operator opt-in pending)
+- FOMC drift SPY: FAIL (dead since ~2018)
+- Russell recon IWM: null
+- DOW SPY: dead post-2000
+- DOW IWM: dead
+
+Audit re-runnable: `python -m ops.audit.run_tom_spy_evaluation --ticker IWM`.
+
+---
+
 ### xs_momentum universe comparison — sector_only matches broad_8
 
 Tested whether the current xs_momentum universe (broad_8 = SPY/QQQ/IWM/
