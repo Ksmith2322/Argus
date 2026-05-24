@@ -763,6 +763,33 @@ healthy, but two scheduled tasks need attention:
 Optionally re-register the full task set via
 `ops/register_tasks.ps1` (must be **Admin** PowerShell).
 
+### NEW (2026-05-24): two scheduled tasks to register
+
+Both come out of this session's Codex-gap closures. From an **Admin**
+PowerShell:
+
+**ArgusDailyHealth** — runs `daily_health_check`:
+```
+$action = New-ScheduledTaskAction -Execute 'C:\Argus\.venv\Scripts\python.exe' `
+    -Argument '-m ops.daily_health_check' -WorkingDirectory 'C:\Argus\repo'
+$trigger = New-ScheduledTaskTrigger -Daily -At 23:00
+Register-ScheduledTask -TaskName 'ArgusDailyHealth' -Action $action -Trigger $trigger `
+    -RunLevel Highest -Description '6-component daily health audit'
+```
+
+**ArgusDataFeedRefresh** — runs the new cache refresher (Codex gap #2):
+```
+$action = New-ScheduledTaskAction -Execute 'C:\Argus\.venv\Scripts\python.exe' `
+    -Argument '-m ops.maintenance.refresh_data_feeds' -WorkingDirectory 'C:\Argus\repo'
+$trigger = New-ScheduledTaskTrigger -Daily -At 22:00
+Register-ScheduledTask -TaskName 'ArgusDataFeedRefresh' -Action $action -Trigger $trigger `
+    -RunLevel Highest -Description 'Refresh yfinance CSV cache for daily-bar strategies'
+```
+
+Full operator playbook for the refresh task in
+[`ops/DATA_FEED_RUNBOOK.md`](ops/DATA_FEED_RUNBOOK.md). Verify both
+via `Get-ScheduledTask -TaskName 'Argus*' | Select TaskName,State`.
+
 ---
 
 ## 4. Verify nq_overnight stale state self-heals on next wake

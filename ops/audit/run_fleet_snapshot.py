@@ -129,12 +129,14 @@ def _canonical_fills_since_epoch() -> dict:
     """Count canonical_fills.jsonl entries by strategy since the current
     epoch start. Truth of 'how much live evidence has the post-reset
     window produced'."""
+    epoch = None
+    epoch_start = None
     try:
         from helio.evidence_epoch import current_epoch
         epoch = current_epoch()
-        epoch_start = epoch.start_ts if hasattr(epoch, "start_ts") else None
+        epoch_start = getattr(epoch, "started_at", None)
     except Exception:
-        epoch_start = None
+        pass
     fills_path = REPO / "argus_flow" / "logs" / "canonical_fills.jsonl"
     if not fills_path.exists():
         return {"error": "no canonical_fills.jsonl"}
@@ -154,7 +156,7 @@ def _canonical_fills_since_epoch() -> dict:
     except Exception as exc:
         return {"error": str(exc)}
     return {
-        "epoch_id": getattr(epoch, "epoch_id", "?") if epoch_start else "?",
+        "epoch_id": getattr(epoch, "id", "?") if epoch is not None else "?",
         "epoch_start": str(epoch_start) if epoch_start else "?",
         "total_fills_since_epoch": total,
         "by_strategy": counts,
