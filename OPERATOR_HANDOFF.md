@@ -196,6 +196,37 @@ Operator items:
 
 ---
 
+## 2.35. Capacity headroom constraint — cluster caps bind at 1× (new — 2026-05-24)
+
+Capacity stress re-run with the surviving roster + $250K anchor reveals
+that all 3 active strategies (xs_momentum, gld_pm_long, tom_spy) have
+**max_safe_multiplier = 1.0×**. Meaning: scaling any active strategy
+above its current configured cap will breach cluster/portfolio limits.
+
+What this means in practice:
+- Current paper roster at the current anchor is sized AT the binding
+  constraint, not below it.
+- A real-money flip can deploy AT the current size, but cannot scale
+  up without raising cluster caps in `helio/cluster_exposure.py`.
+- The preflight surfaces this as YELLOW on capacity_headroom_2x — not
+  RED, because the strategy is fine AT current size; just not for
+  expansion.
+
+To raise the headroom (operator decision):
+- Edit `helio/cluster_exposure.PER_CLUSTER_CAP_X` if cluster cap is
+  the binding constraint
+- OR edit `helio/cluster_exposure.SINGLE_INSTRUMENT_CAP_X` if the
+  individual-symbol cap binds first
+- Re-run `python -m ops.audit.run_capacity_stress` to verify
+
+Until raised, preflight will stay YELLOW on capacity for all 3 active
+strategies — which is acceptable for an initial small real-money
+allocation but blocks scaling.
+
+Audit artifact: `ops/reports/system_audit/capacity_stress.json`.
+
+---
+
 ## 2.4. Run the real-money preflight before any allocation flip (new — 2026-05-24)
 
 The 12-point real-money preflight is now executable. Run before any

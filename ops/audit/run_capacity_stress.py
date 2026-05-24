@@ -83,7 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     # not represented in live positions.
     ALLOC = REPO / "argus_flow" / "configs" / "allocation_factors.json"
     SYMBOL_OF_STRAT = {
+        # Active roster (representative symbols for headroom analysis;
+        # actual positions vary by strategy logic):
+        "forge_xs_momentum": ("SPY", "long"),   # broad-8 universe; SPY is the most-common holding
+        "forge_tom_spy": ("SPY", "long"),       # TOM strategy on SPY
         "forge_gld_pm_long": ("GLD", "long"),
+        # Killed but kept for completeness (skipped at factor=0 line below):
+        "forge_pead": ("PLTR", "long"),         # 16-name watchlist; PLTR is top-fired ticker
         "forge_nq_overnight": ("MNQ", "long"),
         "forge_jpy_pm_short": ("USDJPY", "short"),
         "forge_aud_asian_breakout": ("AUDUSD", "long"),
