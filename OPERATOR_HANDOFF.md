@@ -106,6 +106,46 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### xs_momentum universe comparison — sector_only matches broad_8
+
+Tested whether the current xs_momentum universe (broad_8 = SPY/QQQ/IWM/
+DIA/EFA/EEM/GLD/TLT) is actually optimal vs alternative universes:
+
+  Universe                       PF    CI_lower@10bp  CAGR    Max DD   Layers
+  broad_8 (current)              3.79      1.556      18.04%  22.39%   4/8 PP
+  sector_only (10 US sectors)    3.78      1.604      21.87%  25.76%   5/8 PP
+  country_only (8 markets)       1.37      0.667       3.48%  51.58%   0/8 FAIL
+
+KEY FINDING
+
+sector_only PARTIAL_PASSES with **higher CI lower and CAGR** than the
+current broad_8 baseline — but with worse max DD (25.76% vs 22.39%).
+Different risk profile, not a clear winner. Sector-only passes ALL 3
+block_bootstrap layers; broad_8 fails 2 of 3.
+
+The 5/22 finding that "sector-only fails the disciplined gate (CI lower
+1.05 at 10bps)" was at DIFFERENT params (probably top-3 picks or
+different lookback). At current PARAMS (252/21 lookback, top-quintile
+fraction = 0.2 → 2 picks from broad_8 / 2 picks from sector_only), the
+sector universe is in the same PARTIAL_PASS band.
+
+Country-only is decisively worse (PF 1.37 = breakeven). Cross-country
+dispersion alone is NOT the driver of xs_momentum's edge.
+
+NO ACTION
+
+Both broad_8 and sector_only PARTIAL_PASS. broad_8 has slightly better
+risk-adjusted profile (lower DD for similar PF). Production strategy
+stays on broad_8. The audit is informational; no allocation change.
+
+If operator wants to experiment in a future session, sector_only could
+be a 2nd cross-sectional-momentum slot (different DD timing, possibly
+diversifying with broad_8).
+
+Audit re-runnable: `python -m ops.audit.run_xs_momentum_universe_comparison`.
+
+---
+
 ### Day-of-week effects on IWM — also DEAD (extended null)
 
 Re-ran the DOW audit on IWM (Russell 2000 small-cap, 2000-2025,

@@ -143,7 +143,8 @@ def _write_heartbeat(state: dict, last_rebalance: dict | None) -> None:
 
 # ── Backtest ──────────────────────────────────────────────────────────────
 
-def backtest(period: str = "10y", return_monthly_series: bool = False) -> dict:
+def backtest(period: str = "10y", return_monthly_series: bool = False,
+             universe_override: list[str] | None = None) -> dict:
     """Simulate monthly rebalancing over the historical window.
 
     At each month-end (resampled from daily closes), rank universe by 12-1
@@ -154,8 +155,13 @@ def backtest(period: str = "10y", return_monthly_series: bool = False) -> dict:
     dict (YYYY-MM → equal-weight portfolio return as a fraction, not pct).
     Used by factor-decomposition audits to regress against Fama-French
     proxies.
+
+    universe_override lets callers swap PARAMS['universe'] for a different
+    ticker set without mutating PARAMS. Used by alternative-universe
+    audits (sector-only, country-only, etc.).
     """
-    universe = list(PARAMS["universe"])
+    universe = list(universe_override if universe_override is not None
+                       else PARAMS["universe"])
     long_lb = PARAMS["long_lookback"]
     short_lb = PARAMS["short_lookback"]
 
@@ -296,6 +302,11 @@ def backtest(period: str = "10y", return_monthly_series: bool = False) -> dict:
             m: sum(by_month[m]) / len(by_month[m]) / 100.0
             for m in sorted(by_month)
         }
+    # Always expose the per-trade ledger so alternative-universe / robustness
+    # audits can feed promotion_panel on PER-TRADE pnls (apples-to-apples
+    # with the published broad-8 baseline). Each entry has pnl_pct +
+    # ticker + entry/exit dates.
+    result["trades_detail"] = trades
     return result
 
 
