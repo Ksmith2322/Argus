@@ -39,9 +39,10 @@ OUT_DIR = REPO / "ops" / "reports" / "system_audit"
 DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri"]  # weekday() 0-4
 
 
-def _fetch_spy_daily(start_year: int, end_year: int) -> pd.DataFrame:
+def _fetch_ticker_daily(start_year: int, end_year: int,
+                          ticker: str = "SPY") -> pd.DataFrame:
     import yfinance as yf
-    df = yf.download("SPY", start=f"{start_year}-01-01",
+    df = yf.download(ticker, start=f"{start_year}-01-01",
                        end=f"{end_year}-12-31", interval="1d",
                        progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
@@ -105,14 +106,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-year", type=int, default=1995)
     parser.add_argument("--end-year", type=int, default=2025)
+    parser.add_argument("--ticker", default="SPY",
+                          help="Ticker to test (default SPY; small-cap IWM "
+                               "interesting because liquidity constraints may "
+                               "have prevented arbitrage)")
     parser.add_argument("--slippage-bps", type=float, default=2.0,
-                          help="SPY daily-trade slippage (default 2bp; "
-                               "tight because SPY is highly liquid)")
+                          help="Daily-trade slippage bps (default 2bp — tight; "
+                               "pass higher for less-liquid tickers like IWM)")
     args = parser.parse_args(argv)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1] fetching SPY daily {args.start_year}-{args.end_year}...")
-    daily = _fetch_spy_daily(args.start_year, args.end_year)
+    print(f"[1] fetching {args.ticker} daily {args.start_year}-{args.end_year}...")
+    daily = _fetch_ticker_daily(args.start_year, args.end_year,
+                                  ticker=args.ticker)
     print(f"  {len(daily)} daily bars  "
           f"({daily.index.min().date()} → {daily.index.max().date()})")
 
@@ -164,7 +170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                   f"t={t:+5.2f}  p={_normal_p_two_sided(t):.4f}")
 
     print()
-    print("[5] Friday-effect strategy: buy SPY Thu close, sell Fri close")
+    print(f"[5] Friday-effect strategy: buy {args.ticker} Thu close, sell Fri close")
     fri_trades = []
     for thu_date in daily_sorted[daily_sorted["dow"] == 3].index:
         next_fri = thu_date + pd.Timedelta(days=1)
@@ -216,7 +222,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                           encoding="utf-8")
 
     md_lines: list[str] = []
-    md_lines.append("# SPY day-of-week research")
+    md_lines.append(f"# {args.ticker} day-of-week research")
     md_lines.append("")
     md_lines.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
     md_lines.append(f"Period: {args.start_year}-{args.end_year}, "
@@ -238,7 +244,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
         md_lines.append("")
     md_lines.append(f"Bonferroni-adjusted α at 5 tests: 0.01000")
-    md_path = OUT_DIR / "dow_research.md"
+    md_path = OUT_DIR / f"dow_research_{args.ticker.lower()}.md"
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
 
     print()

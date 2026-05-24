@@ -106,6 +106,35 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### Day-of-week effects on IWM — also DEAD (extended null)
+
+Re-ran the DOW audit on IWM (Russell 2000 small-cap, 2000-2025,
+n=6,436 daily bars) to test whether small-cap liquidity constraints
+preserved any residual edge that SPY arbitraged out.
+
+Bonferroni-adjusted at 5 tests (α=0.01):
+
+  Day  n     mean_bps  t-stat  p       Bonf-sig?
+  Mon  1208  +1.51     +0.33   0.7430  no
+  Tue  1321  +9.07     +2.21   0.0268  no (above Bonferroni)
+  Wed  1320  +4.33     +1.04   0.3004  no
+  Thu  1295  +1.35     +0.32   0.7531  no
+  Fri  1292  +4.90     +1.27   0.2028  no
+
+Tuesday is suggestive (highest mean, p=0.027) but does NOT survive
+multi-testing correction. The Friday-effect strategy (buy IWM Thu
+close, sell Fri close): PF=1.03, CI=[0.88, 1.19] — solidly inside
+the no-edge band, same as SPY.
+
+Conditional weekend effect (Mon after negative Fri): mean +0.46 bps,
+t=+0.06, p=0.95 — null.
+
+**Class of DOW-on-equity strategies is now definitively closed across
+both large-cap (SPY) and small-cap (IWM).** Arbitrage extends to
+small-caps despite their lower liquidity.
+
+Audit re-runnable: `python -m ops.audit.run_dow_research --ticker IWM`.
+
 ### Day-of-week effects — DEAD post-2000
 
 Tested 7,800 SPY daily bars (1995-2025) for systematic Mon-Fri patterns.
