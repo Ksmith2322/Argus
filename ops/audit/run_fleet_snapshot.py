@@ -195,6 +195,49 @@ def _xs_momentum_picks() -> dict:
         return {"error": str(exc)}
 
 
+def _strategy_role_table() -> list[dict]:
+    """Per Codex gap #10: every active strategy declares its role
+    (OFFENSE / DEFENSE / HEDGE / RESEARCH), and the disciplined-gate
+    floor is role-aware. Surface the map so the operator can see at a
+    glance which sleeve each strategy lives in."""
+    try:
+        from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+        from helio.strategy_roles import (
+            STRATEGY_ROLES,
+            get_pf_floor,
+            get_role,
+            role_description,
+        )
+    except Exception as exc:
+        return [{"error": str(exc)}]
+    rows: list[dict] = []
+    seen: set[str] = set()
+    # Active strategies first (alphabetical)
+    for s in sorted(ACTIVE_ROSTER):
+        seen.add(s)
+        role = get_role(s)
+        rows.append({
+            "strategy": s,
+            "role": role,
+            "pf_floor": get_pf_floor(s),
+            "is_active": True,
+            "explicit": s in STRATEGY_ROLES,
+            "role_description": role_description(role),
+        })
+    # Pending-opt-in / known-but-not-active strategies in the registry
+    for s in sorted(set(STRATEGY_ROLES.keys()) - seen):
+        role = get_role(s)
+        rows.append({
+            "strategy": s,
+            "role": role,
+            "pf_floor": get_pf_floor(s),
+            "is_active": False,
+            "explicit": True,
+            "role_description": role_description(role),
+        })
+    return rows
+
+
 def _preflight() -> list[dict]:
     """Preflight verdict per ACTIVE strategy."""
     try:
@@ -258,6 +301,7 @@ def build_snapshot() -> dict:
         "restart_status": _restart_status(heartbeats),
         "canonical_fills_since_epoch": _canonical_fills_since_epoch(),
         "xs_momentum_picks": _xs_momentum_picks(),
+        "strategy_roles": _strategy_role_table(),
         "preflight": _preflight(),
     }
 
@@ -364,6 +408,25 @@ def render_markdown(snapshot: dict) -> str:
         out.append("Full ranking:")
         for s in xp.get("full_ranking", []):
             out.append(f"  - {s['ticker']}: {s['score_pct']:+.2f}%")
+    out.append("")
+
+    out.append("## Strategy roles (offense/defense/hedge/research)")
+    out.append("")
+    sr = snapshot.get("strategy_roles", [])
+    if sr and "error" in sr[0]:
+        out.append(f"  ERROR: {sr[0]['error']}")
+    else:
+        out.append("| Strategy | Role | PF floor | Active | Explicit |")
+        out.append("|---|---|---|---|---|")
+        for r in sr:
+            floor = r["pf_floor"]
+            floor_str = "inf" if floor == float("inf") else f"{floor:.2f}"
+            active = "yes" if r["is_active"] else "no"
+            explicit = "yes" if r["explicit"] else "default"
+            out.append(
+                f"| {r['strategy']} | {r['role']} | {floor_str} | "
+                f"{active} | {explicit} |"
+            )
     out.append("")
 
     out.append("## Real-money preflight (active strategies)")

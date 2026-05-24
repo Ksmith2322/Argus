@@ -150,11 +150,32 @@ def _exposure() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+def _roles(active: list[str]) -> dict[str, Any]:
+    """Per-strategy role + role-aware PF floor (Codex gap #10)."""
+    try:
+        from helio.strategy_roles import (
+            STRATEGY_ROLES,
+            get_pf_floor,
+            get_role,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    out: dict[str, Any] = {}
+    for strategy in active:
+        out[strategy] = {
+            "role": get_role(strategy),
+            "pf_floor": get_pf_floor(strategy),
+            "explicit": strategy in STRATEGY_ROLES,
+        }
+    return out
+
+
 def _strategy_status(
     active: list[str],
     preflight: dict[str, Any],
     canonical: dict[str, Any],
     blockers: dict[str, Any],
+    roles: dict[str, Any],
 ) -> dict[str, Any]:
     blocker_by_strategy = blockers.get("by_strategy") or {}
     canonical_by_strategy = canonical.get("per_strategy") or {}
@@ -191,11 +212,14 @@ def _strategy_status(
             verdict = "REVIEW_BEFORE_SCALE"
             reasons.extend(f"preflight_yellow:{name}" for name in yellow_checks)
 
+        role_info = (roles.get(strategy) or {}) if isinstance(roles, dict) else {}
         statuses[strategy] = {
             "verdict": verdict,
             "reasons": reasons,
             "blockers_30d": blocker_counts,
             "canonical_evidence": evidence,
+            "role": role_info.get("role"),
+            "pf_floor": role_info.get("pf_floor"),
         }
     return statuses
 
@@ -207,6 +231,7 @@ def build_report() -> dict[str, Any]:
     canonical = _canonical_counts(active, epoch)
     blockers = _blockers()
     exposure = _exposure()
+    roles = _roles(active)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "active_roster": active,
@@ -215,8 +240,9 @@ def build_report() -> dict[str, Any]:
         "canonical_evidence": canonical,
         "blockers": blockers,
         "exposure": exposure,
+        "roles": roles,
         "strategy_status": _strategy_status(
-            active, preflight, canonical, blockers
+            active, preflight, canonical, blockers, roles
         ),
     }
 

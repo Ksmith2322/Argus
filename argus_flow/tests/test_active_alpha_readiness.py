@@ -3,6 +3,15 @@ from __future__ import annotations
 from ops.audit.run_active_alpha_readiness import _strategy_status
 
 
+_ROLES = {
+    "forge_xs_momentum": {
+        "role": "OFFENSE",
+        "pf_floor": 1.20,
+        "explicit": True,
+    },
+}
+
+
 def test_strategy_status_blocks_on_red_preflight():
     status = _strategy_status(
         ["forge_xs_momentum"],
@@ -15,11 +24,14 @@ def test_strategy_status_blocks_on_red_preflight():
         },
         {"per_strategy": {"forge_xs_momentum": {"exits": 50}}},
         {"by_strategy": {}},
+        _ROLES,
     )
 
     row = status["forge_xs_momentum"]
     assert row["verdict"] == "BLOCKED"
     assert row["reasons"] == ["preflight_red:live_evidence_n"]
+    assert row["role"] == "OFFENSE"
+    assert row["pf_floor"] == 1.20
 
 
 def test_strategy_status_surfaces_cap_and_data_blocks_after_evidence():
@@ -35,9 +47,11 @@ def test_strategy_status_surfaces_cap_and_data_blocks_after_evidence():
                 },
             },
         },
+        _ROLES,
     )
 
     row = status["forge_xs_momentum"]
     assert row["verdict"] == "GATED_REVIEW"
     assert "cap_blocks_30d:2" in row["reasons"]
     assert "data_blocks_30d:1" in row["reasons"]
+    assert row["role"] == "OFFENSE"

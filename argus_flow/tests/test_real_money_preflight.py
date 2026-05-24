@@ -97,7 +97,7 @@ def test_disciplined_gate_uses_recalibrated_when_present(monkeypatch, tmp_path):
     result = check_disciplined_gate_passes("forge_x")
     # Recalibrated value 0.80 < 1.20 floor → RED, NOT the rosier 2.00
     assert result.verdict == Verdict.RED
-    assert result.value == pytest.approx(0.80)
+    assert result.value["ci_lower"] == pytest.approx(0.80)
 
 
 def test_disciplined_gate_green_when_above_floor(monkeypatch, tmp_path):
@@ -118,7 +118,7 @@ def test_disciplined_gate_green_when_above_floor(monkeypatch, tmp_path):
 
     result = check_disciplined_gate_passes("forge_x")
     assert result.verdict == Verdict.GREEN
-    assert result.value == pytest.approx(1.86)
+    assert result.value["ci_lower"] == pytest.approx(1.86)
 
 
 def test_disciplined_gate_red_when_strategy_missing(monkeypatch, tmp_path):

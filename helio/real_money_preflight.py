@@ -198,9 +198,18 @@ def check_allocation_factor_positive(strategy: str) -> CheckResult:
 
 
 def check_disciplined_gate_passes(strategy: str) -> CheckResult:
-    """promotion_gate_baseline.json CI lower at realistic slippage >= 1.20.
+    """promotion_gate_baseline.json CI lower at realistic slippage >= ROLE FLOOR.
+
+    Per Codex gap #10: gate floor is role-specific. OFFENSE strategies
+    need >= 1.20 (excess return). DEFENSE gets 1.05 (lower bar because
+    the role is DD protection, not return maximization). HEDGE gets
+    0.80 (can lose money if negatively correlated). RESEARCH always
+    fails (floor = infinity).
+
     Uses recalibrated_ci_95_lower_at_realistic when present, falls back
     to ci_95_lower."""
+    from helio.strategy_roles import get_role, get_pf_floor
+
     baseline_path = (REPO / "argus_flow" / "configs"
                        / "promotion_gate_baseline.json")
     try:
@@ -213,7 +222,8 @@ def check_disciplined_gate_passes(strategy: str) -> CheckResult:
     if spec is None:
         return CheckResult("disciplined_gate_passes", Verdict.RED,
                              reason=f"{strategy} missing from promotion_gate_baseline.json")
-    floor = float(baseline.get("promotion_floor", 1.20))
+    role = get_role(strategy)
+    floor = get_pf_floor(strategy)
     realistic = spec.get("recalibrated_ci_95_lower_at_realistic")
     published = spec.get("ci_95_lower")
     ci_lower = float(realistic) if realistic is not None else (
@@ -222,13 +232,17 @@ def check_disciplined_gate_passes(strategy: str) -> CheckResult:
         return CheckResult("disciplined_gate_passes", Verdict.RED,
                              reason=f"{strategy} has no CI lower bound recorded")
     if ci_lower >= floor:
-        return CheckResult("disciplined_gate_passes", Verdict.GREEN,
-                             value=ci_lower,
-                             reason=f"CI lower {ci_lower:.3f} >= floor {floor:.2f}")
-    return CheckResult("disciplined_gate_passes", Verdict.RED,
-                         value=ci_lower,
-                         reason=(f"CI lower {ci_lower:.3f} < floor {floor:.2f} "
-                                 f"(verdict in baseline: {spec.get('verdict', '?')})"))
+        return CheckResult(
+            "disciplined_gate_passes", Verdict.GREEN,
+            value={"ci_lower": ci_lower, "floor": floor, "role": role},
+            reason=f"CI lower {ci_lower:.3f} >= {role} floor {floor:.2f}",
+        )
+    return CheckResult(
+        "disciplined_gate_passes", Verdict.RED,
+        value={"ci_lower": ci_lower, "floor": floor, "role": role},
+        reason=(f"CI lower {ci_lower:.3f} < {role} floor {floor:.2f} "
+                f"(baseline verdict: {spec.get('verdict', '?')})"),
+    )
 
 
 def _live_status(strategy: str):
