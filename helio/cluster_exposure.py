@@ -301,6 +301,18 @@ def _scan_open_positions() -> list[dict]:
                         "entry_px": t.get("entry_px"),
                         "size": t.get("position_size") or t.get("size") or 0,
                     })
+            picks = hb.get("current_picks")
+            if picks and isinstance(picks, dict):
+                for key, t in picks.items():
+                    if not isinstance(t, dict):
+                        continue
+                    positions.append({
+                        "system": system,
+                        "symbol": key,
+                        "direction": _resolve_direction(t),
+                        "entry_px": t.get("entry_px"),
+                        "size": t.get("qty") or t.get("position_size") or t.get("size") or 0,
+                    })
     return positions
 
 
@@ -480,4 +492,54 @@ def would_breach_cluster_cap(
         log.error(f"margin-aware check failed, REFUSING trade: {exc}")
         return "MARGIN_CHECK_ERROR"
 
+    return None
+
+
+def would_breach_strategy_overlap_cap(
+    symbol: str,
+    direction: str,
+    notional_usd: float,
+    *,
+    strategy_label: str,
+) -> Optional[str]:
+    """Specialized overlap guard for active sleeve conflicts.
+
+    The generic METALS cap is intentionally broad. The active roster has a
+    sharper issue: `forge_gld_pm_long` and `forge_xs_momentum` can both hold
+    GLD. Keep their combined GLD exposure below the GLD sleeve cap so the
+    offense sleeve cannot quietly double the defense sleeve.
+    """
+    sym = (symbol or "").upper()
+    strategy = (strategy_label or "").lower()
+    direction_l = (direction or "").lower()
+    if sym != "GLD" or direction_l != "long" or strategy != "forge_xs_momentum":
+        return None
+    if notional_usd <= 0:
+        return None
+
+    try:
+        from helio.fleet_sizing import get_sizing_anchor_usd
+        anchor = float(get_sizing_anchor_usd())
+    except Exception as exc:
+        log.error(f"overlap cap: anchor unavailable, REFUSING trade: {exc}")
+        return "OVERLAP:ANCHOR_UNAVAILABLE"
+    if anchor <= 0:
+        return "OVERLAP:ANCHOR_NON_POSITIVE"
+
+    cap_x = 0.4
+    cap_usd = cap_x * anchor
+    systems = {"gld_pm_long", "forge_gld_pm_long", "xs_momentum", "forge_xs_momentum"}
+    current = 0.0
+    for p in compute_cluster_exposure().get("positions", []) or []:
+        ps = str(p.get("system") or "").lower()
+        if ps not in systems:
+            continue
+        if str(p.get("symbol") or "").upper() != "GLD":
+            continue
+        try:
+            current += abs(float(p.get("entry_px") or 0.0) * float(p.get("size") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    if current + float(notional_usd) > cap_usd:
+        return "OVERLAP:GLD_ACTIVE_SLEEVES"
     return None

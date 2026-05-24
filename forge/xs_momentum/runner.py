@@ -32,6 +32,7 @@ from helio.fleet_sizing import (
     max_notional_usd,
 )
 from helio import ibkr_execution as ibkr
+from helio.blocker_ledger import record_blocker
 from helio.xs_momentum import (
     DEFAULT_UNIVERSE,
     LOOKBACK_LONG_DAYS, LOOKBACK_SHORT_DAYS,
@@ -657,6 +658,11 @@ def evaluate_once(force: bool = False) -> dict:
 
     if not force and not _is_rebalance_due(state, now_utc):
         summary["reason"] = f"not_due (last_rebalance_month={state.get('last_rebalance_month', '')})"
+        record_blocker(
+            STRATEGY_LABEL, "NOT_DUE", stage="evaluate",
+            reason=summary["reason"],
+            context={"last_rebalance_month": state.get("last_rebalance_month", "")},
+        )
         _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
         log.info("xs_momentum eval skipped: %s", summary["reason"])
         return summary
@@ -668,12 +674,16 @@ def evaluate_once(force: bool = False) -> dict:
         log.error("could not read allocation_factor: %s — refusing to trade", exc)
         summary["action"] = "blocked"
         summary["reason"] = f"alloc_read_failed:{exc}"
+        record_blocker(STRATEGY_LABEL, "ALLOC_READ_FAILED",
+                       stage="allocation", reason=str(exc))
         return summary
     if alloc_factor <= 0.0:
         log.info("[ALLOC-GATE] allocation_factor=%.3f — strategy deallocated, "
                   "no rebalance", alloc_factor)
         summary["action"] = "blocked"
         summary["reason"] = f"alloc_factor={alloc_factor}"
+        record_blocker(STRATEGY_LABEL, "ALLOC_ZERO",
+                       stage="allocation", reason=summary["reason"])
         _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
         return summary
 
@@ -684,10 +694,14 @@ def evaluate_once(force: bool = False) -> dict:
         log.error("history fetch failed: %s", exc)
         summary["action"] = "blocked"
         summary["reason"] = f"history_fetch:{exc}"
+        record_blocker(STRATEGY_LABEL, "DATA_UNAVAILABLE",
+                       stage="history", reason=str(exc))
         return summary
     if closes.empty:
         summary["action"] = "blocked"
         summary["reason"] = "no_history"
+        record_blocker(STRATEGY_LABEL, "DATA_UNAVAILABLE",
+                       stage="history", reason=summary["reason"])
         return summary
 
     per_asset = {t: closes[t].dropna().tolist()
@@ -700,6 +714,8 @@ def evaluate_once(force: bool = False) -> dict:
     if not ranked:
         summary["action"] = "blocked"
         summary["reason"] = "ranking_empty"
+        record_blocker(STRATEGY_LABEL, "RANKING_EMPTY",
+                       stage="ranking", reason=summary["reason"])
         return summary
 
     picks = select_top_quintile(ranked,
@@ -736,6 +752,11 @@ def evaluate_once(force: bool = False) -> dict:
         summary["reason"] = "signal_only_mode"
         summary["would_sell"] = to_sell
         summary["would_buy"] = to_buy
+        record_blocker(
+            STRATEGY_LABEL, "SIGNAL_ONLY", stage="execution",
+            reason="signal_only_mode",
+            context={"would_sell": to_sell, "would_buy": to_buy},
+        )
         return summary
 
     try:
@@ -744,6 +765,8 @@ def evaluate_once(force: bool = False) -> dict:
         log.error("IBKR connect failed: %s — aborting rebalance", exc)
         summary["action"] = "blocked"
         summary["reason"] = f"ibkr_connect:{exc}"
+        record_blocker(STRATEGY_LABEL, "IBKR_CONNECT_FAILED",
+                       stage="connect", reason=str(exc))
         return summary
 
     try:
@@ -765,17 +788,26 @@ def evaluate_once(force: bool = False) -> dict:
             if qty <= 0:
                 log.warning("EXIT skipped for %s: state shows qty<=0 (%s)",
                               ticker, qty)
+                record_blocker(STRATEGY_LABEL, "SIZE_ZERO",
+                               symbol=ticker, stage="exit", action="SELL",
+                               qty=qty, reason="state qty <= 0")
                 continue
             contract = ibkr.make_contract(ticker, "etf")
             try:
                 ib.qualifyContracts(contract)
             except Exception as exc:
                 log.error("qualifyContracts(%s) failed: %s", ticker, exc)
+                record_blocker(STRATEGY_LABEL, "CONTRACT_QUALIFY_FAILED",
+                               symbol=ticker, stage="exit", action="SELL",
+                               qty=qty, reason=str(exc))
                 continue
             est_px = last_px.get(ticker) or float(holding.get("entry_px") or 0.0)
             fill = _submit_market_order(ib, contract, "SELL", qty,
                                           est_px=est_px)
             if fill is None:
+                record_blocker(STRATEGY_LABEL, "ORDER_REJECTED",
+                               symbol=ticker, stage="exit", action="SELL",
+                               qty=qty, reason="fill_none")
                 continue
             entry_px = float(holding.get("entry_px") or 0.0)
             pnl_usd = (fill.fill_price - entry_px) * qty
@@ -807,26 +839,71 @@ def evaluate_once(force: bool = False) -> dict:
             est_px = last_px.get(ticker)
             if not est_px or est_px <= 0:
                 log.warning("ENTRY skipped for %s: no estimated price", ticker)
+                record_blocker(STRATEGY_LABEL, "DATA_UNAVAILABLE",
+                               symbol=ticker, stage="entry", action="BUY",
+                               reason="missing estimated price")
                 continue
             qty = int(per_pick_usd // est_px)
             if qty < 1:
+                record_blocker(STRATEGY_LABEL, "SIZE_ZERO",
+                               symbol=ticker, stage="entry", action="BUY",
+                               notional_usd=per_pick_usd,
+                               reason="computed quantity < 1")
                 log.warning("ENTRY skipped for %s: per_pick_usd=%.2f / est_px=%.2f → qty<1",
                               ticker, per_pick_usd, est_px)
+                continue
+            proposed_notional = float(qty) * float(est_px)
+            try:
+                from helio.cluster_exposure import (
+                    would_breach_cluster_cap,
+                    would_breach_strategy_overlap_cap,
+                )
+                breach = would_breach_strategy_overlap_cap(
+                    ticker, "long", proposed_notional,
+                    strategy_label=STRATEGY_LABEL,
+                )
+                if breach is None:
+                    breach = would_breach_cluster_cap(
+                        ticker, "long", proposed_notional,
+                        strategy_label=STRATEGY_LABEL,
+                    )
+            except Exception as exc:
+                breach = f"CAP_CHECK_ERROR:{type(exc).__name__}"
+            if breach:
+                log.warning("ENTRY blocked for %s: %s notional=%.2f",
+                            ticker, breach, proposed_notional)
+                record_blocker(
+                    STRATEGY_LABEL, "CAP_EXCEEDED", symbol=ticker,
+                    stage="entry", action="BUY", qty=qty,
+                    notional_usd=proposed_notional, reason=breach,
+                )
                 continue
             contract = ibkr.make_contract(ticker, "etf")
             try:
                 ib.qualifyContracts(contract)
             except Exception as exc:
                 log.error("qualifyContracts(%s) failed: %s", ticker, exc)
+                record_blocker(STRATEGY_LABEL, "CONTRACT_QUALIFY_FAILED",
+                               symbol=ticker, stage="entry", action="BUY",
+                               qty=qty, notional_usd=proposed_notional,
+                               reason=str(exc))
                 continue
             existing = ibkr.query_position(ib, contract)
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION %s qty=%.0f — skipping entry",
                               ticker, existing)
+                record_blocker(STRATEGY_LABEL, "BROKER_POSITION_EXISTS",
+                               symbol=ticker, stage="entry", action="BUY",
+                               qty=qty, notional_usd=proposed_notional,
+                               reason=f"broker existing qty={existing}")
                 continue
             fill = _submit_market_order(ib, contract, "BUY", qty,
                                           est_px=est_px)
             if fill is None:
+                record_blocker(STRATEGY_LABEL, "ORDER_REJECTED",
+                               symbol=ticker, stage="entry", action="BUY",
+                               qty=qty, notional_usd=proposed_notional,
+                               reason="fill_none")
                 continue
             current[ticker] = {
                 "entry_ts": datetime.now(timezone.utc).isoformat(),
