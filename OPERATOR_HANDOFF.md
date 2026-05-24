@@ -330,31 +330,47 @@ Exit codes: 0 if all READY_FOR_REAL, 1 if any BLOCKED_PENDING_REVIEW
 
 ---
 
-## 2.5. Register the daily auto-pause cron (new — 2026-05-24)
+## 2.5. Register the daily health-check cron (updated — 2026-05-24)
 
-The auto-pause loop alerts when a strategy's live PF crosses the FAIL
-band for K consecutive days. Without a daily cron, it never gets
-the chance to detect anything.
+`ops/daily_health_check.py` is the canonical daily-cron entrypoint.
+It composes everything tonight's safety work added into ONE scheduled
+task: auto-pause recommendation, orphan-phantom detection, real-money
+preflight, halt/flatten flag check. Posts ONE consolidated Discord
+message if anything is RED or YELLOW; stays silent if all GREEN.
 
-From an **Admin** PowerShell:
+From an **Admin** PowerShell (replaces the ArgusAutoPause task that
+was in earlier drafts of this doc):
 ```powershell
+# Remove the old narrow auto_pause task if it was registered
+Unregister-ScheduledTask -TaskName "ArgusAutoPause" -Confirm:$false -ErrorAction SilentlyContinue
+
 $action = New-ScheduledTaskAction `
     -Execute "C:\Argus\.venv\Scripts\python.exe" `
-    -Argument "-m ops.auto_pause" `
+    -Argument "-m ops.daily_health_check" `
     -WorkingDirectory "C:\Argus\repo"
 $trigger = New-ScheduledTaskTrigger -Daily -At "10:00 PM"
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "ArgusAutoPause" `
+Register-ScheduledTask -TaskName "ArgusDailyHealth" `
     -Action $action -Trigger $trigger -Settings $settings -Force
 ```
 
-This runs nightly at 22:00 local time (after US market close), snapshots
-the cohort gate, appends to `argus_flow/logs/cohort_gate_history.jsonl`,
-and writes `argus_flow/logs/auto_pause_recommendations.json`. If any
-strategy crosses the 5-consecutive-FAIL-days threshold for the first
-time today, it posts to Discord. Discord requires the webhook (item #1
-above) to be working.
+Daily at 22:00 local (post-market-close US), the task runs all four
+checks. Output:
+- stdout: human-readable summary
+- `argus_flow/logs/daily_health_check.json`: machine-readable for
+  later inspection
+- Discord (only when not-all-GREEN): one combined message listing
+  each RED/YELLOW component with a one-liner
+
+Exit codes (cron-friendly):
+- 0 if all GREEN
+- 1 if any YELLOW (warning tier)
+- 2 if any RED or ERROR (action required)
+
+If you prefer the narrower auto-pause-only behavior, the old
+`python -m ops.auto_pause` still works — daily_health_check just wraps
+it as one of four components.
 
 **Operator workflow when a PAUSE_RECOMMENDED alert fires**:
 
