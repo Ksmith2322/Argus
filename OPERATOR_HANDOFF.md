@@ -61,6 +61,56 @@ Operator items:
 
 ---
 
+## 2.5. Register the daily auto-pause cron (new — 2026-05-24)
+
+The auto-pause loop alerts when a strategy's live PF crosses the FAIL
+band for K consecutive days. Without a daily cron, it never gets
+the chance to detect anything.
+
+From an **Admin** PowerShell:
+```powershell
+$action = New-ScheduledTaskAction `
+    -Execute "C:\Argus\.venv\Scripts\python.exe" `
+    -Argument "-m ops.auto_pause" `
+    -WorkingDirectory "C:\Argus\repo"
+$trigger = New-ScheduledTaskTrigger -Daily -At "10:00 PM"
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "ArgusAutoPause" `
+    -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
+This runs nightly at 22:00 local time (after US market close), snapshots
+the cohort gate, appends to `argus_flow/logs/cohort_gate_history.jsonl`,
+and writes `argus_flow/logs/auto_pause_recommendations.json`. If any
+strategy crosses the 5-consecutive-FAIL-days threshold for the first
+time today, it posts to Discord. Discord requires the webhook (item #1
+above) to be working.
+
+**Operator workflow when a PAUSE_RECOMMENDED alert fires**:
+
+1. Read `argus_flow/logs/auto_pause_recommendations.json` to confirm
+   the recommendation (verify it's not noise from a brief drawdown).
+2. Dry-run the apply to see exactly what would change:
+   ```
+   python -m ops.auto_pause --apply
+   ```
+3. If you agree, apply for real:
+   ```
+   python -m ops.auto_pause --apply --confirm
+   ```
+4. This flips `allocation_factor=0.0` for every PAUSE_RECOMMENDED
+   strategy, appends a line to `_kill_log` in allocation_factors.json,
+   writes an event to `auto_pause_apply_events.jsonl`, and posts
+   Discord confirmation.
+
+The recommendation→apply split is intentional: live-PF-degradation
+auto-pause has been wrong before (the 2026-05-23 silent-archive-fallback
+bug made live_gate_monitor lie for 12 days). The human-in-the-loop
+defends against systemic bugs in the signal we'd otherwise act on.
+
+---
+
 ## 3. Register / verify scheduled tasks
 
 After tonight's code changes, the dashboard + auto-watchdog should be

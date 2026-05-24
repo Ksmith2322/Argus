@@ -236,6 +236,34 @@ def write_recommendations(
     return path
 
 
+def _maybe_post_discord(alerts: list[StrategyAlert]) -> None:
+    """Best-effort Discord post for PAUSE_RECOMMENDED-tier alerts. To prevent
+    spam, we only post when the strategy CROSSED into PAUSE_RECOMMENDED today
+    (i.e., consecutive_days_at_verdict == threshold). Existing-pause-recs
+    don't fire every day. Failures are swallowed — a broken webhook must
+    not prevent the recommendation file from being written."""
+    fresh = [a for a in alerts
+              if a.alert_tier == "PAUSE_RECOMMENDED"
+              and a.consecutive_days_at_verdict == a.threshold_days]
+    if not fresh:
+        return
+    try:
+        from ops.notify import send_discord
+        lines = ["**AUTO-PAUSE: strategies crossed the FAIL-days threshold today**"]
+        for a in fresh:
+            lines.append(
+                f"- `{a.strategy}`: verdict={a.current_verdict} for "
+                f"{a.consecutive_days_at_verdict} consecutive days "
+                f"(threshold {a.threshold_days}). live_pf={a.last_live_pf}, "
+                f"ci_lower={a.baseline_ci_lower}. "
+                f"Review: argus_flow/logs/auto_pause_recommendations.json. "
+                f"To apply: `python -m ops.auto_pause --apply --confirm`."
+            )
+        send_discord("\n".join(lines))
+    except Exception:
+        pass
+
+
 def run(
     *,
     snapshot: bool = True,
@@ -258,6 +286,7 @@ def run(
         warning_days_for_flag=warning_days_for_flag,
     )
     write_recommendations(alerts)
+    _maybe_post_discord(alerts)
     # Exit code reflects worst tier
     if any(a.alert_tier == "PAUSE_RECOMMENDED" for a in alerts):
         return 2
