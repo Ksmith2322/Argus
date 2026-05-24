@@ -1,6 +1,6 @@
 # xs_momentum factor decomposition
 
-Generated: 2026-05-24T05:01:55.177745+00:00
+Generated: 2026-05-24T12:11:56.257899+00:00
 
 ETF-proxy Fama-French + Momentum regression (SPY / IWM / IWD / IWF / MTUM). Caveats in helio/factor_decomposition.py module docstring.
 
@@ -18,7 +18,7 @@ ETF-proxy Fama-French + Momentum regression (SPY / IWM / IWD / IWF / MTUM). Cave
 ## Decomposition result
 
 ```
-=== Factor decomposition: forge_xs_momentum (broad-8, 252-21, top-2) ===
+=== Factor decomposition: forge_xs_momentum vs US 4-factor (MKT/SMB/HML/MOM) ===
 period: 2017-07 - 2026-05  (106 months)
 
 alpha (monthly):     +0.000225
@@ -40,4 +40,32 @@ INTERPRETATION:
   • MOM beta = +0.28 (significant, p=0.004). The strategy has meaningful exposure to the momentum factor. A passive MTUM holding captures part of the same return cheaply.
   • R² = 0.549 (factors explain 54.9% of return variance).
   • Annualized Information Ratio (alpha / residual vol) = 0.03.
+
+=== Factor decomposition: forge_xs_momentum vs 8-factor (+DUR/GOLD/INTL_DEV/INTL_EM) ===
+period: 2017-07 - 2026-05  (106 months)
+
+alpha (monthly):     -0.001502
+alpha (annualized):  -1.802%  (t=-0.70, p=0.4809)
+R²:                  0.719   adj R²: 0.695
+Resid std (monthly): 2.39%
+Information Ratio:   -0.22 (annualized)
+
+factor         beta   std_err       t         p
+--------------------------------------------------
+MKT_RF       +1.074    0.0963  +11.15    0.0000
+SMB          -0.003    0.0744   -0.04    0.9721
+HML          -0.042    0.0639   -0.66    0.5065
+MOM          +0.279    0.0865   +3.23    0.0013
+DUR          +0.102    0.0740   +1.38    0.1682
+GOLD         +0.348    0.0929   +3.74    0.0002
+INTL_DEV     -0.027    0.1167   -0.23    0.8171
+INTL_EM      +0.096    0.0997   +0.96    0.3351
+
+INTERPRETATION:
+  • ALPHA NEGATIVE: -1.80%/yr (p=0.481). Strategy underperforms a passive factor-replicating portfolio.
+  • PASSIVE REPLICATION: 71.9% of returns explained by factors. The same exposure can be approximated with a static portfolio of +1.07*MKT_RF, +0.35*GOLD, +0.28*MOM. Execution costs + complexity of the active strategy may not be justified.
+  • MOM beta = +0.28 (significant, p=0.001). The strategy has meaningful exposure to the momentum factor. A passive MTUM holding captures part of the same return cheaply.
+  • MKT beta = +1.07 — high market exposure. The strategy is mostly a long-equity position with factor tilts.
+  • R² = 0.719 (factors explain 71.9% of return variance).
+  • Annualized Information Ratio (alpha / residual vol) = -0.22.
 ```
