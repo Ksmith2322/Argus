@@ -61,6 +61,31 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### Monthly seasonality / Halloween effect — November is the only significant month
+
+Tested 30 years of SPY monthly returns (1995-2025, n=371). Bonferroni-
+adjusted at 12 calendar months (α = 0.00417):
+
+- **November**: mean +2.77%/month, t=+3.75, p=0.0002, WR 80.6% — only
+  Bonferroni-significant month
+- April (mean +1.90%, t=+2.34) and July (+1.46%, t=+2.08) are
+  individually p<0.05 but don't survive multi-testing correction
+- Aug & Sep have NEGATIVE mean returns (−0.26%, −0.40%) but not
+  significant
+
+Classical "Halloween indicator" (winter vs summer): +0.60%/month winter
+outperformance, but p=0.18 — NOT statistically significant. Most of
+the seasonal effect is concentrated in November alone.
+
+**Possible candidate**: `forge_nov_spy` — long SPY for the month of
+November. Single trade per year, n=30 historical observations
+(borderline for disciplined gate). Has natural overlap with tom_spy's
+late-Oct + early-Nov window (~7 days shared), so the strategies would
+be moderately correlated. Worth prototyping in a follow-up batch if
+you want a calendar-anomaly counterpart to tom_spy.
+
+Audit re-runnable: `python -m ops.audit.run_seasonality_research`.
+
 ### forge_fomc_drift — STAYS ARCHIVED (resurrection denied)
 
 forge_fomc_drift was killed 2026-05-20 for zero live fires (operational).
