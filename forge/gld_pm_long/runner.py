@@ -177,6 +177,16 @@ def _write_heartbeat(state: dict, last_eval_ts: str) -> None:
     }, indent=2, default=str))
 
 
+def _last_eval_ts_from_heartbeat() -> str:
+    try:
+        if HEARTBEAT_PATH.exists():
+            data = json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+            return str(data.get("last_eval_ts") or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _append_trade(row: dict) -> None:
     _ensure_trade_csv()
     with open(TRADES_PATH, "a", newline="", encoding="utf-8") as f:
@@ -562,6 +572,8 @@ def loop_mode():
     log.info("GLD PM Long --loop mode started. Signal hours UTC: %s", PARAMS["signal_hours_utc"])
     while True:
         try:
+            state = _load_state()
+            _write_heartbeat(state, _last_eval_ts_from_heartbeat())
             now = datetime.now(timezone.utc)
             # Find next firing time: top of next signal hour + 30s
             candidates = []
@@ -582,7 +594,13 @@ def loop_mode():
             next_fire = min(candidates)
             sleep_s = max(5, (next_fire - now).total_seconds())
             log.info("Next eval at %s UTC (sleep %.0fs)", next_fire.isoformat(), sleep_s)
-            time.sleep(sleep_s)
+            remaining = sleep_s
+            while remaining > 0:
+                chunk = min(300.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+                state = _load_state()
+                _write_heartbeat(state, _last_eval_ts_from_heartbeat())
             try:
                 evaluate_once()
             except Exception as e:
