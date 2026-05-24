@@ -106,6 +106,43 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### Dual-momentum trend-following on broad-8 — FAIL with nuance
+
+Tested per-asset absolute-momentum trend-following (Antonacci-style)
+on the same broad-8 universe xs_momentum uses. For each asset, each
+month: hold if trailing 12-month return > T-bill threshold; else flat.
+
+20y backtest, 1146 asset-month trades:
+  PF 1.53, WR 59.7%, CAGR 7.27%, max DD 26.41%
+  Fraction-of-time-invested per asset: 63%
+
+Disciplined gate: **HEADLINE FAIL (3/8 layers)** — but with structure
+that matters:
+  IID @ 0bp:   PASS (CI lower 1.31)
+  IID @ 10bp:  PASS (CI lower 1.24)
+  Block boot b=3,5,8: ALL FAIL (CI lower 1.15-1.18, just below 1.20 floor)
+  Period stability H1 (2006-2016): fail (CI lower 1.04)
+  Period stability H2 (2016-2026): **PASS (CI lower 1.33)**
+  p-value: 0.047 (marginal)
+
+Cross-era OOS shows modern-era strengthening:
+  2006-2016:  n=638  PF=1.42  CI lower=1.15  (fails)
+  2016-2026:  n=622  PF=1.60  **CI lower=1.30 (passes)**
+
+Same pattern as nov_spy and xs_momentum: modern era stronger than
+historical. But the absolute level of edge (CAGR 7.27%, DD 26.41%)
+is NOT competitive with xs_momentum (CAGR 18.04%, DD 22.39%).
+
+NO ACTION. dual_trend is not added as a candidate. The cross-sectional
+RANK approach of xs_momentum (top-2 of 8) is materially better than
+the absolute MOMENTUM approach (hold-if-above-threshold) on this same
+universe.
+
+Code stays in forge/dual_trend/ as research artifact + reusable
+template. Audit re-runnable: `python -m ops.audit.run_dual_trend_evaluation`.
+
+---
+
 ### TOM on IWM — dead (opposite of SPY where TOM is alive)
 
 Re-ran the TOM (4/3) backtest on IWM (Russell 2000 small-cap) to test
