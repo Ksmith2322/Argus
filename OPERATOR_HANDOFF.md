@@ -11,6 +11,37 @@ by criticality.
 
 ---
 
+## 0. New candidate: forge_tom_spy (2026-05-24 — needs your call)
+
+The new-strategy hunt produced its first candidate: classical turn-of-month
+(TOM) effect on SPY. Backtest-only at this point (no live runner yet).
+
+20-year disciplined-gate result:
+- PF point estimate **1.90**, CI lower **1.215** at 10bps slippage
+- WR 64.2%, n=240 trades
+- CAGR 7.26%, max DD 13.87% (vs SPY buy-and-hold 11.37%/30%+)
+- PARTIAL_PASS verdict (6/9 layers — H1/H2 sub-sample CIs dip below
+  the 1.20 floor independently, but the point PF in H1 (1.717) and H2
+  (1.721) are virtually identical → effect IS persistent across decades)
+
+Cross-decade OOS validation:
+- pre-2006: PF 1.59 (n=155)
+- 2006-2016: PF 1.68 (n=120)
+- 2016-2026: PF 1.76 (n=124) — the effect is actually STRONGER in modern data
+
+Operator decision: do you want to add this to the roster?
+- Recommended: add `forge_tom_spy` at 0.3× allocation as a third
+  diversifying strategy (TOM is only in-market 33% of trading days,
+  reducing concentration risk).
+- A live runner needs to be built (separate batch — daily-cadence
+  market orders on SPY, no brackets). Until then, allocation should
+  stay at 0.0× even if you decide to add it to the active roster pin.
+
+Full report: `ops/reports/system_audit/tom_spy_evaluation.md`. Re-run
+anytime: `python -m ops.audit.run_tom_spy_evaluation`.
+
+---
+
 ## 1. Rotate the Discord webhook (security — do this BEFORE pushing)
 
 The webhook URL committed in `.env` line 96 (DISCORD_WEBHOOK_URL)
