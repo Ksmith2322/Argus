@@ -69,20 +69,106 @@ PARAMS = {
 
 # ── Data ──────────────────────────────────────────────────────────────────
 
+def _period_start(period: str) -> pd.Timestamp | None:
+    """Best-effort cutoff for yfinance-style periods used by this runner."""
+    if not period:
+        return None
+    raw = str(period).strip().lower()
+    now = pd.Timestamp.now(tz="UTC").normalize()
+    try:
+        n = int(raw[:-1])
+    except (TypeError, ValueError):
+        return None
+    suffix = raw[-1:]
+    if suffix == "y":
+        return now - pd.DateOffset(years=n)
+    if suffix == "d":
+        return now - pd.Timedelta(days=n)
+    return None
+
+
+def _close_series_from_yf(out: pd.DataFrame, ticker: str) -> pd.Series | None:
+    """Extract Close for one ticker across yfinance's MultiIndex shapes."""
+    if out is None or out.empty:
+        return None
+    try:
+        if isinstance(out.columns, pd.MultiIndex):
+            for key in ((ticker, "Close"), ("Close", ticker)):
+                if key in out.columns:
+                    return out[key].dropna()
+            level0 = out.columns.get_level_values(0)
+            level1 = out.columns.get_level_values(1)
+            if ticker in set(level0) and "Close" in set(level1):
+                return out.xs(ticker, axis=1, level=0)["Close"].dropna()
+            if "Close" in set(level0) and ticker in set(level1):
+                return out.xs("Close", axis=1, level=0)[ticker].dropna()
+        elif "Close" in out.columns:
+            return out["Close"].dropna()
+    except Exception:
+        return None
+    return None
+
+
+def _cached_daily_close(ticker: str, period: str) -> pd.Series | None:
+    """Read the repo's CSV cache produced by helio.yfinance_data."""
+    safe = ticker.upper().replace("/", "_").replace("=", "_").replace("^", "_")
+    path = REPO / "helio" / "data_yfinance" / f"{safe}_daily.csv"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
+        if "Close" not in df.columns:
+            return None
+        idx = pd.to_datetime(df.index, utc=True)
+        series = pd.Series(df["Close"].astype(float).to_numpy(), index=idx, name=ticker).dropna()
+        start = _period_start(period)
+        if start is not None:
+            series = series[series.index >= start]
+        return series if not series.empty else None
+    except Exception as exc:
+        log.warning("cached daily close read failed for %s: %s", ticker, exc)
+        return None
+
+
 def _fetch_history(tickers: list[str], period: str = "10y") -> pd.DataFrame:
-    """Download daily closes for the universe. Returns a DataFrame indexed
-    by date, columns = tickers.
+    """Download daily closes for the universe, with cache fallback.
 
     auto_adjust=False because the published promotion_gate baseline
     (CI=[1.86, 6.30] from project_2026_05_22_backtest_factory_findings.md)
     was computed at this setting. Switching to True would silently shift
-    live PF vs baseline. See the convention block in helio/yfinance_data.py."""
-    out = yf.download(tickers, period=period, interval="1d",
-                      progress=False, auto_adjust=False, group_by="ticker")
+    live PF vs baseline. See the convention block in helio/yfinance_data.py.
+
+    Production rule: do not quietly return an empty ranking when yfinance is
+    down or changes column shape. Try the repo CSV cache, then fail loudly.
+    """
     cols = {}
-    for t in tickers:
-        if (t, "Close") in out.columns:
-            cols[t] = out[(t, "Close")]
+    errors: dict[str, str] = {}
+    try:
+        out = yf.download(tickers, period=period, interval="1d",
+                          progress=False, auto_adjust=False,
+                          group_by="ticker", threads=False)
+    except Exception as exc:
+        out = pd.DataFrame()
+        errors["bulk_yfinance"] = str(exc)
+
+    for ticker in tickers:
+        series = _close_series_from_yf(out, ticker)
+        if series is None or series.empty:
+            series = _cached_daily_close(ticker, period)
+        if series is not None and not series.empty:
+            cols[ticker] = series
+        else:
+            errors[ticker] = "missing close data"
+
+    if not cols:
+        raise RuntimeError(
+            "xs_momentum history unavailable for all tickers; "
+            f"period={period}; errors={errors}"
+        )
+    missing = sorted(set(tickers) - set(cols))
+    if missing:
+        log.warning("xs_momentum history missing %d/%d tickers: %s",
+                    len(missing), len(tickers), ",".join(missing))
     df = pd.DataFrame(cols).dropna(how="all")
     df.index = pd.to_datetime(df.index, utc=True)
     return df
@@ -788,6 +874,13 @@ def main(argv: list[str] | None = None) -> int:
             long_lookback=PARAMS["long_lookback"],
             short_lookback=PARAMS["short_lookback"],
         )
+        if not ranked:
+            print(json.dumps({
+                "error": "ranking_empty",
+                "as_of": str(closes.index[-1]) if len(closes) else None,
+                "available_columns": sorted(closes.columns.tolist()),
+            }, indent=2, default=str))
+            return 2
         picks = select_top_quintile(ranked, fraction=PARAMS["top_quintile_fraction"])
         print(json.dumps({
             "as_of": str(closes.index[-1]) if len(closes) else None,

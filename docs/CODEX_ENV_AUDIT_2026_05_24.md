@@ -180,9 +180,31 @@ Canonical fills:
 
 This is expected after reset, but it means there is no clean post-reset evidence yet. Any promotion or capital confidence must wait for actual clean ENTRY/EXIT lifecycle rows.
 
+## Data-Feed Follow-Up Applied
+
+`xs_momentum` no longer depends on a single direct `yf.download()` path. The runner now:
+
+- handles both common yfinance MultiIndex column shapes,
+- falls back to the vetted CSV cache in `helio/data_yfinance`,
+- raises loudly if no ticker history is available,
+- returns non-zero from `--check` if ranking is empty.
+
+Verification:
+
+```powershell
+C:\Argus\.venv\Scripts\python.exe -m forge.xs_momentum.runner --check
+```
+
+now returns current picks from cache:
+
+- `GLD`
+- `EEM`
+
+The latest cached bar is `2026-05-21`, so the sleeve is operational again but should still refresh cache/data before the next rebalance.
+
 ## Remaining Red Items
 
-1. `xs_momentum` yfinance download failure prevents offense picks.
+1. yfinance live downloads are still failing, but `xs_momentum` now falls back to cached closes and produces picks.
 2. `real_money_preflight` blocks both active strategies due missing live evidence and disabled allowlist.
 3. `gld_pm_long` remains questionable at realistic slippage.
 4. Discord alert send failed with local connection refused during health check.
@@ -214,4 +236,4 @@ AST parse passed for:
 
 Defense is materially better after this audit: killed strategies are stopped, phantoms are cleared, orphan audit is clean, and the launcher now refuses dead runners.
 
-Offense is not fully ready because the primary active offense sleeve depends on a data feed that is currently returning empty rankings. Fixing the `xs_momentum` data path is now the highest-value next task.
+Offense is usable again after the cache fallback patch, but live yfinance remains unreliable. The next highest-value hardening step is replacing yfinance as the production source of truth for active ETF sleeves or adding a scheduled cache refresh with alerting.
