@@ -157,6 +157,33 @@ def _run_preflight() -> dict:
                 "status": "ERROR"}
 
 
+def _run_roster_state() -> dict:
+    """Run the roster-classification audit. RED if any strategy is in
+    LIMBO or ABANDONED status (meaning the kill registry + allocation
+    config + runner files have drifted out of alignment)."""
+    try:
+        from ops.audit.run_roster_state import classify_all
+        rows = classify_all()
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        problems = (counts.get("LIMBO", 0)
+                       + counts.get("ABANDONED", 0)
+                       + counts.get("UNKNOWN", 0))
+        return {
+            "component": "roster_state",
+            "verdict_counts": counts,
+            "n_problems": problems,
+            "problem_rows": [r for r in rows
+                                if r["verdict"] in ("LIMBO", "ABANDONED",
+                                                       "UNKNOWN")],
+            "status": "RED" if problems else "GREEN",
+        }
+    except Exception as exc:
+        return {"component": "roster_state", "error": str(exc),
+                "status": "ERROR"}
+
+
 def _run_flag_check() -> dict:
     """Check for fleet-halt / flatten flags. RED if either present."""
     halt = HALT_FLAG.exists()
@@ -208,6 +235,14 @@ def _one_liner(report: dict) -> str:
         if report.get("halt_flag"): flags.append("HALT.flag")
         if report.get("flatten_flag"): flags.append("FLATTEN_EOD.flag")
         return f"flags present: {flags}" if flags else "no flags"
+    if component == "roster_state":
+        counts = report.get("verdict_counts", {})
+        n_problems = report.get("n_problems", 0)
+        if n_problems:
+            problem_names = [r["strategy"] + "=" + r["verdict"]
+                                for r in report.get("problem_rows", [])]
+            return f"{n_problems} drift: {problem_names}"
+        return f"clean: {counts}"
     return str(report)
 
 
@@ -218,6 +253,7 @@ def evaluate(post_discord: bool = True) -> dict:
         _run_auto_pause(),
         _run_orphan_check(),
         _run_preflight(),
+        _run_roster_state(),
         _run_flag_check(),
     ]
     if post_discord:

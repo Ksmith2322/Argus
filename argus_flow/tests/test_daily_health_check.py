@@ -69,6 +69,64 @@ def test_run_flag_check_red_when_flatten_flag_present(monkeypatch, tmp_path):
     assert result["flatten_flag"] is True
 
 
+# ─── _run_roster_state ───────────────────────────────────────────────
+
+def test_run_roster_state_green_when_no_drift(monkeypatch):
+    import ops.daily_health_check as dhc
+    from ops.audit import run_roster_state as rs
+    monkeypatch.setattr(rs, "classify_all", lambda: [
+        {"strategy": "forge_x", "verdict": "ACTIVE",
+         "allocation_factor": 1.0, "in_kill_registry": False,
+         "in_active_roster": True, "has_runner": True, "kill_date": ""},
+        {"strategy": "forge_y", "verdict": "KILLED",
+         "allocation_factor": 0.0, "in_kill_registry": True,
+         "in_active_roster": False, "has_runner": True,
+         "kill_date": "2026-05-20"},
+    ])
+    result = dhc._run_roster_state()
+    assert result["status"] == "GREEN"
+    assert result["n_problems"] == 0
+
+
+def test_run_roster_state_red_when_limbo_present(monkeypatch):
+    import ops.daily_health_check as dhc
+    from ops.audit import run_roster_state as rs
+    monkeypatch.setattr(rs, "classify_all", lambda: [
+        {"strategy": "forge_x", "verdict": "LIMBO",
+         "allocation_factor": 0.0, "in_kill_registry": False,
+         "in_active_roster": False, "has_runner": False, "kill_date": ""},
+    ])
+    result = dhc._run_roster_state()
+    assert result["status"] == "RED"
+    assert result["n_problems"] == 1
+    assert len(result["problem_rows"]) == 1
+    assert result["problem_rows"][0]["strategy"] == "forge_x"
+
+
+def test_run_roster_state_red_when_abandoned_present(monkeypatch):
+    import ops.daily_health_check as dhc
+    from ops.audit import run_roster_state as rs
+    monkeypatch.setattr(rs, "classify_all", lambda: [
+        {"strategy": "forge_xyz", "verdict": "ABANDONED",
+         "allocation_factor": None, "in_kill_registry": False,
+         "in_active_roster": False, "has_runner": True, "kill_date": ""},
+    ])
+    result = dhc._run_roster_state()
+    assert result["status"] == "RED"
+    assert result["n_problems"] == 1
+
+
+def test_run_roster_state_error_treated_as_error(monkeypatch):
+    import ops.daily_health_check as dhc
+    from ops.audit import run_roster_state as rs
+    def _raise():
+        raise RuntimeError("simulated failure")
+    monkeypatch.setattr(rs, "classify_all", _raise)
+    result = dhc._run_roster_state()
+    assert result["status"] == "ERROR"
+    assert "error" in result
+
+
 # ─── evaluate() aggregation ──────────────────────────────────────────
 
 def test_evaluate_returns_red_when_any_component_red(monkeypatch):
@@ -81,6 +139,9 @@ def test_evaluate_returns_red_when_any_component_red(monkeypatch):
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
         "component": "flag_check", "status": "GREEN"})
+    monkeypatch.setattr(dhc, "_run_roster_state", lambda: {
+        "component": "roster_state", "status": "GREEN",
+        "verdict_counts": {"ACTIVE": 2, "KILLED": 28}, "n_problems": 0})
     result = dhc.evaluate(post_discord=False)
     assert result["worst_status"] == "RED"
 
@@ -96,6 +157,9 @@ def test_evaluate_returns_yellow_when_only_yellow(monkeypatch):
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
         "component": "flag_check", "status": "GREEN"})
+    monkeypatch.setattr(dhc, "_run_roster_state", lambda: {
+        "component": "roster_state", "status": "GREEN",
+        "verdict_counts": {"ACTIVE": 2, "KILLED": 28}, "n_problems": 0})
     result = dhc.evaluate(post_discord=False)
     assert result["worst_status"] == "YELLOW"
 
@@ -111,6 +175,9 @@ def test_evaluate_returns_green_when_all_green(monkeypatch):
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
         "component": "flag_check", "status": "GREEN"})
+    monkeypatch.setattr(dhc, "_run_roster_state", lambda: {
+        "component": "roster_state", "status": "GREEN",
+        "verdict_counts": {"ACTIVE": 2, "KILLED": 28}, "n_problems": 0})
     result = dhc.evaluate(post_discord=False)
     assert result["worst_status"] == "GREEN"
 
@@ -126,6 +193,9 @@ def test_evaluate_error_treated_as_red(monkeypatch):
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
         "component": "flag_check", "status": "GREEN"})
+    monkeypatch.setattr(dhc, "_run_roster_state", lambda: {
+        "component": "roster_state", "status": "GREEN",
+        "verdict_counts": {"ACTIVE": 2, "KILLED": 28}, "n_problems": 0})
     result = dhc.evaluate(post_discord=False)
     assert result["worst_status"] == "RED"
 
@@ -143,6 +213,9 @@ def test_evaluate_skips_discord_when_all_green(monkeypatch):
         "component": "preflight", "status": "GREEN", "strategies": []})
     monkeypatch.setattr(dhc, "_run_flag_check", lambda: {
         "component": "flag_check", "status": "GREEN"})
+    monkeypatch.setattr(dhc, "_run_roster_state", lambda: {
+        "component": "roster_state", "status": "GREEN",
+        "verdict_counts": {"ACTIVE": 2, "KILLED": 28}, "n_problems": 0})
 
     def _fake_post_discord(reports):
         posted.append(reports)
