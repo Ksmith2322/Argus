@@ -195,6 +195,17 @@ def _xs_momentum_picks() -> dict:
         return {"error": str(exc)}
 
 
+def _data_feed_contracts() -> dict:
+    """Per Codex gap #1: offline verification of each strategy's
+    declared data-feed contract. RED means the strategy has no cache
+    insurance against a live data outage."""
+    try:
+        from helio.data_feed_contract import verify_all_contracts
+        return verify_all_contracts()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def _strategy_role_table() -> list[dict]:
     """Per Codex gap #10: every active strategy declares its role
     (OFFENSE / DEFENSE / HEDGE / RESEARCH), and the disciplined-gate
@@ -302,6 +313,7 @@ def build_snapshot() -> dict:
         "canonical_fills_since_epoch": _canonical_fills_since_epoch(),
         "xs_momentum_picks": _xs_momentum_picks(),
         "strategy_roles": _strategy_role_table(),
+        "data_feed_contracts": _data_feed_contracts(),
         "preflight": _preflight(),
     }
 
@@ -426,6 +438,23 @@ def render_markdown(snapshot: dict) -> str:
             out.append(
                 f"| {r['strategy']} | {r['role']} | {floor_str} | "
                 f"{active} | {explicit} |"
+            )
+    out.append("")
+
+    out.append("## Data-feed contracts (Codex gap #1)")
+    out.append("")
+    dfc = snapshot.get("data_feed_contracts", {})
+    if "error" in dfc:
+        out.append(f"  ERROR: {dfc['error']}")
+    else:
+        out.append("| Strategy | Verdict | Present | Missing | Stale |")
+        out.append("|---|---|---|---|---|")
+        for name, r in dfc.items():
+            out.append(
+                f"| {name} | {r['verdict']} | "
+                f"{len(r['universe_present'])}/{len(r['universe_required'])} | "
+                f"{len(r['universe_missing'])} | "
+                f"{len(r['stale_tickers'])} |"
             )
     out.append("")
 
