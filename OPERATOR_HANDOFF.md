@@ -61,6 +61,30 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### forge_fomc_drift — STAYS ARCHIVED (resurrection denied)
+
+forge_fomc_drift was killed 2026-05-20 for zero live fires (operational).
+Re-ran the existing 2000-2026 backtest (n=216) through the disciplined
+gate to see if it should be resurrected. **It should not.**
+
+  Era                 n   PF    WR     avg/trade   pass @ 5bp?
+  2000-2010 (pre-QE) 85   1.80  62.4%  +0.33%      no (CI lower 1.00)
+  2010-2018 (QE era) 64   1.53  48.4%  +0.15%      no (CI lower 0.73)
+  2018-2026 post-QE  67   0.93  40.3%  −0.03%      no (CI lower 0.49)
+
+The edge was real pre-2010 (PF 1.80) but has been DEAD since ~2018
+(point PF 0.93, WR 40%, avg −0.03% per trade — net loser at any
+slippage). Fed forward guidance + dot plots after 2010 killed the
+pre-announcement uncertainty premium that drove the drift.
+
+Disciplined gate: FAIL 0/9 layers. The legacy "PF 1.58" headline was
+averaging strong pre-QE returns into negative-expectancy post-QE
+returns and misleading.
+
+ACTION: nothing. forge_fomc_drift stays archived at allocation 0.0×.
+
+Audit re-runnable: `python -m ops.audit.run_fomc_drift_evaluation`.
+
 ### Russell reconstitution candidate — NULL RESULT
 
 Also tested IWM around the annual late-June Russell rebalance Friday.
