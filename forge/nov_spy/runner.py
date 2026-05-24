@@ -1,0 +1,451 @@
+"""forge.nov_spy — November SPY effect, live runner.
+
+Calendar-based runner. Wakes daily; on the first trading day of
+November, BUYS SPY at close. On the last trading day of November,
+SELLS at close. One trade per year.
+
+Modes:
+    --check       Print today's intended action (no trade)
+    --evaluate    One cycle (entry / exit / noop)
+    --loop        Daemon: wake daily ~20 min before US close
+
+Allocation fail-closed. Real-money boundary check. Same execution
+plumbing as forge.tom_spy.runner — calendar-aware market orders
+on SPY with no protective brackets (calendar-based exit, not stops).
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone, date
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from forge.logging_setup import setup_logging
+from helio.fleet_sizing import (
+    get_allocation_factor,
+    get_sizing_anchor_usd,
+    max_notional_usd,
+)
+from helio import ibkr_execution as ibkr
+
+STRATEGY_LABEL = "forge_nov_spy"
+IBKR_CLIENT_ID = 124   # next free in the forge range (123 = tom_spy)
+_SIGNAL_ONLY_MODE = False
+
+REPO = Path(__file__).resolve().parents[2]
+LOG_DIR = REPO / "forge" / "logs" / "nov_spy"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_PATH = LOG_DIR / "state.json"
+HEARTBEAT_PATH = LOG_DIR / "heartbeat.json"
+TRADES_PATH = LOG_DIR / "trades.csv"
+
+log = setup_logging("nov_spy")
+
+NY_TZ = ZoneInfo("America/New_York")
+
+PARAMS = {
+    "version": "v1_20260524",
+    "ticker": "SPY",
+    "instrument_type": "etf",
+    "per_trade_fraction": 1.0,    # full anchor; held only 1 month/year
+    "eval_hour_utc": 19,
+    "eval_minute_utc": 40,
+}
+
+
+# ── State / heartbeat / trade CSV ─────────────────────────────────────
+
+def _load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {
+        "open_trade": None,
+        "trade_count": 0,
+        "session_id": str(uuid.uuid4())[:8],
+    }
+
+
+def _save_state(state: dict) -> None:
+    STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
+
+
+TRADE_FIELDS = [
+    "ts", "side", "ticker", "px", "qty",
+    "pnl_usd", "pnl_pct", "session_id", "config_version",
+]
+
+
+def _ensure_trade_csv() -> None:
+    if not TRADES_PATH.exists():
+        with open(TRADES_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(TRADE_FIELDS)
+
+
+def _append_trade(row: dict) -> None:
+    _ensure_trade_csv()
+    with open(TRADES_PATH, "a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=TRADE_FIELDS).writerow(
+            {k: row.get(k, "") for k in TRADE_FIELDS}
+        )
+
+
+def _write_heartbeat(state: dict, action: str) -> None:
+    HEARTBEAT_PATH.write_text(json.dumps({
+        "system": "nov_spy",
+        "family": "forge",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": "signal_only" if _SIGNAL_ONLY_MODE else "paper",
+        "trade_count": state.get("trade_count", 0),
+        "open_trade": state.get("open_trade"),
+        "last_action": action,
+        "version": PARAMS["version"],
+    }, indent=2, default=str))
+
+
+# ── Calendar logic ────────────────────────────────────────────────────
+
+def _us_weekdays_in_month(year: int, month: int) -> list[date]:
+    """All weekdays (Mon-Fri) in (year, month). Ignores holidays; broker
+    rejection is the safety net if a holiday lands on the boundary."""
+    days: list[date] = []
+    d = date(year, month, 1)
+    while d.month == month:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def is_entry_day(today: date) -> bool:
+    """True iff today is the FIRST weekday of November of its year."""
+    if today.month != 11:
+        return False
+    weekdays = _us_weekdays_in_month(today.year, 11)
+    return bool(weekdays) and today == weekdays[0]
+
+
+def is_exit_day(today: date) -> bool:
+    """True iff today is the LAST weekday of November of its year."""
+    if today.month != 11:
+        return False
+    weekdays = _us_weekdays_in_month(today.year, 11)
+    return bool(weekdays) and today == weekdays[-1]
+
+
+# ── Execution helpers (mirrors tom_spy) ───────────────────────────────
+
+def _submit_market(ib, contract, action: str, qty: int, *, est_px: float,
+                    timeout_s: float = 30.0):
+    from ib_insync import MarketOrder
+    try:
+        from helio.real_money import (
+            enforce_real_money_boundary,
+            AccountBoundaryViolationError,
+        )
+        est_notional = abs(qty) * float(est_px) if est_px and qty else None
+        enforce_real_money_boundary(
+            ib, strategy_label=STRATEGY_LABEL, notional_usd=est_notional,
+        )
+    except AccountBoundaryViolationError as exc:
+        log.error("REAL_MONEY_BOUNDARY refusing %s %d %s: %s",
+                  action, qty, contract.symbol, exc)
+        return None
+    halted, reason = ibkr.is_fleet_halted()
+    if halted:
+        log.warning("FLEET_HALTED refusing %s %d %s: %s",
+                    action, qty, contract.symbol, reason)
+        return None
+    if not ibkr.is_market_open(contract):
+        log.warning("MARKET_CLOSED refusing %s %d %s",
+                    action, qty, contract.symbol)
+        return None
+    order = MarketOrder(action, abs(qty))
+    trade = ib.placeOrder(contract, order)
+    fill = ibkr._wait_for_fill(ib, trade, timeout_s=timeout_s)
+    if not fill.filled:
+        log.error("MARKET %s %d %s FAILED: %s",
+                  action, qty, contract.symbol, fill.reject_reason)
+        return None
+    log.info("MARKET %s %d %s @ %.4f", action, qty,
+             contract.symbol, fill.fill_price)
+    return fill
+
+
+def _write_canonical(side: str, ticker: str, qty: int, fill_px: float,
+                      *, entry_px: float | None = None,
+                      entry_ts: str | None = None,
+                      pnl_usd: float | None = None) -> None:
+    try:
+        from helio.canonical_fills import write_fill
+        write_fill(
+            strategy=STRATEGY_LABEL,
+            symbol=ticker,
+            direction="long",
+            side=side,
+            entry_ts=entry_ts or (datetime.now(timezone.utc).isoformat()
+                                    if side == "ENTRY" else None),
+            exit_ts=(datetime.now(timezone.utc).isoformat()
+                      if side == "EXIT" else None),
+            entry_px=entry_px if entry_px is not None else fill_px,
+            exit_px=fill_px if side == "EXIT" else None,
+            size=int(qty),
+            pnl_usd=(round(pnl_usd, 2) if pnl_usd is not None else None),
+        )
+    except Exception as exc:
+        log.warning("canonical %s write failed (non-fatal): %s", side, exc)
+
+
+# ── Core: one evaluation cycle ────────────────────────────────────────
+
+def evaluate_once(force_action: str | None = None) -> dict:
+    """One cycle. Returns a summary dict."""
+    summary: dict = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "action": "noop",
+        "reason": "",
+    }
+    state = _load_state()
+    today = datetime.now(NY_TZ).date()
+    is_entry = (force_action == "entry") or (force_action is None
+                                                and is_entry_day(today))
+    is_exit = (force_action == "exit") or (force_action is None
+                                              and is_exit_day(today))
+
+    if not (is_entry or is_exit):
+        summary["reason"] = (f"not a nov_spy action day "
+                              f"(today={today.isoformat()})")
+        _write_heartbeat(state, action="noop")
+        log.info(summary["reason"])
+        return summary
+
+    if is_entry and state.get("open_trade"):
+        summary["action"] = "skip_entry_position_already_open"
+        summary["reason"] = "state.open_trade is not None"
+        log.warning("ENTRY day but position already open — skipping")
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+    if is_exit and not state.get("open_trade"):
+        summary["action"] = "skip_exit_no_position"
+        summary["reason"] = "state.open_trade is None"
+        log.warning("EXIT day but no position to close")
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+
+    try:
+        alloc = float(get_allocation_factor(STRATEGY_LABEL))
+    except Exception as exc:
+        log.error("allocation_factor read failed: %s — refusing trade", exc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"alloc_read_failed:{exc}"
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+    if alloc <= 0.0:
+        log.info("[ALLOC-GATE] allocation_factor=%.3f — deallocated", alloc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"alloc_factor={alloc}"
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+
+    if _SIGNAL_ONLY_MODE:
+        action_word = "ENTRY" if is_entry else "EXIT"
+        log.info("SIGNAL-ONLY: would %s SPY", action_word)
+        summary["action"] = f"signal_only_{action_word.lower()}"
+        summary["reason"] = "signal_only_mode"
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+
+    try:
+        ib = ibkr.connect_with_retry(IBKR_CLIENT_ID, max_attempts=3)
+    except Exception as exc:
+        log.error("IBKR connect failed: %s — skipping cycle", exc)
+        summary["action"] = "blocked"
+        summary["reason"] = f"ibkr_connect:{exc}"
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+
+    try:
+        contract = ibkr.make_contract(PARAMS["ticker"], PARAMS["instrument_type"])
+        try:
+            ib.qualifyContracts(contract)
+        except Exception as exc:
+            log.error("qualifyContracts(%s) failed: %s", PARAMS["ticker"], exc)
+            summary["action"] = "blocked"
+            summary["reason"] = f"qualify_failed:{exc}"
+            return summary
+
+        try:
+            ticker_data = ib.reqMktData(contract, snapshot=True)
+            ib.sleep(2.0)
+            est_px = float(ticker_data.last or ticker_data.close or 0.0)
+        except Exception:
+            est_px = 0.0
+
+        if is_entry:
+            anchor = get_sizing_anchor_usd()
+            capital = anchor * alloc * PARAMS["per_trade_fraction"]
+            cap_usd = max_notional_usd("etf", strategy_label=STRATEGY_LABEL) or 0.0
+            if cap_usd > 0:
+                capital = min(capital, cap_usd)
+            if est_px <= 0:
+                log.error("no price for sizing — aborting entry")
+                summary["action"] = "blocked"
+                summary["reason"] = "no_price"
+                return summary
+            qty = int(capital // est_px)
+            if qty < 1:
+                log.warning("qty<1 (capital=%.2f / est_px=%.2f)", capital, est_px)
+                summary["action"] = "blocked"
+                summary["reason"] = "size_zero"
+                return summary
+            existing = ibkr.query_position(ib, contract)
+            if existing != 0:
+                log.warning("BROKER_HAS_POSITION %s qty=%.0f — abort",
+                              PARAMS["ticker"], existing)
+                summary["action"] = "blocked"
+                summary["reason"] = "broker_has_position"
+                return summary
+            fill = _submit_market(ib, contract, "BUY", qty, est_px=est_px)
+            if fill is None:
+                summary["action"] = "entry_failed"
+                return summary
+            state["open_trade"] = {
+                "entry_ts": datetime.now(timezone.utc).isoformat(),
+                "entry_px": float(fill.fill_price),
+                "qty": int(qty),
+                "alloc_factor": alloc,
+            }
+            state["trade_count"] = int(state.get("trade_count", 0)) + 1
+            _append_trade({
+                "ts": state["open_trade"]["entry_ts"], "side": "ENTRY",
+                "ticker": PARAMS["ticker"], "px": round(fill.fill_price, 4),
+                "qty": qty, "pnl_usd": "", "pnl_pct": "",
+                "session_id": state.get("session_id", ""),
+                "config_version": PARAMS["version"],
+            })
+            _write_canonical("ENTRY", PARAMS["ticker"], qty, fill.fill_price)
+            summary["action"] = "entered"
+            summary["entry_px"] = fill.fill_price
+            summary["qty"] = qty
+
+        elif is_exit:
+            ot = state.get("open_trade") or {}
+            qty = int(ot.get("qty") or 0)
+            if qty <= 0:
+                summary["action"] = "skip_exit_zero_qty"
+                return summary
+            fill = _submit_market(ib, contract, "SELL", qty, est_px=est_px or 1.0)
+            if fill is None:
+                summary["action"] = "exit_failed"
+                return summary
+            entry_px = float(ot.get("entry_px") or 0.0)
+            pnl_usd = (fill.fill_price - entry_px) * qty
+            pnl_pct = ((fill.fill_price / entry_px - 1.0) * 100.0) \
+                if entry_px > 0 else 0.0
+            _append_trade({
+                "ts": datetime.now(timezone.utc).isoformat(), "side": "EXIT",
+                "ticker": PARAMS["ticker"], "px": round(fill.fill_price, 4),
+                "qty": qty, "pnl_usd": round(pnl_usd, 2),
+                "pnl_pct": round(pnl_pct, 4),
+                "session_id": state.get("session_id", ""),
+                "config_version": PARAMS["version"],
+            })
+            _write_canonical("EXIT", PARAMS["ticker"], qty, fill.fill_price,
+                              entry_px=entry_px,
+                              entry_ts=ot.get("entry_ts"),
+                              pnl_usd=pnl_usd)
+            state["open_trade"] = None
+            state["trade_count"] = int(state.get("trade_count", 0)) + 1
+            summary["action"] = "exited"
+            summary["exit_px"] = fill.fill_price
+            summary["pnl_usd"] = pnl_usd
+            summary["pnl_pct"] = pnl_pct
+
+        _save_state(state)
+        _write_heartbeat(state, action=summary["action"])
+        return summary
+    finally:
+        try:
+            ibkr.disconnect(ib)
+        except Exception:
+            pass
+
+
+# ── Loop ──────────────────────────────────────────────────────────────
+
+def loop_mode() -> None:
+    log.info("nov_spy --loop started: daily wake at %02d:%02d UTC",
+             PARAMS["eval_hour_utc"], PARAMS["eval_minute_utc"])
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            fire = now.replace(hour=PARAMS["eval_hour_utc"],
+                                 minute=PARAMS["eval_minute_utc"],
+                                 second=15, microsecond=0)
+            if fire <= now:
+                fire += timedelta(days=1)
+            sleep_s = max(5.0, (fire - now).total_seconds())
+            log.info("nov_spy next wake at %s UTC (sleep %.0fs)",
+                     fire.isoformat(), sleep_s)
+            time.sleep(sleep_s)
+            try:
+                evaluate_once()
+            except Exception as exc:
+                log.error("evaluate_once failed: %s", exc, exc_info=True)
+                time.sleep(120)
+        except KeyboardInterrupt:
+            log.info("nov_spy loop stopped by user")
+            return
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--force-entry", action="store_true")
+    parser.add_argument("--force-exit", action="store_true")
+    parser.add_argument("--signal-only", action="store_true")
+    args = parser.parse_args(argv)
+
+    global _SIGNAL_ONLY_MODE
+    _SIGNAL_ONLY_MODE = bool(args.signal_only)
+    if _SIGNAL_ONLY_MODE:
+        log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
+
+    if args.check:
+        today = datetime.now(NY_TZ).date()
+        print(json.dumps({
+            "today_ny": today.isoformat(),
+            "is_entry_day": is_entry_day(today),
+            "is_exit_day": is_exit_day(today),
+            "version": PARAMS["version"],
+        }, indent=2, default=str))
+        return 0
+
+    if args.evaluate:
+        force = ("entry" if args.force_entry
+                  else "exit" if args.force_exit
+                  else None)
+        summary = evaluate_once(force_action=force)
+        print(json.dumps(summary, indent=2, default=str))
+        return 0
+
+    if args.loop:
+        loop_mode()
+        return 0
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

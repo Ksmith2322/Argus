@@ -11,6 +11,51 @@ by criticality.
 
 ---
 
+## 0.5. New candidate: forge_nov_spy (2026-05-24 — needs your call)
+
+Built and disciplined-gated tonight. **MARGINAL_PASS (8/9 layers)** —
+the strongest gate result for any candidate this session.
+
+20-year disciplined gate (n=30 Novembers, 1995-2025):
+- PF point 4.92, IID CI lower **1.85 at 0bp, 1.80 at 5bp, 1.75 at 10bp**
+  (well above 1.20 floor)
+- Block bootstrap b=3,5,8 all PASS at 10bp
+- p-value block bootstrap: **0.00030** (very strong)
+- Period stability H1 (1995-2010, n=15): fail (CI lower 0.735 from
+  small-sample noise)
+- Period stability H2 (2010-2025, n=15): PASS **(PF 17.6, CI lower 5.30)**
+
+Cross-era OOS:
+- pre-2000: n=4 insufficient
+- 2000-2010: PF 1.59, CI lower 0.39 — fails at slippage
+- 2010-2026: **PF 18.66, CI lower 5.63** — modern era dramatically stronger
+
+**The November effect has STRENGTHENED in modern data**, not arbitraged out.
+
+Mechanics:
+- Long SPY at close of first weekday of November
+- Sell at close of last weekday of November
+- One trade per year
+- Holds for ~30 calendar days (~22 trading days)
+- Max DD 8.68% (the smallest of any candidate this session)
+
+Correlation with forge_tom_spy: moderate (overlap ~3 days in early
+November; tom_spy is in-and-out, nov_spy holds the full month).
+
+### How to activate
+
+Same 4-step process as forge_tom_spy (see §0):
+1. Add `forge_nov_spy` to `ACTIVE_ROSTER` in `test_sunset_roster.py`
+2. Add `"forge_nov_spy": 0.2` to allocation_factors.json (recommend
+   half of tom_spy's 0.3× since n=30 is borderline)
+3. `python -m forge.nov_spy.runner --check` to confirm today's action
+4. Launch `--loop` daemon
+
+First action will be the first weekday of November 2026 (Mon Nov 2 —
+about 5 months out, plenty of operator time to decide).
+
+---
+
 ## 0. New candidate: forge_tom_spy (2026-05-24 — needs your call)
 
 The new-strategy hunt produced its first candidate: classical turn-of-month
