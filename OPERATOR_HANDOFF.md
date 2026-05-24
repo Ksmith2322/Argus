@@ -61,6 +61,29 @@ above 0.0.
    day (likely the 4th-to-last weekday of either May or June 2026 —
    `--check` will tell you).
 
+### Day-of-week effects — DEAD post-2000
+
+Tested 7,800 SPY daily bars (1995-2025) for systematic Mon-Fri patterns.
+Bonferroni-adjusted at 5 tests (α=0.01):
+
+  Era         Day  mean_bps   t     p       Bonf-sig?
+  Full        Tue  +7.72     2.60  0.0094   YES
+  Pre-2000    Fri  +18.24    2.79  0.0052   YES  ← real then
+  Post-2000   —    nothing significant
+
+Friday-effect strategy (buy Thu close, sell Fri close): **PF=1.04,
+CI=[0.90, 1.20] post-slippage — no edge**. The pre-2000 Friday effect
+has been arbitraged out; the full-window Tuesday signal is driven by
+pre-2000 leakage.
+
+Conditional weekend effect (Monday after negative Friday is supposedly
+weak): tested at n=627, mean +6.47 bps, t=+1.06, p=0.29 — also dead.
+
+ACTION: nothing actionable. Day-of-week strategies on SPY do not have
+edge. Class of strategies closed.
+
+Audit re-runnable: `python -m ops.audit.run_dow_research`.
+
 ### Monthly seasonality / Halloween effect — November is the only significant month
 
 Tested 30 years of SPY monthly returns (1995-2025, n=371). Bonferroni-
