@@ -143,12 +143,17 @@ def _write_heartbeat(state: dict, last_rebalance: dict | None) -> None:
 
 # ── Backtest ──────────────────────────────────────────────────────────────
 
-def backtest(period: str = "10y") -> dict:
+def backtest(period: str = "10y", return_monthly_series: bool = False) -> dict:
     """Simulate monthly rebalancing over the historical window.
 
     At each month-end (resampled from daily closes), rank universe by 12-1
     momentum, compare to last month's picks, simulate sells of removed
     picks and buys of new picks at the next month's first available close.
+
+    When return_monthly_series=True the result includes a `monthly_returns`
+    dict (YYYY-MM → equal-weight portfolio return as a fraction, not pct).
+    Used by factor-decomposition audits to regress against Fama-French
+    proxies.
     """
     universe = list(PARAMS["universe"])
     long_lb = PARAMS["long_lookback"]
@@ -270,7 +275,7 @@ def backtest(period: str = "10y") -> dict:
     except Exception:
         cagr = 0.0
 
-    return {
+    result = {
         "universe_size": len(universe),
         "trades": len(trades),
         "win_rate": round(wr, 3),
@@ -284,6 +289,14 @@ def backtest(period: str = "10y") -> dict:
         "last_exit": str(max(t["exit_date"] for t in trades)),
         "trades_per_ticker": _count_per_ticker(trades),
     }
+    if return_monthly_series:
+        # Equal-weight portfolio return per exit-month, as fraction
+        # (matches the equity-curve compounding above).
+        result["monthly_returns"] = {
+            m: sum(by_month[m]) / len(by_month[m]) / 100.0
+            for m in sorted(by_month)
+        }
+    return result
 
 
 def _count_per_ticker(trades: list[dict]) -> dict:
@@ -291,6 +304,73 @@ def _count_per_ticker(trades: list[dict]) -> dict:
     for t in trades:
         out[t["ticker"]] = out.get(t["ticker"], 0) + 1
     return out
+
+
+def monthly_portfolio_returns(period: str = "10y") -> dict[str, float]:
+    """Compute the strategy's true month-over-month equal-weight portfolio
+    return over the backtest window. Unlike backtest()'s by_month dict (which
+    is keyed by exit_date and skips months where no rotation occurred), this
+    walks every calendar month-end and computes the held-portfolio return.
+
+    Returns {"YYYY-MM": fraction, ...}. Used by factor-decomposition audits.
+    """
+    universe = list(PARAMS["universe"])
+    long_lb = PARAMS["long_lookback"]
+    short_lb = PARAMS["short_lookback"]
+    closes = _fetch_history(universe, period=period)
+    if closes.empty:
+        return {}
+    closes.index = closes.index.tz_convert("UTC")
+    month_ends = closes.groupby(
+        [closes.index.year, closes.index.month]
+    ).tail(1).index
+
+    holdings: set[str] = set()  # current picks held into the next month
+    monthly: dict[str, float] = {}
+    prev_close: dict[str, float] = {}
+
+    for month_end in month_ends:
+        i = closes.index.get_loc(month_end)
+        month_key = month_end.strftime("%Y-%m")
+        # Step 1: realize this month's return on whatever we were HOLDING
+        # at the start of this month (= holdings as set at the previous
+        # rebalance) using start-of-month price → end-of-month price.
+        if holdings and prev_close:
+            rets = []
+            for t in holdings:
+                if t in prev_close and t in closes.columns:
+                    end_px = float(closes[t].iloc[i])
+                    start_px = prev_close[t]
+                    if start_px > 0:
+                        rets.append(end_px / start_px - 1.0)
+            if rets:
+                monthly[month_key] = sum(rets) / len(rets)
+        # Step 2: rebalance — recompute top-2 picks using data ENDING AT
+        # this month_end (no look-ahead), then set holdings for next month.
+        if i > long_lb + short_lb:
+            per_asset = {
+                t: closes[t].iloc[: i + 1].dropna().tolist()
+                for t in universe
+                if t in closes.columns
+            }
+            ranked = rank_universe_by_momentum(
+                per_asset,
+                long_lookback=long_lb,
+                short_lookback=short_lb,
+            )
+            picks = select_top_quintile(
+                ranked, fraction=PARAMS["top_quintile_fraction"]
+            )
+            holdings = {p.ticker for p in picks}
+        # Step 3: snapshot end-of-month prices for the NEXT month's
+        # "start price" reference (we hold from end_of_this_month →
+        # end_of_next_month, since rebalance happens at this bar).
+        prev_close = {
+            t: float(closes[t].iloc[i])
+            for t in holdings
+            if t in closes.columns
+        }
+    return monthly
 
 
 # ── Live execution ────────────────────────────────────────────────────────
