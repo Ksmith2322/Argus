@@ -2905,6 +2905,203 @@ async def api_pre_market_check():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/equity_curves_per_variant")
+async def api_equity_curves_per_variant(window_days: int = 90):
+    """Cumulative-PnL equity curve per strategy over a rolling window.
+
+    Walks canonical_fills, sorts EXIT rows by ts per strategy, accrues
+    a running cum_pnl_usd. Returns one series per strategy:
+        [{ts, cum_pnl_usd}, ...]
+
+    Default 90-day window. Empty curves are still returned (with a
+    zero-anchor point) so the panel can show "0 fills yet" placeholders.
+
+    Cheap (~20ms — single file scan + sort).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        # strategy -> list[(dt, pnl_usd)]
+        by_strat: dict[str, list] = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = _json.loads(line)
+                    except Exception:
+                        continue
+                    if (row.get("side") or "").upper() != "EXIT":
+                        continue
+                    pnl = row.get("pnl_usd")
+                    if pnl is None:
+                        continue
+                    try:
+                        pnl = float(pnl)
+                    except (TypeError, ValueError):
+                        continue
+                    ts = row.get("ts") or row.get("exit_ts") or ""
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        continue
+                    strat = row.get("strategy") or "?"
+                    by_strat.setdefault(strat, []).append((dt, pnl))
+
+        # Build cumulative curves
+        curves: dict[str, list] = {}
+        for strat, points in by_strat.items():
+            points.sort(key=lambda p: p[0])
+            cum = 0.0
+            series = []
+            for dt, pnl in points:
+                cum += pnl
+                series.append({"ts": dt.isoformat(),
+                               "cum_pnl_usd": round(cum, 2)})
+            curves[strat] = series
+
+        # Include zero-anchor series for ACTIVE strategies with no fills
+        try:
+            from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+            for s in ACTIVE_ROSTER:
+                if s not in curves:
+                    curves[s] = []
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "window_days": window_days,
+            "n_strategies": len(curves),
+            "curves": curves,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "equity_curves failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/pnl_attribution")
+async def api_pnl_attribution(window_days: int = 30):
+    """Per-strategy PnL attribution over a recent window.
+
+    Walks argus_flow/logs/canonical_fills.jsonl, sums realized
+    PnL per strategy, returns per-sleeve breakdown + totals.
+
+    Default window 30 days. Pass ?window_days=N to override.
+
+    Built to answer "when money is made (or lost), which sleeve
+    did it?" — the missing visibility for fleet-level decision
+    making. Cheap (~10ms — single file scan).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        if not path.exists():
+            return JSONResponse({
+                "window_days": window_days,
+                "n_strategies": 0,
+                "per_strategy": [],
+                "fleet_total_pnl_usd": 0.0,
+                "fleet_n_trades": 0,
+                "note": "canonical_fills.jsonl not present yet",
+            })
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        # strategy -> aggregate stats
+        agg: dict[str, dict] = {}
+        total_fleet_pnl = 0.0
+        total_fleet_trades = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                # Only count CLOSED trades (have realized pnl_usd)
+                if (row.get("side") or "").upper() != "EXIT":
+                    continue
+                pnl = row.get("pnl_usd")
+                if pnl is None:
+                    continue
+                try:
+                    pnl = float(pnl)
+                except (TypeError, ValueError):
+                    continue
+                ts = row.get("ts") or row.get("exit_ts") or ""
+                # Parse ts; skip trades older than window
+                if ts:
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                strat = row.get("strategy") or "?"
+                a = agg.setdefault(strat, {
+                    "strategy": strat,
+                    "pnl_usd": 0.0,
+                    "n_trades": 0,
+                    "n_wins": 0,
+                    "n_losses": 0,
+                    "best_trade_usd": float("-inf"),
+                    "worst_trade_usd": float("inf"),
+                })
+                a["pnl_usd"] += pnl
+                a["n_trades"] += 1
+                if pnl > 0:
+                    a["n_wins"] += 1
+                elif pnl < 0:
+                    a["n_losses"] += 1
+                a["best_trade_usd"] = max(a["best_trade_usd"], pnl)
+                a["worst_trade_usd"] = min(a["worst_trade_usd"], pnl)
+                total_fleet_pnl += pnl
+                total_fleet_trades += 1
+
+        # Finalize: compute win_rate; clean up sentinel best/worst
+        per_strategy = []
+        for s in sorted(agg.values(), key=lambda x: -x["pnl_usd"]):
+            n = s["n_trades"]
+            s["win_rate"] = round(s["n_wins"] / n, 3) if n else None
+            s["pnl_usd"] = round(s["pnl_usd"], 2)
+            if s["best_trade_usd"] == float("-inf"):
+                s["best_trade_usd"] = 0.0
+            if s["worst_trade_usd"] == float("inf"):
+                s["worst_trade_usd"] = 0.0
+            s["best_trade_usd"] = round(s["best_trade_usd"], 2)
+            s["worst_trade_usd"] = round(s["worst_trade_usd"], 2)
+            per_strategy.append(s)
+
+        return JSONResponse({
+            "window_days": window_days,
+            "n_strategies": len(per_strategy),
+            "per_strategy": per_strategy,
+            "fleet_total_pnl_usd": round(total_fleet_pnl, 2),
+            "fleet_n_trades": total_fleet_trades,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "pnl_attribution failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/variant_exposure")
 async def api_variant_exposure():
     """Combined holdings exposure across the 5 xs_momentum variants.
@@ -9841,6 +10038,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- VARIANT EXPOSURE — combined xs_momentum cohort holdings + concentration warnings -->
 <div id="variant-exposure-panel" style="margin-bottom:12px;"></div>
 
+<!-- PNL ATTRIBUTION — per-strategy realized PnL over rolling window -->
+<div id="pnl-attribution-panel" style="margin-bottom:12px;"></div>
+
+<!-- EQUITY CURVES PER VARIANT — cumulative PnL sparklines, side-by-side -->
+<div id="equity-curves-panel" style="margin-bottom:12px;"></div>
+
 <!-- ACTIVE ALPHA READINESS — synthesis of what's blocking real-money scale per active strategy -->
 <div id="active-alpha-readiness-panel" style="margin-bottom:14px;"></div>
 
@@ -10900,6 +11103,129 @@ function loadVariantExposure() {
 }
 loadVariantExposure();
 setInterval(loadVariantExposure, 600000);  // 10min — picks change only on rebalance
+
+// ─── EQUITY CURVES PER VARIANT ───────────────────────────────────
+// Inline SVG sparklines, one per strategy. See whether variants are
+// converging or diverging in real time.
+function loadEquityCurves() {
+  fetch('/api/equity_curves_per_variant?window_days=90').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('equity-curves-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">EQUITY CURVES</span> · ' + data.error + '</div>';
+      return;
+    }
+    const curves = data.curves || {};
+    const names = Object.keys(curves).sort();
+    if (names.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="margin-bottom:6px;"><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">EQUITY CURVES PER VARIANT</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">cumulative realized PnL · last ' + data.window_days + ' days</span></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">';
+    for (const name of names) {
+      const series = curves[name];
+      const displayName = name.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+      if (series.length === 0) {
+        html += '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:5px;padding:8px 10px;font-size:0.78em;">'
+          + '<div style="color:#e0e0e0;font-weight:bold;">' + displayName + '</div>'
+          + '<div style="color:#7b8ab8;margin-top:6px;text-align:center;">no fills yet</div>'
+          + '</div>';
+        continue;
+      }
+      // Build SVG path
+      const lastPnl = series[series.length - 1].cum_pnl_usd;
+      const minPnl = Math.min(0, ...series.map(p => p.cum_pnl_usd));
+      const maxPnl = Math.max(0, ...series.map(p => p.cum_pnl_usd));
+      const range = (maxPnl - minPnl) || 1;
+      const w = 180, h = 36;
+      let pathD = '';
+      for (let i = 0; i < series.length; i++) {
+        const x = (i / Math.max(series.length - 1, 1)) * w;
+        const y = h - ((series[i].cum_pnl_usd - minPnl) / range) * h;
+        pathD += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+      }
+      const color = lastPnl > 0 ? '#00e676' : lastPnl < 0 ? '#ff5252' : '#9da8c7';
+      const zeroY = h - ((0 - minPnl) / range) * h;
+      html += '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:5px;padding:8px 10px;font-size:0.78em;">'
+        + '<div style="display:flex;justify-content:space-between;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;">' + displayName + '</span>'
+        + '<span style="color:' + color + ';font-weight:bold;">$' + lastPnl.toLocaleString() + '</span>'
+        + '</div>'
+        + '<svg width="' + w + '" height="' + h + '" style="margin-top:4px;display:block;">'
+        + '<line x1="0" y1="' + zeroY.toFixed(1) + '" x2="' + w + '" y2="' + zeroY.toFixed(1) + '" stroke="#1e2a42" stroke-width="0.5"/>'
+        + '<path d="' + pathD + '" stroke="' + color + '" stroke-width="1.5" fill="none"/>'
+        + '</svg>'
+        + '<div style="color:#7b8ab8;font-size:0.7em;">' + series.length + ' trades</div>'
+        + '</div>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('equity curves error:', e);});
+}
+loadEquityCurves();
+setInterval(loadEquityCurves, 300000);
+
+// ─── PNL ATTRIBUTION PANEL ───────────────────────────────────────
+// Per-strategy realized PnL over the last N days. The missing
+// visibility for "when money is made/lost, which sleeve did it?"
+function loadPnLAttribution() {
+  fetch('/api/pnl_attribution?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pnl-attribution-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PNL ATTRIBUTION</span> · ' + data.error + '</div>';
+      return;
+    }
+    const rows = data.per_strategy || [];
+    const total = data.fleet_total_pnl_usd || 0;
+    const totalTrades = data.fleet_n_trades || 0;
+    const totalColor = total > 0 ? '#00e676' : total < 0 ? '#ff5252' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">PNL ATTRIBUTION</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">realized closed-trade PnL · last ' + data.window_days + ' days</span></div>'
+      + '<div style="font-size:0.92em;">'
+      + '<span style="color:' + totalColor + ';font-weight:bold;">$' + total.toLocaleString() + '</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:4px;">across ' + totalTrades + ' trades</span>'
+      + '</div></div>';
+    if (rows.length === 0) {
+      html += '<div style="color:#7b8ab8;font-size:0.85em;text-align:center;padding:12px 0;">'
+        + 'no closed trades in window yet — first canonical fill creates the breakdown'
+        + (data.note ? ' (' + data.note + ')' : '')
+        + '</div>';
+    } else {
+      html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+        + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+        + '<th style="padding:4px 6px;">Strategy</th>'
+        + '<th style="padding:4px 6px;text-align:right;">PnL</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Trades</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Win %</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Best</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Worst</th>'
+        + '</tr></thead><tbody>';
+      for (const r of rows) {
+        const displayName = r.strategy.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+        const pnlColor = r.pnl_usd > 0 ? '#00e676' : r.pnl_usd < 0 ? '#ff5252' : '#9da8c7';
+        const wr = r.win_rate !== null ? (r.win_rate * 100).toFixed(0) + '%' : '—';
+        html += '<tr style="border-bottom:1px solid #11172a;">'
+          + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:' + pnlColor + ';font-weight:bold;">$' + r.pnl_usd.toLocaleString() + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + r.n_trades + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + wr + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#00e676;">$' + r.best_trade_usd.toLocaleString() + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#ff5252;">$' + r.worst_trade_usd.toLocaleString() + '</td>'
+          + '</tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pnl attribution error:', e);});
+}
+loadPnLAttribution();
+setInterval(loadPnLAttribution, 300000);
 
 // ─── ACTIVE ALPHA READINESS PANEL ────────────────────────────────
 // Synthesis: preflight + canonical_fills + blockers per active
@@ -18270,6 +18596,7 @@ PANEL_IDS_ALL = [
     # Audit-suite panels (Codex gap closures — 2026-05-24)
     "audit-health-banner", "data-feed-contracts-panel",
     "strategy-roles-panel", "variant-exposure-panel",
+    "pnl-attribution-panel", "equity-curves-panel",
     "active-alpha-readiness-panel",
     # Decision / fleet panels
     "recommended-actions-panel", "cohort-gate-panel",
@@ -18305,6 +18632,7 @@ VIEW_ALLOWLISTS = {
         "market-clock-bar", "blocked-entries-bar",
         "audit-health-banner", "data-feed-contracts-panel",
         "strategy-roles-panel", "variant-exposure-panel",
+        "pnl-attribution-panel", "equity-curves-panel",
         "active-alpha-readiness-panel",
         "recommended-actions-panel", "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
