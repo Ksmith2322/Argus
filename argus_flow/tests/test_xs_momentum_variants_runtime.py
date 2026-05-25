@@ -25,11 +25,36 @@ def restore_baseline():
 
 # ─── Registry contents ──────────────────────────────────────────────
 
-def test_variant_registry_contains_five_variants():
-    """baseline + 3 universe survivors from 20y sweep + style_top3
-    concentration variant added 2026-05-25."""
-    expected = {"baseline", "sectors", "style", "legacy15", "style_top3"}
+def test_variant_registry_contains_six_variants():
+    """baseline + 3 universe survivors + style_top3 (concentration)
+    + legacy15_regime (SPY-200dma overlay)."""
+    expected = {
+        "baseline", "sectors", "style", "legacy15",
+        "style_top3", "legacy15_regime",
+    }
     assert set(xs_runner.list_variants()) == expected
+
+
+def test_legacy15_regime_variant_carries_regime_gate():
+    """Pin the regime-gate config so future variant additions don't
+    silently break the overlay."""
+    xs_runner.configure_variant("legacy15_regime")
+    assert xs_runner.STRATEGY_LABEL == "forge_xs_momentum_legacy15_regime"
+    assert xs_runner.IBKR_CLIENT_ID == 126
+    assert xs_runner.PARAMS.get("regime_gate") == "spy_above_200dma"
+    # Same universe as plain legacy15
+    assert len(xs_runner.PARAMS["universe"]) == 15
+    assert "EWJ" in xs_runner.PARAMS["universe"]
+
+
+def test_non_regime_variants_have_no_gate():
+    """Baseline + other universe variants should explicitly carry
+    regime_gate=None so the runtime check is a no-op."""
+    for name in ("baseline", "sectors", "style", "legacy15", "style_top3"):
+        xs_runner.configure_variant(name)
+        assert xs_runner.PARAMS.get("regime_gate") is None, (
+            f"variant {name} should NOT have a regime gate"
+        )
 
 
 def test_style_top3_variant_uses_concentration_override():

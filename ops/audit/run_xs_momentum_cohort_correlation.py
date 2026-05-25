@@ -38,11 +38,15 @@ OUT_DIR = REPO / "ops" / "reports" / "system_audit"
 
 # Map variant name -> (universe_key, top_pick_fraction)
 VARIANTS = {
-    "baseline":   (None,                          0.20),   # broad-8, top-2
-    "sectors":    ("sectors_spdr_11",             0.20),   # 11 SPDRs, top-2/3
-    "style":      ("style_factors_8",             0.20),   # 8 style, top-2
-    "legacy15":   ("legacy_sectors_countries_15", 0.20),   # 15-mix, top-3
-    "style_top3": ("style_factors_8",             0.35),   # 8 style, top-3
+    "baseline":         (None,                          0.20),   # broad-8, top-2
+    "sectors":          ("sectors_spdr_11",             0.20),   # 11 SPDRs, top-2/3
+    "style":            ("style_factors_8",             0.20),   # 8 style, top-2
+    "legacy15":         ("legacy_sectors_countries_15", 0.20),   # 15-mix, top-3
+    "style_top3":       ("style_factors_8",             0.35),   # 8 style, top-3
+    # 2026-05-25 regime gate. Same universe + concentration as
+    # legacy15 — return correlation tests whether the SPY>200dma
+    # overlay produces a meaningfully different return stream.
+    "legacy15_regime":  ("legacy_sectors_countries_15", 0.20),
 }
 
 

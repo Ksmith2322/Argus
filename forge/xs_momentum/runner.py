@@ -80,6 +80,7 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "client_id": 121,
         "universe_key": None,  # use DEFAULT_UNIVERSE
         "top_pick_fraction": None,  # use PARAMS default 0.2
+        "regime_gate": None,        # no overlay
     },
     "sectors": {
         "label": "forge_xs_momentum_sectors",
@@ -87,6 +88,7 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "client_id": 122,
         "universe_key": "sectors_spdr_11",
         "top_pick_fraction": None,
+        "regime_gate": None,
     },
     "style": {
         "label": "forge_xs_momentum_style",
@@ -94,6 +96,7 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "client_id": 123,
         "universe_key": "style_factors_8",
         "top_pick_fraction": None,
+        "regime_gate": None,
     },
     "legacy15": {
         "label": "forge_xs_momentum_legacy15",
@@ -101,6 +104,7 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "client_id": 124,
         "universe_key": "legacy_sectors_countries_15",
         "top_pick_fraction": None,
+        "regime_gate": None,
     },
     # 2026-05-25 amplification: top-3 sweep at 20y showed style_factors_8
     # at top_fraction=0.35 jumps PF 3.78 -> 5.40 with same DD (34%).
@@ -112,6 +116,21 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "client_id": 125,
         "universe_key": "style_factors_8",
         "top_pick_fraction": 0.35,   # ~3 picks of 8
+        "regime_gate": None,
+    },
+    # 2026-05-25 regime overlay: SPY>200dma gate cuts max DD by 50%+
+    # on legacy/sectors/style universes while raising Sharpe on every
+    # universe tested. Shipped as a 6th variant on the legacy15
+    # universe (worst DD of the bunch at 65% baseline -> 29% gated).
+    # Same engine, same universe, same picks — only adds the regime
+    # check before each monthly rebalance.
+    "legacy15_regime": {
+        "label": "forge_xs_momentum_legacy15_regime",
+        "log_dir_name": "xs_momentum_legacy15_regime",
+        "client_id": 126,
+        "universe_key": "legacy_sectors_countries_15",
+        "top_pick_fraction": None,
+        "regime_gate": "spy_above_200dma",
     },
 }
 
@@ -155,6 +174,12 @@ def configure_variant(name: str) -> None:
     override = cfg.get("top_pick_fraction")
     PARAMS["top_quintile_fraction"] = (override if override is not None
                                        else TOP_QUINTILE_FRACTION)
+
+    # Optional regime-gate overlay (2026-05-25). Variants can opt in by
+    # naming a key from helio.regime.REGIME_GATES. When set, the runner's
+    # evaluate_once() calls the gate before rebalancing — if FALSE, it
+    # exits existing positions and skips new entries. None = no overlay.
+    PARAMS["regime_gate"] = cfg.get("regime_gate")
 
 
 def list_variants() -> list[str]:
@@ -804,6 +829,56 @@ def evaluate_once(force: bool = False) -> dict:
                        stage="allocation", reason=summary["reason"])
         _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
         return summary
+
+    # Regime gate (optional, per variant). Skip the rebalance if the
+    # configured gate says we're in a bad regime. Per the 2026-05-25
+    # sweep, the SPY-above-200dma gate cuts max DD by 50%+ on the
+    # high-DD universes without sacrificing CAGR.
+    gate_name = PARAMS.get("regime_gate")
+    if gate_name:
+        try:
+            from helio.regime import REGIME_GATES, fetch_regime_data
+            gate_cfg = REGIME_GATES.get(gate_name)
+            if gate_cfg is None:
+                log.warning("unknown regime_gate %r; skipping check", gate_name)
+            else:
+                regime_data = fetch_regime_data(period="2y")
+                needed = gate_cfg["needs"][0]
+                series = regime_data.get(needed)
+                if series is None or series.empty:
+                    log.warning("regime_gate=%s but no %s data; "
+                                "trading anyway (fail-OPEN)",
+                                gate_name, needed)
+                else:
+                    is_bullish = bool(gate_cfg["fn"](series))
+                    if not is_bullish:
+                        summary["action"] = "regime_skip"
+                        summary["reason"] = (
+                            f"regime_gate {gate_name} = bearish "
+                            f"({gate_cfg['description']})"
+                        )
+                        record_blocker(
+                            STRATEGY_LABEL, "REGIME_BEARISH",
+                            stage="regime",
+                            reason=summary["reason"],
+                            context={"gate": gate_name},
+                        )
+                        # Exit any open picks at next-bar close
+                        # (in paper mode, just clear state)
+                        existing_picks = (state.get("current_picks") or {})
+                        if existing_picks:
+                            log.info("regime_skip: exiting %d open picks",
+                                     len(existing_picks))
+                            state["current_picks"] = {}
+                            _save_state(state)
+                        _write_heartbeat(state,
+                                         last_rebalance=state.get("last_rebalance"))
+                        log.info("regime_gate FALSE: %s — skipping rebalance",
+                                 summary["reason"])
+                        return summary
+        except Exception as exc:
+            # Fail-OPEN — bug in gate logic shouldn't kill the strategy
+            log.warning("regime_gate check failed: %s — trading anyway", exc)
 
     universe = list(PARAMS["universe"])
     try:

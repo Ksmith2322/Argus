@@ -234,6 +234,24 @@ CONTRACTS: dict[str, DataFeedContract] = {
             "axis live."
         ),
     ),
+    "forge_xs_momentum_legacy15_regime": DataFeedContract(
+        strategy="forge_xs_momentum_legacy15_regime",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        # SPY needed for the 200dma regime gate, plus the 15-ticker
+        # universe. SPY is already in DEFAULT cache; the rest is shared
+        # with the legacy15 variant.
+        universe=_LEGACY_15 + ("SPY",),
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "Same universe as forge_xs_momentum_legacy15 PLUS SPY for "
+            "the 200-day SMA regime gate. 20y regime-gate sweep: cuts "
+            "max DD 66% -> 29%, raises Sharpe 0.73 -> 1.26. Live test "
+            "whether the gate fires on the right months."
+        ),
+    ),
 }
 
 
