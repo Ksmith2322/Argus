@@ -810,7 +810,108 @@ def evaluate_once(force: bool = False) -> dict:
         log.info("xs_momentum eval skipped: %s", summary["reason"])
         return summary
 
-    # Fail-closed on allocation_factor
+    # ── REGIME GATE — runs BEFORE allocation check ────────────────────
+    # H2 fix (2026-05-25): the gate's job is to "exit positions in bad
+    # regimes." That has to happen regardless of allocation status —
+    # otherwise a deallocated variant trapped in an open position can't
+    # exit just because alloc=0. Run the gate FIRST.
+    #
+    # C1 fix (2026-05-25): fail-CLOSED on missing regime data. Trading
+    # without verified regime status is too risky for real money.
+    #
+    # C3 fix (2026-05-25): require regime data fresh within 2 business
+    # days. Yfinance can be stale through long weekends / holidays.
+    gate_name = PARAMS.get("regime_gate")
+    if gate_name:
+        try:
+            from helio.regime import REGIME_GATES, fetch_regime_data
+            gate_cfg = REGIME_GATES.get(gate_name)
+            if gate_cfg is None:
+                summary["action"] = "blocked"
+                summary["reason"] = f"unknown_regime_gate:{gate_name}"
+                record_blocker(STRATEGY_LABEL, "REGIME_UNKNOWN",
+                               stage="regime", reason=summary["reason"])
+                log.error("UNKNOWN regime_gate=%r — refusing to trade",
+                          gate_name)
+                return summary
+            regime_data = fetch_regime_data(period="2y")
+            needed = gate_cfg["needs"][0]
+            series = regime_data.get(needed)
+            if series is None or series.empty:
+                # C1 fix: fail-CLOSED
+                summary["action"] = "blocked"
+                summary["reason"] = (
+                    f"regime_data_missing:{needed} (gate={gate_name})"
+                )
+                record_blocker(STRATEGY_LABEL, "REGIME_DATA_MISSING",
+                               stage="regime",
+                               reason=summary["reason"],
+                               context={"gate": gate_name, "needed": needed})
+                log.error("regime_gate=%s but no %s data — REFUSING to "
+                          "trade (fail-CLOSED)", gate_name, needed)
+                return summary
+            # C3 fix: validate data freshness
+            try:
+                latest_dt = pd.to_datetime(series.index[-1])
+                if latest_dt.tzinfo is not None:
+                    latest_dt = latest_dt.tz_localize(None)
+                staleness_days = (
+                    pd.Timestamp.now().tz_localize(None) - latest_dt
+                ).total_seconds() / 86400
+            except Exception:
+                staleness_days = 999  # treat unparseable as very stale
+            if staleness_days > 4.0:   # >4 calendar days = stale (covers long weekends)
+                summary["action"] = "blocked"
+                summary["reason"] = (
+                    f"regime_data_stale:{needed} age={staleness_days:.1f}d"
+                )
+                record_blocker(STRATEGY_LABEL, "REGIME_DATA_STALE",
+                               stage="regime",
+                               reason=summary["reason"],
+                               context={"gate": gate_name,
+                                        "staleness_days": staleness_days})
+                log.error("regime_gate=%s data %.1fd stale — REFUSING to "
+                          "trade (fail-CLOSED)", gate_name, staleness_days)
+                return summary
+
+            is_bullish = bool(gate_cfg["fn"](series))
+            if not is_bullish:
+                summary["action"] = "regime_skip"
+                summary["reason"] = (
+                    f"regime_gate {gate_name} = bearish "
+                    f"({gate_cfg['description']})"
+                )
+                record_blocker(
+                    STRATEGY_LABEL, "REGIME_BEARISH",
+                    stage="regime",
+                    reason=summary["reason"],
+                    context={"gate": gate_name},
+                )
+                # M1 fix: always save state, including in early-return paths
+                existing_picks = (state.get("current_picks") or {})
+                if existing_picks:
+                    log.info("regime_skip: exiting %d open picks",
+                             len(existing_picks))
+                    state["current_picks"] = {}
+                _save_state(state)
+                _write_heartbeat(state,
+                                 last_rebalance=state.get("last_rebalance"))
+                log.info("regime_gate FALSE: %s — skipping rebalance",
+                         summary["reason"])
+                return summary
+        except Exception as exc:
+            # C1 fix: ANY unexpected error in the gate check = fail-CLOSED.
+            # A bug in gate logic should NOT silently allow a trade.
+            summary["action"] = "blocked"
+            summary["reason"] = f"regime_check_error:{exc}"
+            record_blocker(STRATEGY_LABEL, "REGIME_CHECK_ERROR",
+                           stage="regime", reason=str(exc),
+                           context={"gate": gate_name})
+            log.error("regime_gate check raised %s — REFUSING to trade "
+                      "(fail-CLOSED)", exc, exc_info=True)
+            return summary
+
+    # ── ALLOCATION GATE (now AFTER regime check) ──────────────────────
     try:
         alloc_factor = float(get_allocation_factor(STRATEGY_LABEL))
     except Exception as exc:
@@ -829,56 +930,6 @@ def evaluate_once(force: bool = False) -> dict:
                        stage="allocation", reason=summary["reason"])
         _write_heartbeat(state, last_rebalance=state.get("last_rebalance"))
         return summary
-
-    # Regime gate (optional, per variant). Skip the rebalance if the
-    # configured gate says we're in a bad regime. Per the 2026-05-25
-    # sweep, the SPY-above-200dma gate cuts max DD by 50%+ on the
-    # high-DD universes without sacrificing CAGR.
-    gate_name = PARAMS.get("regime_gate")
-    if gate_name:
-        try:
-            from helio.regime import REGIME_GATES, fetch_regime_data
-            gate_cfg = REGIME_GATES.get(gate_name)
-            if gate_cfg is None:
-                log.warning("unknown regime_gate %r; skipping check", gate_name)
-            else:
-                regime_data = fetch_regime_data(period="2y")
-                needed = gate_cfg["needs"][0]
-                series = regime_data.get(needed)
-                if series is None or series.empty:
-                    log.warning("regime_gate=%s but no %s data; "
-                                "trading anyway (fail-OPEN)",
-                                gate_name, needed)
-                else:
-                    is_bullish = bool(gate_cfg["fn"](series))
-                    if not is_bullish:
-                        summary["action"] = "regime_skip"
-                        summary["reason"] = (
-                            f"regime_gate {gate_name} = bearish "
-                            f"({gate_cfg['description']})"
-                        )
-                        record_blocker(
-                            STRATEGY_LABEL, "REGIME_BEARISH",
-                            stage="regime",
-                            reason=summary["reason"],
-                            context={"gate": gate_name},
-                        )
-                        # Exit any open picks at next-bar close
-                        # (in paper mode, just clear state)
-                        existing_picks = (state.get("current_picks") or {})
-                        if existing_picks:
-                            log.info("regime_skip: exiting %d open picks",
-                                     len(existing_picks))
-                            state["current_picks"] = {}
-                            _save_state(state)
-                        _write_heartbeat(state,
-                                         last_rebalance=state.get("last_rebalance"))
-                        log.info("regime_gate FALSE: %s — skipping rebalance",
-                                 summary["reason"])
-                        return summary
-        except Exception as exc:
-            # Fail-OPEN — bug in gate logic shouldn't kill the strategy
-            log.warning("regime_gate check failed: %s — trading anyway", exc)
 
     universe = list(PARAMS["universe"])
     try:
@@ -1024,6 +1075,12 @@ def evaluate_once(force: bool = False) -> dict:
             )
             current.pop(ticker, None)
             state["trade_count"] = int(state.get("trade_count", 0)) + 1
+            # C2 fix (2026-05-25): persist state IMMEDIATELY after each
+            # fill. Previously, state was only saved at end of both
+            # loops — a crash mid-loop would leave trades.csv + broker
+            # positions out of sync with state (phantom positions).
+            state["current_picks"] = current
+            _save_state(state)
             sells.append({"ticker": ticker, "qty": qty,
                           "exit_px": fill.fill_price, "pnl_usd": pnl_usd})
 
@@ -1122,6 +1179,9 @@ def evaluate_once(force: bool = False) -> dict:
                 score=score_by_ticker.get(ticker, 0.0),
                 anchor_at_fill=anchor,
             )
+            # C2 fix (2026-05-25): persist state immediately after fill.
+            state["current_picks"] = current
+            _save_state(state)
             buys.append({"ticker": ticker, "qty": qty,
                           "entry_px": fill.fill_price})
 
