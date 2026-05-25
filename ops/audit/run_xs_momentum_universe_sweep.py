@@ -51,6 +51,7 @@ def _run_one(
     period: str = "10y",
     *,
     slippage_bps: float = 10.0,
+    top_pick_fraction: float | None = None,
 ) -> dict:
     """Backtest one (universe, variant) combo and score against the
     disciplined gate."""
@@ -64,18 +65,17 @@ def _run_one(
             "error": f"import failed: {exc}",
         }
 
+    # Map variant cfg -> backtest kwargs. The variant catalog defines
+    # ranker + sizer; sizer is currently informational (equal_weight is
+    # the only mode the equal-weight by-month-aggregation backtest
+    # natively supports). The ranker IS wired through.
+    ranker = variant_cfg.get("ranker", "single_12_1")
     try:
-        # Current backtest engine doesn't accept variant configs yet —
-        # we run the BASELINE variant (single_12_1 + equal_weight) here.
-        # Multi-horizon / vol-scaled variants are scored in a follow-up
-        # pass via the variant-aware backtest helper (TODO: wire into
-        # backtest()). For now this sweep proves out the universe axis;
-        # variant axis stays at baseline for parity with the live
-        # broad-8 baseline.
-        result = backtest(
-            period=period,
-            universe_override=list(universe),
-        )
+        kwargs = {"period": period, "universe_override": list(universe),
+                  "ranking_mode": ranker}
+        if top_pick_fraction is not None:
+            kwargs["top_pick_fraction"] = top_pick_fraction
+        result = backtest(**kwargs)
     except Exception as exc:
         return {
             "universe": universe_name,
@@ -202,6 +202,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Variant config (default: v1_baseline)")
     parser.add_argument("--period", default="10y",
                         help="Backtest history (default: 10y)")
+    parser.add_argument("--top-fraction", type=float, default=None,
+                        help="Override universe selection fraction "
+                        "(e.g. 0.125 for top-1-of-8, 0.25 for top-2). "
+                        "Default: use PARAMS['top_quintile_fraction'] (0.2)")
     parser.add_argument("--json", action="store_true",
                         help="Emit JSON to stdout instead of markdown")
     args = parser.parse_args(argv)
@@ -227,9 +231,11 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict] = []
     for uname, universe in universes.items():
         print(f"  running {uname} ({len(universe)} tickers, "
-              f"variant={args.variant})...", file=sys.stderr)
+              f"variant={args.variant}, top_fraction={args.top_fraction})...",
+              file=sys.stderr)
         row = _run_one(uname, universe, args.variant, variant_cfg,
-                       period=args.period)
+                       period=args.period,
+                       top_pick_fraction=args.top_fraction)
         rows.append(row)
         if "error" in row:
             print(f"    ERROR: {row['error']}", file=sys.stderr)

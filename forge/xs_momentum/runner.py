@@ -388,7 +388,10 @@ def _write_heartbeat(state: dict, last_rebalance: dict | None) -> None:
 # ── Backtest ──────────────────────────────────────────────────────────────
 
 def backtest(period: str = "10y", return_monthly_series: bool = False,
-             universe_override: list[str] | None = None) -> dict:
+             universe_override: list[str] | None = None,
+             *,
+             ranking_mode: str = "single_12_1",
+             top_pick_fraction: float | None = None) -> dict:
     """Simulate monthly rebalancing over the historical window.
 
     At each month-end (resampled from daily closes), rank universe by 12-1
@@ -403,11 +406,21 @@ def backtest(period: str = "10y", return_monthly_series: bool = False,
     universe_override lets callers swap PARAMS['universe'] for a different
     ticker set without mutating PARAMS. Used by alternative-universe
     audits (sector-only, country-only, etc.).
+
+    ranking_mode lets the sweep test alternative rankers:
+        "single_12_1"   — production 12-1 momentum (default)
+        "multi_horizon" — equal-weight 12-1 + 6-1 + 3-1 ensemble
+
+    top_pick_fraction overrides PARAMS["top_quintile_fraction"] so the
+    sweep can test top-1 / top-2 / top-3 concentration variants without
+    mutating PARAMS.
     """
     universe = list(universe_override if universe_override is not None
                        else PARAMS["universe"])
     long_lb = PARAMS["long_lookback"]
     short_lb = PARAMS["short_lookback"]
+    if top_pick_fraction is None:
+        top_pick_fraction = PARAMS["top_quintile_fraction"]
 
     closes = _fetch_history(universe, period=period)
     if closes.empty:
@@ -433,12 +446,17 @@ def backtest(period: str = "10y", return_monthly_series: bool = False,
             for t in universe
             if t in closes.columns
         }
-        ranked = rank_universe_by_momentum(per_asset_closes,
-                                            long_lookback=long_lb,
-                                            short_lookback=short_lb)
+        if ranking_mode == "multi_horizon":
+            from helio.xs_momentum_variants import rank_universe_multi_horizon
+            ranked = rank_universe_multi_horizon(per_asset_closes)
+        else:
+            ranked = rank_universe_by_momentum(
+                per_asset_closes,
+                long_lookback=long_lb, short_lookback=short_lb,
+            )
         if not ranked:
             continue
-        picks = select_top_quintile(ranked, fraction=PARAMS["top_quintile_fraction"])
+        picks = select_top_quintile(ranked, fraction=top_pick_fraction)
         pick_tickers = {p.ticker for p in picks}
 
         # Execution happens at the NEXT trading day's close (no look-ahead)

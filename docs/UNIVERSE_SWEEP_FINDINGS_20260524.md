@@ -108,6 +108,72 @@ live evidence the strategy's live PF doesn't track the production
 baseline's CI band, the strategy should be demoted to OBSERVE or
 killed. The live evidence is the tiebreaker, not the backtest.
 
+## Late-night amplification findings (variant + top-N sweeps)
+
+After the universe sweep, ran two additional axes on the 3 surviving
+universes:
+
+### Multi-horizon ranker (v3_multihorizon at 20y)
+
+Ensemble of 12-1 + 6-1 + 3-1 momentum signals, equal-weight.
+
+| Universe | v1_baseline CI | v3_multihorizon CI | Verdict |
+|---|---|---|---|
+| sectors_spdr_11 | 1.44 | 1.19 | drops below floor — REJECTED |
+| style_factors_8 | 1.85 | 1.51 | weaker but still passes |
+| legacy_15 | 1.38 | 1.21 | barely passes |
+
+**v3_multihorizon is WORSE than v1_baseline.** The shorter-horizon
+3-1 signal adds noise on these universes. Do not deploy.
+
+### Top-N concentration sweep at 20y
+
+Test top-1 (fraction=0.125), default top-2 (0.2), and top-3-ish (0.35).
+
+| Universe | top-1 (0.125) | top-2 (default) | top-3-ish (0.35) |
+|---|---|---|---|
+| sectors_spdr_11 | CI 1.17 ✗ | CI 1.44 ✓ | CI 1.74 ✓✓ (DD 62%) |
+| style_factors_8 | CI 1.29 ✓ | CI 1.85 ✓ | **CI 2.70 ✓✓ (DD 34%)** |
+| legacy_15 | CI 1.07 ✗ | CI 1.38 ✓ | CI 1.49 ✓✓ (DD 88%) |
+
+**Top-3 concentration substantially improves PF and CI lower on all
+3 survivor universes.** Drawdowns explode on legacy_15 (65% → 88%)
+but style stays at 34% with the highest CI lower (2.70) of any
+configuration tested all session.
+
+**Decision deferred**: variants are SHIPPING at top-2 (matching
+production baseline). Top-3 promotion is a candidate for v2 after
+30 days of clean live evidence at top-2.
+
+## gld_pm_long methodology gap — resolved
+
+The 13-instrument sweep produced GLD baseline PF 0.95 (CI 0.78) at
+5bp slippage, inconsistent with the production disciplined-gate
+baseline (CI 1.08).
+
+**Root cause**: the two methodologies measure different things.
+
+| Methodology | What it computes | GLD result |
+|---|---|---|
+| Production baseline (`forge.gld_pm_long.backtest()`) | PF on `pnl_atr = (exit - entry) / ATR` — i.e. PnL in units of ATR, no slippage applied | PF 1.32 / CI 1.08 |
+| This sweep (`run_gld_pm_long_universe_sweep`) | PF on `pnl_pct = (exit - entry) / entry × 100` minus 2×slippage_bps drag per round-trip | PF 0.95 / CI 0.78 |
+
+The production methodology is technically correct as "does the signal
+have edge in ATR-space" but is OPTIMISTIC because 522 trades at 5bp
+each is a ~52% total slippage drag that the ATR-space PF doesn't see.
+My sweep methodology is conservative and matches what the strategy
+would actually earn in real trading.
+
+**Practical implication**: gld_pm_long's live deployment is justified
+ONLY by the operator's tolerance for DEFENSE-floor (1.05) sleeves at
+marginal edge. The 30-day live evidence window is the tiebreaker. If
+live PF stays below 1.0 on n>=20 trades, the strategy should be
+demoted regardless of what the baseline says.
+
+**Action**: no code change tonight. Document the methodology gap and
+let the live evidence decide. Production baseline notes already say
+"Fails at 5bp slippage" — operator was aware.
+
 ## Recommended next actions
 
 1. **Build `xs_momentum` paper-variant runners** for the 3 survivors
