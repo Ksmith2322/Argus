@@ -132,6 +132,26 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "top_pick_fraction": None,
         "regime_gate": "spy_above_200dma",
     },
+    # 2026-05-25 universe-broadening sweep: 5 standalone dormant
+    # universes (commodities/countries/bonds/real_assets/international)
+    # all FAILED their own walk-forward OOS test. But the dispersion
+    # hypothesis — that cross-sectional momentum benefits from a wider
+    # pool, not 5 narrow ones — was VALIDATED on combined universes.
+    # wide_global_47 (broad-8 ∪ sectors ∪ styles ∪ countries ∪
+    # international, de-duped to 43 unique ETFs) passes the disciplined
+    # gate with STRENGTHENED_OOS: IS CI 1.21 → OOS CI 2.33, Sharpe
+    # 0.77 → 1.58 (improves OOS by +0.81). Shipped at 0.25x because
+    # the universe overlaps heavily with sectors+style+legacy15 variants
+    # already running — live evidence decides whether the broader pool
+    # actually outperforms the narrower ones.
+    "global47": {
+        "label": "forge_xs_momentum_global47",
+        "log_dir_name": "xs_momentum_global47",
+        "client_id": 128,
+        "universe_key": "wide_global_47",
+        "top_pick_fraction": None,
+        "regime_gate": None,
+    },
 }
 
 

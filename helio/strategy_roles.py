@@ -71,6 +71,10 @@ STRATEGY_ROLES: dict[str, str] = {
     "forge_xs_momentum_legacy15": OFFENSE,
     "forge_xs_momentum_style_top3": OFFENSE,
     "forge_xs_momentum_legacy15_regime": OFFENSE,
+    # 2026-05-25: 43-ticker global variant (broad-8 + sectors + style
+    # + countries + international). Passed walk-forward OOS with
+    # STRENGTHENED verdict (IS CI 1.21 → OOS CI 2.33). OFFENSE role.
+    "forge_xs_momentum_global47": OFFENSE,
     # 2026-05-25: first HEDGE-role strategy. Long GLD+TLT when SPY <
     # 200dma; flat otherwise. Backtest PF 2.91 (n=28); intentionally
     # placed in HEDGE bucket so the 0.80 PF floor applies.

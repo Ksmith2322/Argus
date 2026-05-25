@@ -118,6 +118,45 @@ LEGACY_SECTORS_COUNTRIES_15 = (
 )
 
 
+# 2026-05-25 dispersion hypothesis: cross-sectional momentum
+# benefits from a *wider* pool, not 5 standalone narrow pools. The
+# 5 dormant universes (commodities/countries/bonds/real_assets/
+# international) each failed their own OOS test, but the operator
+# asked for ~60 tickers active. These combined universes test
+# whether a unioned pool of 27/47/57 distinct ETFs lets the
+# xs_momentum engine pick winners from more dispersion.
+#
+# Construction rule: union with de-dup, preserving order.
+
+def _dedup_union(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for g in groups:
+        for t in g:
+            seen.setdefault(t, None)
+    return tuple(seen)
+
+
+# broad-8 plus sectors plus styles — equity-only dispersion at 27
+# tickers. Survivors of the disciplined gate stacked into one pool.
+BROAD_8 = ("SPY", "QQQ", "IWM", "DIA", "EFA", "EEM", "GLD", "TLT")
+WIDE_EQUITY_27 = _dedup_union(
+    BROAD_8, SECTORS_SPDR_11, STYLE_FACTORS_8,
+)
+
+# Adds country/international for ~47-ticker global pool.
+WIDE_GLOBAL_47 = _dedup_union(
+    BROAD_8, SECTORS_SPDR_11, STYLE_FACTORS_8,
+    COUNTRIES_10, INTERNATIONAL_EQUITY_8,
+)
+
+# Everything — equity + commodity + bond + global + real-assets.
+WIDE_ALL_57 = _dedup_union(
+    BROAD_8, SECTORS_SPDR_11, STYLE_FACTORS_8,
+    COUNTRIES_10, INTERNATIONAL_EQUITY_8,
+    COMMODITIES_7, BONDS_DURATION_7, REAL_ASSETS_7,
+)
+
+
 CANDIDATE_UNIVERSES: dict[str, tuple[str, ...]] = {
     "sectors_spdr_11":        SECTORS_SPDR_11,
     "commodities_7":          COMMODITIES_7,
@@ -127,6 +166,9 @@ CANDIDATE_UNIVERSES: dict[str, tuple[str, ...]] = {
     "real_assets_7":          REAL_ASSETS_7,
     "international_equity_8": INTERNATIONAL_EQUITY_8,
     "legacy_sectors_countries_15": LEGACY_SECTORS_COUNTRIES_15,
+    "wide_equity_27":         WIDE_EQUITY_27,
+    "wide_global_47":         WIDE_GLOBAL_47,
+    "wide_all_57":            WIDE_ALL_57,
 }
 
 

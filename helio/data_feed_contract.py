@@ -117,11 +117,13 @@ try:
         SECTORS_SPDR_11 as _SECTORS_SPDR_11,
         STYLE_FACTORS_8 as _STYLE_FACTORS_8,
         LEGACY_SECTORS_COUNTRIES_15 as _LEGACY_15,
+        WIDE_GLOBAL_47 as _WIDE_GLOBAL_47,
     )
 except Exception:  # registry not yet importable in some test contexts
     _SECTORS_SPDR_11 = ()
     _STYLE_FACTORS_8 = ()
     _LEGACY_15 = ()
+    _WIDE_GLOBAL_47 = ()
 
 
 CONTRACTS: dict[str, DataFeedContract] = {
@@ -247,6 +249,23 @@ CONTRACTS: dict[str, DataFeedContract] = {
             "HEDGE-role strategy. Holds 50/50 GLD+TLT when SPY < 200dma; "
             "flat otherwise. Backtest PF 2.91 over 20y (n=28), Sharpe 1.91 "
             "when engaged. SPY needed for the 200dma regime gate."
+        ),
+    ),
+    "forge_xs_momentum_global47": DataFeedContract(
+        strategy="forge_xs_momentum_global47",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=_WIDE_GLOBAL_47,
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "43-ticker combined universe (broad-8 ∪ sectors_spdr_11 ∪ "
+            "style_factors_8 ∪ countries_10 ∪ international_equity_8). "
+            "20y walk-forward OOS: STRENGTHENED_OOS verdict — IS CI "
+            "[1.21, 2.71] → OOS CI [2.33, 6.73]; Sharpe 0.77 → 1.58. "
+            "Tests the dispersion hypothesis: wider pool = more "
+            "cross-sectional signal."
         ),
     ),
     "forge_xs_momentum_legacy15_regime": DataFeedContract(

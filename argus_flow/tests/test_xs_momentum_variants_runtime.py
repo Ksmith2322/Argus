@@ -25,12 +25,13 @@ def restore_baseline():
 
 # ─── Registry contents ──────────────────────────────────────────────
 
-def test_variant_registry_contains_six_variants():
+def test_variant_registry_contains_seven_variants():
     """baseline + 3 universe survivors + style_top3 (concentration)
-    + legacy15_regime (SPY-200dma overlay)."""
+    + legacy15_regime (SPY-200dma overlay) + global47 (43-ETF
+    dispersion-hypothesis pool)."""
     expected = {
         "baseline", "sectors", "style", "legacy15",
-        "style_top3", "legacy15_regime",
+        "style_top3", "legacy15_regime", "global47",
     }
     assert set(xs_runner.list_variants()) == expected
 
@@ -50,7 +51,7 @@ def test_legacy15_regime_variant_carries_regime_gate():
 def test_non_regime_variants_have_no_gate():
     """Baseline + other universe variants should explicitly carry
     regime_gate=None so the runtime check is a no-op."""
-    for name in ("baseline", "sectors", "style", "legacy15", "style_top3"):
+    for name in ("baseline", "sectors", "style", "legacy15", "style_top3", "global47"):
         xs_runner.configure_variant(name)
         assert xs_runner.PARAMS.get("regime_gate") is None, (
             f"variant {name} should NOT have a regime gate"

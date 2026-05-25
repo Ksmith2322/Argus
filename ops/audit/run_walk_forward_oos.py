@@ -42,10 +42,26 @@ SURVIVOR_PF_FLOOR = 1.20
 SLIPPAGE_BPS = 10.0
 
 UNIVERSES_TO_TEST = [
-    ("broad_8",         None),
-    ("sectors_spdr_11", "sectors_spdr_11"),
-    ("style_factors_8", "style_factors_8"),
-    ("legacy_15",       "legacy_sectors_countries_15"),
+    ("broad_8",               None),
+    ("sectors_spdr_11",       "sectors_spdr_11"),
+    ("style_factors_8",       "style_factors_8"),
+    ("legacy_15",             "legacy_sectors_countries_15"),
+    # 2026-05-25 universe-broadening sweep: 5 dormant universes from
+    # the registry. Operator wants ~60 distinct tickers in production;
+    # these 5 are pre-defined but never gate-validated. Each is run
+    # through the same 70/30 walk-forward split — survivors get wired
+    # to live variants, failures stay dormant with kill-log entries.
+    ("commodities_7",         "commodities_7"),
+    ("countries_10",          "countries_10"),
+    ("bonds_duration_7",      "bonds_duration_7"),
+    ("real_assets_7",         "real_assets_7"),
+    ("international_equity_8","international_equity_8"),
+    # 2026-05-25 dispersion hypothesis: combined pools of 27/47/57
+    # tickers. If cross-sectional momentum is dispersion-limited,
+    # a wider pool should beat any subset.
+    ("wide_equity_27",        "wide_equity_27"),
+    ("wide_global_47",        "wide_global_47"),
+    ("wide_all_57",           "wide_all_57"),
 ]
 
 

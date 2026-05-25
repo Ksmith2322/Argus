@@ -168,6 +168,7 @@ def _strategy_to_universe_label() -> dict[str, str]:
         "forge_xs_momentum_legacy15":     "legacy_15",
         "forge_xs_momentum_style_top3":   "style_factors_8",  # same universe
         "forge_xs_momentum_legacy15_regime": "legacy_15",
+        "forge_xs_momentum_global47":     "wide_global_47",
     }
 
 
