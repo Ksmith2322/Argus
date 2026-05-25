@@ -134,6 +134,34 @@ CONTRACTS: dict[str, DataFeedContract] = {
         auto_adjust=False,
         notes="GLD daily close drives the PM-long entry/exit gate.",
     ),
+    "forge_tom_spy": DataFeedContract(
+        strategy="forge_tom_spy",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=("SPY",),
+        max_age_days=3,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "PENDING_OPT_IN. Turn-of-month SPY (last 3-4 trading days + "
+            "first 1-2). PARTIAL_PASS 6/9 layers; CI lower 1.22 @ 10bp. "
+            "Recommended allocation 0.3x once activated."
+        ),
+    ),
+    "forge_nov_spy": DataFeedContract(
+        strategy="forge_nov_spy",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=("SPY",),
+        max_age_days=3,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "PENDING_OPT_IN. November-only SPY (single-month strategy). "
+            "MARGINAL_PASS 8/9 layers; CI lower 1.75 @ 10bp. First "
+            "live action 2026-11-02; allocation 0.2x recommended."
+        ),
+    ),
 }
 
 

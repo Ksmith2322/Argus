@@ -5086,9 +5086,28 @@ async def api_strategy_actions(window_days: int = 30):
     # Sort order: SCALE_UP, HOLD, REDUCE, QUARANTINE, KILL, OBSERVE
     action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "QUARANTINE": 3, "KILL": 4, "OBSERVE": 5}
     rows.sort(key=lambda r: (action_order.get(r["action"], 6), -r["pnl_usd"]))
+
+    # Surface the current evidence epoch so consumers can refuse acting
+    # on recommendations computed against a contaminated epoch (Codex X4
+    # follow-up). Epoch lookup is best-effort — keeps the endpoint
+    # working even if helio.evidence_epoch is unavailable.
+    epoch_info: dict = {}
+    try:
+        from helio.evidence_epoch import current_epoch
+        ep = current_epoch()
+        epoch_info = {
+            "id": ep.id,
+            "label": ep.label,
+            "started_at": ep.started_at.isoformat(),
+            "is_clean": ep.is_clean,
+        }
+    except Exception as exc:
+        epoch_info = {"error": str(exc)}
+
     return JSONResponse({
         "window_days": window_days,
         "rules_version": "v2_2026-04-28",
+        "evidence_epoch": epoch_info,
         "strategies": rows,
         "summary": {
             "scale_up":   sum(1 for r in rows if r["action"] == "SCALE_UP"),
