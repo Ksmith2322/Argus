@@ -171,6 +171,7 @@ ACTIVE_ROSTER = {
     "forge_xs_momentum_legacy15",
     "forge_xs_momentum_style_top3",
     "forge_xs_momentum_legacy15_regime",
+    "forge_tail_hedge",
 }
 
 

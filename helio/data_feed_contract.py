@@ -234,6 +234,21 @@ CONTRACTS: dict[str, DataFeedContract] = {
             "axis live."
         ),
     ),
+    "forge_tail_hedge": DataFeedContract(
+        strategy="forge_tail_hedge",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        # GLD + TLT for the hedge holdings, SPY for the regime gate
+        universe=("GLD", "TLT", "SPY"),
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "HEDGE-role strategy. Holds 50/50 GLD+TLT when SPY < 200dma; "
+            "flat otherwise. Backtest PF 2.91 over 20y (n=28), Sharpe 1.91 "
+            "when engaged. SPY needed for the 200dma regime gate."
+        ),
+    ),
     "forge_xs_momentum_legacy15_regime": DataFeedContract(
         strategy="forge_xs_momentum_legacy15_regime",
         primary_source="yfinance",

@@ -71,6 +71,10 @@ STRATEGY_ROLES: dict[str, str] = {
     "forge_xs_momentum_legacy15": OFFENSE,
     "forge_xs_momentum_style_top3": OFFENSE,
     "forge_xs_momentum_legacy15_regime": OFFENSE,
+    # 2026-05-25: first HEDGE-role strategy. Long GLD+TLT when SPY <
+    # 200dma; flat otherwise. Backtest PF 2.91 (n=28); intentionally
+    # placed in HEDGE bucket so the 0.80 PF floor applies.
+    "forge_tail_hedge": HEDGE,
     # Pending-opt-in candidates (also classified so we know what bar
     # they'll be evaluated against if/when activated)
     "forge_tom_spy": OFFENSE,        # PARTIAL_PASS at 1.20 floor; alpha-equivalent
