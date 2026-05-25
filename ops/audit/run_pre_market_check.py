@@ -63,14 +63,26 @@ def _expected_actions(today: datetime) -> list[dict]:
     next_5 = _trading_days_from(today, 5)
     dates_str = ", ".join(d.strftime("%a %m-%d") for d in next_5)
 
-    # xs_momentum — monthly rebalance, fires first Mon-Fri ≤ day-7 each month
+    # xs_momentum and its universe variants — monthly rebalance, fires
+    # first Mon-Fri ≤ day-7 each month. All four run the same engine on
+    # the same cadence; their UNIVERSE differs.
     rebalance_window = [d for d in next_5 if d.day <= 7]
-    out.append({
-        "strategy": "forge_xs_momentum",
-        "schedule": "monthly rebalance (first 7 days of month, weekdays)",
-        "action_in_next_5_days": bool(rebalance_window),
-        "expected_dates": [d.strftime("%Y-%m-%d") for d in rebalance_window],
-    })
+    for label, universe_desc in (
+        ("forge_xs_momentum",
+         "broad-8 ETFs (SPY/QQQ/IWM/DIA/EFA/EEM/GLD/TLT)"),
+        ("forge_xs_momentum_sectors",
+         "11 SPDR sectors"),
+        ("forge_xs_momentum_style",
+         "8 style factors (VTV/VUG/MTUM/QUAL/etc.)"),
+        ("forge_xs_momentum_legacy15",
+         "15-ticker legacy (10 sectors + 5 country)"),
+    ):
+        out.append({
+            "strategy": label,
+            "schedule": f"monthly rebalance (first 7 days of month, weekdays) | {universe_desc}",
+            "action_in_next_5_days": bool(rebalance_window),
+            "expected_dates": [d.strftime("%Y-%m-%d") for d in rebalance_window],
+        })
 
     # gld_pm_long — daily evaluation
     out.append({
