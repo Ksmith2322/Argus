@@ -104,6 +104,16 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     # credit-leads-equity relationship by stepping in before equity
     # reacts. Full results: docs/AUDIT_2026_05_25_PART2/CREDIT_SPREAD_KILL.md
     "forge_credit_spread_regime": "2026-05-25",
+    # 2026-05-25 (late evening): Strategy agent's #7 candidate (Halloween
+    # effect SPY/SHY rotation) killed by disciplined-gate backtest.
+    # H1 (2005-2015) outperformed SPY by +4.4pp; H2 (2015-2026)
+    # underperformed by -188pp during the QE-driven bull market.
+    # TIME_SPLIT_DIVERGES. The strategy has materially lower max DD
+    # (17% vs 56%) but the modern-era CAGR cost (-3.91%/yr) makes it
+    # a net loser as a standalone. Useful as a defensive overlay idea
+    # but not a standalone strategy. Full results:
+    # docs/AUDIT_2026_05_25_PART2/SELL_IN_MAY_KILL.md
+    "forge_sell_in_may_modulated": "2026-05-25",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

@@ -73,6 +73,9 @@ KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
     # backstops likely amputated the credit-leads-equity signal.
     # See docs/AUDIT_2026_05_25_PART2/CREDIT_SPREAD_KILL.md.
     "forge_credit_spread_regime": ("SPY",),
+    # 2026-05-25 (late evening): always-invested SPY/SHY rotation.
+    # See docs/AUDIT_2026_05_25_PART2/SELL_IN_MAY_KILL.md.
+    "forge_sell_in_may_modulated": ("SPY", "SHY"),
 }
 
 
