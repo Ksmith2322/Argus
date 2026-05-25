@@ -2871,6 +2871,58 @@ async def api_active_alpha_readiness():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/pre_market_check")
+async def api_pre_market_check():
+    """Pre-market readiness audit. Composes daily_health_check +
+    data_feed_contracts (with auto-refresh if RED) + restart status +
+    heartbeat freshness + flag check + first-action calendar.
+
+    Single verdict (READY / REVIEW / NOT_READY) + reasons array.
+
+    Moderate cost (~2-5s — runs the full audit suite). Cached via
+    artifact at ops/reports/system_audit/pre_market_check.json.
+    Pass ?fresh=1 to force a re-run."""
+    try:
+        from pathlib import Path
+        import json as _json
+        from fastapi import Request  # noqa: F401  (imported elsewhere)
+
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "ops" / "reports" / "system_audit"
+                    / "pre_market_check.json")
+        if artifact.exists():
+            try:
+                return JSONResponse(_json.loads(
+                    artifact.read_text(encoding="utf-8")
+                ))
+            except Exception:
+                pass
+        # Live re-run (no data-feed refresh, faster + no network)
+        from ops.audit.run_pre_market_check import build_report
+        return JSONResponse(build_report())
+    except Exception as e:
+        return JSONResponse({"error": "pre_market_check failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/order_lifecycle")
+async def api_order_lifecycle():
+    """Per-lineage order lifecycle reconciliation (Codex X7).
+
+    Every distinct strategy intent classified as COMPLETE /
+    ORPHAN_ENTRY / ORPHAN_EXIT / DUPLICATE_ENTRY / PARTIAL_EXIT /
+    LINEAGE_MISSING. Aggregated by strategy.
+
+    Cheap (~50ms — single scan of canonical_fills.jsonl, no network).
+    """
+    try:
+        from helio.order_lifecycle import reconcile_all
+        return JSONResponse(reconcile_all())
+    except Exception as e:
+        return JSONResponse({"error": "order_lifecycle failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/daily_health_check")
 async def api_daily_health_check():
     """Latest run of the 6-component daily health check (auto_pause,
@@ -9694,6 +9746,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
 <div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
 
+<!-- PRE-MARKET READINESS — single READY/REVIEW/NOT_READY verdict before US open -->
+<div id="pre-market-readiness-banner" style="margin-bottom:10px;"></div>
+
 <!-- AUDIT HEALTH — 6-component daily check at a glance (Codex gap closure visibility) -->
 <div id="audit-health-banner" style="margin-bottom:10px;"></div>
 
@@ -10481,6 +10536,62 @@ const ACTION_COLORS = {
   KILL:       {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
   OBSERVE:    {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
+
+// ─── PRE-MARKET READINESS BANNER ─────────────────────────────────
+// Composite verdict: READY / REVIEW / NOT_READY. Most actionable
+// pre-open signal — operator looks here first.
+const PRE_MARKET_COLORS = {
+  READY:     {bg:'#0d3320', border:'#00e676', fg:'#00e676', icon:'OK'},
+  REVIEW:    {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00', icon:'!!'},
+  NOT_READY: {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252', icon:'XX'},
+};
+function loadPreMarketReadiness() {
+  fetch('/api/pre_market_check').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pre-market-readiness-banner');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:6px 12px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PRE-MARKET READINESS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const verdict = data.verdict || 'REVIEW';
+    const c = PRE_MARKET_COLORS[verdict] || PRE_MARKET_COLORS.REVIEW;
+    const reasons = data.reasons || [];
+    const actions = (data.expected_actions_next_5_days || []).filter(a => a.action_in_next_5_days);
+    let html = '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:6px;padding:8px 14px;font-size:0.78em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;">'
+      + '<div><span style="color:' + c.fg + ';font-weight:bold;letter-spacing:2px;">[' + c.icon + '] PRE-MARKET READINESS</span>'
+      + ' <span style="color:' + c.fg + ';font-weight:bold;margin-left:8px;">' + verdict + '</span>';
+    if (data.generated_at) {
+      html += ' <span style="color:#7b8ab8;margin-left:8px;">as of ' + data.generated_at.slice(11, 16) + ' UTC</span>';
+    }
+    html += '</div>';
+    if (actions.length) {
+      html += '<div style="color:#9da8c7;font-size:0.92em;">'
+        + actions.length + ' strateg' + (actions.length===1?'y':'ies') + ' active this week</div>';
+    }
+    html += '</div>';
+    if (reasons.length) {
+      html += '<div style="margin-top:6px;color:' + c.fg + ';font-size:0.92em;">';
+      for (const r of reasons) {
+        html += '<div>↳ ' + r + '</div>';
+      }
+      html += '</div>';
+    }
+    if (actions.length) {
+      html += '<div style="margin-top:6px;color:#7b8ab8;font-size:0.85em;">';
+      const labels = actions.map(a => {
+        const nm = a.strategy.replace(/^forge_/, '');
+        return '<b style="color:#e0e0e0;">' + nm + '</b>';
+      });
+      html += 'this week: ' + labels.join(' · ') + '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pre-market readiness error:', e);});
+}
+loadPreMarketReadiness();
+setInterval(loadPreMarketReadiness, 300000);  // 5min refresh; cheap to read artifact
 
 // ─── AUDIT HEALTH BANNER ─────────────────────────────────────────
 // 6-component daily check at a glance. Tiny banner, top of decision

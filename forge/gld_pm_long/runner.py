@@ -688,14 +688,23 @@ def main():
         global _SIGNAL_ONLY_MODE
         _SIGNAL_ONLY_MODE = True
         log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
-    if args.evaluate:
-        evaluate_once()
-    elif args.scan:
-        scan()
-    elif args.backtest:
+    if args.backtest:
         backtest(args.period)
-    elif args.loop:
-        loop_mode()
+        return
+    # Lock is only meaningful for live/loop modes — backtests are
+    # one-shot offline computations.
+    from helio.runner_lock import acquire_runner_lock, RunnerAlreadyRunning
+    try:
+        with acquire_runner_lock("forge_gld_pm_long"):
+            if args.evaluate:
+                evaluate_once()
+            elif args.scan:
+                scan()
+            elif args.loop:
+                loop_mode()
+    except RunnerAlreadyRunning as exc:
+        log.error("REFUSING_DUPLICATE_RUNNER: %s", exc)
+        sys.exit(75)  # EX_TEMPFAIL
 
 
 if __name__ == "__main__":

@@ -414,17 +414,25 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2, default=str))
         return 0
 
-    if args.evaluate:
-        force = ("entry" if args.force_entry
-                  else "exit" if args.force_exit
-                  else None)
-        summary = evaluate_once(force_action=force)
-        print(json.dumps(summary, indent=2, default=str))
-        return 0
-
-    if args.loop:
-        loop_mode()
-        return 0
+    # Live evaluate/loop modes acquire a single-instance PID lock —
+    # prevents a duplicate runner (e.g. system Python vs venv Python)
+    # from stomping on shared state.
+    if args.evaluate or args.loop:
+        from helio.runner_lock import acquire_runner_lock, RunnerAlreadyRunning
+        try:
+            with acquire_runner_lock("forge_nov_spy"):
+                if args.evaluate:
+                    force = ("entry" if args.force_entry
+                              else "exit" if args.force_exit
+                              else None)
+                    summary = evaluate_once(force_action=force)
+                    print(json.dumps(summary, indent=2, default=str))
+                    return 0
+                loop_mode()
+                return 0
+        except RunnerAlreadyRunning as exc:
+            log.error("REFUSING_DUPLICATE_RUNNER: %s", exc)
+            return 75  # EX_TEMPFAIL
 
     parser.print_help()
     return 1
