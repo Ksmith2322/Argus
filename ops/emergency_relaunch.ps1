@@ -14,7 +14,9 @@
 
 $pyExe = "C:\Argus\.venv\Scripts\python.exe"
 $repoRoot = "C:\Argus\repo"
-$env:IBKR_PORT = "7497"
+# 2026-05-25: default to IB Gateway paper (4002). Override before running
+# this script if you specifically need TWS instead.
+if (-not $env:IBKR_PORT) { $env:IBKR_PORT = "4002" }
 
 Set-Location $repoRoot
 

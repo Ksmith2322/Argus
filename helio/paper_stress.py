@@ -26,11 +26,15 @@ _log = logging.getLogger(__name__)
 _MIN_MULT = 0.1
 _MAX_MULT = 10.0
 
+# TWS paper = 7497; IB Gateway paper = 4002. Both are paper modes;
+# paper_stress applies to either. Keeping PAPER_PORT as a single
+# string for backward compatibility with anything that imports it.
 PAPER_PORT = "7497"
+PAPER_PORTS = {"7497", "4002"}
 
 
 def _is_paper() -> bool:
-    if os.environ.get("IBKR_PORT", "") != PAPER_PORT:
+    if os.environ.get("IBKR_PORT", "") not in PAPER_PORTS:
         return False
     if os.environ.get("REAL_MONEY_ENABLED", "").strip().lower() in ("1", "true", "yes"):
         return False

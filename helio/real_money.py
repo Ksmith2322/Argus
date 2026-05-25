@@ -60,8 +60,13 @@ PAPER_ACCOUNT_ID: str = "DUP472829"
 REAL_ACCOUNT_ID: Optional[str] = None  # Set via env or config when funded
 
 # IBKR ports map directly to account class.
-PAPER_PORT: int = 7497
-REAL_PORT: int = 7496
+# TWS uses 7497 (paper) / 7496 (live); IB Gateway uses 4002 (paper) /
+# 4001 (live). Both are supported — the boundary check trusts ANY of
+# the real ports as a real-money signal.
+PAPER_PORT: int = 7497          # TWS paper (canonical default)
+REAL_PORT: int = 7496           # TWS live
+PAPER_PORTS: frozenset[int] = frozenset({7497, 4002})   # TWS + Gateway paper
+REAL_PORTS: frozenset[int] = frozenset({7496, 4001})    # TWS + Gateway live
 
 ALLOWLIST_PATH = Path("argus_flow/configs/real_money_allowlist.json")
 
@@ -162,7 +167,7 @@ def is_real_money_connection(ib_client) -> bool:
         port = int(getattr(ib_client.client, "port", 0) or 0)
     except Exception:
         port = 0
-    if port == REAL_PORT:
+    if port in REAL_PORTS:
         return True
     try:
         accounts = list(ib_client.managedAccounts() or [])
@@ -328,6 +333,8 @@ __all__ = [
     "REAL_ACCOUNT_ID",
     "PAPER_PORT",
     "REAL_PORT",
+    "PAPER_PORTS",
+    "REAL_PORTS",
     "ALLOWLIST_PATH",
     "AccountBoundaryViolationError",
     "Allowlist",

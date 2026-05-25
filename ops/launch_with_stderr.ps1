@@ -29,7 +29,9 @@ $stderrLog = Join-Path $logDir "${Name}_stderr_${dateTag}.log"
 # Build full arg list: -m <module> <args>
 $pyArgs = @('-m', $Module) + $ModuleArgs
 
-$env:IBKR_PORT = '7497'
+# 2026-05-25: default to IB Gateway paper (4002). Override before invoking
+# this script if you need TWS (7497): `$env:IBKR_PORT = '7497'; .\ops\launch_with_stderr.ps1 ...`
+if (-not $env:IBKR_PORT) { $env:IBKR_PORT = '4002' }
 
 Write-Host "Launching $Name (module=$Module)" -ForegroundColor Cyan
 Write-Host "  stderr -> $stderrLog" -ForegroundColor DarkGray

@@ -27,6 +27,36 @@ def live_env(monkeypatch):
     monkeypatch.delenv("REAL_MONEY_ENABLED", raising=False)
 
 
+@pytest.fixture
+def gateway_paper_env(monkeypatch):
+    """IB Gateway paper port (4002) — should be treated as paper for
+    paper_stress purposes. Added 2026-05-25 alongside the TWS→Gateway
+    migration."""
+    monkeypatch.setenv("IBKR_PORT", "4002")
+    monkeypatch.delenv("REAL_MONEY_ENABLED", raising=False)
+
+
+@pytest.fixture
+def gateway_live_env(monkeypatch):
+    monkeypatch.setenv("IBKR_PORT", "4001")
+    monkeypatch.delenv("REAL_MONEY_ENABLED", raising=False)
+
+
+def test_paper_stress_recognizes_gateway_paper_port(gateway_paper_env):
+    """Gateway paper (4002) must trigger the same paper-stress multiplier
+    path that TWS paper (7497) does — otherwise migrating to Gateway
+    silently disables the entire paper-stress mechanism."""
+    assert paper_stress.apply(3.0, 0.5, strategy="x", knob="y") == 1.5
+
+
+def test_paper_stress_refuses_gateway_live_port(gateway_live_env, caplog):
+    """Gateway live (4001) must NOT be eligible for paper-stress —
+    same guarantee TWS live (7496) gets."""
+    with caplog.at_level(logging.WARNING):
+        assert paper_stress.apply(3.0, 0.5, strategy="x", knob="y") == 3.0
+    assert any("IGNORED" in r.message for r in caplog.records)
+
+
 # ── unit behavior ─────────────────────────────────────────────────────────
 
 def test_multiplier_1_returns_base_unchanged():

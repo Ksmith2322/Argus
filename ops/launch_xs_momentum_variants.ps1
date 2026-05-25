@@ -20,7 +20,10 @@ $ErrorActionPreference = "Continue"
 $venvPython = "C:\Argus\.venv\Scripts\python.exe"
 $repoRoot = "C:\Argus\repo"
 
-if (-not $env:IBKR_PORT) { $env:IBKR_PORT = "7497" }
+# 2026-05-25: cut over from TWS (7497) to IB Gateway (4002) for unattended
+# production. TWS still available via ops/start_tws_via_ibc.ps1 for manual
+# UI sessions; override IBKR_PORT here only if you need to point at TWS.
+if (-not $env:IBKR_PORT) { $env:IBKR_PORT = "4002" }
 Write-Host "Using IBKR_PORT=$($env:IBKR_PORT)"
 Write-Host "Using venv Python: $venvPython"
 Write-Host ""
