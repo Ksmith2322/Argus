@@ -108,6 +108,21 @@ _XS_MOMENTUM_UNIVERSE = (
     "SPY", "QQQ", "IWM", "DIA", "EFA", "EEM", "GLD", "TLT",
 )
 
+# 2026-05-24 universe-expansion variants — each surviving universe is
+# importable from helio.xs_momentum_universes. The variant runners
+# share the same cache root because every universe ultimately resolves
+# to yfinance daily ETF closes.
+try:
+    from helio.xs_momentum_universes import (
+        SECTORS_SPDR_11 as _SECTORS_SPDR_11,
+        STYLE_FACTORS_8 as _STYLE_FACTORS_8,
+        LEGACY_SECTORS_COUNTRIES_15 as _LEGACY_15,
+    )
+except Exception:  # registry not yet importable in some test contexts
+    _SECTORS_SPDR_11 = ()
+    _STYLE_FACTORS_8 = ()
+    _LEGACY_15 = ()
+
 
 CONTRACTS: dict[str, DataFeedContract] = {
     "forge_xs_momentum": DataFeedContract(
@@ -160,6 +175,48 @@ CONTRACTS: dict[str, DataFeedContract] = {
             "PENDING_OPT_IN. November-only SPY (single-month strategy). "
             "MARGINAL_PASS 8/9 layers; CI lower 1.75 @ 10bp. First "
             "live action 2026-11-02; allocation 0.2x recommended."
+        ),
+    ),
+    "forge_xs_momentum_sectors": DataFeedContract(
+        strategy="forge_xs_momentum_sectors",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=_SECTORS_SPDR_11,
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "20y disciplined gate: PF 2.50 CI [1.44, 4.53], DD 50%. "
+            "Same engine as broad-8 xs_momentum, sector universe (11 SPDRs)."
+        ),
+    ),
+    "forge_xs_momentum_style": DataFeedContract(
+        strategy="forge_xs_momentum_style",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=_STYLE_FACTORS_8,
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "20y disciplined gate: PF 3.78 CI [1.85, 8.55], DD 34% "
+            "(best risk profile of the variants). Style factors: "
+            "VTV/VUG/VYM/VIG/MTUM/QUAL/USMV/VLUE."
+        ),
+    ),
+    "forge_xs_momentum_legacy15": DataFeedContract(
+        strategy="forge_xs_momentum_legacy15",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=_LEGACY_15,
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "20y disciplined gate: PF 2.22 CI [1.38, 3.75], DD 65%. "
+            "15-ticker pre-5/22 default universe (10 sectors + 5 country). "
+            "Accept the higher DD because the universe size enables larger "
+            "trade count (n=165 over 20y)."
         ),
     ),
 }

@@ -67,6 +67,78 @@ PARAMS = {
     "eval_minute_utc": 30,
 }
 
+
+# ─── Variant configuration (Codex universe-sweep 2026-05-24) ─────────
+# Multiple universes survived the 20y disciplined gate. Each gets its
+# own paper-trading instance via --variant <name>. The base broad-8
+# strategy keeps client_id 121; variants take 122+.
+
+_VARIANT_REGISTRY: dict[str, dict] = {
+    "baseline": {
+        "label": "forge_xs_momentum",
+        "log_dir_name": "xs_momentum",
+        "client_id": 121,
+        "universe_key": None,  # use DEFAULT_UNIVERSE
+    },
+    "sectors": {
+        "label": "forge_xs_momentum_sectors",
+        "log_dir_name": "xs_momentum_sectors",
+        "client_id": 122,
+        "universe_key": "sectors_spdr_11",
+    },
+    "style": {
+        "label": "forge_xs_momentum_style",
+        "log_dir_name": "xs_momentum_style",
+        "client_id": 123,
+        "universe_key": "style_factors_8",
+    },
+    "legacy15": {
+        "label": "forge_xs_momentum_legacy15",
+        "log_dir_name": "xs_momentum_legacy15",
+        "client_id": 124,
+        "universe_key": "legacy_sectors_countries_15",
+    },
+}
+
+
+def configure_variant(name: str) -> None:
+    """Reconfigure module-level globals for the given variant.
+
+    Must be called BEFORE any other module function (state read,
+    backtest, evaluate, loop). Idempotent for the same name.
+    """
+    global STRATEGY_LABEL, IBKR_CLIENT_ID
+    global LOG_DIR, STATE_PATH, HEARTBEAT_PATH, TRADES_PATH
+
+    if name not in _VARIANT_REGISTRY:
+        raise ValueError(
+            f"unknown xs_momentum variant {name!r}; "
+            f"known: {list(_VARIANT_REGISTRY)}"
+        )
+    cfg = _VARIANT_REGISTRY[name]
+    STRATEGY_LABEL = cfg["label"]
+    IBKR_CLIENT_ID = cfg["client_id"]
+    LOG_DIR = REPO / "forge" / "logs" / cfg["log_dir_name"]
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH = LOG_DIR / "state.json"
+    HEARTBEAT_PATH = LOG_DIR / "heartbeat.json"
+    TRADES_PATH = LOG_DIR / "trades.csv"
+
+    # Override universe for non-default variants; for baseline, explicitly
+    # reset to DEFAULT_UNIVERSE so re-configuring across variants doesn't
+    # leave stale state.
+    universe_key = cfg["universe_key"]
+    if universe_key is not None:
+        from helio.xs_momentum_universes import get_universe
+        PARAMS["universe"] = list(get_universe(universe_key))
+    else:
+        PARAMS["universe"] = list(DEFAULT_UNIVERSE)
+
+
+def list_variants() -> list[str]:
+    """Return the names of all configured variants."""
+    return list(_VARIANT_REGISTRY)
+
 MAX_DAILY_DATA_AGE_DAYS = 5
 
 
@@ -1012,7 +1084,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--loop", action="store_true",
                           help="Daemon: daily wake, rebalance only on first wake of month")
     parser.add_argument("--signal-only", action="store_true")
+    parser.add_argument("--variant", default="baseline",
+                          choices=list(_VARIANT_REGISTRY),
+                          help="Strategy variant: which universe + log dir + client_id (default: baseline)")
     args = parser.parse_args(argv)
+
+    # Wire variant config BEFORE anything reads state/heartbeat/etc.
+    configure_variant(args.variant)
+    log.info("variant=%s strategy_label=%s log_dir=%s client_id=%s "
+             "universe=%s",
+             args.variant, STRATEGY_LABEL, LOG_DIR.name, IBKR_CLIENT_ID,
+             PARAMS["universe"])
 
     global _SIGNAL_ONLY_MODE
     _SIGNAL_ONLY_MODE = bool(args.signal_only)
@@ -1059,7 +1141,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.evaluate or args.loop:
         from helio.runner_lock import acquire_runner_lock, RunnerAlreadyRunning
         try:
-            with acquire_runner_lock("forge_xs_momentum"):
+            # Use the variant-aware STRATEGY_LABEL so each variant owns
+            # its own lock file under forge/logs/<variant>/runner.lock.
+            with acquire_runner_lock(STRATEGY_LABEL):
                 if args.evaluate:
                     summary = evaluate_once(force=args.force)
                     print(json.dumps(summary, indent=2, default=str))

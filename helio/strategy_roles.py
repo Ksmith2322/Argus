@@ -63,6 +63,12 @@ STRATEGY_ROLES: dict[str, str] = {
     # Active roster
     "forge_xs_momentum": OFFENSE,
     "forge_gld_pm_long": DEFENSE,
+    # 2026-05-24 universe-expansion variants — same engine, same role
+    # as baseline xs_momentum (OFFENSE, 1.20 floor). Each survived the
+    # 20y disciplined gate on an alternative universe.
+    "forge_xs_momentum_sectors": OFFENSE,
+    "forge_xs_momentum_style": OFFENSE,
+    "forge_xs_momentum_legacy15": OFFENSE,
     # Pending-opt-in candidates (also classified so we know what bar
     # they'll be evaluated against if/when activated)
     "forge_tom_spy": OFFENSE,        # PARTIAL_PASS at 1.20 floor; alpha-equivalent

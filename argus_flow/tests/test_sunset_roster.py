@@ -157,7 +157,19 @@ def test_post_reset_target_roster_size():
 # gate at realistic slippage (PEAD 1.025 @ 40bps, NQ 0.526 @ 7bps), so
 # both were flipped to 0.0×. The ACTIVE roster (factor > 0) is now just
 # the two strategies that survive realistic execution costs.
-ACTIVE_ROSTER = {"forge_xs_momentum", "forge_gld_pm_long"}
+#
+# 2026-05-24 universe-expansion sprint: 3 xs_momentum variants survived
+# the 20y disciplined gate on alternative universes (sectors_spdr_11,
+# style_factors_8, legacy_sectors_countries_15). Each runs the SAME
+# engine via the new --variant flag, with its own state dir + client_id.
+# Activated at 0.5x for paper-evidence accumulation through 6/30.
+ACTIVE_ROSTER = {
+    "forge_xs_momentum",
+    "forge_gld_pm_long",
+    "forge_xs_momentum_sectors",
+    "forge_xs_momentum_style",
+    "forge_xs_momentum_legacy15",
+}
 
 
 def test_active_roster_is_exactly_xs_momentum_and_gld_pm_long():
