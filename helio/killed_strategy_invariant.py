@@ -65,6 +65,9 @@ KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
     "argus_gbpusd":           ("GBPUSD",),
     "argus_usdjpy":           ("USDJPY",),
     "argus_cadjpy":           ("CADJPY",),
+    # 2026-05-25: gate-killed before deployment (no runner ever shipped).
+    # See docs/AUDIT_2026_05_25_PART2/OVERNIGHT_DRIFT_KILL.md.
+    "forge_overnight_drift_qqq": ("SPY", "QQQ", "IWM"),
 }
 
 

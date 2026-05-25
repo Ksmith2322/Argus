@@ -84,6 +84,15 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     # 2026-05-23 concentrate-on-winner reweight: 0.614 correlation with
     # xs_momentum, redundant beta. Could be revived as a benchmark.
     "forge_spy_trend_follower":  "2026-05-23",
+    # 2026-05-25: Strategy agent's #1 candidate from
+    # docs/AUDIT_2026_05_25_PART2/STRATEGY.md killed by disciplined-gate
+    # backtest (helio/overnight_drift + ops/audit/run_overnight_drift_backtest).
+    # FAILS at every plausible slippage: PF 0.72-0.81 @ 10bps, 0.90-0.97
+    # @ 5bps, 1.02-1.09 @ 2bps — even the best (QQQ @ 2bps) has CI lower
+    # 1.01 < 1.20 floor. The overnight premium IS real (~5-7%/yr gross)
+    # but slippage drag at 250 trades/yr (25%/yr at 10bps) swamps it.
+    # Full results: docs/AUDIT_2026_05_25_PART2/OVERNIGHT_DRIFT_KILL.md
+    "forge_overnight_drift_qqq": "2026-05-25",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the
