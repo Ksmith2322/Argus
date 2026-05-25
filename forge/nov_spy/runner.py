@@ -34,7 +34,10 @@ from helio.fleet_sizing import (
 from helio import ibkr_execution as ibkr
 
 STRATEGY_LABEL = "forge_nov_spy"
-IBKR_CLIENT_ID = 124   # next free in the forge range (123 = tom_spy)
+# 2026-05-25 (v21 opt-in): reassigned 124 → 130 because 124 collides
+# with xs_momentum_legacy15 added during the 2026-05-24 universe-
+# expansion sprint. Sequenced after tom_spy's new 129.
+IBKR_CLIENT_ID = 130
 _SIGNAL_ONLY_MODE = False
 
 REPO = Path(__file__).resolve().parents[2]

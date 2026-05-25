@@ -173,6 +173,8 @@ ACTIVE_ROSTER = {
     "forge_xs_momentum_legacy15_regime",
     "forge_tail_hedge",
     "forge_xs_momentum_global47",
+    "forge_tom_spy",
+    "forge_nov_spy",
 }
 
 
