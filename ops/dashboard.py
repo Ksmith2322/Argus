@@ -2905,6 +2905,39 @@ async def api_pre_market_check():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/promotion_recommendations")
+async def api_promotion_recommendations():
+    """Pending auto-promotion recommendations.
+
+    Reads argus_flow/logs/auto_promotion_recommendations.json (last
+    snapshot from `python -m ops.auto_promotion`). Returns the
+    proposed allocation flips + confidence + reasons.
+
+    Cheap (~5ms — file read). Operator reviews from the panel +
+    runs `--apply --confirm` in CLI to actually flip allocations
+    (intentionally NOT a button — capital moves require operator
+    in the loop).
+    """
+    try:
+        from pathlib import Path
+        import json as _json
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "argus_flow" / "logs"
+                    / "auto_promotion_recommendations.json")
+        if not artifact.exists():
+            return JSONResponse({
+                "n_recommendations": 0,
+                "recommendations": [],
+                "hint": "run `python -m ops.auto_promotion` to snapshot",
+            })
+        return JSONResponse(_json.loads(
+            artifact.read_text(encoding="utf-8")
+        ))
+    except Exception as e:
+        return JSONResponse({"error": "promotion_recommendations failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/pnl_vs_benchmark")
 async def api_pnl_vs_benchmark(window_days: int = 30):
     """Fleet realized PnL vs SPY + MTUM benchmark over the window.
@@ -10173,6 +10206,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- VARIANT EXPOSURE — combined xs_momentum cohort holdings + concentration warnings -->
 <div id="variant-exposure-panel" style="margin-bottom:12px;"></div>
 
+<!-- PROMOTION RECOMMENDATIONS — pending audit-driven allocation flips -->
+<div id="promotion-recommendations-panel" style="margin-bottom:12px;"></div>
+
 <!-- PNL vs BENCHMARK — fleet PnL minus SPY/MTUM return (alpha-relative read) -->
 <div id="pnl-vs-benchmark-panel" style="margin-bottom:12px;"></div>
 
@@ -11241,6 +11277,64 @@ function loadVariantExposure() {
 }
 loadVariantExposure();
 setInterval(loadVariantExposure, 600000);  // 10min — picks change only on rebalance
+
+// ─── PROMOTION RECOMMENDATIONS PANEL ─────────────────────────────
+// Pending audit-driven allocation flips. Operator reviews here +
+// runs `python -m ops.auto_promotion --apply --confirm` in CLI to
+// actually flip allocations. Intentionally NOT a button: capital
+// moves require operator in the loop.
+const PROMOTION_CONFIDENCE_COLORS = {
+  HIGH: {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  MED:  {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  LOW:  {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+};
+function loadPromotionRecommendations() {
+  fetch('/api/promotion_recommendations').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('promotion-recommendations-panel');
+    if (!el) return;
+    if (data.error) { el.innerHTML = ''; return; }
+    const recs = data.recommendations || [];
+    if (recs.length === 0) {
+      // Hide the panel entirely when there's nothing pending
+      el.innerHTML = '';
+      return;
+    }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">PROMOTION RECOMMENDATIONS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">audit-driven allocation flips pending operator review</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + recs.length + ' pending</div>'
+      + '</div>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;margin-bottom:8px;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Strategy</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Current</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Proposed</th>'
+      + '<th style="padding:4px 6px;text-align:center;">Confidence</th>'
+      + '<th style="padding:4px 6px;">Reasons</th>'
+      + '</tr></thead><tbody>';
+    for (const r of recs) {
+      const c = PROMOTION_CONFIDENCE_COLORS[r.confidence] || PROMOTION_CONFIDENCE_COLORS.LOW;
+      const displayName = r.strategy.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + r.current_alloc.toFixed(2) + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#00e676;font-weight:bold;">' + r.proposed_alloc.toFixed(2) + '</td>'
+        + '<td style="padding:4px 6px;text-align:center;"><span style="background:' + c.bg + ';color:' + c.fg + ';border:1px solid ' + c.border + ';padding:1px 6px;border-radius:3px;font-size:0.85em;">' + r.confidence + '</span></td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;font-size:0.85em;">' + (r.reasons || []).join('; ') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="background:#0a1a30;padding:6px 10px;border-radius:4px;font-size:0.72em;color:#88a8ff;font-family:monospace;">'
+      + '<b>To apply:</b> python -m ops.auto_promotion --apply --confirm'
+      + '<br><span style="color:#7b8ab8;">(operator-in-the-loop — capital moves require explicit confirmation)</span>'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('promotion recommendations error:', e);});
+}
+loadPromotionRecommendations();
+setInterval(loadPromotionRecommendations, 600000);
 
 // ─── PNL VS BENCHMARK ────────────────────────────────────────────
 // The honest read: is the fleet generating ALPHA, or just tracking
@@ -18818,7 +18912,8 @@ PANEL_IDS_ALL = [
     # Audit-suite panels (Codex gap closures — 2026-05-24)
     "audit-health-banner", "data-feed-contracts-panel",
     "strategy-roles-panel", "variant-exposure-panel",
-    "pnl-vs-benchmark-panel", "pnl-attribution-panel", "equity-curves-panel",
+    "promotion-recommendations-panel", "pnl-vs-benchmark-panel",
+    "pnl-attribution-panel", "equity-curves-panel",
     "active-alpha-readiness-panel",
     # Decision / fleet panels
     "recommended-actions-panel", "cohort-gate-panel",
@@ -18854,7 +18949,8 @@ VIEW_ALLOWLISTS = {
         "market-clock-bar", "blocked-entries-bar",
         "audit-health-banner", "data-feed-contracts-panel",
         "strategy-roles-panel", "variant-exposure-panel",
-        "pnl-vs-benchmark-panel", "pnl-attribution-panel", "equity-curves-panel",
+        "promotion-recommendations-panel", "pnl-vs-benchmark-panel",
+    "pnl-attribution-panel", "equity-curves-panel",
         "active-alpha-readiness-panel",
         "recommended-actions-panel", "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
