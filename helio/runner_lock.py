@@ -1,14 +1,21 @@
 """Single-instance PID lock for forge runners.
 
-Background (2026-05-24): a rogue gld_pm_long runner using the system
-Python (not the venv) ran in parallel with the official venv-based
-runner for an indeterminate period. The two processes stomped on each
-other's state file and the rogue, on stale code/state, spammed Discord
-with NOTIONAL_CAP warnings using cached pre-reset anchor values.
+Purpose: prevent a SECOND invocation of the same runner (e.g. from a
+second PowerShell session, or a stale scheduled task) from stomping on
+the first's state/heartbeat/canonical_fills.
 
-This module provides a cross-process PID lock so a second invocation
-of a runner detects the first and refuses to start, regardless of
-which Python launched it.
+NOT TO BE CONFUSED with the venv shim/real-Python pattern: on Windows,
+every `.venv\\Scripts\\python.exe` invocation is a 270KB redirector that
+spawns the real interpreter from `base_prefix` (`AppData\\Local\\Programs\\
+Python\\Python312\\python.exe`) and waits on it. Both processes show up in
+WMI / Get-CimInstance but they're ONE logical invocation. See
+`ops/operational_vetting.py::_duplicate_process_advisory` for the
+already-shipped detector that distinguishes shim/real pairs from real
+duplicates.
+
+This lock only catches REAL duplicates — independent process trees
+running the same module. A shim/real pair never trips the lock because
+the real interpreter inherits the lock from its shim parent.
 
 USAGE
 =====

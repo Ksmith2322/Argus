@@ -67,6 +67,28 @@ November-only and won't fire either way until Nov 2.
 | `argus_flow/logs/canonical_fills.jsonl` | first post-reset fill lands when `gld_pm_long` fires ~21:05 UTC |
 | Discord | `daily_health_check` runs nightly 23:00 UTC, posts if anything not all-GREEN |
 
+## What's normal: 10 python.exe processes for 5 runners
+
+When you query `Get-CimInstance Win32_Process -Filter "name='python.exe'"`
+expect roughly **10 python.exe** entries for the 5 active runners.
+
+That's normal Windows venv mechanics, not a bug:
+- venv `python.exe` (`C:\Argus\.venv\Scripts\python.exe`, ~3 MB) is a
+  redirector shim
+- it spawns + waits on the base interpreter
+  (`C:\Users\ksmit\AppData\Local\Programs\Python\Python312\python.exe`,
+  ~125 MB) which actually runs the code
+
+Both processes show in WMI but they're ONE logical runner instance.
+`ops/operational_vetting.py::_duplicate_process_advisory` filters these
+shim/real pairs and only flags genuine duplicate launches.
+
+**DO NOT** kill the base-Python (`Programs\Python\Python312\python.exe`)
+thinking it's a rogue — its venv shim parent will die as collateral.
+The 2026-04-28 incident memory documents this lesson; we re-learned it
+2026-05-24 and again briefly 2026-05-25. See helio/runner_lock.py
+docstring for the canonical writeup.
+
 ## What to NOT touch
 
 - **Don't change `allocation_factor` for `xs_momentum` or the 3 variants mid-week** — the disciplined gate was scored at the current size; changing it invalidates the live evidence.

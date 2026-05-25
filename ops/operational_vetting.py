@@ -534,14 +534,20 @@ def _duplicate_process_advisory() -> dict:
             "started": str(p.get("CreationDate") or "")[:19],
         }
 
-    # Group by runner module
+    # Group by runner module + variant flag. forge.xs_momentum.runner has
+    # 4 variant deployments (baseline + 3 universe variants) that are
+    # legitimately separate invocations sharing the module name. Treat
+    # `--variant <name>` as a discriminator so they don't false-flag.
     by_module: dict[str, list[dict]] = {}
     for pid, info in info_by_pid.items():
         m = _re.search(r"-m\s+(\S+)", info["cmdline"])
         if not m:
             continue
         mod = m.group(1)
-        by_module.setdefault(mod, []).append({"pid": pid, **info})
+        # Append variant flag if present so each variant is its own bucket
+        var = _re.search(r"--variant\s+(\S+)", info["cmdline"])
+        key = f"{mod}::{var.group(1)}" if var else mod
+        by_module.setdefault(key, []).append({"pid": pid, **info})
 
     # For modules with > 1 process, filter out the (shim, real) redirector pairs.
     # A pair is a redirector if one process's PPID == the other's PID AND they're
