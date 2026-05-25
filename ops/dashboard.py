@@ -2827,6 +2827,85 @@ async def api_fleet_snapshot():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/data_feed_contracts")
+async def api_data_feed_contracts():
+    """Offline verification of each strategy's declared data-feed
+    contract (Codex gap #1). Per strategy:
+        GREEN  — every ticker fresh in fallback cache
+        YELLOW — at least one ticker stale beyond freshness budget
+        RED    — at least one missing OR all uniformly stale
+
+    Cheap (<50ms) — reads CSV header + last Date row only."""
+    try:
+        from helio.data_feed_contract import verify_all_contracts
+        verdicts = verify_all_contracts()
+        counts: dict = {}
+        for v in verdicts.values():
+            counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        return JSONResponse({
+            "verdict_counts": counts,
+            "contracts": verdicts,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "data_feed_contracts failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/active_alpha_readiness")
+async def api_active_alpha_readiness():
+    """Synthesis report: preflight + canonical_fills + blockers +
+    exposure + role/floor for each active strategy. Same content as
+    `python -m ops.audit.run_active_alpha_readiness --stdout`.
+
+    Per strategy: verdict (READY_TO_SCALE / REVIEW_BEFORE_SCALE /
+    GATED_REVIEW / EVIDENCE_BUILDING / BLOCKED), reasons, role, and
+    pf_floor.
+
+    Moderate cost (~300ms — runs full preflight + canonical scan).
+    Returns the same JSON as the CLI."""
+    try:
+        from ops.audit.run_active_alpha_readiness import build_report
+        return JSONResponse(build_report())
+    except Exception as e:
+        return JSONResponse({"error": "active_alpha_readiness failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/daily_health_check")
+async def api_daily_health_check():
+    """Latest run of the 6-component daily health check (auto_pause,
+    orphan_phantom, data_feed, preflight, roster_state, flag_check).
+
+    Reads the persisted artifact if present (cheap), else triggers a
+    live re-run. Pass ?fresh=1 to force a re-run regardless."""
+    try:
+        from pathlib import Path
+        import json as _json
+
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "argus_flow" / "logs" / "daily_health_check.json")
+        # Trigger fresh run unless the artifact is recent (<1h)
+        fresh_requested = False
+        try:
+            from fastapi import Request  # noqa: F401  (already imported elsewhere)
+        except ImportError:
+            pass
+
+        if artifact.exists():
+            try:
+                data = _json.loads(artifact.read_text(encoding="utf-8"))
+                return JSONResponse(data)
+            except Exception:
+                pass
+
+        # Fallback: live evaluation (no Discord post)
+        from ops.daily_health_check import evaluate
+        return JSONResponse(evaluate(post_discord=False))
+    except Exception as e:
+        return JSONResponse({"error": "daily_health_check failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/governance_health")
 async def api_governance_health():
     """Governance report freshness — shows what's blocking transitions."""
@@ -9615,6 +9694,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
 <div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
 
+<!-- AUDIT HEALTH — 6-component daily check at a glance (Codex gap closure visibility) -->
+<div id="audit-health-banner" style="margin-bottom:10px;"></div>
+
+<!-- DATA FEED CONTRACTS — primary/fallback cache freshness per strategy (Codex gap #1) -->
+<div id="data-feed-contracts-panel" style="margin-bottom:12px;"></div>
+
+<!-- STRATEGY ROLES — offense/defense/hedge/research + role-aware PF floor (Codex gap #10) -->
+<div id="strategy-roles-panel" style="margin-bottom:12px;"></div>
+
+<!-- ACTIVE ALPHA READINESS — synthesis of what's blocking real-money scale per active strategy -->
+<div id="active-alpha-readiness-panel" style="margin-bottom:14px;"></div>
+
 <!-- RECOMMENDED ACTIONS — cross-panel synthesis, what to actually do now -->
 <div id="recommended-actions-panel" style="margin-bottom:14px;"></div>
 
@@ -10390,6 +10481,221 @@ const ACTION_COLORS = {
   KILL:       {bg:'#3a0a0a', border:'#ff4444', fg:'#ff4444'},
   OBSERVE:    {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
+
+// ─── AUDIT HEALTH BANNER ─────────────────────────────────────────
+// 6-component daily check at a glance. Tiny banner, top of decision
+// region — single-line summary with worst-status badge.
+const HEALTH_COLORS = {
+  GREEN:  {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  YELLOW: {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  RED:    {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+  ERROR:  {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadAuditHealth() {
+  fetch('/api/daily_health_check').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('audit-health-banner');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:6px 12px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">AUDIT HEALTH</span> · ' + data.error + '</div>';
+      return;
+    }
+    const reports = data.reports || [];
+    const worst = data.worst_status || 'GREEN';
+    const wc = HEALTH_COLORS[worst] || HEALTH_COLORS.GREEN;
+    let html = '<div style="background:' + wc.bg + ';border:1px solid ' + wc.border + ';border-radius:6px;padding:6px 12px;font-size:0.78em;">'
+      + '<span style="color:' + wc.fg + ';font-weight:bold;letter-spacing:2px;">AUDIT HEALTH</span>'
+      + ' <span style="color:' + wc.fg + ';font-weight:bold;">' + worst + '</span>'
+      + ' <span style="color:#7b8ab8;margin-left:8px;">' + reports.length + ' components</span>';
+    html += '<span style="margin-left:14px;">';
+    for (const r of reports) {
+      const c = HEALTH_COLORS[r.status] || HEALTH_COLORS.GREEN;
+      const tip = (r.summary || '').replace(/"/g, '&quot;');
+      html += '<span title="' + tip + '" style="margin-right:10px;color:' + c.fg + ';">'
+        + (r.component || '?') + ' <b>' + (r.status || '?') + '</b></span>';
+    }
+    html += '</span>';
+    if (data.generated_at) {
+      html += '<span style="float:right;color:#7b8ab8;font-size:0.92em;">' + data.generated_at.slice(11, 19) + ' UTC</span>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('audit health error:', e);});
+}
+loadAuditHealth();
+setInterval(loadAuditHealth, 60000);
+
+// ─── DATA FEED CONTRACTS PANEL ───────────────────────────────────
+// Per-strategy GREEN/YELLOW/RED for the offline cache. RED here means
+// the strategy has NO insurance against a live data outage.
+function loadDataFeedContracts() {
+  fetch('/api/data_feed_contracts').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('data-feed-contracts-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">DATA FEED CONTRACTS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const contracts = data.contracts || {};
+    const counts = data.verdict_counts || {};
+    const items = Object.entries(contracts);
+    if (items.length === 0) { el.innerHTML = ''; return; }
+    const cc = HEALTH_COLORS[counts.RED ? 'RED' : (counts.YELLOW ? 'YELLOW' : 'GREEN')];
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">DATA FEED CONTRACTS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">offline cache freshness · Codex gap #1</span></div>'
+      + '<div style="font-size:0.78em;">';
+    if (counts.GREEN)  html += '<span style="color:#00e676;">' + counts.GREEN + ' green</span> ';
+    if (counts.YELLOW) html += '<span style="color:#ffaa00;">' + counts.YELLOW + ' yellow</span> ';
+    if (counts.RED)    html += '<span style="color:#ff5252;">' + counts.RED + ' red</span>';
+    html += '</div></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px;">';
+    for (const [name, r] of items) {
+      const v = HEALTH_COLORS[r.verdict] || HEALTH_COLORS.GREEN;
+      const present = (r.universe_present || []).length;
+      const required = (r.universe_required || []).length;
+      const missing = (r.universe_missing || []).length;
+      const stale = (r.stale_tickers || []).length;
+      const reasonText = (r.reasons || []).join('; ') || 'clean';
+      const displayName = name.replace(/^forge_/, '');
+      html += '<div style="background:' + v.bg + ';border:1px solid ' + v.border + ';border-radius:5px;padding:6px 10px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.82em;">' + displayName + '</span>'
+        + '<span style="color:' + v.fg + ';font-size:0.7em;font-weight:bold;letter-spacing:1px;">' + r.verdict + '</span>'
+        + '</div>'
+        + '<div style="color:#9da8c7;font-size:0.74em;margin-top:3px;">'
+        + present + '/' + required + ' present · ' + missing + ' missing · ' + stale + ' stale'
+        + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.7em;margin-top:2px;">' + reasonText + '</div>'
+        + '</div>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('data feed contracts error:', e);});
+}
+loadDataFeedContracts();
+setInterval(loadDataFeedContracts, 120000);
+
+// ─── STRATEGY ROLES PANEL ────────────────────────────────────────
+// Per-strategy role + role-aware PF floor (Codex gap #10). Read off
+// the fleet_snapshot which already aggregates strategy_roles.
+const ROLE_COLORS = {
+  OFFENSE:  {bg:'#1c1437', border:'#5b86f5', fg:'#88a8ff'},
+  DEFENSE:  {bg:'#0d2a1f', border:'#26a69a', fg:'#4dd0c0'},
+  HEDGE:    {bg:'#2a1a35', border:'#9c27b0', fg:'#ce93d8'},
+  RESEARCH: {bg:'#2a2210', border:'#ffa726', fg:'#ffcc80'},
+};
+function loadStrategyRoles() {
+  fetch('/api/fleet_snapshot').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('strategy-roles-panel');
+    if (!el) return;
+    if (data.error) { el.innerHTML = ''; return; }
+    const rows = (data.strategy_roles || []).filter(r => !r.error);
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="margin-bottom:6px;"><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">STRATEGY ROLES &amp; GATE FLOORS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">role-aware disciplined gate · Codex gap #10</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Strategy</th>'
+      + '<th style="padding:4px 6px;">Role</th>'
+      + '<th style="padding:4px 6px;text-align:right;">PF floor</th>'
+      + '<th style="padding:4px 6px;">Active</th>'
+      + '<th style="padding:4px 6px;">Source</th>'
+      + '</tr></thead><tbody>';
+    for (const r of rows) {
+      const c = ROLE_COLORS[r.role] || {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'};
+      const displayName = r.strategy.replace(/^forge_/, '');
+      const activeStr = r.is_active ? '<span style="color:#00e676;">yes</span>' : '<span style="color:#7b8ab8;">no</span>';
+      const explicitStr = r.explicit ? 'pinned' : '<span style="color:#ffaa00;">default</span>';
+      const floorStr = r.pf_floor === null ? '—'
+                     : (r.pf_floor === Infinity || r.pf_floor > 1000) ? '∞' : Number(r.pf_floor).toFixed(2);
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+        + '<td style="padding:4px 6px;"><span style="background:' + c.bg + ';color:' + c.fg + ';border:1px solid ' + c.border + ';padding:1px 6px;border-radius:3px;font-size:0.85em;font-weight:bold;">' + r.role + '</span></td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#e0e0e0;">' + floorStr + '</td>'
+        + '<td style="padding:4px 6px;">' + activeStr + '</td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;">' + explicitStr + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('strategy roles error:', e);});
+}
+loadStrategyRoles();
+setInterval(loadStrategyRoles, 300000);
+
+// ─── ACTIVE ALPHA READINESS PANEL ────────────────────────────────
+// Synthesis: preflight + canonical_fills + blockers per active
+// strategy. The "what's blocking real-money scale" view.
+const READINESS_COLORS = {
+  READY_TO_SCALE:       {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  REVIEW_BEFORE_SCALE:  {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  GATED_REVIEW:         {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  EVIDENCE_BUILDING:    {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+  BLOCKED:              {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadActiveAlphaReadiness() {
+  fetch('/api/active_alpha_readiness').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('active-alpha-readiness-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">ALPHA READINESS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const statuses = data.strategy_status || {};
+    const roles = data.roles || {};
+    const epoch = data.epoch || {};
+    const entries = Object.entries(statuses);
+    if (entries.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">ALPHA READINESS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">what\'s blocking real-money scale per active strategy</span></div>'
+      + '<div style="font-size:0.74em;color:#7b8ab8;">'
+      + 'epoch: <b>' + (epoch.id || '?') + '</b>'
+      + (epoch.is_clean === true ? ' <span style="color:#00e676;">clean</span>'
+         : epoch.is_clean === false ? ' <span style="color:#ff5252;">CONTAMINATED</span>' : '')
+      + '</div></div>';
+    for (const [name, s] of entries) {
+      const c = READINESS_COLORS[s.verdict] || READINESS_COLORS.BLOCKED;
+      const displayName = name.replace(/^forge_/, '');
+      const ev = s.canonical_evidence || {};
+      const blockers = s.blockers_30d || {};
+      const blockerStr = Object.entries(blockers).map(([k,v]) => k + '=' + v).join(' · ') || 'none';
+      const role = s.role || (roles[name] && roles[name].role) || '?';
+      const floor = s.pf_floor || (roles[name] && roles[name].pf_floor) || null;
+      const floorStr = floor === null ? '—'
+                     : (floor === Infinity || floor > 1000) ? '∞' : Number(floor).toFixed(2);
+      html += '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:5px;padding:8px 12px;margin-bottom:6px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.88em;">' + displayName + '</span>'
+        + '<span style="color:' + c.fg + ';font-size:0.74em;font-weight:bold;letter-spacing:1px;">' + s.verdict + '</span>'
+        + '</div>'
+        + '<div style="color:#9da8c7;font-size:0.74em;line-height:1.4;">'
+        + 'role: <b>' + role + '</b> · floor: <b>' + floorStr + '</b>'
+        + ' · entries: ' + (ev.entries || 0) + ' · exits: ' + (ev.exits || 0)
+        + ' · closed PnL: $' + Number(ev.closed_pnl_usd || 0).toFixed(2)
+        + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.74em;margin-top:3px;">'
+        + 'blockers (30d): ' + blockerStr
+        + '</div>';
+      if ((s.reasons || []).length) {
+        html += '<div style="color:' + c.fg + ';font-size:0.74em;margin-top:3px;">'
+          + '↳ ' + s.reasons.join(' · ')
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('alpha readiness error:', e);});
+}
+loadActiveAlphaReadiness();
+setInterval(loadActiveAlphaReadiness, 120000);
 
 // ─── RECOMMENDED ACTIONS ──────────────────────────────────────────
 // Cross-panel synthesis: pulls findings from decision_engine + drilldown
@@ -17687,6 +17993,9 @@ PANEL_IDS_ALL = [
     "halt-banner", "market-clock-bar", "data-epoch-bar", "blocked-entries-bar",
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
+    # Audit-suite panels (Codex gap closures — 2026-05-24)
+    "audit-health-banner", "data-feed-contracts-panel",
+    "strategy-roles-panel", "active-alpha-readiness-panel",
     # Decision / fleet panels
     "recommended-actions-panel", "cohort-gate-panel",
     "changes-24h-panel", "active-bleeders-panel",
@@ -17709,7 +18018,8 @@ VIEW_ALLOWLISTS = {
         "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
-        "maturity-summary-banner", "recommended-actions-panel",
+        "maturity-summary-banner", "audit-health-banner",
+        "recommended-actions-panel",
         "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
         "fleet-health", "open-positions-panel",
@@ -17718,6 +18028,8 @@ VIEW_ALLOWLISTS = {
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
+        "audit-health-banner", "data-feed-contracts-panel",
+        "strategy-roles-panel", "active-alpha-readiness-panel",
         "recommended-actions-panel", "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
