@@ -93,6 +93,17 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     # but slippage drag at 250 trades/yr (25%/yr at 10bps) swamps it.
     # Full results: docs/AUDIT_2026_05_25_PART2/OVERNIGHT_DRIFT_KILL.md
     "forge_overnight_drift_qqq": "2026-05-25",
+    # 2026-05-25 (later same evening): Strategy agent's #3 candidate
+    # killed by disciplined-gate backtest (helio/credit_spread_regime +
+    # ops/audit/run_credit_spread_backtest). FAILS at every parameter
+    # combination tested: SMA50/100/200, with/without VIX filter,
+    # with/without 5-day confirmation. Best variant (SMA200) hits the
+    # agent's predicted point PF=1.53 but H1 PF=2.09 / H2 PF=1.23 split
+    # exposes modern-era erosion (CI lower 0.33 in H2). Likely cause:
+    # central-bank backstops since 2008 amputate the
+    # credit-leads-equity relationship by stepping in before equity
+    # reacts. Full results: docs/AUDIT_2026_05_25_PART2/CREDIT_SPREAD_KILL.md
+    "forge_credit_spread_regime": "2026-05-25",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

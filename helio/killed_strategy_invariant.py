@@ -68,6 +68,11 @@ KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
     # 2026-05-25: gate-killed before deployment (no runner ever shipped).
     # See docs/AUDIT_2026_05_25_PART2/OVERNIGHT_DRIFT_KILL.md.
     "forge_overnight_drift_qqq": ("SPY", "QQQ", "IWM"),
+    # 2026-05-25 (same evening): gate-killed at every parameter combo.
+    # H1 (2007-2016) strong, H2 (2016-2026) erodes — central-bank
+    # backstops likely amputated the credit-leads-equity signal.
+    # See docs/AUDIT_2026_05_25_PART2/CREDIT_SPREAD_KILL.md.
+    "forge_credit_spread_regime": ("SPY",),
 }
 
 
