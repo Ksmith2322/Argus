@@ -114,6 +114,14 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     # but not a standalone strategy. Full results:
     # docs/AUDIT_2026_05_25_PART2/SELL_IN_MAY_KILL.md
     "forge_sell_in_may_modulated": "2026-05-25",
+    # 2026-05-25 (very late evening): Strategy agent's #2 candidate
+    # (turn-of-quarter SPY) killed at MARGINAL fail. Best variant
+    # (30y/5bps) PF=1.71 but CI lower 1.08 vs floor 1.20; H1/H2 both
+    # fail. CAGR contribution ~1.7%/yr at full alloc is below noise
+    # floor for marginal new strategies. Mechanical overlap with
+    # tom_spy's already-deployed window (50% per Q). Full results:
+    # docs/AUDIT_2026_05_25_PART2/TURN_OF_QUARTER_KILL.md
+    "forge_turn_of_quarter": "2026-05-25",
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

@@ -76,6 +76,7 @@ KILLED_STRATEGY_SYMBOLS: dict[str, tuple[str, ...]] = {
     # 2026-05-25 (late evening): always-invested SPY/SHY rotation.
     # See docs/AUDIT_2026_05_25_PART2/SELL_IN_MAY_KILL.md.
     "forge_sell_in_may_modulated": ("SPY", "SHY"),
+    "forge_turn_of_quarter": ("SPY",),
 }
 
 
