@@ -219,6 +219,21 @@ CONTRACTS: dict[str, DataFeedContract] = {
             "trade count (n=165 over 20y)."
         ),
     ),
+    "forge_xs_momentum_style_top3": DataFeedContract(
+        strategy="forge_xs_momentum_style_top3",
+        primary_source="yfinance",
+        fallback_cache_root=_DEFAULT_CACHE_ROOT,
+        universe=_STYLE_FACTORS_8,
+        max_age_days=7,
+        required_columns=("Close",),
+        auto_adjust=False,
+        notes=(
+            "Same universe as forge_xs_momentum_style but top-3 picks "
+            "(fraction 0.35) instead of top-2. 20y sweep: PF 5.40 CI "
+            "[2.70, 12.81], DD 33.9% (same as top-2). Tests concentration "
+            "axis live."
+        ),
+    ),
 }
 
 

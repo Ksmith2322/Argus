@@ -69,6 +69,7 @@ STRATEGY_ROLES: dict[str, str] = {
     "forge_xs_momentum_sectors": OFFENSE,
     "forge_xs_momentum_style": OFFENSE,
     "forge_xs_momentum_legacy15": OFFENSE,
+    "forge_xs_momentum_style_top3": OFFENSE,
     # Pending-opt-in candidates (also classified so we know what bar
     # they'll be evaluated against if/when activated)
     "forge_tom_spy": OFFENSE,        # PARTIAL_PASS at 1.20 floor; alpha-equivalent

@@ -169,6 +169,7 @@ ACTIVE_ROSTER = {
     "forge_xs_momentum_sectors",
     "forge_xs_momentum_style",
     "forge_xs_momentum_legacy15",
+    "forge_xs_momentum_style_top3",
 }
 
 

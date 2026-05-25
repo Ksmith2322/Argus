@@ -79,24 +79,39 @@ _VARIANT_REGISTRY: dict[str, dict] = {
         "log_dir_name": "xs_momentum",
         "client_id": 121,
         "universe_key": None,  # use DEFAULT_UNIVERSE
+        "top_pick_fraction": None,  # use PARAMS default 0.2
     },
     "sectors": {
         "label": "forge_xs_momentum_sectors",
         "log_dir_name": "xs_momentum_sectors",
         "client_id": 122,
         "universe_key": "sectors_spdr_11",
+        "top_pick_fraction": None,
     },
     "style": {
         "label": "forge_xs_momentum_style",
         "log_dir_name": "xs_momentum_style",
         "client_id": 123,
         "universe_key": "style_factors_8",
+        "top_pick_fraction": None,
     },
     "legacy15": {
         "label": "forge_xs_momentum_legacy15",
         "log_dir_name": "xs_momentum_legacy15",
         "client_id": 124,
         "universe_key": "legacy_sectors_countries_15",
+        "top_pick_fraction": None,
+    },
+    # 2026-05-25 amplification: top-3 sweep at 20y showed style_factors_8
+    # at top_fraction=0.35 jumps PF 3.78 -> 5.40 with same DD (34%).
+    # Ship as a parallel variant so the live evidence decides: does
+    # top-3 actually outperform top-2 on the same universe?
+    "style_top3": {
+        "label": "forge_xs_momentum_style_top3",
+        "log_dir_name": "xs_momentum_style_top3",
+        "client_id": 125,
+        "universe_key": "style_factors_8",
+        "top_pick_fraction": 0.35,   # ~3 picks of 8
     },
 }
 
@@ -133,6 +148,13 @@ def configure_variant(name: str) -> None:
         PARAMS["universe"] = list(get_universe(universe_key))
     else:
         PARAMS["universe"] = list(DEFAULT_UNIVERSE)
+
+    # Override top-quintile fraction for variants that test alternative
+    # concentration (e.g. top-3 picks of 8). None = use baseline 0.2 from
+    # the helio.xs_momentum.TOP_QUINTILE_FRACTION constant.
+    override = cfg.get("top_pick_fraction")
+    PARAMS["top_quintile_fraction"] = (override if override is not None
+                                       else TOP_QUINTILE_FRACTION)
 
 
 def list_variants() -> list[str]:

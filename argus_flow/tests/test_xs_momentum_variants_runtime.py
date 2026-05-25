@@ -25,10 +25,30 @@ def restore_baseline():
 
 # ─── Registry contents ──────────────────────────────────────────────
 
-def test_variant_registry_contains_four_variants():
-    """baseline + 3 disciplined-gate survivors from the 20y sweep."""
-    expected = {"baseline", "sectors", "style", "legacy15"}
+def test_variant_registry_contains_five_variants():
+    """baseline + 3 universe survivors from 20y sweep + style_top3
+    concentration variant added 2026-05-25."""
+    expected = {"baseline", "sectors", "style", "legacy15", "style_top3"}
     assert set(xs_runner.list_variants()) == expected
+
+
+def test_style_top3_variant_uses_concentration_override():
+    """Pin the top-3 picks override so future variant additions don't
+    silently break it."""
+    xs_runner.configure_variant("style_top3")
+    assert xs_runner.STRATEGY_LABEL == "forge_xs_momentum_style_top3"
+    assert xs_runner.IBKR_CLIENT_ID == 125
+    # Same universe as style variant
+    assert "MTUM" in xs_runner.PARAMS["universe"]
+    # But different concentration
+    assert xs_runner.PARAMS["top_quintile_fraction"] == 0.35
+
+
+def test_baseline_variant_uses_default_concentration():
+    """baseline gets the canonical 0.2 fraction."""
+    from helio.xs_momentum import TOP_QUINTILE_FRACTION
+    xs_runner.configure_variant("baseline")
+    assert xs_runner.PARAMS["top_quintile_fraction"] == TOP_QUINTILE_FRACTION
 
 
 def test_each_variant_has_unique_client_id():
