@@ -45,12 +45,11 @@ SINGLE_TICKER_RED_PCT  = 50.0   # > 50% -> RED
 def _get_picks_for_variant(variant_name: str, *, period: str = "2y") -> dict:
     """Compute what the variant would pick if it rebalanced today.
 
-    Reuses the runner's variant config + ranking pipeline. Doesn't
-    mutate live state (the variant's --check mode does the same
-    thing).
+    Saves and restores the runner's module globals so callers that
+    don't expect side effects (e.g. daily_health_check, pytest)
+    don't see leaked PARAMS["universe"] state.
     """
     try:
-        # Lazy import the runner module so configure_variant works
         from forge.xs_momentum import runner as xs
         from helio.xs_momentum import (
             rank_universe_by_momentum, select_top_quintile,
@@ -58,42 +57,65 @@ def _get_picks_for_variant(variant_name: str, *, period: str = "2y") -> dict:
     except Exception as exc:
         return {"variant": variant_name, "error": f"import: {exc}"}
 
-    try:
-        xs.configure_variant(variant_name)
-    except Exception as exc:
-        return {"variant": variant_name, "error": f"configure: {exc}"}
-
-    try:
-        closes = xs._fetch_history(xs.PARAMS["universe"], period=period)
-    except Exception as exc:
-        return {"variant": variant_name, "error": f"fetch: {exc}"}
-    if closes.empty:
-        return {"variant": variant_name, "error": "no data"}
-
-    per_asset = {
-        t: closes[t].dropna().tolist()
-        for t in xs.PARAMS["universe"] if t in closes.columns
+    # Snapshot mutable state we're about to clobber so the function
+    # is side-effect-free at the module level
+    saved = {
+        "STRATEGY_LABEL": xs.STRATEGY_LABEL,
+        "IBKR_CLIENT_ID": xs.IBKR_CLIENT_ID,
+        "LOG_DIR": xs.LOG_DIR,
+        "STATE_PATH": xs.STATE_PATH,
+        "HEARTBEAT_PATH": xs.HEARTBEAT_PATH,
+        "TRADES_PATH": xs.TRADES_PATH,
+        "universe": list(xs.PARAMS["universe"]),
+        "top_fraction": xs.PARAMS["top_quintile_fraction"],
     }
     try:
-        ranked = rank_universe_by_momentum(
-            per_asset,
-            long_lookback=xs.PARAMS["long_lookback"],
-            short_lookback=xs.PARAMS["short_lookback"],
-        )
-        picks = select_top_quintile(
-            ranked, fraction=xs.PARAMS["top_quintile_fraction"]
-        )
-    except Exception as exc:
-        return {"variant": variant_name, "error": f"rank: {exc}"}
+        try:
+            xs.configure_variant(variant_name)
+        except Exception as exc:
+            return {"variant": variant_name, "error": f"configure: {exc}"}
 
-    return {
-        "variant": variant_name,
-        "strategy_label": xs.STRATEGY_LABEL,
-        "universe_size": len(xs.PARAMS["universe"]),
-        "picks": [{"ticker": p.ticker, "score": round(p.score * 100, 2)}
-                  for p in picks],
-        "as_of": str(closes.index[-1]) if len(closes) else None,
-    }
+        try:
+            closes = xs._fetch_history(xs.PARAMS["universe"], period=period)
+        except Exception as exc:
+            return {"variant": variant_name, "error": f"fetch: {exc}"}
+        if closes.empty:
+            return {"variant": variant_name, "error": "no data"}
+
+        per_asset = {
+            t: closes[t].dropna().tolist()
+            for t in xs.PARAMS["universe"] if t in closes.columns
+        }
+        try:
+            ranked = rank_universe_by_momentum(
+                per_asset,
+                long_lookback=xs.PARAMS["long_lookback"],
+                short_lookback=xs.PARAMS["short_lookback"],
+            )
+            picks = select_top_quintile(
+                ranked, fraction=xs.PARAMS["top_quintile_fraction"]
+            )
+        except Exception as exc:
+            return {"variant": variant_name, "error": f"rank: {exc}"}
+
+        return {
+            "variant": variant_name,
+            "strategy_label": xs.STRATEGY_LABEL,
+            "universe_size": len(xs.PARAMS["universe"]),
+            "picks": [{"ticker": p.ticker, "score": round(p.score * 100, 2)}
+                      for p in picks],
+            "as_of": str(closes.index[-1]) if len(closes) else None,
+        }
+    finally:
+        # Restore module globals so callers don't see leaked state
+        xs.STRATEGY_LABEL = saved["STRATEGY_LABEL"]
+        xs.IBKR_CLIENT_ID = saved["IBKR_CLIENT_ID"]
+        xs.LOG_DIR = saved["LOG_DIR"]
+        xs.STATE_PATH = saved["STATE_PATH"]
+        xs.HEARTBEAT_PATH = saved["HEARTBEAT_PATH"]
+        xs.TRADES_PATH = saved["TRADES_PATH"]
+        xs.PARAMS["universe"] = saved["universe"]
+        xs.PARAMS["top_quintile_fraction"] = saved["top_fraction"]
 
 
 def _allocation_for(strategy_label: str) -> float:

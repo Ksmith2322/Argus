@@ -317,6 +317,33 @@ def _aggregate_verdict(
     return "READY", []
 
 
+def _expected_picks() -> dict:
+    """Best-effort: query each xs_momentum variant for its current
+    top picks. Operator sees what would actually trade on the next
+    rebalance. No data fetch if any variant errors — keep the audit
+    cheap on cold-start.
+    """
+    try:
+        from ops.audit.run_variant_exposure_audit import (
+            _get_picks_for_variant,
+        )
+        from forge.xs_momentum.runner import _VARIANT_REGISTRY
+    except Exception as exc:
+        return {"error": str(exc)}
+    out: dict[str, list] = {}
+    for v in _VARIANT_REGISTRY:
+        r = _get_picks_for_variant(v)
+        if r.get("error"):
+            out[v] = [{"error": r["error"]}]
+        else:
+            out[v] = [
+                {"ticker": p["ticker"], "score_pct": p["score"]}
+                for p in r.get("picks", [])
+            ]
+    return {"as_of": datetime.now(timezone.utc).isoformat(),
+            "picks": out}
+
+
 def build_report() -> dict:
     today = datetime.now(timezone.utc)
     daily = _daily_health()
@@ -325,6 +352,7 @@ def build_report() -> dict:
     heartbeats = _heartbeat_freshness()
     flags = _flag_check()
     actions = _expected_actions(today)
+    picks = _expected_picks()
     verdict, reasons = _aggregate_verdict(daily, feeds, restart, heartbeats, flags)
     return {
         "generated_at": today.isoformat(),
@@ -336,6 +364,7 @@ def build_report() -> dict:
         "heartbeat_freshness": heartbeats,
         "flags": flags,
         "expected_actions_next_5_days": actions,
+        "expected_picks_xs_momentum_variants": picks,
     }
 
 
@@ -392,6 +421,23 @@ def _render_markdown(report: dict) -> str:
                        f"({s.get('age_hours')}h)")
     else:
         out.append("  all ACTIVE heartbeats fresh")
+    out.append("")
+
+    out.append("## Current xs_momentum-variant picks (would enter on next rebalance)")
+    out.append("")
+    picks = report.get("expected_picks_xs_momentum_variants", {})
+    if picks.get("error"):
+        out.append(f"  ERROR: {picks['error']}")
+    else:
+        for variant, plist in (picks.get("picks") or {}).items():
+            if plist and "error" in plist[0]:
+                out.append(f"  {variant}: ERR {plist[0]['error']}")
+            else:
+                ts = ", ".join(
+                    f"{p['ticker']} ({p['score_pct']:+.1f}%)"
+                    for p in plist
+                )
+                out.append(f"  {variant}: {ts}")
     out.append("")
 
     out.append("## Action calendar (next 5 trading days)")

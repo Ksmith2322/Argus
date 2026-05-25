@@ -227,6 +227,60 @@ def _run_flag_check() -> dict:
     }
 
 
+def _run_variant_exposure_check() -> dict:
+    """Check combined exposure across xs_momentum variants. Flags
+    concentration risk (single ticker > 30% / > 50% of fleet
+    notional) that low return-correlation can hide.
+
+    Cheap (~5-10s — runs the same live ranking pipeline as each
+    variant's --check mode). Doesn't mutate state.
+    """
+    try:
+        from ops.audit.run_variant_exposure_audit import (
+            _compute_combined_exposure,
+            _get_picks_for_variant,
+        )
+        from forge.xs_momentum.runner import _VARIANT_REGISTRY
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+        except Exception:
+            anchor = 250_000.0  # post-reset paper anchor fallback
+
+        picks_per_variant = []
+        for v in _VARIANT_REGISTRY:
+            picks_per_variant.append(_get_picks_for_variant(v))
+        exposure = _compute_combined_exposure(
+            picks_per_variant, anchor_usd=anchor
+        )
+        warnings = exposure.get("warnings", [])
+        if any(w.get("level") == "RED" for w in warnings):
+            status = "RED"
+        elif warnings:
+            status = "YELLOW"
+        else:
+            status = "GREEN"
+        # Pull top-3 tickers by % for the one-liner summary
+        top = exposure.get("per_ticker", [])[:3]
+        return {
+            "component": "variant_exposure",
+            "status": status,
+            "anchor_usd": anchor,
+            "fleet_notional_usd": exposure.get("fleet_notional_usd", 0),
+            "n_warnings": len(warnings),
+            "top_3_tickers": [
+                {"ticker": t["ticker"],
+                 "pct": t["pct_of_fleet"],
+                 "n_holders": t["n_holders"]}
+                for t in top
+            ],
+            "warnings": warnings,
+        }
+    except Exception as exc:
+        return {"component": "variant_exposure", "error": str(exc),
+                "status": "ERROR"}
+
+
 def _post_discord(reports: list[dict]) -> bool:
     """Post a single combined Discord message summarising RED+YELLOW
     findings only. Best-effort; failures swallowed."""
@@ -290,6 +344,18 @@ def _one_liner(report: dict) -> str:
                                 for r in report.get("problem_rows", [])]
             return f"{n_problems} drift: {problem_names}"
         return f"clean: {counts}"
+    if component == "variant_exposure":
+        n = report.get("n_warnings", 0)
+        top = report.get("top_3_tickers", [])
+        if n:
+            wn = [f"{w['ticker']}={w['pct_of_fleet']}%/{w['level']}"
+                  for w in report.get("warnings", [])]
+            return f"{n} concentration warning(s): {wn}"
+        if top:
+            return f"top: " + ", ".join(
+                f"{t['ticker']}@{t['pct']}%" for t in top
+            )
+        return "no picks (variants idle)"
     return str(report)
 
 
@@ -303,6 +369,7 @@ def evaluate(post_discord: bool = True) -> dict:
         _run_preflight(),
         _run_roster_state(),
         _run_flag_check(),
+        _run_variant_exposure_check(),
     ]
     if post_discord:
         _post_discord(reports)

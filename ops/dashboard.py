@@ -2905,6 +2905,67 @@ async def api_pre_market_check():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/variant_exposure")
+async def api_variant_exposure():
+    """Combined holdings exposure across the 5 xs_momentum variants.
+
+    Answers "what would the variants hold combined on the next
+    rebalance day, and is there hidden concentration risk?" Two
+    strategies with rho=0.07 return correlation can still hold the
+    same instrument in different months — this audit catches that.
+
+    Cheap (~5-10s — runs ranking pipeline per variant, no order
+    submission). Returns per-variant picks + combined per-ticker
+    exposure + WARN/RED concentration flags.
+    """
+    try:
+        from ops.audit.run_variant_exposure_audit import (
+            _compute_combined_exposure,
+            _get_picks_for_variant,
+        )
+        from forge.xs_momentum.runner import _VARIANT_REGISTRY
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+        except Exception:
+            anchor = 250_000.0
+        picks = [_get_picks_for_variant(v) for v in _VARIANT_REGISTRY]
+        exposure = _compute_combined_exposure(picks, anchor_usd=anchor)
+        return JSONResponse({
+            "anchor_usd": anchor,
+            "picks_per_variant": picks,
+            "exposure": exposure,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "variant_exposure failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/cohort_correlation")
+async def api_cohort_correlation():
+    """Pairwise Pearson correlation of monthly returns across the 5
+    variants + per-variant Sharpe/DD + all-5 equal-weight portfolio
+    stats. Reads the persisted artifact (last run via the CLI); does
+    NOT trigger a fresh backtest (those take ~30s each)."""
+    try:
+        from pathlib import Path
+        import json as _json
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "ops" / "reports" / "system_audit"
+                    / "xs_momentum_cohort_correlation.json")
+        if artifact.exists():
+            return JSONResponse(_json.loads(
+                artifact.read_text(encoding="utf-8")
+            ))
+        return JSONResponse({
+            "error": "no artifact",
+            "hint": "run `python -m ops.audit.run_xs_momentum_cohort_correlation`",
+        }, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": "cohort_correlation failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/order_lifecycle")
 async def api_order_lifecycle():
     """Per-lineage order lifecycle reconciliation (Codex X7).
@@ -9777,6 +9838,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- STRATEGY ROLES — offense/defense/hedge/research + role-aware PF floor (Codex gap #10) -->
 <div id="strategy-roles-panel" style="margin-bottom:12px;"></div>
 
+<!-- VARIANT EXPOSURE — combined xs_momentum cohort holdings + concentration warnings -->
+<div id="variant-exposure-panel" style="margin-bottom:12px;"></div>
+
 <!-- ACTIVE ALPHA READINESS — synthesis of what's blocking real-money scale per active strategy -->
 <div id="active-alpha-readiness-panel" style="margin-bottom:14px;"></div>
 
@@ -10756,6 +10820,86 @@ function loadStrategyRoles() {
 }
 loadStrategyRoles();
 setInterval(loadStrategyRoles, 300000);
+
+// ─── VARIANT EXPOSURE PANEL ──────────────────────────────────────
+// Combined holdings exposure across the 5 xs_momentum variants. Shows
+// per-variant picks + per-ticker fleet % + concentration WARN/RED
+// flags. Two strategies with rho=0.07 return correlation can hold
+// the same ticker in different months — this catches that.
+const EXPOSURE_LEVEL_COLORS = {
+  GREEN:  {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  WARN:   {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  YELLOW: {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  RED:    {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadVariantExposure() {
+  fetch('/api/variant_exposure').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('variant-exposure-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">VARIANT EXPOSURE</span> · ' + data.error + '</div>';
+      return;
+    }
+    const exp = data.exposure || {};
+    const tickers = exp.per_ticker || [];
+    const warnings = exp.warnings || [];
+    const picks = data.picks_per_variant || [];
+    if (tickers.length === 0) { el.innerHTML = ''; return; }
+    const level = warnings.find(w => w.level === 'RED') ? 'RED'
+                : warnings.length ? 'WARN' : 'GREEN';
+    const c = EXPOSURE_LEVEL_COLORS[level];
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">VARIANT EXPOSURE</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">combined xs_momentum cohort holdings</span></div>'
+      + '<div style="font-size:0.78em;">'
+      + '<span style="color:' + c.fg + ';font-weight:bold;">' + level + '</span>'
+      + ' <span style="color:#7b8ab8;margin-left:10px;">anchor $' + Number(data.anchor_usd || 0).toLocaleString()
+      + ' · fleet $' + Number(exp.fleet_notional_usd || 0).toLocaleString() + '</span>'
+      + '</div></div>';
+    // Picks per variant
+    html += '<div style="margin-bottom:8px;font-size:0.78em;color:#9da8c7;">';
+    for (const v of picks) {
+      if (v.error) continue;
+      const label = (v.strategy_label || '').replace('forge_xs_momentum_', '').replace('forge_xs_momentum', 'baseline');
+      const tickerStr = (v.picks || []).map(p => p.ticker + ' (' + (p.score>=0?'+':'') + p.score.toFixed(1) + '%)').join(', ');
+      html += '<div><b style="color:#e0e0e0;">' + label + '</b>: ' + tickerStr + '</div>';
+    }
+    html += '</div>';
+    // Per-ticker breakdown table
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Ticker</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Notional</th>'
+      + '<th style="padding:4px 6px;text-align:right;">% fleet</th>'
+      + '<th style="padding:4px 6px;">Holders</th>'
+      + '</tr></thead><tbody>';
+    for (const t of tickers) {
+      const warn = warnings.find(w => w.ticker === t.ticker);
+      const rowColor = warn ? EXPOSURE_LEVEL_COLORS[warn.level].fg : '#e0e0e0';
+      const holders = (t.held_by || []).map(h => h.replace('forge_xs_momentum_', '').replace('forge_xs_momentum', 'baseline')).join(', ');
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;font-weight:bold;color:' + rowColor + ';">' + t.ticker + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#e0e0e0;">$' + Number(t.notional_usd).toLocaleString() + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + rowColor + ';">' + t.pct_of_fleet.toFixed(1) + '%</td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;">' + holders + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    if (warnings.length) {
+      html += '<div style="margin-top:6px;color:' + c.fg + ';font-size:0.78em;">';
+      for (const w of warnings) {
+        html += '<div>↳ ' + w.level + ' — ' + w.ticker + ' = ' + w.pct_of_fleet + '% of fleet (' + w.held_by.length + ' variants: ' + w.held_by.join(', ') + ')</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('variant exposure error:', e);});
+}
+loadVariantExposure();
+setInterval(loadVariantExposure, 600000);  // 10min — picks change only on rebalance
 
 // ─── ACTIVE ALPHA READINESS PANEL ────────────────────────────────
 // Synthesis: preflight + canonical_fills + blockers per active
@@ -18125,7 +18269,8 @@ PANEL_IDS_ALL = [
     "maturity-summary-banner",
     # Audit-suite panels (Codex gap closures — 2026-05-24)
     "audit-health-banner", "data-feed-contracts-panel",
-    "strategy-roles-panel", "active-alpha-readiness-panel",
+    "strategy-roles-panel", "variant-exposure-panel",
+    "active-alpha-readiness-panel",
     # Decision / fleet panels
     "recommended-actions-panel", "cohort-gate-panel",
     "changes-24h-panel", "active-bleeders-panel",
@@ -18159,7 +18304,8 @@ VIEW_ALLOWLISTS = {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
         "audit-health-banner", "data-feed-contracts-panel",
-        "strategy-roles-panel", "active-alpha-readiness-panel",
+        "strategy-roles-panel", "variant-exposure-panel",
+        "active-alpha-readiness-panel",
         "recommended-actions-panel", "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",

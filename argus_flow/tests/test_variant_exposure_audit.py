@@ -113,6 +113,31 @@ def test_skip_variants_with_errors(monkeypatch):
     assert result["fleet_notional_usd"] == 40_000
 
 
+def test_get_picks_for_variant_does_not_leak_module_state():
+    """Regression: _get_picks_for_variant used to mutate
+    forge.xs_momentum.runner module globals (STRATEGY_LABEL, LOG_DIR,
+    PARAMS['universe'], etc.) without restoring them. Pinned an
+    intermittent test-order failure where this leaked state broke
+    later tests in the suite that read PARAMS['universe']."""
+    from forge.xs_momentum import runner as xs
+    from ops.audit.run_variant_exposure_audit import _get_picks_for_variant
+    xs.configure_variant("baseline")
+    saved = {
+        "label": xs.STRATEGY_LABEL,
+        "client_id": xs.IBKR_CLIENT_ID,
+        "log_dir": str(xs.LOG_DIR),
+        "universe": tuple(xs.PARAMS["universe"]),
+        "top_fraction": xs.PARAMS["top_quintile_fraction"],
+    }
+    # Picks call mutates internally — must restore on exit
+    _get_picks_for_variant("style_top3")
+    assert xs.STRATEGY_LABEL == saved["label"]
+    assert xs.IBKR_CLIENT_ID == saved["client_id"]
+    assert str(xs.LOG_DIR) == saved["log_dir"]
+    assert tuple(xs.PARAMS["universe"]) == saved["universe"]
+    assert xs.PARAMS["top_quintile_fraction"] == saved["top_fraction"]
+
+
 def test_warn_level_threshold(monkeypatch):
     """30-49% exposure -> WARN, not RED."""
     import ops.audit.run_variant_exposure_audit as mod
