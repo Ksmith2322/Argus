@@ -2905,6 +2905,141 @@ async def api_pre_market_check():
                               "detail": str(e)}, status_code=500)
 
 
+@app.get("/api/pnl_vs_benchmark")
+async def api_pnl_vs_benchmark(window_days: int = 30):
+    """Fleet realized PnL vs SPY + MTUM benchmark over the window.
+
+    The 5/25 audit's "skeptic" review highlighted that the fleet's
+    expected return is FACTOR BETA (zero alpha vs MKT+SMB+HML+MOM).
+    The honest metric isn't absolute PnL but PnL VS the benchmark
+    the strategy is actually exposed to.
+
+    Returns:
+      fleet_pnl_usd       — realized PnL from canonical_fills
+      fleet_pnl_pct       — % of $250K anchor (or supplied anchor)
+      spy_return_pct      — SPY total return same window
+      mtum_return_pct     — MTUM total return same window
+      excess_vs_spy_pct   — fleet_pct - spy_pct (positive = beating)
+      excess_vs_mtum_pct  — fleet_pct - mtum_pct
+      alpha_signal        — "tracking_beta" / "outperforming" /
+                            "underperforming" / "insufficient_data"
+
+    Cheap (~1-2s — single canonical_fills scan + 2 yfinance calls).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        fleet_pnl = 0.0
+        n_fills = 0
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = _json.loads(line)
+                    except Exception:
+                        continue
+                    if (row.get("side") or "").upper() != "EXIT":
+                        continue
+                    pnl = row.get("pnl_usd")
+                    if pnl is None:
+                        continue
+                    try:
+                        pnl = float(pnl)
+                    except (TypeError, ValueError):
+                        continue
+                    ts = row.get("ts") or row.get("exit_ts") or ""
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        continue
+                    fleet_pnl += pnl
+                    n_fills += 1
+
+        # Pull SPY + MTUM returns
+        try:
+            import yfinance as yf
+            spy = yf.download("SPY", period=f"{max(window_days + 5, 30)}d",
+                              interval="1d", progress=False, auto_adjust=False)
+            mtum = yf.download("MTUM", period=f"{max(window_days + 5, 30)}d",
+                              interval="1d", progress=False, auto_adjust=False)
+            def _ret(df, days):
+                if df is None or df.empty:
+                    return None
+                try:
+                    if hasattr(df.columns, "get_level_values"):
+                        try:
+                            closes = df["Close"]
+                            if hasattr(closes, "columns"):
+                                closes = closes.iloc[:, 0]
+                        except Exception:
+                            closes = df.iloc[:, df.columns.get_level_values(0) == "Close"].iloc[:, 0]
+                    else:
+                        closes = df["Close"]
+                    if len(closes) < 2:
+                        return None
+                    return float(closes.iloc[-1] / closes.iloc[0] - 1) * 100
+                except Exception:
+                    return None
+            spy_return_pct = _ret(spy, window_days)
+            mtum_return_pct = _ret(mtum, window_days)
+        except Exception:
+            spy_return_pct = None
+            mtum_return_pct = None
+
+        # Use a $250K anchor as default fleet base for percent math
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+        except Exception:
+            anchor = 250_000.0
+        fleet_pnl_pct = (fleet_pnl / anchor * 100) if anchor > 0 else 0
+
+        excess_vs_spy = (fleet_pnl_pct - spy_return_pct
+                         if spy_return_pct is not None else None)
+        excess_vs_mtum = (fleet_pnl_pct - mtum_return_pct
+                          if mtum_return_pct is not None else None)
+
+        # Honest alpha-signal classification
+        if n_fills < 20:
+            signal = "insufficient_data"
+        elif excess_vs_mtum is None:
+            signal = "no_benchmark"
+        elif excess_vs_mtum > 1.0:
+            signal = "outperforming"
+        elif excess_vs_mtum < -1.0:
+            signal = "underperforming"
+        else:
+            signal = "tracking_beta"
+
+        return JSONResponse({
+            "window_days": window_days,
+            "anchor_usd": anchor,
+            "fleet_pnl_usd": round(fleet_pnl, 2),
+            "fleet_pnl_pct": round(fleet_pnl_pct, 3),
+            "fleet_n_fills": n_fills,
+            "spy_return_pct": round(spy_return_pct, 3) if spy_return_pct is not None else None,
+            "mtum_return_pct": round(mtum_return_pct, 3) if mtum_return_pct is not None else None,
+            "excess_vs_spy_pct": round(excess_vs_spy, 3) if excess_vs_spy is not None else None,
+            "excess_vs_mtum_pct": round(excess_vs_mtum, 3) if excess_vs_mtum is not None else None,
+            "alpha_signal": signal,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "pnl_vs_benchmark failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/equity_curves_per_variant")
 async def api_equity_curves_per_variant(window_days: int = 90):
     """Cumulative-PnL equity curve per strategy over a rolling window.
@@ -10038,6 +10173,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- VARIANT EXPOSURE — combined xs_momentum cohort holdings + concentration warnings -->
 <div id="variant-exposure-panel" style="margin-bottom:12px;"></div>
 
+<!-- PNL vs BENCHMARK — fleet PnL minus SPY/MTUM return (alpha-relative read) -->
+<div id="pnl-vs-benchmark-panel" style="margin-bottom:12px;"></div>
+
 <!-- PNL ATTRIBUTION — per-strategy realized PnL over rolling window -->
 <div id="pnl-attribution-panel" style="margin-bottom:12px;"></div>
 
@@ -11103,6 +11241,90 @@ function loadVariantExposure() {
 }
 loadVariantExposure();
 setInterval(loadVariantExposure, 600000);  // 10min — picks change only on rebalance
+
+// ─── PNL VS BENCHMARK ────────────────────────────────────────────
+// The honest read: is the fleet generating ALPHA, or just tracking
+// the factor beta that ETFs sell at 15bp? Per the 5/25 audit
+// (factor decomposition + short-side sweep), the fleet has zero
+// alpha vs MTUM+SPY+SMB+HML. This panel makes that visible to the
+// operator in real time.
+const ALPHA_SIGNAL_COLORS = {
+  outperforming:     {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  tracking_beta:     {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  underperforming:   {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+  insufficient_data: {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+  no_benchmark:      {bg:'#1f1f1f', border:'#5a6a8a', fg:'#9da8c7'},
+};
+const ALPHA_SIGNAL_LABEL = {
+  outperforming:     'OUTPERFORMING',
+  tracking_beta:     'TRACKING BETA',
+  underperforming:   'UNDERPERFORMING',
+  insufficient_data: 'INSUFFICIENT DATA (n < 20)',
+  no_benchmark:      'NO BENCHMARK',
+};
+function loadPnLVsBenchmark() {
+  fetch('/api/pnl_vs_benchmark?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pnl-vs-benchmark-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PNL vs BENCHMARK</span> · ' + data.error + '</div>';
+      return;
+    }
+    const signal = data.alpha_signal || 'insufficient_data';
+    const c = ALPHA_SIGNAL_COLORS[signal];
+    const fleetPnl = data.fleet_pnl_usd || 0;
+    const fleetPct = data.fleet_pnl_pct || 0;
+    const spy = data.spy_return_pct;
+    const mtum = data.mtum_return_pct;
+    const excSpy = data.excess_vs_spy_pct;
+    const excMtum = data.excess_vs_mtum_pct;
+    const nFills = data.fleet_n_fills || 0;
+    let html = '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+      + '<div><span style="color:' + c.fg + ';font-weight:bold;font-size:0.92em;letter-spacing:2px;">PNL vs BENCHMARK</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">honest alpha read · last ' + data.window_days + ' days</span></div>'
+      + '<div style="color:' + c.fg + ';font-weight:bold;font-size:0.85em;">' + ALPHA_SIGNAL_LABEL[signal] + '</div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Series</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Return</th>'
+      + '<th style="padding:4px 6px;text-align:right;">vs Fleet</th>'
+      + '</tr></thead><tbody>'
+      + '<tr style="border-bottom:1px solid #11172a;">'
+      + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">Fleet (' + nFills + ' fills)</td>'
+      + '<td style="padding:4px 6px;text-align:right;color:' + (fleetPct > 0 ? '#00e676' : fleetPct < 0 ? '#ff5252' : '#9da8c7') + ';font-weight:bold;">'
+      + fleetPct.toFixed(2) + '% ($' + fleetPnl.toLocaleString() + ')</td>'
+      + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">—</td>'
+      + '</tr>';
+    if (spy !== null) {
+      const excColor = excSpy > 0 ? '#00e676' : excSpy < 0 ? '#ff5252' : '#9da8c7';
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;">SPY (buy-and-hold)</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + spy.toFixed(2) + '%</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + excColor + ';font-weight:bold;">' + (excSpy >= 0 ? '+' : '') + excSpy.toFixed(2) + '%</td>'
+        + '</tr>';
+    }
+    if (mtum !== null) {
+      const excColor = excMtum > 0 ? '#00e676' : excMtum < 0 ? '#ff5252' : '#9da8c7';
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;">MTUM (momentum ETF)</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + mtum.toFixed(2) + '%</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + excColor + ';font-weight:bold;">' + (excMtum >= 0 ? '+' : '') + excMtum.toFixed(2) + '%</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="color:#7b8ab8;font-size:0.72em;margin-top:6px;">'
+      + '↳ "outperforming" requires excess > +1% vs MTUM. "tracking beta" means within ±1%. '
+      + 'Anything else is the strategy doing what an MTUM ETF would do for 15bp.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pnl vs benchmark error:', e);});
+}
+loadPnLVsBenchmark();
+setInterval(loadPnLVsBenchmark, 600000);
 
 // ─── EQUITY CURVES PER VARIANT ───────────────────────────────────
 // Inline SVG sparklines, one per strategy. See whether variants are
@@ -18596,7 +18818,7 @@ PANEL_IDS_ALL = [
     # Audit-suite panels (Codex gap closures — 2026-05-24)
     "audit-health-banner", "data-feed-contracts-panel",
     "strategy-roles-panel", "variant-exposure-panel",
-    "pnl-attribution-panel", "equity-curves-panel",
+    "pnl-vs-benchmark-panel", "pnl-attribution-panel", "equity-curves-panel",
     "active-alpha-readiness-panel",
     # Decision / fleet panels
     "recommended-actions-panel", "cohort-gate-panel",
@@ -18632,7 +18854,7 @@ VIEW_ALLOWLISTS = {
         "market-clock-bar", "blocked-entries-bar",
         "audit-health-banner", "data-feed-contracts-panel",
         "strategy-roles-panel", "variant-exposure-panel",
-        "pnl-attribution-panel", "equity-curves-panel",
+        "pnl-vs-benchmark-panel", "pnl-attribution-panel", "equity-curves-panel",
         "active-alpha-readiness-panel",
         "recommended-actions-panel", "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
