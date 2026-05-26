@@ -26,6 +26,22 @@ STOCKS = [
     "JPM", "V", "MA", "JNJ", "UNH", "XOM", "HD", "PG", "WMT",
 ]
 
+# 2026-05-26 v31 extension: S&P 100 minus the mega-caps already in STOCKS.
+# Used for short-term mean reversion sweep (Path X) -- individual-stock
+# universe is where the Connors 2-day RSI mean reversion edge actually
+# lives at honest slippage (per 2026-05-26 mean_reversion_sweep findings).
+SP100_EXTENSION = [
+    "TSLA", "LLY", "AVGO", "BAC", "WFC", "ABBV", "MRK", "KO", "PEP", "COST",
+    "CSCO", "CVX", "ADBE", "ACN", "ABT", "NFLX", "TMO", "DIS", "CMCSA", "MCD",
+    "DHR", "NKE", "NEE", "VZ", "T", "TXN", "CRM", "AMD", "ORCL", "IBM",
+    "PFE", "BMY", "GE", "GS", "MS", "AMGN", "CAT", "BA", "MMM", "HON",
+    "RTX", "AXP", "BLK", "SCHW", "USB", "PNC", "COF", "MET", "AIG", "ALL",
+    "TGT", "LOW", "SBUX", "MDLZ", "KMB", "CL", "MO", "GIS", "ADP", "INTU",
+    "SPGI", "BKNG", "GM", "F", "GILD", "REGN", "CI", "ELV", "BIIB", "MDT",
+    "ISRG", "LMT", "NOC", "GD", "EMR", "ETN", "ITW", "CSX", "UPS", "FDX",
+    "UNP", "DUK", "SO", "D",
+]
+
 # Specialty ETFs (sector / thematic) we haven't tested yet
 SPECIALTY_ETFS = [
     "SMH",    # semiconductors
@@ -55,7 +71,7 @@ COMMODITY_ETFS = [
     "TIP",    # TIPS (inflation-linked)
 ]
 
-ALL_TICKERS = STOCKS + SPECIALTY_ETFS + COMMODITY_ETFS
+ALL_TICKERS = STOCKS + SPECIALTY_ETFS + COMMODITY_ETFS + SP100_EXTENSION
 
 
 def download_ticker(ticker: str, period: str = "20y") -> bool:

@@ -55,9 +55,19 @@ CANDIDATES = [
     # commodity / bond
     "GLD", "TLT", "IEF", "USO", "UNG", "SLV", "COPX", "URA", "DBA", "LIT",
     "HYG", "EMB", "LQD", "TIP",
-    # mega-cap stocks
+    # mega-cap stocks (16)
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B",
     "JPM", "V", "MA", "JNJ", "UNH", "XOM", "HD", "PG", "WMT",
+    # 2026-05-26 v31 Path X: S&P 100 extension (84 names) for sleeve cadence
+    "TSLA", "LLY", "AVGO", "BAC", "WFC", "ABBV", "MRK", "KO", "PEP", "COST",
+    "CSCO", "CVX", "ADBE", "ACN", "ABT", "NFLX", "TMO", "DIS", "CMCSA", "MCD",
+    "DHR", "NKE", "NEE", "VZ", "T", "TXN", "CRM", "AMD", "ORCL", "IBM",
+    "PFE", "BMY", "GE", "GS", "MS", "AMGN", "CAT", "BA", "MMM", "HON",
+    "RTX", "AXP", "BLK", "SCHW", "USB", "PNC", "COF", "MET", "AIG", "ALL",
+    "TGT", "LOW", "SBUX", "MDLZ", "KMB", "CL", "MO", "GIS", "ADP", "INTU",
+    "SPGI", "BKNG", "GM", "F", "GILD", "REGN", "CI", "ELV", "BIIB", "MDT",
+    "ISRG", "LMT", "NOC", "GD", "EMR", "ETN", "ITW", "CSX", "UPS", "FDX",
+    "UNP", "DUK", "SO", "D",
 ]
 
 SLIPPAGE_BPS_ROUND_TRIP = 5.0
