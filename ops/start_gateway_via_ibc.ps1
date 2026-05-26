@@ -83,6 +83,24 @@ Write-Host "Launching IBC against Gateway..." -ForegroundColor Cyan
 New-Item -Path "$IbcPath\Logs" -ItemType Directory -Force | Out-Null
 $logFile = "$IbcPath\Logs\ibc_gateway_$(Get-Date -Format yyyyMMdd_HHmmss).log"
 
+# Find the right Java executable. Gateway 1037+ requires Java 17 (class
+# version 61), but the system 'java.exe' on PATH may be older. The Gateway
+# installer drops a preferred-JRE path at
+# C:\Jts\ibgateway\<VERSION>\.install4j\pref_jre.cfg — use that if present.
+$prefJreCfg = "C:\Jts\ibgateway\$gatewayVersion\.install4j\pref_jre.cfg"
+$javaExe = "java.exe"   # PATH default fallback
+if (Test-Path $prefJreCfg) {
+    $prefJreDir = (Get-Content $prefJreCfg -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+    if ($prefJreDir -and (Test-Path "$prefJreDir\bin\java.exe")) {
+        $javaExe = "$prefJreDir\bin\java.exe"
+        Write-Host "Using Gateway-bundled JRE: $prefJreDir" -ForegroundColor Gray
+    } else {
+        Write-Host "WARNING: pref_jre.cfg points at $prefJreDir but java.exe not found there; falling back to PATH java" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "WARNING: no $prefJreCfg; using PATH java (may be wrong version for Gateway $gatewayVersion)" -ForegroundColor Yellow
+}
+
 # Build the classpath and run IBC's Gateway entry point
 $classpath = "$IbcPath\IBC.jar;$gatewayJars\*"
 $javaArgs = @(
@@ -92,12 +110,12 @@ $javaArgs = @(
 )
 
 if ($Hidden) {
-    $proc = Start-Process -FilePath "java.exe" -ArgumentList $javaArgs `
+    $proc = Start-Process -FilePath $javaExe -ArgumentList $javaArgs `
                           -WorkingDirectory $IbcPath `
                           -WindowStyle Hidden -RedirectStandardOutput $logFile -PassThru
     Write-Host "  IBC PID=$($proc.Id) launched (hidden, log: $logFile)" -ForegroundColor Green
 } else {
-    $proc = Start-Process -FilePath "java.exe" -ArgumentList $javaArgs `
+    $proc = Start-Process -FilePath $javaExe -ArgumentList $javaArgs `
                           -WorkingDirectory $IbcPath `
                           -WindowStyle Minimized -PassThru
     Write-Host "  IBC PID=$($proc.Id) launched (minimized)" -ForegroundColor Green
