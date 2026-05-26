@@ -400,6 +400,82 @@ anyone with read access can post to your Discord.
 
 ---
 
+## 1.5. Power-cycle / morning recovery (new — 2026-05-25 evening)
+
+After a power outage or Windows reboot, the fleet ends up in a known-bad
+split-brain state because the surviving scheduled tasks were registered
+for pre-sunset strategies. Symptoms verified 2026-05-25 evening:
+
+- 8 zombie KILLED-strategy runner processes restarted automatically:
+  - `forge.multi_orb.runner --loop` (×2 PIDs)
+  - `forge.vix_intraday.runner --loop` (×2)
+  - `forge.spy_mean_rev.runner --loop` (×2)
+  - `forge.cuebanks.paper_bridge --loop` (×2)
+- 0 active-roster runners came up (xs_momentum, tom_spy, nov_spy,
+  tail_hedge, xs_momentum variants, gld_pm_long — nothing).
+- Both **TWS** and **IB Gateway** running simultaneously:
+  - TWS PID 4384 stuck on "Attempt 5: Authenticating..." (failed-login
+    retry loop, port 7497 — pre-migration default).
+  - IB Gateway PID 7140 healthy on port 4002 — this is the post-5/25
+    canonical broker.
+
+The KILLED registry blocks `submit_bracket` from accepting orders from
+zombie runners, so they cannot trade. But they're consuming client_id
+slots, generating log noise, and burning CPU. And nothing is actually
+trading the live allocation.
+
+### Recovery sequence (run in PowerShell)
+
+```powershell
+# Step 1 — kill the stuck TWS process (keep Gateway running).
+$tws = Get-Process -Name 'tws' -ErrorAction SilentlyContinue
+if ($tws) { Stop-Process -Id $tws.Id -Force; Write-Host "Killed TWS PID $($tws.Id)" }
+
+# Step 2 — stop all KILLED-strategy runner zombies.
+$killedPattern = 'forge\.(multi_orb|vix_intraday|spy_mean_rev|cuebanks|tori|aud_asian_breakout|wick_gbpusd|jpy_pm_short|mamba|nq_london_close|nq_overnight|pead|spy_trend_follower|fomc_drift|tom_international|vix_revert|vix_carry|coint_pairs|gdx_gld|rebalance|atlas|themis)\.'
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -match $killedPattern } |
+  ForEach-Object { Write-Host "Stopping PID $($_.ProcessId): $($_.CommandLine.Substring(0,[Math]::Min(100,$_.CommandLine.Length)))"; Stop-Process -Id $_.ProcessId -Force }
+
+# Step 3 — disable scheduled tasks that auto-restart KILLED strategies.
+# (Optional: skip if you want to re-evaluate one of them later.)
+$staleTasks = 'ArgusMultiOrbLoop','ArgusVixIntradayLoop','ArgusSpyMeanRevLoop','ArgusCueBanksPaperLoop','ArgusAudOrbLoop','ArgusNqLondonCloseLoop','ArgusToriPaperLoop'
+foreach ($t in $staleTasks) { Disable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue | Out-Null; Write-Host "Disabled task: $t" }
+
+# Step 4 — launch the v26 active fleet (12 runners, all on Gateway 4002).
+# Dry-run first so you can see what will fire:
+.\ops\start_post_reset_runners.ps1 -DryRun
+# Then for real:
+.\ops\start_post_reset_runners.ps1
+
+# Step 5 — verify the fleet snapshot post-launch.
+$env:PYTHONIOENCODING = 'utf-8'
+& C:\Argus\.venv\Scripts\python.exe -X utf8 -m ops.audit.run_fleet_snapshot --skip-yfinance --json |
+  ConvertFrom-Json | Select-Object -ExpandProperty strategies |
+  Where-Object { $_.allocation -gt 0 } |
+  Format-Table strategy, status, allocation, heartbeat_age_h -AutoSize
+```
+
+### Why these scheduled tasks are stale
+
+The `ArgusMultiOrbLoop` / `ArgusVixIntradayLoop` / etc. tasks were
+registered before the 5/20 sunset batch. They predate the kill registry
+formalization (5/24) and the post-reset 5-survivor roster (5/22). The
+right long-term fix is to re-register a single `ArgusV26FleetStartup`
+task that runs `start_post_reset_runners.ps1` at logon — but disabling
+the stale ones first prevents the zombie restart cycle.
+
+### Why TWS is up at all
+
+The 5/25 Gateway-migration commit (4f6cb0c) cut over the runners but
+did NOT remove TWS auto-start. TWS launches via `C:\Jts\tws.exe` —
+either from a Startup shortcut, a desktop shortcut the operator
+clicked, or via the IBC scheduled task. Until `C:\IBC\config.ini`
+credentials are filled in OR the TWS startup is fully disabled, TWS
+will continue launching and locking out the paper account login.
+
+---
+
 ## 2. Start TWS / verify IBKR session is up
 
 `nq_overnight` was stuck overnight in stale signal-only state because
