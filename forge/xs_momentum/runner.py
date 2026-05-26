@@ -584,28 +584,36 @@ def backtest(period: str = "10y", return_monthly_series: bool = False,
     pf = abs(sum(wins) / sum(losses)) if losses else float("inf")
     wr = len(wins) / len(trades)
 
-    # Portfolio equity curve: equal-weight across simultaneous picks.
-    # Approximation: compound average per-trade returns (since picks are
-    # held in parallel, the fleet return per month is the average of the
-    # 3 picks' month return).
+    # Portfolio equity curve — calendar-walk over every month-end, including
+    # months where no rotation happened. The earlier path keyed by trade
+    # exit_date skipped idle months entirely, inflating eq and CAGR (idle
+    # months were dropped from the compound rather than contributing 0%).
+    # The honest series tracks the held portfolio's mark-to-market return
+    # at every month-end of the data window. See _calendar_monthly_returns.
+    calendar_monthly = _calendar_monthly_returns(
+        closes, universe, long_lb, short_lb, top_pick_fraction,
+        ranking_mode=ranking_mode,
+    )
     eq = 1.0
     peak = 1.0
     max_dd = 0.0
-    # Group trades by exit_date to approximate monthly portfolio return
-    by_month: dict[str, list[float]] = {}
-    for t in trades:
-        m = str(t["exit_date"])[:7]
-        by_month.setdefault(m, []).append(t["pnl_pct"])
-    for m in sorted(by_month):
-        ret = sum(by_month[m]) / len(by_month[m]) / 100.0
+    for m in sorted(calendar_monthly):
+        ret = calendar_monthly[m]
         eq *= (1.0 + ret)
         peak = max(peak, eq)
         max_dd = max(max_dd, (peak - eq) / peak)
 
     try:
-        first_dt = min(pd.to_datetime(t["entry_date"]) for t in trades)
-        last_dt = max(pd.to_datetime(t["exit_date"]) for t in trades)
-        days = max(1, (last_dt - first_dt).days)
+        if calendar_monthly:
+            first_m = sorted(calendar_monthly)[0] + "-01"
+            last_m = sorted(calendar_monthly)[-1] + "-01"
+            first_dt = pd.to_datetime(first_m)
+            last_dt = pd.to_datetime(last_m) + pd.offsets.MonthEnd(0)
+            days = max(1, (last_dt - first_dt).days)
+        else:
+            first_dt = min(pd.to_datetime(t["entry_date"]) for t in trades)
+            last_dt = max(pd.to_datetime(t["exit_date"]) for t in trades)
+            days = max(1, (last_dt - first_dt).days)
         cagr = (eq ** (365.25 / days) - 1.0) * 100.0
     except Exception:
         cagr = 0.0
@@ -625,12 +633,10 @@ def backtest(period: str = "10y", return_monthly_series: bool = False,
         "trades_per_ticker": _count_per_ticker(trades),
     }
     if return_monthly_series:
-        # Equal-weight portfolio return per exit-month, as fraction
-        # (matches the equity-curve compounding above).
-        result["monthly_returns"] = {
-            m: sum(by_month[m]) / len(by_month[m]) / 100.0
-            for m in sorted(by_month)
-        }
+        # Calendar-walk monthly returns (every month-end of the data window,
+        # including months where no rotation occurred). Factor-decomposition
+        # callers regress this series against Fama-French + Momentum factors.
+        result["monthly_returns"] = dict(calendar_monthly)
     # Always expose the per-trade ledger so alternative-universe / robustness
     # audits can feed promotion_panel on PER-TRADE pnls (apples-to-apples
     # with the published broad-8 baseline). Each entry has pnl_pct +
@@ -646,35 +652,33 @@ def _count_per_ticker(trades: list[dict]) -> dict:
     return out
 
 
-def monthly_portfolio_returns(period: str = "10y") -> dict[str, float]:
-    """Compute the strategy's true month-over-month equal-weight portfolio
-    return over the backtest window. Unlike backtest()'s by_month dict (which
-    is keyed by exit_date and skips months where no rotation occurred), this
-    walks every calendar month-end and computes the held-portfolio return.
+def _calendar_monthly_returns(
+    closes,
+    universe: list[str],
+    long_lb: int,
+    short_lb: int,
+    top_pick_fraction: float,
+    *,
+    ranking_mode: str = "single_12_1",
+) -> dict[str, float]:
+    """Calendar-walk monthly equal-weight portfolio returns over `closes`.
 
-    Returns {"YYYY-MM": fraction, ...}. Used by factor-decomposition audits.
+    Walks every month-end, marks the held portfolio to market, then rebalances
+    (without look-ahead) using data through month_end. Idle months (no
+    rotation) still contribute a return — that's the whole point of this
+    function vs the bugged trade-exit-grouped path. See backtest() comments.
     """
-    universe = list(PARAMS["universe"])
-    long_lb = PARAMS["long_lookback"]
-    short_lb = PARAMS["short_lookback"]
-    closes = _fetch_history(universe, period=period)
     if closes.empty:
         return {}
-    closes.index = closes.index.tz_convert("UTC")
     month_ends = closes.groupby(
         [closes.index.year, closes.index.month]
     ).tail(1).index
-
-    holdings: set[str] = set()  # current picks held into the next month
+    holdings: set[str] = set()
     monthly: dict[str, float] = {}
     prev_close: dict[str, float] = {}
-
     for month_end in month_ends:
         i = closes.index.get_loc(month_end)
         month_key = month_end.strftime("%Y-%m")
-        # Step 1: realize this month's return on whatever we were HOLDING
-        # at the start of this month (= holdings as set at the previous
-        # rebalance) using start-of-month price → end-of-month price.
         if holdings and prev_close:
             rets = []
             for t in holdings:
@@ -685,32 +689,50 @@ def monthly_portfolio_returns(period: str = "10y") -> dict[str, float]:
                         rets.append(end_px / start_px - 1.0)
             if rets:
                 monthly[month_key] = sum(rets) / len(rets)
-        # Step 2: rebalance — recompute top-2 picks using data ENDING AT
-        # this month_end (no look-ahead), then set holdings for next month.
         if i > long_lb + short_lb:
             per_asset = {
                 t: closes[t].iloc[: i + 1].dropna().tolist()
                 for t in universe
                 if t in closes.columns
             }
-            ranked = rank_universe_by_momentum(
-                per_asset,
-                long_lookback=long_lb,
-                short_lookback=short_lb,
-            )
-            picks = select_top_quintile(
-                ranked, fraction=PARAMS["top_quintile_fraction"]
-            )
+            if ranking_mode == "multi_horizon":
+                from helio.xs_momentum_variants import rank_universe_multi_horizon
+                ranked = rank_universe_multi_horizon(per_asset)
+            else:
+                ranked = rank_universe_by_momentum(
+                    per_asset,
+                    long_lookback=long_lb,
+                    short_lookback=short_lb,
+                )
+            picks = select_top_quintile(ranked, fraction=top_pick_fraction)
             holdings = {p.ticker for p in picks}
-        # Step 3: snapshot end-of-month prices for the NEXT month's
-        # "start price" reference (we hold from end_of_this_month →
-        # end_of_next_month, since rebalance happens at this bar).
         prev_close = {
             t: float(closes[t].iloc[i])
             for t in holdings
             if t in closes.columns
         }
     return monthly
+
+
+def monthly_portfolio_returns(period: str = "10y") -> dict[str, float]:
+    """Compute the strategy's true month-over-month equal-weight portfolio
+    return over the backtest window. Calendar-walks every month-end of the
+    data window — idle (no-rotation) months still contribute a return.
+
+    Returns {"YYYY-MM": fraction, ...}. Used by factor-decomposition audits
+    and by backtest() for honest equity-curve / CAGR computation.
+    """
+    universe = list(PARAMS["universe"])
+    long_lb = PARAMS["long_lookback"]
+    short_lb = PARAMS["short_lookback"]
+    closes = _fetch_history(universe, period=period)
+    if closes.empty:
+        return {}
+    closes.index = closes.index.tz_convert("UTC")
+    return _calendar_monthly_returns(
+        closes, universe, long_lb, short_lb,
+        PARAMS["top_quintile_fraction"],
+    )
 
 
 # ── Live execution ────────────────────────────────────────────────────────

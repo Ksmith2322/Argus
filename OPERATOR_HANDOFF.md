@@ -11,6 +11,46 @@ by criticality.
 
 ---
 
+## 0.0. TRUTH CORRECTION — xs_momentum CAGR was inflated (2026-05-25 evening)
+
+**Every "18.04% CAGR" claim for forge_xs_momentum in prior docs / kill_log
+entries / audit reports was wrong.** The actual 20y CAGR on broad_8 is
+**9.96%** (and MaxDD 23.86%, MaxDD was reported close enough).
+
+**Root cause** (fixed in this same commit batch):
+`forge/xs_momentum/runner.backtest()` was grouping per-trade returns by
+`exit_date` and compounding *only months with rotation*. Idle months —
+when the held portfolio stayed the same — were silently dropped from
+the compound but counted in the days-elapsed denominator for CAGR. Net
+effect: ~80% inflation of the headline CAGR.
+
+The bug was found by an independent backtest audit (see Agent 2 finding
+in the 5/25 multi-agent debate). `forge.xs_momentum.runner.monthly_portfolio_returns()`
+was already the honest calendar-walk version; the bug was that
+`backtest()` had its own divergent path. Fix: extracted
+`_calendar_monthly_returns` helper, called from both, with pinning
+tests (`test_calendar_walk_includes_every_month_after_warmup`,
+`test_backtest_cagr_matches_calendar_walk_compound`,
+`test_monthly_returns_field_uses_calendar_walk`).
+
+**Implication for the June 30 decision:** on the corrected number,
+xs_momentum 1.0× **loses to a static risk-parity SPY/TLT/GLD portfolio**
+on Sharpe (~0.70 vs ~0.78) and Sortino (~0.74 vs ~0.87). The CAGR
+edge over 60/30/5/5 SPY/TLT/GLD/BIL is only ~3 pts and well inside
+backtest noise. The honest framing flipped: **passive is the baseline;
+Argus must overcome it, not vice versa.**
+
+Historical docs that used 18.04%:
+  - `OPERATOR_HANDOFF.md` lines 171, 228 (this file — left as historical artifact)
+  - `ops/reports/system_audit/xs_momentum_*.md` (3 reports)
+  - `argus_flow/configs/allocation_factors.json` _kill_log entries cite "18%/yr CAGR" implicitly
+  - Memory files `project_2026_05_22_backtest_factory_findings.md`, `project_2026_05_23_pre_tuesday_hardening.md`
+
+Don't bother retro-editing them — anyone reading those historicals will
+land here via the truth-correction memory file.
+
+---
+
 ## 0.5. New candidate: forge_nov_spy (2026-05-24 — needs your call)
 
 Built and disciplined-gated tonight. **MARGINAL_PASS (8/9 layers)** —
@@ -424,36 +464,75 @@ zombie runners, so they cannot trade. But they're consuming client_id
 slots, generating log noise, and burning CPU. And nothing is actually
 trading the live allocation.
 
-### Recovery sequence (run in PowerShell)
+### Recovery sequence (run in PowerShell — verify at every gate before proceeding)
+
+**Order matters.** Per the 5/25 multi-agent debate, neutralize stale
+state BEFORE bringing up the new fleet, so killed-strategy zombies
+can't pollute canonical_fills alongside legitimate runners.
 
 ```powershell
-# Step 1 — kill the stuck TWS process (keep Gateway running).
-$tws = Get-Process -Name 'tws' -ErrorAction SilentlyContinue
-if ($tws) { Stop-Process -Id $tws.Id -Force; Write-Host "Killed TWS PID $($tws.Id)" }
+# ─── Gate 1: Stop scheduled tasks that auto-restart KILLED strategies ───
+$staleTasks = 'ArgusMultiOrbLoop','ArgusVixIntradayLoop','ArgusSpyMeanRevLoop','ArgusCueBanksPaperLoop','ArgusAudOrbLoop','ArgusNqLondonCloseLoop','ArgusToriPaperLoop'
+foreach ($t in $staleTasks) { Disable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue | Out-Null; Write-Host "Disabled task: $t" }
+# Verify: re-list to confirm State=Disabled
+Get-ScheduledTask | Where-Object { $_.TaskName -in $staleTasks } | Select-Object TaskName, State | Format-Table -AutoSize
 
-# Step 2 — stop all KILLED-strategy runner zombies.
+# ─── Gate 2: Stop all KILLED-strategy runner zombies ────────────────────
 $killedPattern = 'forge\.(multi_orb|vix_intraday|spy_mean_rev|cuebanks|tori|aud_asian_breakout|wick_gbpusd|jpy_pm_short|mamba|nq_london_close|nq_overnight|pead|spy_trend_follower|fomc_drift|tom_international|vix_revert|vix_carry|coint_pairs|gdx_gld|rebalance|atlas|themis)\.'
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
   Where-Object { $_.CommandLine -match $killedPattern } |
   ForEach-Object { Write-Host "Stopping PID $($_.ProcessId): $($_.CommandLine.Substring(0,[Math]::Min(100,$_.CommandLine.Length)))"; Stop-Process -Id $_.ProcessId -Force }
+# Verify: re-run the same selector — should be empty now
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match $killedPattern } | Measure-Object | Select-Object Count
 
-# Step 3 — disable scheduled tasks that auto-restart KILLED strategies.
-# (Optional: skip if you want to re-evaluate one of them later.)
-$staleTasks = 'ArgusMultiOrbLoop','ArgusVixIntradayLoop','ArgusSpyMeanRevLoop','ArgusCueBanksPaperLoop','ArgusAudOrbLoop','ArgusNqLondonCloseLoop','ArgusToriPaperLoop'
-foreach ($t in $staleTasks) { Disable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue | Out-Null; Write-Host "Disabled task: $t" }
+# ─── Gate 3: Resolve dual-broker conflict ───────────────────────────────
+# Pick exactly ONE path before continuing.
+#
+# Path A — kill TWS, keep IB Gateway as sole broker:
+$tws = Get-Process -Name 'tws' -ErrorAction SilentlyContinue
+if ($tws) { Stop-Process -Id $tws.Id -Force; Write-Host "Killed TWS PID $($tws.Id)" }
+# Path B — fill IBC credentials and use TWS via IBC:
+#   notepad C:\IBC\config.ini   # set IbLoginId + IbPassword on lines 83/88
+#   .\ops\start_tws_via_ibc.ps1
+#   then kill Gateway: Get-Process -Name 'ibgateway' | Stop-Process -Force
+#
+# Verify: exactly ONE listener on port 4002 OR 7497, not both
+Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 4002,7497 } | Select-Object LocalPort, OwningProcess, @{N='Process';E={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Format-Table -AutoSize
 
-# Step 4 — launch the v26 active fleet (12 runners, all on Gateway 4002).
-# Dry-run first so you can see what will fire:
-.\ops\start_post_reset_runners.ps1 -DryRun
-# Then for real:
-.\ops\start_post_reset_runners.ps1
+# ─── Gate 4: Launch the v26 active fleet (Gateway 4002) ─────────────────
+.\ops\start_post_reset_runners.ps1 -DryRun     # show what will fire
+.\ops\start_post_reset_runners.ps1             # for real
+# Verify: launcher exits 0, all 12 runners listed as launched/already-running
 
-# Step 5 — verify the fleet snapshot post-launch.
+# ─── Gate 5: Register persistent scheduled tasks (so this isn't manual next time) ───
+# (One-time setup; skip if already registered.)
+$python = 'C:\Argus\.venv\Scripts\python.exe'
+$repo = 'C:\Argus\repo'
+# V26 fleet auto-startup (at logon + every 4h thereafter):
+$action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$repo\ops\start_post_reset_runners.ps1`""
+$trigger1 = New-ScheduledTaskTrigger -AtLogOn
+$trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(4) -RepetitionInterval (New-TimeSpan -Hours 4)
+Register-ScheduledTask -TaskName 'ArgusV26FleetStartup' -Action $action -Trigger @($trigger1,$trigger2) -Description 'Launch v26 active fleet (replaces ArgusFleetStartup)' -Force
+# Replay-health nightly cron (so the pre-trade bridge actually activates after day 35):
+$rhAction = New-ScheduledTaskAction -Execute $python -Argument "-X utf8 -m ops.audit.run_replay_health_check" -WorkingDirectory $repo
+$rhTrigger = New-ScheduledTaskTrigger -Daily -At 22:30
+Register-ScheduledTask -TaskName 'ArgusReplayHealth' -Action $rhAction -Trigger $rhTrigger -Description 'Nightly replay-vs-ledger health check' -Force
+# Daily-health (composes auto_pause + orphan + preflight + flag_check):
+$dhAction = New-ScheduledTaskAction -Execute $python -Argument "-X utf8 -m ops.daily_health_check" -WorkingDirectory $repo
+$dhTrigger = New-ScheduledTaskTrigger -Daily -At 23:00
+Register-ScheduledTask -TaskName 'ArgusDailyHealth' -Action $dhAction -Trigger $dhTrigger -Description 'Daily aggregated safety/audit health check' -Force
+
+# ─── Gate 6: Verify canonical artifacts are receiving fresh rows ────────
+# Wait ~30 min for the first runner heartbeat / first signal evaluation, then:
 $env:PYTHONIOENCODING = 'utf-8'
-& C:\Argus\.venv\Scripts\python.exe -X utf8 -m ops.audit.run_fleet_snapshot --skip-yfinance --json |
+& $python -X utf8 -m ops.audit.run_fleet_snapshot --skip-yfinance --json |
   ConvertFrom-Json | Select-Object -ExpandProperty strategies |
   Where-Object { $_.allocation -gt 0 } |
   Format-Table strategy, status, allocation, heartbeat_age_h -AutoSize
+# Also check canonical_fills is being written to. It will likely stay
+# 0 bytes until an intraday strategy actually fires (gld_pm_long should
+# write within ~2h of market open; xs_momentum variants wait for month-end).
+Get-Item argus_flow\logs\canonical_fills.jsonl | Select-Object Length, LastWriteTime
 ```
 
 ### Why these scheduled tasks are stale

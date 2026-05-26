@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 from forge.xs_momentum import runner as xsm
@@ -142,3 +143,97 @@ def test_data_diagnostics_red_when_bars_are_stale(monkeypatch):
     result = xsm.data_diagnostics(period="2y")
     assert result["status"] == "RED"
     assert result["stale_tickers"] == ["SPY"]
+
+
+# ─── CAGR truth: calendar-walk vs trade-exit-grouped ─────────────────────
+
+def _synth_closes(tickers: list[str], months: int = 36, seed: int = 0):
+    """Build daily closes over `months` calendar months for `tickers`.
+
+    Each ticker is a random walk; one ticker (`A`) is given a steady upward
+    drift so it always ranks first. The other two drift around zero so they
+    occasionally swap top-2. Designed so backtest() has both rotation
+    months and idle months — the bug only shows up when idle months exist.
+    """
+    rng = np.random.default_rng(seed)
+    days_per_month = 21
+    n = months * days_per_month
+    start = pd.Timestamp("2020-01-01", tz="UTC")
+    idx = pd.bdate_range(start, periods=n, tz="UTC")
+    data = {}
+    for k, t in enumerate(tickers):
+        drift = 0.0008 if t == "A" else 0.0
+        noise = rng.normal(loc=drift, scale=0.01, size=n)
+        prices = 100.0 * np.exp(np.cumsum(noise))
+        data[t] = prices
+    return pd.DataFrame(data, index=idx)
+
+
+def test_calendar_walk_includes_every_month_after_warmup(monkeypatch):
+    """_calendar_monthly_returns must emit one entry per month-end once
+    warmup is complete — idle months are NOT skipped."""
+    closes = _synth_closes(["A", "B", "C"], months=24, seed=1)
+    monthly = xsm._calendar_monthly_returns(
+        closes,
+        universe=["A", "B", "C"],
+        long_lb=252, short_lb=21,
+        top_pick_fraction=0.34,  # top-1 of 3
+    )
+    # 24 months of data, ~12-13 month warmup (252 trading days), so we
+    # should see roughly months 13 onward — never zero entries.
+    assert len(monthly) >= 8
+    # Every key must be a valid YYYY-MM
+    for k in monthly:
+        assert len(k) == 7 and k[4] == "-"
+
+
+def test_backtest_cagr_matches_calendar_walk_compound(monkeypatch):
+    """The truth-integrity bug: backtest() used trade exit_date grouping
+    which skipped idle months and inflated compound + CAGR. After fix,
+    backtest's reported CAGR must equal the annualized compound of the
+    calendar-walk monthly returns from _calendar_monthly_returns."""
+    closes = _synth_closes(["A", "B", "C"], months=24, seed=2)
+    monkeypatch.setattr(xsm, "_fetch_history", lambda *a, **kw: closes)
+    # Force universe override matching our synthetic data
+    result = xsm.backtest(
+        period="2y",
+        universe_override=["A", "B", "C"],
+        top_pick_fraction=0.34,
+    )
+    assert "cagr_pct" in result
+    # Recompute the calendar-walk CAGR independently and compare
+    monthly = xsm._calendar_monthly_returns(
+        closes, ["A", "B", "C"], 252, 21, 0.34,
+    )
+    eq = 1.0
+    for m in sorted(monthly):
+        eq *= 1.0 + monthly[m]
+    days = (
+        (pd.to_datetime(sorted(monthly)[-1] + "-01") + pd.offsets.MonthEnd(0))
+        - pd.to_datetime(sorted(monthly)[0] + "-01")
+    ).days
+    expected_cagr_pct = (eq ** (365.25 / max(1, days)) - 1.0) * 100.0
+    assert abs(result["cagr_pct"] - expected_cagr_pct) < 0.05, (
+        f"backtest cagr_pct {result['cagr_pct']} drifted from calendar-walk "
+        f"compound {expected_cagr_pct}"
+    )
+
+
+def test_monthly_returns_field_uses_calendar_walk(monkeypatch):
+    """When return_monthly_series=True, the monthly_returns dict must be
+    the calendar-walk series (one entry per month, not trade-exit-grouped)."""
+    closes = _synth_closes(["A", "B", "C"], months=24, seed=3)
+    monkeypatch.setattr(xsm, "_fetch_history", lambda *a, **kw: closes)
+    result = xsm.backtest(
+        period="2y",
+        universe_override=["A", "B", "C"],
+        top_pick_fraction=0.34,
+        return_monthly_series=True,
+    )
+    series = result["monthly_returns"]
+    calendar = xsm._calendar_monthly_returns(
+        closes, ["A", "B", "C"], 252, 21, 0.34,
+    )
+    assert set(series.keys()) == set(calendar.keys())
+    for k in series:
+        assert abs(series[k] - calendar[k]) < 1e-9

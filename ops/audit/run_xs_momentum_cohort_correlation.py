@@ -47,6 +47,8 @@ VARIANTS = {
     # legacy15 — return correlation tests whether the SPY>200dma
     # overlay produces a meaningfully different return stream.
     "legacy15_regime":  ("legacy_sectors_countries_15", 0.20),
+    # 2026-05-25 v20 universe-broadening sweep — 43-ETF global universe.
+    "global47":         ("wide_global_47",              0.20),
 }
 
 
