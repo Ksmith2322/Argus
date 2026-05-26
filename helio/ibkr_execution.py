@@ -704,6 +704,33 @@ def submit_bracket(
                 reject_reason="kill_registry_unreadable",
             ))
 
+    # Pre-trade replay-health bridge (Creative agent #1, 2026-05-25).
+    # See helio/replay_health.py module docstring. Refuses entry when the
+    # nightly replay-vs-ledger diff shows blocking-class mismatches
+    # (REPLAY_ONLY or TICKER_DIVERGENT) for this strategy, or when the
+    # health-check artifact is stale (>36h, default). Allows when the
+    # strategy isn't in the supported list, no health file exists yet, or
+    # the operator has set REPLAY_BRIDGE_DISABLED=1. Exits are NOT blocked.
+    if strategy_label:
+        try:
+            from helio.replay_health import check_replay_health
+            health = check_replay_health(strategy_label)
+            if not health.allow:
+                log.warning(
+                    f"REPLAY_BRIDGE_BLOCK: refusing entry {direction} {size} "
+                    f"{contract.symbol} strategy={strategy_label} "
+                    f"reason={health.reason} — {health.detail}"
+                )
+                return BracketResult(entry=FillResult(
+                    filled=False,
+                    reject_reason=f"replay_bridge_{health.reason}:{health.detail[:80]}",
+                ))
+        except ImportError:
+            # Bridge module not importable — don't break the fleet. Log and continue.
+            log.warning("REPLAY_BRIDGE_UNAVAILABLE: helio.replay_health not importable; bypassing")
+        except Exception as exc:
+            log.warning(f"REPLAY_BRIDGE_ERROR: {exc!r}; bypassing")
+
     # Kill-switch — fleet-wide halt. Refuses all new entries; existing positions
     # can still exit via close_position_market.
     halted, halt_reason = is_fleet_halted()
