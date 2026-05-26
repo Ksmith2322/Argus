@@ -4060,8 +4060,35 @@ from ops.dashboard_data import (
 @app.get("/api/fleet_health")
 async def api_fleet_health():
     """Canonical fleet health — from argus_flow/logs/fleet_status.json
-    (written by helio.fleet_monitor every 60s)."""
-    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180))
+    (written by helio.fleet_monitor every 60s).
+
+    2026-05-26: post-filter the systems list to demote killed/sunset
+    strategies into a separate `sunset_systems` bucket so the dashboard
+    can render the active roster prominently without 22+ DOWN-tile noise
+    from strategies that intentionally aren't running. Source of truth
+    for the kill list is helio.roi_filter.KILLED_STRATEGY_CUTOFFS.
+    Falls back to passthrough if the kill registry can't be imported."""
+    data = _read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180)
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS as _KILLED
+        killed_set = set(_KILLED.keys())
+        # Map fleet_monitor system names that don't exactly match canonical
+        # strategy IDs. The argus group monitors all 3 FX pairs under one
+        # "argus" entry; all 3 pairs are killed so the umbrella counts.
+        if all(f"argus_{p}" in killed_set for p in ("usdjpy", "gbpusd", "cadjpy")):
+            killed_set.add("argus")
+        systems = data.get("systems") or {}
+        active = {k: v for k, v in systems.items() if k not in killed_set}
+        sunset = {k: v for k, v in systems.items() if k in killed_set}
+        data["systems"] = active
+        data["sunset_systems"] = sunset
+        data["_filter_note"] = (
+            f"systems filtered to active v26 roster; {len(sunset)} sunset "
+            f"strategies moved to sunset_systems"
+        )
+    except Exception:
+        pass
+    return JSONResponse(data)
 
 
 @app.get("/api/exit_reasons")

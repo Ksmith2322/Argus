@@ -65,19 +65,26 @@ def fetch_net_liquidation_usd(*, port: int = 4002, client_id: int = 998,
                               attempts: int = 3, backoff_s: float = 2.0) -> float | None:
     """Connect to IBKR (Gateway 4002 paper by default), fetch NetLiquidation
     in USD, return the value. Retries up to `attempts` times with
-    `backoff_s * attempt` linear backoff -- this exists because when called
-    from refresh_managed_truth the previous module (position_monitor)
-    may not have released its IB connection yet, and Gateway will reject
-    rapid back-to-back connects from the same process tree. Returns None
-    on every-attempt failure; caller treats None as 'leave cache untouched'."""
+    `backoff_s * attempt` linear backoff.
+
+    Rotates client_id across attempts (base, base+1, base+2, ...) to avoid
+    "client id already in use" failures when a prior cycle's connection
+    hasn't been fully released by Gateway yet. This was the 2026-05-26
+    failure mode -- every ManagedTruth cycle reused client_id=998 and
+    Gateway rejected with the standard 'API port not open' error pattern.
+
+    Returns None on every-attempt failure; caller treats None as 'leave
+    cache untouched'."""
     import time
     last = None
-    for i in range(1, max(1, attempts) + 1):
-        last = _fetch_once(port, client_id)
+    for i in range(max(1, attempts)):
+        # Rotate client_id: 998, 999, 997, 996, ... (within reserved ops range)
+        cid = client_id + i if i < 2 else client_id - (i - 1)
+        last = _fetch_once(port, cid)
         if last is not None and last > 0:
             return last
-        if i < attempts:
-            time.sleep(backoff_s * i)
+        if i < attempts - 1:
+            time.sleep(backoff_s * (i + 1))
     return last
 
 
