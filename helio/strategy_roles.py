@@ -85,6 +85,11 @@ STRATEGY_ROLES: dict[str, str] = {
     # 2026-05-26: extends gld_pm_long pattern to USO. PF net 1.40 @ 5bps,
     # CI lower 1.20 at gate floor. Independent intraday edge family.
     "forge_uso_pm_long": OFFENSE,
+    # 2026-05-26 v32: TSMOM SHADOW (allocation 0.0, virtual trades only).
+    # Sleeve of 11 SURVIVES tickers from TSMOM sweep. 21% sleeve CAGR
+    # passes individual bar but 1.2/mo cadence fails -- shipped as
+    # shadow to accumulate live evidence pending Aug 31 promotion review.
+    "forge_tsmom_sleeve": RESEARCH,
     # 2026-05-26 v31 CADENCE CULL: removed forge_nov_spy / forge_ewz_breakout /
     # forge_ief_jul_hold / forge_gld_jan_hold / forge_uso_jun_hold /
     # forge_hyg_apr_hold. All passed the disciplined backtest gate but fail

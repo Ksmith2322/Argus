@@ -268,6 +268,18 @@ SYSTEMS = {
     },
     # forge_tom_spy removed in v31.5: CAGR 3% fails SPY net-of-tax bar.
     # forge_nov_spy removed in v31 cadence cull (see comment block below)
+    "forge_tsmom_sleeve": {
+        # 2026-05-26 v32: TSMOM shadow runner. Wakes weekly (Monday 20:00 UTC)
+        # to check 3-month trailing return signal on 11 single-stock tickers.
+        # No broker connection. Heartbeats every 5 min while in sleep loop.
+        # 7.5-day artifact age covers weekly wake gap with slack for holiday weeks.
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.tsmom_sleeve.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "tsmom_sleeve" / "heartbeat.json"),
+        "artifact_max_age_s": 648000,  # 7.5 days
+        "no_restart": True,
+    },
     "forge_xs_momentum_consensus": {
         "heartbeats": [],
         "stale_threshold_s": 0,

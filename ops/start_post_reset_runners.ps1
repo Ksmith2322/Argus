@@ -43,6 +43,7 @@ $runners = @(
     @{Module='forge.tail_hedge.runner';             Args=@('--loop');                                    ClientId=127; Alloc=0.1;  Note='GLD/TLT when SPY<200dma (HEDGE role)'},
     @{Module='forge.xs_momentum.runner';            Args=@('--variant','global47','--loop');            ClientId=128; Alloc=0.25; Note='43-ETF global universe'},
     @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'},
+    @{Module='forge.tsmom_sleeve.runner';            Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- TSMOM 11-ticker sleeve, virtual trades only (v32)'},
     @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'}
     # v31 cadence cull (2026-05-26): removed forge.nov_spy / ewz_breakout /
     # ief_jul_hold / gld_jan_hold / uso_jun_hold / hyg_apr_hold. All passed
