@@ -440,6 +440,56 @@ anyone with read access can post to your Discord.
 
 ---
 
+## 1.45. Tuesday 2026-05-26 morning recovery — STATUS
+
+**Executed by Claude at ~07:57 ET on 2026-05-26** (commit pending). What was done:
+
+| Gate | Item | Status | Note |
+|---|---|---|---|
+| 1 | Disable 7 stale `ArgusXxxLoop` scheduled tasks | **OPERATOR TODO (admin)** | `Disable-ScheduledTask` denied at user-level. Must run in elevated PowerShell. |
+| 2 | Stop 8 zombie KILLED-strategy runner processes | DONE | All zombies stopped; verified 0 remaining. |
+| 3 | Kill stuck TWS (PID 20448, "Attempt 41 auth") | DONE | Only Gateway listening on 4002. |
+| 4 | Launch v26 fleet via `start_post_reset_runners.ps1` | DONE | 12 runners launched, 10/12 heartbeats fresh within 105s. `tom_spy` + `nov_spy` wake at 19:40 UTC daily (heartbeat populates then). |
+| 5 | Register persistent scheduled tasks | DONE | `ArgusReplayHealth` (daily 10:30pm), `ArgusDailyHealth` (daily 11:00pm), `ArgusV26FleetStartup` (every 2h — `AtLogOn` trigger needed admin so used 2h-interval as compromise). |
+| 6 | Verify fleet | DONE | All 12 runners alive, heartbeats <2min old. `canonical_fills.jsonl` will populate when `gld_pm_long` fires (next intraday window). |
+| 7 | Broker setup | PARTIAL | Created `C:\IBC\config_gateway.ini` with Gateway path (`IbDir=C:\Jts\ibgateway\1037`) + port (`OverrideTwsApiPort=4002`). Registered `ArgusGatewayWatchdog` (every 2h, self-heal — exits clean if Gateway already up). **OPERATOR TODO**: fill `IbLoginId` (line 83) + `IbPassword` (line 88) with real paper-account credentials. Until then, `start_gateway_via_ibc.ps1` will refuse with `exit 3: PLACEHOLDER values`. |
+
+### Operator-only items remaining (need elevated PowerShell + admin)
+
+```powershell
+# Run as Administrator (Win+X → "Windows PowerShell (Admin)")
+
+# A. Disable 7 stale loop tasks that auto-restart KILLED strategies
+$stale = 'ArgusMultiOrbLoop','ArgusVixIntradayLoop','ArgusSpyMeanRevLoop',
+         'ArgusCueBanksPaperLoop','ArgusAudOrbLoop','ArgusNqLondonCloseLoop',
+         'ArgusToriPaperLoop'
+foreach ($t in $stale) { Disable-ScheduledTask -TaskName $t }
+
+# B. Replace ArgusV26FleetStartup (currently every-2h) with at-logon + every-4h
+#    for faster reboot recovery.
+Unregister-ScheduledTask -TaskName 'ArgusV26FleetStartup' -Confirm:$false
+$a = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
+       -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\Argus\repo\ops\start_post_reset_runners.ps1"'
+$t1 = New-ScheduledTaskTrigger -AtLogOn
+$t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(4) `
+        -RepetitionInterval (New-TimeSpan -Hours 4)
+Register-ScheduledTask -TaskName 'ArgusV26FleetStartup' -Action $a `
+  -Trigger @($t1,$t2) -Description 'Launch v26 active fleet'
+```
+
+### Operator-only items requiring you (creds + decisions)
+
+1. **Fill IBC Gateway credentials** in `C:\IBC\config_gateway.ini`:
+   - Line 83: `IbLoginId=PLACEHOLDER_YOUR_PAPER_USERNAME` → real paper username
+   - Line 88: `IbPassword=PLACEHOLDER_YOUR_PAPER_PASSWORD` → real paper password
+   After this, the `ArgusGatewayWatchdog` task can actually launch Gateway. Until you do, Gateway must be launched manually after every reboot.
+
+2. **Discord webhook rotation** still pending (URL in tracked `.env` line 96 — exposed in git history).
+
+3. **The remaining `OPERATOR_HANDOFF.md §1.5` is the canonical reference if you need to repeat this recovery later.**
+
+---
+
 ## 1.5. Power-cycle / morning recovery (new — 2026-05-25 evening)
 
 After a power outage or Windows reboot, the fleet ends up in a known-bad
