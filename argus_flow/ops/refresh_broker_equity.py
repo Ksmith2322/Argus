@@ -34,10 +34,7 @@ _REPO = Path(__file__).resolve().parents[2]
 REPORT_PATH = _REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
 
 
-def fetch_net_liquidation_usd(*, port: int = 4002, client_id: int = 998) -> float | None:
-    """Connect to IBKR (Gateway 4002 paper by default), fetch NetLiquidation
-    in USD, return the value. Returns None on any failure -- the caller
-    treats None as 'leave cache untouched'."""
+def _fetch_once(port: int, client_id: int) -> float | None:
     try:
         from helio import ibkr_execution as ibkr
     except ImportError:
@@ -62,6 +59,26 @@ def fetch_net_liquidation_usd(*, port: int = 4002, client_id: int = 998) -> floa
             ib.disconnect()
         except Exception:
             pass
+
+
+def fetch_net_liquidation_usd(*, port: int = 4002, client_id: int = 998,
+                              attempts: int = 3, backoff_s: float = 2.0) -> float | None:
+    """Connect to IBKR (Gateway 4002 paper by default), fetch NetLiquidation
+    in USD, return the value. Retries up to `attempts` times with
+    `backoff_s * attempt` linear backoff -- this exists because when called
+    from refresh_managed_truth the previous module (position_monitor)
+    may not have released its IB connection yet, and Gateway will reject
+    rapid back-to-back connects from the same process tree. Returns None
+    on every-attempt failure; caller treats None as 'leave cache untouched'."""
+    import time
+    last = None
+    for i in range(1, max(1, attempts) + 1):
+        last = _fetch_once(port, client_id)
+        if last is not None and last > 0:
+            return last
+        if i < attempts:
+            time.sleep(backoff_s * i)
+    return last
 
 
 def patch_report(equity_usd: float, *, path: Path = REPORT_PATH) -> bool:
