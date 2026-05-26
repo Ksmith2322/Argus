@@ -370,6 +370,12 @@ def evaluate_once(force_action: str | None = None) -> dict:
 def loop_mode() -> None:
     log.info("nov_spy --loop started: daily wake at %02d:%02d UTC",
              PARAMS["eval_hour_utc"], PARAMS["eval_minute_utc"])
+    # Write boot heartbeat so fleet_monitor sees us alive immediately
+    # rather than waiting for first daily wake.
+    try:
+        _write_heartbeat(_load_state(), action="boot")
+    except Exception as exc:
+        log.warning("boot heartbeat write failed: %s", exc)
     while True:
         try:
             now = datetime.now(timezone.utc)

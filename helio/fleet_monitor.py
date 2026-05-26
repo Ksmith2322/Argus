@@ -195,6 +195,101 @@ SYSTEMS = {
         "artifact_max_age_s": 7200,  # 2h — runs at top of hours 18/19/20 UTC weekdays
         "no_restart": True,  # scheduled externally
     },
+    # ─── 2026-05-26: v26 active roster (post-reset) ────────────────────
+    # All wake every 5 min and write heartbeat each cycle; max_age 600s
+    # flags STALE if a strategy has missed 2 heartbeats. No_restart=True
+    # because ArgusV26FleetStartup scheduled task is the canonical bulk
+    # restart authority (avoids fleet_monitor race-restarting individuals).
+    # process_match uses trailing space for legacy15/style to disambiguate
+    # from legacy15_regime/style_top3 (substring match).
+    "forge_xs_momentum": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant baseline",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_sectors": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant sectors",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_sectors" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_style": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant style ",  # trailing space — distinguish from style_top3
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_style" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_legacy15": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant legacy15 ",  # trailing space — distinguish from legacy15_regime
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_legacy15" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_style_top3": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant style_top3",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_style_top3" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_legacy15_regime": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant legacy15_regime",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_legacy15_regime" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_xs_momentum_global47": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "--variant global47",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_global47" / "heartbeat.json"),
+        "artifact_max_age_s": 600,
+        "no_restart": True,
+    },
+    "forge_tail_hedge": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.tail_hedge.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "tail_hedge" / "heartbeat.json"),
+        "artifact_max_age_s": 86400,  # 24h — regime-gated, only fires when SPY<200dma
+        "no_restart": True,
+    },
+    "forge_tom_spy": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.tom_spy.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "tom_spy" / "heartbeat.json"),
+        "artifact_max_age_s": 86400,  # 24h — daily wake at 19:40 UTC
+        "no_restart": True,
+    },
+    "forge_nov_spy": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.nov_spy.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "nov_spy" / "heartbeat.json"),
+        "artifact_max_age_s": 86400,  # 24h — daily wake at 19:40 UTC
+        "no_restart": True,
+    },
+    "forge_xs_momentum_consensus": {
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.xs_momentum_consensus.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "xs_momentum_consensus" / "heartbeat.json"),
+        "artifact_max_age_s": 86400,  # 24h — shadow runner, evaluates monthly + heartbeats hourly
+        "no_restart": True,
+    },
     "forge_nq_overnight": {
         "heartbeats": [],
         "stale_threshold_s": 0,
