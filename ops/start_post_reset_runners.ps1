@@ -45,7 +45,10 @@ $runners = @(
     @{Module='forge.tom_spy.runner';                Args=@('--loop');                                    ClientId=129; Alloc=0.3;  Note='turn-of-month SPY (calendar)'},
     @{Module='forge.nov_spy.runner';                Args=@('--loop');                                    ClientId=130; Alloc=0.2;  Note='November-only SPY (calendar)'},
     @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'},
-    @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'}
+    @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'},
+    @{Module='forge.ewz_breakout.runner';            Args=@('--loop');                                    ClientId=132; Alloc=0.2;  Note='daily EWZ 21d breakout (v28)'},
+    @{Module='forge.ief_jul_hold.runner';            Args=@('--loop');                                    ClientId=133; Alloc=0.1;  Note='IEF July seasonal (v29 orthogonal)'},
+    @{Module='forge.gld_jan_hold.runner';            Args=@('--loop');                                    ClientId=134; Alloc=0.1;  Note='GLD January seasonal (v29 orthogonal)'}
 )
 
 # Modules that must NOT be running when this launcher fires. KILLED registry

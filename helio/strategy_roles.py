@@ -86,6 +86,15 @@ STRATEGY_ROLES: dict[str, str] = {
     # 2026-05-26: extends gld_pm_long pattern to USO. PF net 1.40 @ 5bps,
     # CI lower 1.20 at gate floor. Independent intraday edge family.
     "forge_uso_pm_long": OFFENSE,
+    # 2026-05-26: 21-day breakout on EWZ. PF 1.73, CI lower 1.275, ~3.6 fills/yr.
+    # Diversifier from xs_momentum and PM-pattern families.
+    "forge_ewz_breakout": OFFENSE,
+    # 2026-05-26: orthogonal calendar extensions (one trade per year each).
+    # IEF July (PF 12.14, bond rally) + GLD January (PF 4.23, gold seasonal).
+    # Picked from extension matrix sweep specifically because they are
+    # uncorrelated with the US-equity-beta cohort.
+    "forge_ief_jul_hold": OFFENSE,
+    "forge_gld_jan_hold": OFFENSE,
 }
 
 

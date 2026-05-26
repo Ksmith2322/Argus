@@ -301,6 +301,39 @@ SYSTEMS = {
         "artifact_max_age_s": 7200,
         "no_restart": True,
     },
+    "forge_ewz_breakout": {
+        # 2026-05-26: daily 21-day breakout on EWZ. One evaluation per day
+        # ~20:30 UTC, heartbeats every 5 min during loop. 26h max age
+        # covers weekday-to-weekday gap (Fri eval to Mon eval = 72h with
+        # weekend skip; use the 26h threshold and accept weekend staleness).
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.ewz_breakout.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "ewz_breakout" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h
+        "no_restart": True,
+    },
+    "forge_ief_jul_hold": {
+        # 2026-05-26: one trade per year (enter 1st weekday of July, exit
+        # last weekday of July). Daily wake ~19:45 UTC writes a noop
+        # heartbeat. 26h max age covers normal weekday gap.
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.ief_jul_hold.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "ief_jul_hold" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h
+        "no_restart": True,
+    },
+    "forge_gld_jan_hold": {
+        # 2026-05-26: one trade per year (enter 1st weekday of January,
+        # exit last weekday of January). Daily wake ~19:50 UTC.
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.gld_jan_hold.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "gld_jan_hold" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h
+        "no_restart": True,
+    },
     "forge_nq_overnight": {
         "heartbeats": [],
         "stale_threshold_s": 0,

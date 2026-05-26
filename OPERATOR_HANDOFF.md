@@ -440,6 +440,21 @@ anyone with read access can post to your Discord.
 
 ---
 
+## 1.46. Tuesday 2026-05-26 afternoon batch — STATUS
+
+**Compatibility-matrix sweep + 4-strategy expansion (v26 → v29).** Built and ran `ops/audit/run_extension_matrix_sweep.py` testing TOM + 12-month single-month patterns × 33 ETFs at 6bps RT slippage. 26 SURVIVES / 5 MARGINAL / 266 FAIL out of 297 cells. Plus earlier-in-day breakout sweep (EWZ won) + PM-pattern sweep (USO won). Net additions to active roster:
+
+- `forge_uso_pm_long` (v27, client_id 131, alloc 0.3×) — extends gld_pm_long to USO. Hourly PM-window intraday.
+- `forge_ewz_breakout` (v28, client_id 132, alloc 0.2×) — 21-day high breakout on EWZ. Daily, ~3-4 fills/yr.
+- `forge_ief_jul_hold` (v29, client_id 133, alloc 0.1×) — Treasury July seasonal. One trade/yr (1st→last weekday of July).
+- `forge_gld_jan_hold` (v29, client_id 134, alloc 0.1×) — gold January seasonal. One trade/yr.
+
+The IEF + GLD picks are deliberately the only matrix survivors uncorrelated with the existing US-equity-beta cohort. The other 22 matrix survivors are tom_spy/nov_spy clones on correlated tickers — left as documented intelligence for the post-vetting review next month.
+
+**Fleet now stands at 16 active runners summing 4.50× anchor.** Vetting phase begins: no new strategy adds until end-of-June review unless a bug forces it. Weekends-only for tweaks. See `ops/reports/system_audit/extension_matrix_sweep.md` for the full matrix.
+
+---
+
 ## 1.45. Tuesday 2026-05-26 morning recovery — STATUS
 
 **Executed by Claude at ~07:57 ET on 2026-05-26** (commit pending). What was done:
@@ -449,9 +464,9 @@ anyone with read access can post to your Discord.
 | 1 | Disable 7 stale `ArgusXxxLoop` scheduled tasks | **OPERATOR TODO (admin)** | `Disable-ScheduledTask` denied at user-level. Must run in elevated PowerShell. |
 | 2 | Stop 8 zombie KILLED-strategy runner processes | DONE | All zombies stopped; verified 0 remaining. |
 | 3 | Kill stuck TWS (PID 20448, "Attempt 41 auth") | DONE | Only Gateway listening on 4002. |
-| 4 | Launch v26 fleet via `start_post_reset_runners.ps1` | DONE | 12 runners launched, 10/12 heartbeats fresh within 105s. `tom_spy` + `nov_spy` wake at 19:40 UTC daily (heartbeat populates then). |
+| 4 | Launch v26 fleet via `start_post_reset_runners.ps1` | DONE | 16 runners launched (added forge_uso_pm_long client_id=131, forge_ewz_breakout 132, forge_ief_jul_hold 133, forge_gld_jan_hold 134 across 2026-05-26 sessions). `tom_spy`/`nov_spy`/`ief_jul_hold`/`gld_jan_hold` wake daily ~19:40-19:50 UTC. |
 | 5 | Register persistent scheduled tasks | DONE | `ArgusReplayHealth` (daily 10:30pm), `ArgusDailyHealth` (daily 11:00pm), `ArgusV26FleetStartup` (every 2h — `AtLogOn` trigger needed admin so used 2h-interval as compromise). |
-| 6 | Verify fleet | DONE | All 12 runners alive, heartbeats <2min old. `canonical_fills.jsonl` will populate when `gld_pm_long` fires (next intraday window). |
+| 6 | Verify fleet | DONE | All 16 runners alive, heartbeats <2min old. `canonical_fills.jsonl` will populate when intraday strategies fire (gld_pm_long, uso_pm_long PM windows). |
 | 7 | Broker setup | PARTIAL | Created `C:\IBC\config_gateway.ini` with Gateway path (`IbDir=C:\Jts\ibgateway\1037`) + port (`OverrideTwsApiPort=4002`). Registered `ArgusGatewayWatchdog` (every 2h, self-heal — exits clean if Gateway already up). **OPERATOR TODO**: fill `IbLoginId` (line 83) + `IbPassword` (line 88) with real paper-account credentials. Until then, `start_gateway_via_ibc.ps1` will refuse with `exit 3: PLACEHOLDER values`. |
 
 ### Operator-only items remaining (need elevated PowerShell + admin)
@@ -552,7 +567,7 @@ Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 4002,7497 }
 # ─── Gate 4: Launch the v26 active fleet (Gateway 4002) ─────────────────
 .\ops\start_post_reset_runners.ps1 -DryRun     # show what will fire
 .\ops\start_post_reset_runners.ps1             # for real
-# Verify: launcher exits 0, all 12 runners listed as launched/already-running
+# Verify: launcher exits 0, all 16 runners listed as launched/already-running
 
 # ─── Gate 5: Register persistent scheduled tasks (so this isn't manual next time) ───
 # (One-time setup; skip if already registered.)
