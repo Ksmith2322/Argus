@@ -7794,11 +7794,24 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
 
     ibkr_port = _env_from_file("IBKR_PORT", "7497")
     ibkr_account = _env_from_file("IBKR_ACCOUNT_ID", "")
+    # 2026-05-26: prefer broker equity (current ~$250K post-reset);
+    # fallback to risk_oversight cache; final fallback to $250K (the
+    # post-reset paper anchor) so % math stays meaningful. Old $10K
+    # fallback was the pre-reset anchor and made % calculations wrong.
+    anchor = None
     try:
         from helio.fleet_sizing import get_sizing_anchor_usd as _gs
-        anchor = _gs()
+        anchor = float(_gs())
     except Exception:
-        anchor = 10000.0
+        try:
+            ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+            eq = ro.get("broker_truth", {}).get("account_equity_usd")
+            if eq and float(eq) > 0:
+                anchor = float(eq)
+        except Exception:
+            pass
+    if anchor is None or anchor <= 0:
+        anchor = 250000.0  # post-reset paper anchor
     # Actual broker equity (from risk_oversight)
     try:
         ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
@@ -7898,11 +7911,24 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
 
     events.sort(key=lambda e: e[0])
 
+    # 2026-05-26: prefer broker equity (current ~$250K post-reset);
+    # fallback to risk_oversight cache; final fallback to $250K (the
+    # post-reset paper anchor) so % math stays meaningful. Old $10K
+    # fallback was the pre-reset anchor and made % calculations wrong.
+    anchor = None
     try:
         from helio.fleet_sizing import get_sizing_anchor_usd as _gs
-        anchor = _gs()
+        anchor = float(_gs())
     except Exception:
-        anchor = 10000.0
+        try:
+            ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+            eq = ro.get("broker_truth", {}).get("account_equity_usd")
+            if eq and float(eq) > 0:
+                anchor = float(eq)
+        except Exception:
+            pass
+    if anchor is None or anchor <= 0:
+        anchor = 250000.0  # post-reset paper anchor
     cumulative = 0.0
     points = []
     by_strategy: dict[str, float] = {}
@@ -7979,43 +8005,55 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
 @app.get("/api/gateway_status")
 async def api_gateway_status():
     """IBKR gateway + broker health summary for the top-of-page banner.
-    Reads the latest Argus heartbeats + oversight report.
+
+    2026-05-26: rewritten for the v26 era. Pre-v26 this loop iterated
+    the 3 argus FX heartbeats which are now sunset (last write 5/22
+    pre-reset). Result: banner was perpetually RED. Now health is
+    derived from (a) port 4002 OR 7497 listening AND (b) broker
+    equity > 0. The legacy per_pair structure is preserved with the
+    sunset pairs explicitly tagged so any old JS handler doesn't choke.
     """
     out = {"all_healthy": False, "per_pair": {}, "pause_entries_present": False, "broker_equity_usd": None}
+    # Sunset FX pairs -- present-but-sunset, not used for health calc
     for sym in ("usdjpy", "gbpusd", "cadjpy"):
-        p = REPO / "argus_flow" / "logs" / sym / "heartbeat.json"
-        if not p.exists():
-            out["per_pair"][sym] = {"present": False}
-            continue
-        age = int(time.time() - p.stat().st_mtime)
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            out["per_pair"][sym] = {"present": True, "age_s": age, "error": "parse_failed"}
-            continue
-        out["per_pair"][sym] = {
-            "present": True,
-            "age_s": age,
-            "fresh": age < 300,
-            "broker_connected": d.get("broker_connected"),
-            "entries_blocked": d.get("entries_blocked"),
-            "entry_block_reason": d.get("entry_block_reason"),
-            "consecutive_errors": d.get("consecutive_errors"),
-            "position": d.get("position"),
-        }
-    out["all_healthy"] = all(
-        p.get("fresh") and p.get("broker_connected") is True and int(p.get("consecutive_errors") or 0) == 0
-        for p in out["per_pair"].values() if p.get("present")
-    ) and any(p.get("present") for p in out["per_pair"].values())
+        out["per_pair"][sym] = {"present": False, "sunset": True, "note": "argus FX sunset 2026-05-20"}
+    # Pause flag
     out["pause_entries_present"] = (REPO / "PAUSE_ENTRIES").exists()
+    # Broker equity from risk_oversight cache (refreshed by ManagedTruth)
     try:
         ro_path = REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
         ro = json.loads(ro_path.read_text())
-        out["broker_equity_usd"] = ro.get("broker_truth", {}).get("account_equity_usd")
-        # Freshness — powers the stale-data dashboard banner
+        eq = ro.get("broker_truth", {}).get("account_equity_usd")
+        out["broker_equity_usd"] = float(eq) if eq is not None else None
         out["risk_oversight_age_s"] = int(time.time() - ro_path.stat().st_mtime)
     except Exception:
         pass
+    # Broker port check -- 4002 (Gateway paper) or 7497 (TWS paper)
+    port_listening = False
+    listening_port = None
+    try:
+        import socket as _sock
+        for p in (4002, 7497):
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(0.5)
+            try:
+                if s.connect_ex(("127.0.0.1", p)) == 0:
+                    port_listening = True
+                    listening_port = p
+                    s.close()
+                    break
+            except Exception:
+                pass
+            finally:
+                try: s.close()
+                except Exception: pass
+    except Exception:
+        pass
+    out["broker_port_listening"] = port_listening
+    out["broker_port"] = listening_port
+    # Headline health: port listening + broker equity > 0 + no pause flag
+    eq_ok = out["broker_equity_usd"] is not None and out["broker_equity_usd"] > 0
+    out["all_healthy"] = port_listening and eq_ok and not out["pause_entries_present"]
     return JSONResponse(out)
 
 
