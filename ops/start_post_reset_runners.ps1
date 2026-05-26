@@ -42,15 +42,15 @@ $runners = @(
     @{Module='forge.xs_momentum.runner';            Args=@('--variant','legacy15_regime','--loop');     ClientId=126; Alloc=0.25; Note='legacy15 + SPY>200dma gate'},
     @{Module='forge.tail_hedge.runner';             Args=@('--loop');                                    ClientId=127; Alloc=0.1;  Note='GLD/TLT when SPY<200dma (HEDGE role)'},
     @{Module='forge.xs_momentum.runner';            Args=@('--variant','global47','--loop');            ClientId=128; Alloc=0.25; Note='43-ETF global universe'},
-    @{Module='forge.tom_spy.runner';                Args=@('--loop');                                    ClientId=129; Alloc=0.3;  Note='turn-of-month SPY (calendar)'},
-    @{Module='forge.nov_spy.runner';                Args=@('--loop');                                    ClientId=130; Alloc=0.2;  Note='November-only SPY (calendar)'},
     @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'},
-    @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'},
-    @{Module='forge.ewz_breakout.runner';            Args=@('--loop');                                    ClientId=132; Alloc=0.2;  Note='daily EWZ 21d breakout (v28)'},
-    @{Module='forge.ief_jul_hold.runner';            Args=@('--loop');                                    ClientId=133; Alloc=0.1;  Note='IEF July seasonal (v29 orthogonal)'},
-    @{Module='forge.gld_jan_hold.runner';            Args=@('--loop');                                    ClientId=134; Alloc=0.1;  Note='GLD January seasonal (v29 orthogonal)'},
-    @{Module='forge.uso_jun_hold.runner';            Args=@('--loop');                                    ClientId=135; Alloc=0.1;  Note='USO June seasonal (v30 orthogonal)'},
-    @{Module='forge.hyg_apr_hold.runner';            Args=@('--loop');                                    ClientId=136; Alloc=0.1;  Note='HYG April seasonal (v30 orthogonal)'}
+    @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'}
+    # v31 cadence cull (2026-05-26): removed forge.nov_spy / ewz_breakout /
+    # ief_jul_hold / gld_jan_hold / uso_jun_hold / hyg_apr_hold. All passed
+    # the disciplined backtest gate but fail the 30-trades/month cadence
+    # floor (1-2 fills/year = decades to validate). Added to
+    # helio/roi_filter.KILLED_STRATEGY_CUTOFFS so submit_bracket refuses
+    # entries even if a zombie restart fires. .md sweep reports preserved
+    # as parked intelligence.
 )
 
 # Modules that must NOT be running when this launcher fires. KILLED registry

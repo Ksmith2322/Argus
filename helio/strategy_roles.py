@@ -81,25 +81,17 @@ STRATEGY_ROLES: dict[str, str] = {
     "forge_tail_hedge": HEDGE,
     # Pending-opt-in candidates (also classified so we know what bar
     # they'll be evaluated against if/when activated)
-    "forge_tom_spy": OFFENSE,        # PARTIAL_PASS at 1.20 floor; alpha-equivalent
-    "forge_nov_spy": OFFENSE,        # MARGINAL_PASS at 1.20 floor; alpha-equivalent
+    # forge_tom_spy removed in v31.5: CAGR 3% fails SPY net-of-tax bar.
     # 2026-05-26: extends gld_pm_long pattern to USO. PF net 1.40 @ 5bps,
     # CI lower 1.20 at gate floor. Independent intraday edge family.
     "forge_uso_pm_long": OFFENSE,
-    # 2026-05-26: 21-day breakout on EWZ. PF 1.73, CI lower 1.275, ~3.6 fills/yr.
-    # Diversifier from xs_momentum and PM-pattern families.
-    "forge_ewz_breakout": OFFENSE,
-    # 2026-05-26: orthogonal calendar extensions (one trade per year each).
-    # IEF July (PF 12.14, bond rally) + GLD January (PF 4.23, gold seasonal).
-    # Picked from extension matrix sweep specifically because they are
-    # uncorrelated with the US-equity-beta cohort.
-    "forge_ief_jul_hold": OFFENSE,
-    "forge_gld_jan_hold": OFFENSE,
-    # 2026-05-26 v30: more orthogonal calendar adds from expanded-universe sweep.
-    # USO June (PF 4.07, oil driving-season) + HYG April (PF 7.41, high-yield
-    # risk-on). Both 1 trade/yr, orthogonal to bonds + gold + equity cohort.
-    "forge_uso_jun_hold": OFFENSE,
-    "forge_hyg_apr_hold": OFFENSE,
+    # 2026-05-26 v31 CADENCE CULL: removed forge_nov_spy / forge_ewz_breakout /
+    # forge_ief_jul_hold / forge_gld_jan_hold / forge_uso_jun_hold /
+    # forge_hyg_apr_hold. All passed the disciplined backtest gate but fail
+    # the 30-trades/month cadence floor (1-2 trades/year = decades to
+    # validate). They are now in helio.roi_filter.KILLED_STRATEGY_CUTOFFS.
+    # If revived for diversification rather than learning velocity, add back
+    # here with appropriate role classification.
 }
 
 

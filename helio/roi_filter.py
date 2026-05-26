@@ -122,6 +122,27 @@ KILLED_STRATEGY_CUTOFFS: dict[str, str] = {
     # tom_spy's already-deployed window (50% per Q). Full results:
     # docs/AUDIT_2026_05_25_PART2/TURN_OF_QUARTER_KILL.md
     "forge_turn_of_quarter": "2026-05-25",
+    # 2026-05-26 (v31 cadence cull): killed for failing the operator's
+    # explicit "30 trades/month per strategy, 15-25% per-strategy CAGR"
+    # bar. Mathematically these can't be validated in any human-relevant
+    # timeframe: 1-2 trades/year means decades to confirm edge persistence.
+    # All passed the disciplined backtest gate at honest slippage; killed
+    # for *velocity*, not validity. They go to the "considered, validated,
+    # parked — revisit when optimizing for diversification, not learning
+    # speed" pile. To revive: remove this entry and document why.
+    "forge_nov_spy":             "2026-05-26",  # 2 fills/yr (1 round-trip), PF 4.79
+    "forge_ewz_breakout":        "2026-05-26",  # ~4 fills/yr, PF 1.73
+    "forge_ief_jul_hold":        "2026-05-26",  # 2 fills/yr, PF 12.14
+    "forge_gld_jan_hold":        "2026-05-26",  # 2 fills/yr, PF 4.23
+    "forge_uso_jun_hold":        "2026-05-26",  # 2 fills/yr, PF 4.07
+    "forge_hyg_apr_hold":        "2026-05-26",  # 2 fills/yr, PF 7.41
+    # 2026-05-26 v31.5: operator added explicit "each strategy must beat SPY
+    # net of taxes" bar = ~13% pre-tax CAGR floor per strategy. tom_spy at
+    # 3% backtest CAGR fails this bar by 10pp on its own AND drags fleet-
+    # combined CAGR below 13%. Removing it pushes fleet CAGR ~12.89% -> 13.74%
+    # (passes mandatory floor). See docs/decisions/
+    # 2026_08_31_real_money_promotion_gate.md condition #1.
+    "forge_tom_spy":             "2026-05-26",  # 12 fills/yr but CAGR 3% < 13% bar
 }
 
 # Single-trade P&L threshold for "obviously phantom" rows that escaped the

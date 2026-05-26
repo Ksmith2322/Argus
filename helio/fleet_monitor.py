@@ -266,22 +266,8 @@ SYSTEMS = {
         "artifact_max_age_s": 86400,  # 24h — regime-gated, only fires when SPY<200dma
         "no_restart": True,
     },
-    "forge_tom_spy": {
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.tom_spy.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "tom_spy" / "heartbeat.json"),
-        "artifact_max_age_s": 86400,  # 24h — daily wake at 19:40 UTC
-        "no_restart": True,
-    },
-    "forge_nov_spy": {
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.nov_spy.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "nov_spy" / "heartbeat.json"),
-        "artifact_max_age_s": 86400,  # 24h — daily wake at 19:40 UTC
-        "no_restart": True,
-    },
+    # forge_tom_spy removed in v31.5: CAGR 3% fails SPY net-of-tax bar.
+    # forge_nov_spy removed in v31 cadence cull (see comment block below)
     "forge_xs_momentum_consensus": {
         "heartbeats": [],
         "stale_threshold_s": 0,
@@ -301,57 +287,11 @@ SYSTEMS = {
         "artifact_max_age_s": 7200,
         "no_restart": True,
     },
-    "forge_ewz_breakout": {
-        # 2026-05-26: daily 21-day breakout on EWZ. One evaluation per day
-        # ~20:30 UTC, heartbeats every 5 min during loop. 26h max age
-        # covers weekday-to-weekday gap (Fri eval to Mon eval = 72h with
-        # weekend skip; use the 26h threshold and accept weekend staleness).
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.ewz_breakout.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "ewz_breakout" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h
-        "no_restart": True,
-    },
-    "forge_ief_jul_hold": {
-        # 2026-05-26: one trade per year (enter 1st weekday of July, exit
-        # last weekday of July). Daily wake ~19:45 UTC writes a noop
-        # heartbeat. 26h max age covers normal weekday gap.
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.ief_jul_hold.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "ief_jul_hold" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h
-        "no_restart": True,
-    },
-    "forge_gld_jan_hold": {
-        # 2026-05-26: one trade per year (enter 1st weekday of January,
-        # exit last weekday of January). Daily wake ~19:50 UTC.
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.gld_jan_hold.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "gld_jan_hold" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h
-        "no_restart": True,
-    },
-    "forge_uso_jun_hold": {
-        # 2026-05-26 v30: one trade per year (June, oil seasonal).
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.uso_jun_hold.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "uso_jun_hold" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h
-        "no_restart": True,
-    },
-    "forge_hyg_apr_hold": {
-        # 2026-05-26 v30: one trade per year (April, high-yield risk-on).
-        "heartbeats": [],
-        "stale_threshold_s": 0,
-        "process_match": "forge.hyg_apr_hold.runner",
-        "artifact_glob": str(REPO / "forge" / "logs" / "hyg_apr_hold" / "heartbeat.json"),
-        "artifact_max_age_s": 93600,  # 26h
-        "no_restart": True,
-    },
+    # 2026-05-26 v31 CADENCE CULL: forge_ewz_breakout + forge_ief_jul_hold +
+    # forge_gld_jan_hold + forge_uso_jun_hold + forge_hyg_apr_hold + forge_nov_spy
+    # all removed from SYSTEMS. They are in KILLED_STRATEGY_CUTOFFS so
+    # submit_bracket refuses entries; no need to monitor heartbeats for
+    # processes that should not be running.
     "forge_nq_overnight": {
         "heartbeats": [],
         "stale_threshold_s": 0,
