@@ -86,7 +86,7 @@ $logFile = "$IbcPath\Logs\ibc_gateway_$(Get-Date -Format yyyyMMdd_HHmmss).log"
 # Find the right Java executable. Gateway 1037+ requires Java 17 (class
 # version 61), but the system 'java.exe' on PATH may be older. The Gateway
 # installer drops a preferred-JRE path at
-# C:\Jts\ibgateway\<VERSION>\.install4j\pref_jre.cfg — use that if present.
+# C:\Jts\ibgateway\<VERSION>\.install4j\pref_jre.cfg -- use that if present.
 $prefJreCfg = "C:\Jts\ibgateway\$gatewayVersion\.install4j\pref_jre.cfg"
 $javaExe = "java.exe"   # PATH default fallback
 if (Test-Path $prefJreCfg) {
