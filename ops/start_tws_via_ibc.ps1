@@ -51,7 +51,7 @@ if ($cfg -match "PLACEHOLDER_YOUR_PAPER_") {
     exit 2
 }
 
-# Bail if TWS is already running — IBC owns the launch
+# Bail if TWS is already running -- IBC owns the launch
 $existing = Get-CimInstance Win32_Process -Filter "Name='tws.exe'" -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "WARNING: tws.exe already running (PID $($existing.ProcessId))." -ForegroundColor Yellow

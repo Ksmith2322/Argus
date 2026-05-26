@@ -30,7 +30,7 @@ function Log($msg) {
     Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
 }
 
-# Active roster — matches allocation_factors.json v26.
+# Active roster -- matches allocation_factors.json v26.
 # (module, args, client_id, allocation, note)
 $runners = @(
     @{Module='forge.gld_pm_long.runner';            Args=@('--loop');                                    ClientId=102; Alloc=0.5;  Note='defense / metals diversifier'},
@@ -44,7 +44,7 @@ $runners = @(
     @{Module='forge.xs_momentum.runner';            Args=@('--variant','global47','--loop');            ClientId=128; Alloc=0.25; Note='43-ETF global universe'},
     @{Module='forge.tom_spy.runner';                Args=@('--loop');                                    ClientId=129; Alloc=0.3;  Note='turn-of-month SPY (calendar)'},
     @{Module='forge.nov_spy.runner';                Args=@('--loop');                                    ClientId=130; Alloc=0.2;  Note='November-only SPY (calendar)'},
-    @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW — virtual trades, no broker'}
+    @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'}
 )
 
 # Modules that must NOT be running when this launcher fires. KILLED registry
@@ -70,7 +70,7 @@ $blockedModules = @(
 
 Log "=== Argus v26 active fleet startup (target: $($runners.Count) runners; IBKR_PORT=$($env:IBKR_PORT)) ==="
 
-# Broker pre-flight — warn but don't refuse. Gateway/TWS may come up
+# Broker pre-flight -- warn but don't refuse. Gateway/TWS may come up
 # after the launcher and runners will retry their initial connect.
 $gw = Get-NetTCPConnection -LocalPort $env:IBKR_PORT -State Listen -ErrorAction SilentlyContinue
 if (-not $gw) {

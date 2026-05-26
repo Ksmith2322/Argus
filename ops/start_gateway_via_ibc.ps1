@@ -40,7 +40,7 @@ if (-not (Test-Path "$IbcPath\IBC.jar")) {
 $cfgPath = "$IbcPath\$ConfigFile"
 if (-not (Test-Path $cfgPath)) {
     Write-Host "FAIL: $cfgPath not found." -ForegroundColor Red
-    Write-Host "      Copy config.ini → config_gateway.ini and edit per ops/IBC_GATEWAY_SETUP.md" -ForegroundColor Red
+    Write-Host "      Copy config.ini -> config_gateway.ini and edit per ops/IBC_GATEWAY_SETUP.md" -ForegroundColor Red
     exit 2
 }
 
@@ -53,7 +53,7 @@ if ($cfg -match "PLACEHOLDER_YOUR_PAPER_") {
 
 # Sanity: config really targets Gateway (not TWS by accident)
 if ($cfg -notmatch "(?im)^\s*FIX\s*=\s*no") {
-    Write-Host "WARNING: $cfgPath does not contain 'FIX=no' — verify IBC is configured for Gateway." -ForegroundColor Yellow
+    Write-Host "WARNING: $cfgPath does not contain 'FIX=no' -- verify IBC is configured for Gateway." -ForegroundColor Yellow
 }
 if ($cfg -notmatch "(?im)OverrideTwsApiPort\s*=\s*4002") {
     Write-Host "WARNING: $cfgPath does not pin OverrideTwsApiPort=4002. Continuing anyway." -ForegroundColor Yellow
@@ -70,7 +70,7 @@ $gatewayVersion = ($gatewayDirs | Sort-Object LastWriteTime -Descending | Select
 $gatewayJars = "C:\Jts\ibgateway\$gatewayVersion\jars"
 Write-Host "Using IB Gateway version: $gatewayVersion" -ForegroundColor Gray
 
-# Bail if Gateway is already running — IBC owns the lifecycle
+# Bail if Gateway is already running -- IBC owns the lifecycle
 $existing = Get-CimInstance Win32_Process -Filter "Name='ibgateway.exe'" -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "WARNING: ibgateway.exe already running (PID $($existing.ProcessId))." -ForegroundColor Yellow
