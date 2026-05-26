@@ -334,6 +334,24 @@ SYSTEMS = {
         "artifact_max_age_s": 93600,  # 26h
         "no_restart": True,
     },
+    "forge_uso_jun_hold": {
+        # 2026-05-26 v30: one trade per year (June, oil seasonal).
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.uso_jun_hold.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "uso_jun_hold" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h
+        "no_restart": True,
+    },
+    "forge_hyg_apr_hold": {
+        # 2026-05-26 v30: one trade per year (April, high-yield risk-on).
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.hyg_apr_hold.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "hyg_apr_hold" / "heartbeat.json"),
+        "artifact_max_age_s": 93600,  # 26h
+        "no_restart": True,
+    },
     "forge_nq_overnight": {
         "heartbeats": [],
         "stale_threshold_s": 0,

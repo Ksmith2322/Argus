@@ -50,8 +50,14 @@ CANDIDATES = [
     "MTUM", "QUAL", "USMV", "VIG", "VLUE", "VTV", "VUG", "VYM",
     # international + EM
     "EFA", "EEM", "EWJ", "EWG", "EWZ", "INDA", "FXI",
-    # commodities / bonds
-    "GLD", "TLT", "IEF",
+    # specialty ETFs (2026-05-26 expansion)
+    "SMH", "KRE", "XBI", "ITB", "KWEB", "EWY", "EWT", "EWA", "EWU", "EWC",
+    # commodity / bond ETFs (2026-05-26 expansion)
+    "GLD", "TLT", "IEF", "USO", "UNG", "SLV", "COPX", "URA", "DBA", "LIT",
+    "HYG", "EMB", "LQD", "TIP",
+    # mega-cap stocks (2026-05-26 expansion)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B",
+    "JPM", "V", "MA", "JNJ", "UNH", "XOM", "HD", "PG", "WMT",
 ]
 
 SLIPPAGE_BPS_ROUND_TRIP = 6.0

@@ -48,7 +48,9 @@ $runners = @(
     @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'},
     @{Module='forge.ewz_breakout.runner';            Args=@('--loop');                                    ClientId=132; Alloc=0.2;  Note='daily EWZ 21d breakout (v28)'},
     @{Module='forge.ief_jul_hold.runner';            Args=@('--loop');                                    ClientId=133; Alloc=0.1;  Note='IEF July seasonal (v29 orthogonal)'},
-    @{Module='forge.gld_jan_hold.runner';            Args=@('--loop');                                    ClientId=134; Alloc=0.1;  Note='GLD January seasonal (v29 orthogonal)'}
+    @{Module='forge.gld_jan_hold.runner';            Args=@('--loop');                                    ClientId=134; Alloc=0.1;  Note='GLD January seasonal (v29 orthogonal)'},
+    @{Module='forge.uso_jun_hold.runner';            Args=@('--loop');                                    ClientId=135; Alloc=0.1;  Note='USO June seasonal (v30 orthogonal)'},
+    @{Module='forge.hyg_apr_hold.runner';            Args=@('--loop');                                    ClientId=136; Alloc=0.1;  Note='HYG April seasonal (v30 orthogonal)'}
 )
 
 # Modules that must NOT be running when this launcher fires. KILLED registry

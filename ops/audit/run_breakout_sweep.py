@@ -41,13 +41,19 @@ _REPO = Path(__file__).resolve().parents[2]
 _OUT_DIR = _REPO / "ops" / "reports" / "system_audit"
 _DATA_DIR = _REPO / "helio" / "data_yfinance"
 
-# Universe: all liquid ETFs we have daily data for
+# Universe: all liquid ETFs + stocks + commodities we have daily data for
 CANDIDATES = [
     "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB", "XLRE", "XLC",
     "MTUM", "QUAL", "USMV", "VIG", "VLUE", "VTV", "VUG", "VYM",
     "EFA", "EEM", "VEA", "EWJ", "EWG", "EWZ", "INDA", "FXI",
     "GLD", "TLT", "IEF",
+    # 2026-05-26 universe expansion
+    "SMH", "KRE", "XBI", "ITB", "KWEB", "EWY", "EWT", "EWA", "EWU", "EWC",
+    "USO", "UNG", "SLV", "COPX", "URA", "DBA", "LIT",
+    "HYG", "EMB", "LQD", "TIP",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B",
+    "JPM", "V", "MA", "JNJ", "UNH", "XOM", "HD", "PG", "WMT",
 ]
 
 ATR_PERIOD = 14
@@ -90,6 +96,10 @@ def _backtest_variant(df: pd.DataFrame, variant: str) -> list[dict]:
     elif variant == "monthly_high_breakout":
         roll_high = df["Close"].rolling(21).max().values
         prior_high = pd.Series(roll_high).shift(1).values
+    elif variant == "quarterly_high_breakout":
+        # 60d = ~3 months / 1 quarter -- middle ground between 21d and 252d
+        roll_high = df["Close"].rolling(60).max().values
+        prior_high = pd.Series(roll_high).shift(1).values
     else:
         return []
 
@@ -118,6 +128,11 @@ def _backtest_variant(df: pd.DataFrame, variant: str) -> list[dict]:
             stop_px = entry * 0.98  # -2% stop
             target_px = None
             max_hold = 5
+        elif variant == "quarterly_high_breakout":
+            # Wider stop (-4%) + longer hold (15d) to match longer-cycle entry
+            stop_px = entry * 0.96
+            target_px = None
+            max_hold = 15
 
         exit_px = None
         exit_idx = None
@@ -195,7 +210,8 @@ def evaluate_gate(trades: list[dict]) -> dict:
     }
 
 
-VARIANTS = ["fresh_52w_high", "fresh_high_with_atr_stop", "monthly_high_breakout"]
+VARIANTS = ["fresh_52w_high", "fresh_high_with_atr_stop",
+            "monthly_high_breakout", "quarterly_high_breakout"]
 
 
 def run_sweep() -> dict:

@@ -95,6 +95,11 @@ STRATEGY_ROLES: dict[str, str] = {
     # uncorrelated with the US-equity-beta cohort.
     "forge_ief_jul_hold": OFFENSE,
     "forge_gld_jan_hold": OFFENSE,
+    # 2026-05-26 v30: more orthogonal calendar adds from expanded-universe sweep.
+    # USO June (PF 4.07, oil driving-season) + HYG April (PF 7.41, high-yield
+    # risk-on). Both 1 trade/yr, orthogonal to bonds + gold + equity cohort.
+    "forge_uso_jun_hold": OFFENSE,
+    "forge_hyg_apr_hold": OFFENSE,
 }
 
 
