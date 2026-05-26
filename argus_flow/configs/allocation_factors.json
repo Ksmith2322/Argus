@@ -44,9 +44,10 @@
     "forge_credit_spread_regime": 0.0,
     "forge_sell_in_may_modulated": 0.0,
     "forge_xs_momentum_consensus": 0.0,
-    "forge_turn_of_quarter": 0.0
+    "forge_turn_of_quarter": 0.0,
+    "forge_uso_pm_long": 0.3
   },
-  "version": "2026-05-25.v26_turn_of_quarter_killed",
+  "version": "2026-05-26.v27_uso_pm_long_added",
   "last_updated": "2026-05-26T00:50:00.000000+00:00",
   "_kill_log": [
     "2026-04-30: forge_spy_mean_rev -> 0.0 (PF<1, structural loser, no recovery path)",
@@ -75,5 +76,6 @@
     "2026-05-25 (v18): WALK-FORWARD OOS REALLOCATION. Tonight's run_walk_forward_oos.py audit split 20y backtest into train (70%) + test (30%) and ranked each universe by whether train survivors STAYED survivors in test: broad_8 STRENGTHENED_OOS (IS Sharpe 1.06 -> OOS 1.22), style_factors_8 STRENGTHENED_OOS (1.18 -> 1.50), sectors_spdr_11 LUCKY_OOS (0.78 -> 1.35 — train fails, test passes = noise), legacy_15 BOTH_FAIL (0.65 -> 1.00, never had real edge in either window). Cut the OOS-weak variants in half: forge_xs_momentum_sectors 0.5 -> 0.25, forge_xs_momentum_legacy15 0.5 -> 0.25, forge_xs_momentum_legacy15_regime 0.5 -> 0.25. Keep them ALIVE (not 0.0) to collect live evidence over the 30-day window — if live PF agrees with the OOS verdict (likely underperformance), the next allocation review at 6/25 considers full kill. broad_8 stays at 1.0x, style + style_top3 stay at 0.5x — they earned their places. Total fleet allocation: 7 strategies summing to 3.25x vs previous 3.5x (saved 0.25x of capacity for re-deployment if a new winner emerges)."
   ],
   "_2026-05-22_change": "Reset cutover brought forward from 5/31. Activated 5-strategy survivor cohort at 0.5x. argus_usdjpy returned to 0.0.",
-  "_2026-05-23_change": "Concentrate-on-winner reweight per allocation analysis. forge_spy_trend_follower 0.5 -> 0.0 (correlates 0.614 with xs_momentum, redundant beta). forge_xs_momentum 0.5 -> 1.0 (only candidate passing the disciplined gate 8/8 layers). Projected forward CAGR roughly doubles (5% -> 10%) at the cost of higher single-strategy drawdown (-13% -> -27%). Full analysis: argus_flow/logs/allocation_analysis_20260523.md + memory project_2026_05_22_backtest_factory_findings.md."
+  "_2026-05-23_change": "Concentrate-on-winner reweight per allocation analysis. forge_spy_trend_follower 0.5 -> 0.0 (correlates 0.614 with xs_momentum, redundant beta). forge_xs_momentum 0.5 -> 1.0 (only candidate passing the disciplined gate 8/8 layers). Projected forward CAGR roughly doubles (5% -> 10%) at the cost of higher single-strategy drawdown (-13% -> -27%). Full analysis: argus_flow/logs/allocation_analysis_20260523.md + memory project_2026_05_22_backtest_factory_findings.md.",
+  "_2026-05-26_v27_change": "Added forge_uso_pm_long at 0.3x (client_id 131). PM-pattern sweep tested gld_pm_long's exact backtest logic on 13 candidate ETFs at realistic 5bps round-trip slippage; USO was the only survivor: gross PF 1.71 (matches GLD baseline 1.73), net PF 1.40 @ 5bps, bootstrap CI lower 1.20 (right at floor), 259 fills/yr from 18/19/20 UTC PM-window entries. ATR-based 1:0.5 target:stop, hold up to 4 bars. Independent edge family from xs_momentum (single-instrument intraday, not cross-sectional rank). Allocation 0.3x matches tom_spy entry tier; ladder up to 0.5x after 30d clean live evidence. ALSO surfaced concern: gld_pm_long PF crashes from 1.73 (gross) to 1.08 (net @ 5bps) and fails the disciplined gate at honest slippage -- flagged for June 30 decision doc review. See ops/reports/system_audit/pm_pattern_sweep.md."
 }

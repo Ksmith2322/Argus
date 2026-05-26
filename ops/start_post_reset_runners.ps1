@@ -44,7 +44,8 @@ $runners = @(
     @{Module='forge.xs_momentum.runner';            Args=@('--variant','global47','--loop');            ClientId=128; Alloc=0.25; Note='43-ETF global universe'},
     @{Module='forge.tom_spy.runner';                Args=@('--loop');                                    ClientId=129; Alloc=0.3;  Note='turn-of-month SPY (calendar)'},
     @{Module='forge.nov_spy.runner';                Args=@('--loop');                                    ClientId=130; Alloc=0.2;  Note='November-only SPY (calendar)'},
-    @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'}
+    @{Module='forge.xs_momentum_consensus.runner';  Args=@('--loop');                                    ClientId=$null; Alloc=0.0; Note='SHADOW -- virtual trades, no broker'},
+    @{Module='forge.uso_pm_long.runner';             Args=@('--loop');                                    ClientId=131; Alloc=0.3;  Note='hourly USO PM-long (v27)'}
 )
 
 # Modules that must NOT be running when this launcher fires. KILLED registry

@@ -83,6 +83,9 @@ STRATEGY_ROLES: dict[str, str] = {
     # they'll be evaluated against if/when activated)
     "forge_tom_spy": OFFENSE,        # PARTIAL_PASS at 1.20 floor; alpha-equivalent
     "forge_nov_spy": OFFENSE,        # MARGINAL_PASS at 1.20 floor; alpha-equivalent
+    # 2026-05-26: extends gld_pm_long pattern to USO. PF net 1.40 @ 5bps,
+    # CI lower 1.20 at gate floor. Independent intraday edge family.
+    "forge_uso_pm_long": OFFENSE,
 }
 
 

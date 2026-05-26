@@ -290,6 +290,17 @@ SYSTEMS = {
         "artifact_max_age_s": 86400,  # 24h — shadow runner, evaluates monthly + heartbeats hourly
         "no_restart": True,
     },
+    "forge_uso_pm_long": {
+        # 2026-05-26: hourly intraday on USO. Heartbeats at top of each
+        # signal hour + every 5 min during eval loop. 2h max age covers
+        # the 3-hour 18-21 UTC PM window with reasonable slack.
+        "heartbeats": [],
+        "stale_threshold_s": 0,
+        "process_match": "forge.uso_pm_long.runner",
+        "artifact_glob": str(REPO / "forge" / "logs" / "uso_pm_long" / "heartbeat.json"),
+        "artifact_max_age_s": 7200,
+        "no_restart": True,
+    },
     "forge_nq_overnight": {
         "heartbeats": [],
         "stale_threshold_s": 0,
