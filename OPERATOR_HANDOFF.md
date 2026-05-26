@@ -440,6 +440,37 @@ anyone with read access can post to your Discord.
 
 ---
 
+## 1.47. Tuesday 2026-05-26 evening — Gateway API issue (NEEDS MANUAL CLICK)
+
+**Symptom**: PM-window runners (`forge_gld_pm_long`, `forge_uso_pm_long`) silently failed every signal-hour evaluation since the 5/22 reset with `BrokerEquityUnavailableError: broker equity unavailable and last-known-good cache absent`. Vetting rollup (`ops/audit/run_vetting_rollup.py`) surfaced it as a cadence violation: expected ~5 PM-window fills since reset, got 0.
+
+**Root cause chain**:
+1. Gateway TCP port 4002 was up (Java process listening) but the IBKR API socket was refusing connections.
+2. Cascade: runner connects to IBKR fine -> calls `get_sizing_anchor_usd()` -> reads `risk_oversight_report.json` -> sees `account_equity_usd: 0.0` (because `argus_flow.ops.refresh_broker_equity` had been silently failing for hours with `ConnectionRefusedError`) -> raises `BrokerEquityUnavailableError`.
+3. This is *correct architectural behavior* per CLAUDE.md rule #2 (no fallback on broker equity) -- but the failure surface was invisible because no alert fired.
+
+**Partial fix shipped 2026-05-26 19:42 UTC**:
+- Killed stale Java (PID 22896 from earlier session).
+- Patched `C:\IBC\config_gateway.ini` line 329: `ExistingSessionDetectedAction=primary` -> `primaryoverride`. Without this, the new Gateway instance saw "Existing session detected (scenario 4)" and shut itself down rather than taking over.
+- Triggered `ArgusGatewayWatchdog` scheduled task. New Java (PID 7448) came up, IBC drove through login + Warning + Login Messages dialogs successfully.
+
+**Still broken**: Gateway API socket on 4002 still refuses connections. Most likely Gateway has its "Enable ActiveX and Socket Clients" disabled or trusted-IPs missing. Because `C:\Jts\jts.ini` has `useRemoteSettings=true`, the API config is loaded from IBKR's server-side account settings.
+
+**Operator action required** (pick ONE path):
+1. **Manual GUI path**: Right-click the Gateway icon in system tray -> Restore -> Configure -> API -> Settings -> verify "Enable ActiveX and Socket Clients" is checked, Socket port is 4002, "Read-Only API" is unchecked, and 127.0.0.1 is in Trusted IPs. OK -> let runners retry on next signal hour.
+2. **IBKR web path**: Log into Account Management at interactivebrokers.com -> Settings -> API -> enable the same flags. Restart Gateway via watchdog task.
+
+**Verification command** (run after the fix):
+```powershell
+C:\Argus\.venv\Scripts\python.exe -m argus_flow.ops.refresh_broker_equity
+# Then check: risk_oversight_report.json should show account_equity_usd > 0.
+# PM runners will pick it up automatically on their next signal-hour wake (18/19/20 UTC).
+```
+
+**Why I left it unfixed**: API enable/trusted-IP settings live behind a GUI checkbox or in IBKR Account Management, neither of which I can drive programmatically without UI automation. Documented here so any future Claude session sees the trail.
+
+---
+
 ## 1.46. Tuesday 2026-05-26 afternoon batch — STATUS
 
 **Compatibility-matrix sweep + 4-strategy expansion (v26 → v29).** Built and ran `ops/audit/run_extension_matrix_sweep.py` testing TOM + 12-month single-month patterns × 33 ETFs at 6bps RT slippage. 26 SURVIVES / 5 MARGINAL / 266 FAIL out of 297 cells. Plus earlier-in-day breakout sweep (EWZ won) + PM-pattern sweep (USO won). Net additions to active roster:
