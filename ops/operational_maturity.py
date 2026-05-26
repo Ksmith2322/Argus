@@ -35,36 +35,60 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 LOGS_DIR = REPO / "argus_flow" / "logs"
-POST_CLAMP_CUTOFF = datetime(2026, 4, 23, 14, 0, tzinfo=timezone.utc)  # reset day
+# 2026-05-26: epoch advanced to post_reset_20260522. Pre-reset trades
+# were contaminated by silent bugs (CBOT routing, Error 321, EXIT cascade,
+# sizing-formula at 38x leverage, etc.) and are not honest evidence.
+# Only trades AFTER this cutoff count toward live PF/maturity verdicts.
+POST_CLAMP_CUTOFF = datetime(2026, 5, 22, 18, 14, tzinfo=timezone.utc)
 
-# Strategies to track. Each entry maps strategy_id -> (csv_path, ts_col, backtest_pf).
-# backtest_pf is the published expectation; live_pf will be compared against it.
-# Backtest values match dashboard strategy_performance artifact sources.
+# v26 active roster only (matches argus_flow/configs/allocation_factors.json v26).
+# Killed/sunset strategies tracked separately (see _KILLED_STRATEGIES below)
+# and emitted with verdict="SUNSET" so the dashboard can dim them rather
+# than count them as active. backtest_pf values from the disciplined-gate
+# audit results (ops/reports/system_audit/static_vs_argus_benchmark.md +
+# argus_flow/configs/allocation_factors.json _kill_log).
 STRATEGIES: list[dict[str, Any]] = [
-    {"id": "argus_usdjpy",        "csv": "argus_flow/logs/usdjpy/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.20, "valid_filter": True},
-    {"id": "argus_gbpusd",        "csv": "argus_flow/logs/gbpusd/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.20, "valid_filter": True},
-    {"id": "argus_cadjpy",        "csv": "argus_flow/logs/cadjpy/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.01, "valid_filter": True},
-    {"id": "forge_gdx_gld",       "csv": "forge/logs/gdx_gld/trades.csv",             "ts_col": "exit_date", "pnl_col": "pnl_usd",  "bt_pf": 1.56, "valid_filter": False},
-    {"id": "forge_gld_pm_long",   "csv": "forge/logs/gld_pm_long/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.73, "valid_filter": False},
-    {"id": "forge_jpy_pm_short",  "csv": "forge/logs/jpy_pm_short/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.40, "valid_filter": False},
-    {"id": "forge_nq_overnight",  "csv": "forge/logs/nq_overnight/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.30, "valid_filter": False},
-    {"id": "forge_spy_mean_rev",  "csv": "forge/logs/spy_mean_rev/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.45, "valid_filter": False},
-    {"id": "forge_multi_orb",     "csv": "forge/logs/multi_orb/trades.csv",           "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.25, "valid_filter": False},
-    {"id": "forge_vix_intraday",  "csv": "forge/logs/vix_intraday/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.30, "valid_filter": False},
-    {"id": "forge_nq_london_close",    "csv": "forge/logs/nq_london_close/trades.csv",    "ts_col": "ts", "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": False},
-    {"id": "forge_aud_asian_breakout", "csv": "forge/logs/aud_asian_breakout/trades.csv", "ts_col": "ts", "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": False},
-    {"id": "forge_mamba",         "csv": "forge/logs/mamba/trades.csv",               "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 0.68, "valid_filter": False},
-    {"id": "forge_tori",          "csv": "forge/logs/tori/trades.csv",                "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 0.61, "valid_filter": False},
-    {"id": "forge_cuebanks",      "csv": "forge/logs/cuebanks/trades.csv",            "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 0.89, "valid_filter": False},
-    {"id": "forge_vix_revert",    "csv": "forge/logs/vix_revert/trades.csv",          "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 2.40, "valid_filter": False},
-    {"id": "forge_rebalance",     "csv": "forge/logs/rebalance/trades.csv",           "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 6.65, "valid_filter": False},
-    {"id": "forge_wick_gbpusd",   "csv": "forge/logs/wick_gbpusd/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.50, "valid_filter": False},
-    {"id": "apollo",              "csv": "apollo/logs/trades.csv",                    "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 2.00, "valid_filter": False},
-    {"id": "hermes",              "csv": "hermes/logs/trades.csv",                    "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.11, "valid_filter": False},
-    {"id": "titan",               "csv": "titan/logs/trades.csv",                     "ts_col": "ts",        "pnl_col": "pnl_usd",  "bt_pf": 1.52, "valid_filter": False},
-    {"id": "forge_fomc_drift",    "csv": "forge/logs/fomc_drift/trades.csv",          "ts_col": "entry_ts",  "pnl_col": "pnl_usd",  "bt_pf": 1.58, "valid_filter": False},
-    {"id": "forge_tom_international", "csv": "forge/logs/tom_international/trades.csv", "ts_col": "entry_ts", "pnl_col": "pnl_usd", "bt_pf": 1.31, "valid_filter": False},
+    {"id": "forge_xs_momentum",                  "csv": "forge/logs/xs_momentum/trades.csv",                 "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 3.30, "valid_filter": False},
+    {"id": "forge_xs_momentum_sectors",          "csv": "forge/logs/xs_momentum_sectors/trades.csv",         "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 2.50, "valid_filter": False},
+    {"id": "forge_xs_momentum_style",            "csv": "forge/logs/xs_momentum_style/trades.csv",           "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 3.78, "valid_filter": False},
+    {"id": "forge_xs_momentum_legacy15",         "csv": "forge/logs/xs_momentum_legacy15/trades.csv",        "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 2.22, "valid_filter": False},
+    {"id": "forge_xs_momentum_style_top3",       "csv": "forge/logs/xs_momentum_style_top3/trades.csv",      "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 5.40, "valid_filter": False},
+    {"id": "forge_xs_momentum_legacy15_regime",  "csv": "forge/logs/xs_momentum_legacy15_regime/trades.csv", "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 2.50, "valid_filter": False},
+    {"id": "forge_xs_momentum_global47",         "csv": "forge/logs/xs_momentum_global47/trades.csv",        "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 3.00, "valid_filter": False},
+    {"id": "forge_tail_hedge",                   "csv": "forge/logs/tail_hedge/trades.csv",                  "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 2.91, "valid_filter": False},
+    {"id": "forge_gld_pm_long",                  "csv": "forge/logs/gld_pm_long/trades.csv",                 "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.73, "valid_filter": False},
+    {"id": "forge_tom_spy",                      "csv": "forge/logs/tom_spy/trades.csv",                     "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 1.90, "valid_filter": False},
+    {"id": "forge_nov_spy",                      "csv": "forge/logs/nov_spy/trades.csv",                     "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 4.92, "valid_filter": False},
 ]
+
+# Killed/sunset strategies — kept here so historical trades remain
+# visible in the dated archive reports + are auto-marked SUNSET in
+# the verdict surface (vs INSUFFICIENT_DATA which implies "still trying").
+_KILLED_STRATEGIES: list[dict[str, Any]] = [
+    {"id": "argus_usdjpy",             "csv": "argus_flow/logs/usdjpy/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": True},
+    {"id": "argus_gbpusd",             "csv": "argus_flow/logs/gbpusd/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": True},
+    {"id": "argus_cadjpy",             "csv": "argus_flow/logs/cadjpy/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.01, "valid_filter": True},
+    {"id": "forge_gdx_gld",            "csv": "forge/logs/gdx_gld/trades.csv",             "ts_col": "exit_date", "pnl_col": "pnl_usd", "bt_pf": 1.56, "valid_filter": False},
+    {"id": "forge_jpy_pm_short",       "csv": "forge/logs/jpy_pm_short/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.40, "valid_filter": False},
+    {"id": "forge_nq_overnight",       "csv": "forge/logs/nq_overnight/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.30, "valid_filter": False},
+    {"id": "forge_spy_mean_rev",       "csv": "forge/logs/spy_mean_rev/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.45, "valid_filter": False},
+    {"id": "forge_multi_orb",          "csv": "forge/logs/multi_orb/trades.csv",           "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.25, "valid_filter": False},
+    {"id": "forge_vix_intraday",       "csv": "forge/logs/vix_intraday/trades.csv",        "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.30, "valid_filter": False},
+    {"id": "forge_nq_london_close",    "csv": "forge/logs/nq_london_close/trades.csv",     "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": False},
+    {"id": "forge_aud_asian_breakout", "csv": "forge/logs/aud_asian_breakout/trades.csv",  "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.20, "valid_filter": False},
+    {"id": "forge_mamba",              "csv": "forge/logs/mamba/trades.csv",               "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 0.68, "valid_filter": False},
+    {"id": "forge_tori",               "csv": "forge/logs/tori/trades.csv",                "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 0.61, "valid_filter": False},
+    {"id": "forge_cuebanks",           "csv": "forge/logs/cuebanks/trades.csv",            "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 0.89, "valid_filter": False},
+    {"id": "forge_vix_revert",         "csv": "forge/logs/vix_revert/trades.csv",          "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 2.40, "valid_filter": False},
+    {"id": "forge_rebalance",          "csv": "forge/logs/rebalance/trades.csv",           "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 6.65, "valid_filter": False},
+    {"id": "forge_wick_gbpusd",        "csv": "forge/logs/wick_gbpusd/trades.csv",         "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.50, "valid_filter": False},
+    {"id": "apollo",                   "csv": "apollo/logs/trades.csv",                    "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 2.00, "valid_filter": False},
+    {"id": "hermes",                   "csv": "hermes/logs/trades.csv",                    "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.11, "valid_filter": False},
+    {"id": "titan",                    "csv": "titan/logs/trades.csv",                     "ts_col": "ts",        "pnl_col": "pnl_usd", "bt_pf": 1.52, "valid_filter": False},
+    {"id": "forge_fomc_drift",         "csv": "forge/logs/fomc_drift/trades.csv",          "ts_col": "entry_ts",  "pnl_col": "pnl_usd", "bt_pf": 1.58, "valid_filter": False},
+    {"id": "forge_tom_international",  "csv": "forge/logs/tom_international/trades.csv",   "ts_col": "entry_ts",  "pnl_col": "pnl_usd", "bt_pf": 1.31, "valid_filter": False},
+]
+_KILLED_IDS: set[str] = {s["id"] for s in _KILLED_STRATEGIES}
 
 
 @dataclass
@@ -204,20 +228,32 @@ def compute_strategy_report(spec: dict, cutoff: datetime) -> StrategyReport:
 
 
 def build_report(cutoff: datetime) -> dict:
-    reports = [compute_strategy_report(spec, cutoff) for spec in STRATEGIES]
+    # 2026-05-26: emit ACTIVE v26 roster + SUNSET historical strategies
+    # separately. Active reports drive verdict counts; sunset reports
+    # preserve historical trade data but are tagged so the dashboard
+    # can dim/exclude them from the headline counts.
+    active_reports = [compute_strategy_report(spec, cutoff) for spec in STRATEGIES]
+    sunset_reports = [compute_strategy_report(spec, cutoff) for spec in _KILLED_STRATEGIES]
+    for r in sunset_reports:
+        r.verdict = "SUNSET"
+        r.verdict_reason = f"killed/sunset before cutoff {cutoff.date()}; historical only"
     totals = {
-        "strategies_count": len(reports),
-        "total_live_trades": sum(r.live_trades for r in reports),
+        "strategies_count": len(active_reports),       # v26 active only
+        "sunset_count": len(sunset_reports),
+        "total_live_trades": sum(r.live_trades for r in active_reports),
+        "total_sunset_trades": sum(r.live_trades for r in sunset_reports),
         "verdict_counts": {},
-        "total_live_pnl_usd": round(sum(r.live_total_pnl_usd for r in reports), 2),
+        "total_live_pnl_usd": round(sum(r.live_total_pnl_usd for r in active_reports), 2),
     }
-    for r in reports:
+    for r in active_reports:
         totals["verdict_counts"][r.verdict] = totals["verdict_counts"].get(r.verdict, 0) + 1
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "post_clamp_cutoff": cutoff.isoformat(),
+        "epoch_id": "post_reset_20260522",
         "totals": totals,
-        "strategies": [asdict(r) for r in reports],
+        "strategies": [asdict(r) for r in active_reports],   # dashboard reads this list
+        "sunset_strategies": [asdict(r) for r in sunset_reports],
     }
 
 
@@ -253,7 +289,7 @@ def to_markdown(report: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cutoff", help="ISO timestamp for post-clamp cutoff (default: 2026-04-23T14:00:00Z)")
+    parser.add_argument("--cutoff", help="ISO timestamp for post-clamp cutoff (default: 2026-05-22T18:14:00Z post_reset_20260522)")
     parser.add_argument("--stdout", action="store_true", help="Also print markdown to stdout")
     args = parser.parse_args(argv)
 

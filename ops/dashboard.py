@@ -7232,6 +7232,18 @@ async def api_positions_open():
         REPO / "hermes" / "logs",
         REPO / "titan" / "logs",
     ]
+    # 2026-05-26: filter out KILLED-strategy phantoms. Their heartbeat.json
+    # may still hold stale open_trade dicts from before the kill date. The
+    # cluster_exposure scan + dashboard were showing these as live positions,
+    # creating phantom risk numbers. Source of truth: helio.roi_filter
+    # KILLED_STRATEGY_CUTOFFS (the runtime invariant that submit_bracket
+    # uses to refuse new entries from killed strategies).
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS as _KILLED_CUTOFFS
+        _killed_set = set(_KILLED_CUTOFFS.keys())
+    except Exception:
+        _killed_set = set()
+
     for root in hb_roots:
         if not root.exists():
             continue
@@ -7245,6 +7257,16 @@ async def api_positions_open():
             open_trade = hb.get("open_trade")
             open_trades = hb.get("open_trades")  # some strategies use plural
             system = hb.get("system") or hb_path.parent.name
+            # Map common heartbeat-system labels back to canonical strategy
+            # IDs used by the kill registry. argus per-pair labels like
+            # "usdjpy"/"gbpusd"/"cadjpy" map to argus_<pair>.
+            canonical = system
+            if canonical in ("usdjpy", "gbpusd", "cadjpy") or canonical.lower() in ("usdjpy", "gbpusd", "cadjpy"):
+                canonical = f"argus_{canonical.lower()}"
+            elif not canonical.startswith(("argus_", "forge_", "apollo", "hermes", "titan")):
+                canonical = f"forge_{canonical}"
+            if canonical in _killed_set:
+                continue  # skip phantom open_trade from killed strategy
             if open_trade and isinstance(open_trade, dict):
                 positions.append({
                     "strategy": system,
@@ -7443,8 +7465,10 @@ async def api_operational_maturity():
     return JSONResponse({
         "generated_at": data.get("generated_at"),
         "post_clamp_cutoff": data.get("post_clamp_cutoff"),
+        "epoch_id": data.get("epoch_id"),                # 2026-05-26: surface epoch
         "totals": data.get("totals", {}),
         "strategies": data.get("strategies", []),
+        "sunset_strategies": data.get("sunset_strategies", []),  # 2026-05-26: historical
     })
 
 
@@ -7786,34 +7810,31 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
     `window_days` (default 90) restricts to recent trades so the 20-year
     historical gdx_gld back-fill doesn't dominate the visual.
     """
+    # 2026-05-26: v26 active roster only — pre-sunset PnL was contaminated
+    # (CBOT bug, sizing-formula 38x leverage, JPY-decimal, etc.) and isn't
+    # honest evidence. Historical/killed strategies are tracked separately
+    # in operational_maturity.sunset_strategies if needed.
     specs = [
-        ("argus_usdjpy",            "argus_flow/logs/usdjpy/trades.csv",             "ts",        "pnl_usd", True),
-        ("argus_gbpusd",            "argus_flow/logs/gbpusd/trades.csv",             "ts",        "pnl_usd", True),
-        ("argus_cadjpy",            "argus_flow/logs/cadjpy/trades.csv",             "ts",        "pnl_usd", True),
-        ("forge_gld_pm_long",       "forge/logs/gld_pm_long/trades.csv",             "ts",        "pnl_usd", False),
-        ("forge_wick_gbpusd",       "forge/logs/wick_gbpusd/trades.csv",             "ts",        "pnl_usd", False),
-        ("forge_nq_overnight",      "forge/logs/nq_overnight/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_jpy_pm_short",      "forge/logs/jpy_pm_short/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_gdx_gld",           "forge/logs/gdx_gld/trades.csv",                 "exit_date", "pnl_usd", False),
-        ("forge_multi_orb",         "forge/logs/multi_orb/trades.csv",               "ts",        "pnl_usd", False),
-        ("forge_vix_intraday",      "forge/logs/vix_intraday/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_spy_mean_rev",      "forge/logs/spy_mean_rev/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_nq_london_close",   "forge/logs/nq_london_close/trades.csv",         "ts",        "pnl_usd", False),
-        ("forge_aud_asian_breakout","forge/logs/aud_asian_breakout/trades.csv",      "ts",        "pnl_usd", False),
-        ("forge_mamba",             "forge/logs/mamba/trades.csv",                   "ts",        "pnl_usd", False),
-        ("forge_tori",              "forge/logs/tori/trades.csv",                    "ts",        "pnl_usd", False),
-        ("forge_cuebanks",          "forge/logs/cuebanks/trades.csv",                "ts",        "pnl_usd", False),
-        ("forge_vix_revert",        "forge/logs/vix_revert/trades.csv",              "ts",        "pnl_usd", False),
-        ("forge_rebalance",         "forge/logs/rebalance/trades.csv",               "ts",        "pnl_usd", False),
-        ("apollo",                  "apollo/logs/trades.csv",                        "ts",        "pnl_usd", False),
-        ("hermes",                  "hermes/logs/trades.csv",                        "ts",        "pnl_usd", False),
-        ("titan",                   "titan/logs/trades.csv",                         "ts",        "pnl_usd", False),
-        ("forge_fomc_drift",        "forge/logs/fomc_drift/trades.csv",              "entry_ts",  "pnl_usd", False),
-        ("forge_tom_international", "forge/logs/tom_international/trades.csv",       "entry_ts",  "pnl_usd", False),
+        ("forge_xs_momentum",                  "forge/logs/xs_momentum/trades.csv",                 "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_sectors",          "forge/logs/xs_momentum_sectors/trades.csv",         "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_style",            "forge/logs/xs_momentum_style/trades.csv",           "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_legacy15",         "forge/logs/xs_momentum_legacy15/trades.csv",        "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_style_top3",       "forge/logs/xs_momentum_style_top3/trades.csv",      "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_legacy15_regime",  "forge/logs/xs_momentum_legacy15_regime/trades.csv", "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_global47",         "forge/logs/xs_momentum_global47/trades.csv",        "exit_date", "pnl_usd", False),
+        ("forge_tail_hedge",                   "forge/logs/tail_hedge/trades.csv",                  "exit_date", "pnl_usd", False),
+        ("forge_gld_pm_long",                  "forge/logs/gld_pm_long/trades.csv",                 "ts",        "pnl_usd", False),
+        ("forge_tom_spy",                      "forge/logs/tom_spy/trades.csv",                     "exit_date", "pnl_usd", False),
+        ("forge_nov_spy",                      "forge/logs/nov_spy/trades.csv",                     "exit_date", "pnl_usd", False),
     ]
-    cutoff = None
+    # 2026-05-26: enforce post-reset epoch cutoff. Even within window_days,
+    # any trade before 2026-05-22 18:14 UTC (post_reset_20260522 start) is
+    # excluded -- those were contaminated bug-sized trades.
+    EPOCH_START = datetime(2026, 5, 22, 18, 14, tzinfo=timezone.utc)
+    cutoff = EPOCH_START
     if window_days and window_days > 0:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+        win_cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+        cutoff = max(cutoff, win_cutoff)
     live_cutoffs = _strategy_live_cutoffs()
 
     events: list[tuple[datetime, str, float]] = []
