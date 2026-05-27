@@ -1173,3 +1173,18 @@ the committed CI suggests for those two.
 
 42 tests passing (xs_momentum runner: 9, xs_momentum pure logic: 13,
 live_gate_monitor: 20).
+
+---
+
+## 1.48. Tuesday 2026-05-26 late evening — disabled ArgusManagedTruth scheduled task
+
+**Symptom**: Discord alerts firing every 1-3 minutes through the evening:
+- WARNING: `STALE for USD/JPY: runner=FLAT, broker=FLAT, hb_age=204617s, recon=CLEAN_FLAT`
+- CRITICAL: `max managed-fleet reconciles exhausted - 3 attempts in the last hour. Manual intervention needed.`
+
+**Root cause**: `ops/watchdog_managed.ps1` runs via `ArgusManagedTruth` scheduled task. It's a legacy watchdog from the pre-sunset era — it monitors argus FX trio (usdjpy/gbpusd/cadjpy) + Greek family (apollo/hermes/titan/ares) and tries to restart their runners on stale heartbeats. ALL of those strategies are in `helio.roi_filter.KILLED_STRATEGY_CUTOFFS` since the 2026-05-20 sunset batch. The watchdog has nothing legitimate to watch but was still firing alerts every hour about its "failures" to keep them alive.
+
+**Resolution**: `Disable-ScheduledTask -TaskName 'ArgusManagedTruth'` + killed in-flight PID 26712. Fleet_monitor (`helio.fleet_monitor`) handles the current active fleet via the SYSTEMS dict; nothing else needs the legacy managed-truth watchdog.
+
+**Re-enable conditions**: if any argus FX or Greek-family strategy is ever revived from the kill registry, also re-enable this task. Otherwise leave disabled.
+
