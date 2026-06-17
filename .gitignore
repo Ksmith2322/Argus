@@ -1,66 +1,66 @@
-﻿# --- Python ---
-__pycache__/
+
+
+!argus_flow/configs/*.json
+!data/btc_usd_1m.csv
+!data/eth_usd_1m.csv
+!data/sol_usd_1m.csv
+!ops/coin_pool.json
+# --- Argus Flow (Cascade/IBKR) ---
+# --- Backtest artifacts ---
+# --- Candle data (keep in repo for PC2 sync) ---
+# --- Env / secrets ---
+# --- OS / editor ---
+# --- Runtime flag files (operational state, not source) ---
+# --- Runtime outputs ---
+# .env
+# .env is tracked intentionally for PC1/PC2 sync (paper trading only — no real keys)
+# Coinbase API credentials
+# Data files too large for git (re-downloadable)
+# Forge runtime data (databases, generated artifacts)
+# IB Gateway installer
+# Keep configs in git
+# Remove this comment and uncomment the lines below before adding real API credentials
+*.csv
+*.egg-info/
+*.env
+*.json
+*.lock
+*.log
+*.pidlock
 *.py[cod]
 *.pyd
 *.so
-*.egg-info/
-.venv/
-venv/
-
-# --- Env / secrets ---
-# .env is tracked intentionally for PC1/PC2 sync (paper trading only — no real keys)
-# Remove this comment and uncomment the lines below before adding real API credentials
-# .env
-*.env
+.DS_Store
 .env.*
-
-# --- Runtime outputs ---
-logs/
-ops/logs/
-*.log
-*.csv
-*.json
+.env.coinbase
 .pycache_verify/
-!ops/coin_pool.json
-
-# --- Runtime flag files (operational state, not source) ---
-PAUSE_ENTRIES
-KILL_SWITCH
+.tmp*/
 .tmp_*/
-*.lock
-*.pidlock
-
-# --- Candle data (keep in repo for PC2 sync) ---
-!data/eth_usd_1m.csv
-!data/btc_usd_1m.csv
-!data/sol_usd_1m.csv
-
-# --- Backtest artifacts ---
-bt_summary_latest.json
-bt_summary_*.json
+.venv/
+.vscode/
+KILL_SWITCH
+PAUSE_ENTRIES
+Thumbs.db
+__pycache__/
+_tmp/
+argus_flow/data/
+argus_flow/logs/
+argus_flow/replay_out/
 backtest/trades_debug.csv
 backtest/trades_from_events.csv
-
-# --- OS / editor ---
-.DS_Store
-Thumbs.db
-.vscode/
-.tmp*/
-
-# Coinbase API credentials
+bt_summary_*.json
+bt_summary_latest.json
 cdp_api_key.json
-.env.coinbase
-
-# --- Argus Flow (Cascade/IBKR) ---
-# Data files too large for git (re-downloadable)
-argus_flow/data/
-argus_flow/replay_out/
-argus_flow/logs/
-# Keep configs in git
-!argus_flow/configs/*.json
-# IB Gateway installer
-ibgateway-*.exe
-
-# Forge runtime data (databases, generated artifacts)
 forge/data/
 forge/logs/
+ibgateway-*.exe
+logs/
+ops/logs/
+pytest-cache-files-*/
+secrets/
+venv/
+
+# Whitelists that must come AFTER *.json above to take effect
+!argus_flow/configs/*.json
+!helio/backtest_factory/configs/*.json
+﻿# --- Python ---

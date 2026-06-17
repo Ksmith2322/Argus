@@ -4,7 +4,7 @@ param(
     [hashtable]$EnvOverrides = @{}  # e.g. @{USE_TRENDLINES="true"; TL_PENALTY_RESIST_SLOPE_NEG="5"}
 )
 
-$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.101"
 $BRANCH = "phase6-hardening"
 
 Write-Host "--- DISPATCH TO PC2 ---"

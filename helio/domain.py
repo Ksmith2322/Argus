@@ -29,6 +29,26 @@ Direction = Literal["long", "short", ""]
 Side = Literal["ENTRY", "EXIT", ""]
 
 
+def make_lineage_id(
+    strategy: str,
+    session_id: str | None,
+    entry_order_id: str | None,
+) -> str:
+    """Compose a stable lineage identifier for an entry intent.
+
+    Format: ``<strategy>.<session_id>.<entry_order_id>``. The session_id
+    isolates within-process intents (a runner restart produces a new
+    session and therefore a new lineage namespace); the entry_order_id
+    discriminates concurrent intents within one session.
+
+    Either part may be empty; the helper emits ``"-"`` placeholders so
+    the format stays parseable. Callers that don't have a session yet
+    (e.g., paper-only signals before a broker order id exists) can still
+    produce a useful key via ``strategy + "" + ""`` = ``strategy.-.-``.
+    """
+    return f"{strategy}.{(session_id or '-')[:24]}.{(entry_order_id or '-')[:24]}"
+
+
 def _coerce_float(v: Any) -> Optional[float]:
     """Tolerate 'price is a string like "159.736"' rows from historical CSVs."""
     if v is None or v == "":
@@ -62,6 +82,14 @@ class Fill:
     exit_reason: Optional[str] = None
     broker_anchor_at_fill_usd: Optional[float] = None
     source: Optional[str] = None                  # "backfill_from_trade_csv" | None (live)
+    # Codex audit 2026-05-18 X3+X7 prerequisite: a stable lineage identifier
+    # so each broker fill can be attributed to a specific strategy intent,
+    # not just a symbol. Format: "<strategy>.<session_id>.<entry_order_id>".
+    # ENTRY rows compute lineage_id from their own order_id; matching EXIT
+    # rows copy the ENTRY lineage_id. Enables intent-based reconciliation
+    # (which strategy *intended* this position) rather than symbol-based
+    # (which strategy *trades* this symbol).
+    lineage_id: Optional[str] = None
     extra: Optional[dict] = None
 
     @classmethod
@@ -84,17 +112,22 @@ class Fill:
             exit_reason=row.get("exit_reason"),
             broker_anchor_at_fill_usd=_coerce_float(row.get("broker_anchor_at_fill_usd")),
             source=row.get("source"),
+            lineage_id=row.get("lineage_id"),
             extra=row.get("extra"),
         )
 
     def to_canonical_row(self) -> dict:
         """Serialize back to the canonical_fills.jsonl shape.
-        Drops None-valued 'extra' and 'source' for symmetry with write_fill()."""
+        Drops None-valued 'extra', 'source', and 'lineage_id' for symmetry
+        with write_fill() (older rows lack the field; writer omits it when
+        unset to preserve dedup-key stability)."""
         d = asdict(self)
         if d.get("extra") is None:
             d.pop("extra", None)
         if d.get("source") is None:
             d.pop("source", None)
+        if d.get("lineage_id") is None:
+            d.pop("lineage_id", None)
         return d
 
 

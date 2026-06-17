@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$PC2 = "ksmith2322@yahoo.com@192.168.1.98"
+$PC2 = "ksmith2322@yahoo.com@192.168.1.101"
 $BRANCH = "phase6-hardening"
 
 Set-Location C:\Argus\repo

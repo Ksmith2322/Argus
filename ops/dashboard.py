@@ -483,7 +483,7 @@ def read_queue_status(skip_pc2: bool = False) -> dict:
 
 # --- PC2 status (cached SSH, refreshes every 60s) ---
 _pc2_cache: dict = {"ts": 0, "data": None}
-PC2_SSH = 'ksmith2322@yahoo.com@192.168.1.98'
+PC2_SSH = 'ksmith2322@yahoo.com@192.168.1.101'
 PC2_CACHE_TTL = 60  # seconds
 
 
@@ -1956,7 +1956,13 @@ def _build_paper_model_summary() -> dict:
     """Build a clearly labeled hypothetical validation account model."""
     deployment = _load_deployment_registry()
     policy = deployment.get("risk_policy", {}) if isinstance(deployment.get("risk_policy", {}), dict) else {}
-    start_equity = float(policy.get("model_start_equity_usd", PAPER_MODEL_START_USD) or PAPER_MODEL_START_USD)
+    # `model_start_equity_usd` may be a number OR the sentinel string
+    # "fleet_anchor" meaning "use the live broker anchor". Coerce the
+    # sentinel before float() to avoid ValueError in the 200-response path.
+    raw_start = policy.get("model_start_equity_usd", PAPER_MODEL_START_USD)
+    if isinstance(raw_start, str):
+        raw_start = PAPER_MODEL_START_USD
+    start_equity = float(raw_start or PAPER_MODEL_START_USD)
     base_risk_pct = float(policy.get("base_risk_pct", PAPER_MODEL_BASE_RISK_PCT) or PAPER_MODEL_BASE_RISK_PCT)
     cap_risk_pct = float(policy.get("earned_cap_pct", PAPER_MODEL_CAP_RISK_PCT) or PAPER_MODEL_CAP_RISK_PCT)
     manual_step_up_required = bool(policy.get("manual_step_up_required", False))
@@ -2726,6 +2732,658 @@ async def api_stage_history():
         return JSONResponse({"events": [], "count": 0, "error": str(e)})
 
 
+@app.get("/api/cohort_gate_status")
+async def api_cohort_gate_status():
+    """Live disciplined-gate status per cohort strategy.
+
+    For each strategy in argus_flow/configs/promotion_gate_baseline.json,
+    compares the rolling live PF (last 30 trades and last 90 days) to the
+    offline disciplined-gate CI lower bound. Returns per-strategy verdict:
+    PASS_GATE / WARNING / FAIL / INSUFFICIENT_N / NO_BASELINE.
+
+    Computes on-demand; no caching. Cheap (~50ms for the full cohort).
+    """
+    try:
+        from helio.live_gate_monitor import evaluate_cohort
+        report = evaluate_cohort()
+        return JSONResponse(report)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": "baseline config not found",
+                              "detail": str(e)}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": "evaluation failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/roster_state")
+async def api_roster_state():
+    """Roster classification — every strategy bucketed into ACTIVE /
+    KILLED / PENDING_OPT_IN / LIMBO / ABANDONED. Single source of
+    truth for 'what's the actual state of the fleet right now'.
+
+    Composes allocation_factors + KILLED_STRATEGY_CUTOFFS + the
+    ACTIVE_ROSTER test pin + runner-file inventory.
+
+    Cheap (~10ms); no caching."""
+    try:
+        from ops.audit.run_roster_state import classify_all
+        rows = classify_all()
+        counts: dict = {}
+        for r in rows:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        return JSONResponse({
+            "verdict_counts": counts,
+            "strategies": rows,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "roster_state failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/real_money_preflight")
+async def api_real_money_preflight():
+    """12-point real-money preflight per ACTIVE strategy.
+
+    Returns one StrategyPreflight per strategy in test_sunset_roster.ACTIVE_ROSTER.
+    Each entry has verdict (READY_FOR_REAL / BLOCKED_PENDING_REVIEW / BLOCKED)
+    + per-check GREEN/YELLOW/RED breakdown.
+
+    Computes on-demand; ~100ms (incl. capacity_stress.json read + heartbeat
+    stat calls). No mutations — diagnosis only."""
+    try:
+        from helio.real_money_preflight import evaluate_strategy
+        try:
+            from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+            strategies = sorted(ACTIVE_ROSTER)
+        except Exception:
+            strategies = []
+        results = []
+        for s in strategies:
+            try:
+                p = evaluate_strategy(s)
+                results.append(p.to_dict())
+            except Exception as exc:
+                results.append({"strategy": s, "error": str(exc)})
+        return JSONResponse({"strategies": results})
+    except Exception as e:
+        return JSONResponse({"error": "preflight failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/fleet_snapshot")
+async def api_fleet_snapshot():
+    """Composite fleet snapshot — roster + allocation + capacity + heartbeats
+    + canonical_fills + xs_momentum picks + preflight. Same content as
+    `python -m ops.audit.run_fleet_snapshot --json`.
+
+    More expensive (~3-5s if xs_momentum picks live yfinance fetch is
+    included). Pass ?skip_yf=1 to skip the yfinance query."""
+    try:
+        from ops.audit.run_fleet_snapshot import build_snapshot
+        snapshot = build_snapshot()
+        return JSONResponse(snapshot)
+    except Exception as e:
+        return JSONResponse({"error": "fleet_snapshot failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/data_feed_contracts")
+async def api_data_feed_contracts():
+    """Offline verification of each strategy's declared data-feed
+    contract (Codex gap #1). Per strategy:
+        GREEN  — every ticker fresh in fallback cache
+        YELLOW — at least one ticker stale beyond freshness budget
+        RED    — at least one missing OR all uniformly stale
+
+    Cheap (<50ms) — reads CSV header + last Date row only."""
+    try:
+        from helio.data_feed_contract import verify_all_contracts
+        verdicts = verify_all_contracts()
+        counts: dict = {}
+        for v in verdicts.values():
+            counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        return JSONResponse({
+            "verdict_counts": counts,
+            "contracts": verdicts,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "data_feed_contracts failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/active_alpha_readiness")
+async def api_active_alpha_readiness():
+    """Synthesis report: preflight + canonical_fills + blockers +
+    exposure + role/floor for each active strategy. Same content as
+    `python -m ops.audit.run_active_alpha_readiness --stdout`.
+
+    Per strategy: verdict (READY_TO_SCALE / REVIEW_BEFORE_SCALE /
+    GATED_REVIEW / EVIDENCE_BUILDING / BLOCKED), reasons, role, and
+    pf_floor.
+
+    Moderate cost (~300ms — runs full preflight + canonical scan).
+    Returns the same JSON as the CLI."""
+    try:
+        from ops.audit.run_active_alpha_readiness import build_report
+        return JSONResponse(build_report())
+    except Exception as e:
+        return JSONResponse({"error": "active_alpha_readiness failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/pre_market_check")
+async def api_pre_market_check():
+    """Pre-market readiness audit. Composes daily_health_check +
+    data_feed_contracts (with auto-refresh if RED) + restart status +
+    heartbeat freshness + flag check + first-action calendar.
+
+    Single verdict (READY / REVIEW / NOT_READY) + reasons array.
+
+    Moderate cost (~2-5s — runs the full audit suite). Cached via
+    artifact at ops/reports/system_audit/pre_market_check.json.
+    Pass ?fresh=1 to force a re-run."""
+    try:
+        from pathlib import Path
+        import json as _json
+        from fastapi import Request  # noqa: F401  (imported elsewhere)
+
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "ops" / "reports" / "system_audit"
+                    / "pre_market_check.json")
+        if artifact.exists():
+            try:
+                return JSONResponse(_json.loads(
+                    artifact.read_text(encoding="utf-8")
+                ))
+            except Exception:
+                pass
+        # Live re-run (no data-feed refresh, faster + no network)
+        from ops.audit.run_pre_market_check import build_report
+        return JSONResponse(build_report())
+    except Exception as e:
+        return JSONResponse({"error": "pre_market_check failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/promotion_recommendations")
+async def api_promotion_recommendations():
+    """Pending auto-promotion recommendations.
+
+    Reads argus_flow/logs/auto_promotion_recommendations.json (last
+    snapshot from `python -m ops.auto_promotion`). Returns the
+    proposed allocation flips + confidence + reasons.
+
+    Cheap (~5ms — file read). Operator reviews from the panel +
+    runs `--apply --confirm` in CLI to actually flip allocations
+    (intentionally NOT a button — capital moves require operator
+    in the loop).
+    """
+    try:
+        from pathlib import Path
+        import json as _json
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "argus_flow" / "logs"
+                    / "auto_promotion_recommendations.json")
+        if not artifact.exists():
+            return JSONResponse({
+                "n_recommendations": 0,
+                "recommendations": [],
+                "hint": "run `python -m ops.auto_promotion` to snapshot",
+            })
+        return JSONResponse(_json.loads(
+            artifact.read_text(encoding="utf-8")
+        ))
+    except Exception as e:
+        return JSONResponse({"error": "promotion_recommendations failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/pnl_vs_benchmark")
+async def api_pnl_vs_benchmark(window_days: int = 30):
+    """Fleet realized PnL vs SPY + MTUM benchmark over the window.
+
+    The 5/25 audit's "skeptic" review highlighted that the fleet's
+    expected return is FACTOR BETA (zero alpha vs MKT+SMB+HML+MOM).
+    The honest metric isn't absolute PnL but PnL VS the benchmark
+    the strategy is actually exposed to.
+
+    Returns:
+      fleet_pnl_usd       — realized PnL from canonical_fills
+      fleet_pnl_pct       — % of $250K anchor (or supplied anchor)
+      spy_return_pct      — SPY total return same window
+      mtum_return_pct     — MTUM total return same window
+      excess_vs_spy_pct   — fleet_pct - spy_pct (positive = beating)
+      excess_vs_mtum_pct  — fleet_pct - mtum_pct
+      alpha_signal        — "tracking_beta" / "outperforming" /
+                            "underperforming" / "insufficient_data"
+
+    Cheap (~1-2s — single canonical_fills scan + 2 yfinance calls).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        fleet_pnl = 0.0
+        n_fills = 0
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = _json.loads(line)
+                    except Exception:
+                        continue
+                    if (row.get("side") or "").upper() != "EXIT":
+                        continue
+                    pnl = row.get("pnl_usd")
+                    if pnl is None:
+                        continue
+                    try:
+                        pnl = float(pnl)
+                    except (TypeError, ValueError):
+                        continue
+                    ts = row.get("ts") or row.get("exit_ts") or ""
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        continue
+                    fleet_pnl += pnl
+                    n_fills += 1
+
+        # Pull SPY + MTUM returns
+        try:
+            import yfinance as yf
+            spy = yf.download("SPY", period=f"{max(window_days + 5, 30)}d",
+                              interval="1d", progress=False, auto_adjust=False)
+            mtum = yf.download("MTUM", period=f"{max(window_days + 5, 30)}d",
+                              interval="1d", progress=False, auto_adjust=False)
+            def _ret(df, days):
+                if df is None or df.empty:
+                    return None
+                try:
+                    if hasattr(df.columns, "get_level_values"):
+                        try:
+                            closes = df["Close"]
+                            if hasattr(closes, "columns"):
+                                closes = closes.iloc[:, 0]
+                        except Exception:
+                            closes = df.iloc[:, df.columns.get_level_values(0) == "Close"].iloc[:, 0]
+                    else:
+                        closes = df["Close"]
+                    if len(closes) < 2:
+                        return None
+                    return float(closes.iloc[-1] / closes.iloc[0] - 1) * 100
+                except Exception:
+                    return None
+            spy_return_pct = _ret(spy, window_days)
+            mtum_return_pct = _ret(mtum, window_days)
+        except Exception:
+            spy_return_pct = None
+            mtum_return_pct = None
+
+        # Use a $250K anchor as default fleet base for percent math
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+        except Exception:
+            anchor = 250_000.0
+        fleet_pnl_pct = (fleet_pnl / anchor * 100) if anchor > 0 else 0
+
+        excess_vs_spy = (fleet_pnl_pct - spy_return_pct
+                         if spy_return_pct is not None else None)
+        excess_vs_mtum = (fleet_pnl_pct - mtum_return_pct
+                          if mtum_return_pct is not None else None)
+
+        # Honest alpha-signal classification
+        if n_fills < 20:
+            signal = "insufficient_data"
+        elif excess_vs_mtum is None:
+            signal = "no_benchmark"
+        elif excess_vs_mtum > 1.0:
+            signal = "outperforming"
+        elif excess_vs_mtum < -1.0:
+            signal = "underperforming"
+        else:
+            signal = "tracking_beta"
+
+        return JSONResponse({
+            "window_days": window_days,
+            "anchor_usd": anchor,
+            "fleet_pnl_usd": round(fleet_pnl, 2),
+            "fleet_pnl_pct": round(fleet_pnl_pct, 3),
+            "fleet_n_fills": n_fills,
+            "spy_return_pct": round(spy_return_pct, 3) if spy_return_pct is not None else None,
+            "mtum_return_pct": round(mtum_return_pct, 3) if mtum_return_pct is not None else None,
+            "excess_vs_spy_pct": round(excess_vs_spy, 3) if excess_vs_spy is not None else None,
+            "excess_vs_mtum_pct": round(excess_vs_mtum, 3) if excess_vs_mtum is not None else None,
+            "alpha_signal": signal,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "pnl_vs_benchmark failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/equity_curves_per_variant")
+async def api_equity_curves_per_variant(window_days: int = 90):
+    """Cumulative-PnL equity curve per strategy over a rolling window.
+
+    Walks canonical_fills, sorts EXIT rows by ts per strategy, accrues
+    a running cum_pnl_usd. Returns one series per strategy:
+        [{ts, cum_pnl_usd}, ...]
+
+    Default 90-day window. Empty curves are still returned (with a
+    zero-anchor point) so the panel can show "0 fills yet" placeholders.
+
+    Cheap (~20ms — single file scan + sort).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        # strategy -> list[(dt, pnl_usd)]
+        by_strat: dict[str, list] = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = _json.loads(line)
+                    except Exception:
+                        continue
+                    if (row.get("side") or "").upper() != "EXIT":
+                        continue
+                    pnl = row.get("pnl_usd")
+                    if pnl is None:
+                        continue
+                    try:
+                        pnl = float(pnl)
+                    except (TypeError, ValueError):
+                        continue
+                    ts = row.get("ts") or row.get("exit_ts") or ""
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        continue
+                    strat = row.get("strategy") or "?"
+                    by_strat.setdefault(strat, []).append((dt, pnl))
+
+        # Build cumulative curves
+        curves: dict[str, list] = {}
+        for strat, points in by_strat.items():
+            points.sort(key=lambda p: p[0])
+            cum = 0.0
+            series = []
+            for dt, pnl in points:
+                cum += pnl
+                series.append({"ts": dt.isoformat(),
+                               "cum_pnl_usd": round(cum, 2)})
+            curves[strat] = series
+
+        # Include zero-anchor series for ACTIVE strategies with no fills
+        try:
+            from argus_flow.tests.test_sunset_roster import ACTIVE_ROSTER
+            for s in ACTIVE_ROSTER:
+                if s not in curves:
+                    curves[s] = []
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "window_days": window_days,
+            "n_strategies": len(curves),
+            "curves": curves,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "equity_curves failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/pnl_attribution")
+async def api_pnl_attribution(window_days: int = 30):
+    """Per-strategy PnL attribution over a recent window.
+
+    Walks argus_flow/logs/canonical_fills.jsonl, sums realized
+    PnL per strategy, returns per-sleeve breakdown + totals.
+
+    Default window 30 days. Pass ?window_days=N to override.
+
+    Built to answer "when money is made (or lost), which sleeve
+    did it?" — the missing visibility for fleet-level decision
+    making. Cheap (~10ms — single file scan).
+    """
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        import json as _json
+        path = (Path(__file__).resolve().parents[1]
+                / "argus_flow" / "logs" / "canonical_fills.jsonl")
+        if not path.exists():
+            return JSONResponse({
+                "window_days": window_days,
+                "n_strategies": 0,
+                "per_strategy": [],
+                "fleet_total_pnl_usd": 0.0,
+                "fleet_n_trades": 0,
+                "note": "canonical_fills.jsonl not present yet",
+            })
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+        # strategy -> aggregate stats
+        agg: dict[str, dict] = {}
+        total_fleet_pnl = 0.0
+        total_fleet_trades = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                # Only count CLOSED trades (have realized pnl_usd)
+                if (row.get("side") or "").upper() != "EXIT":
+                    continue
+                pnl = row.get("pnl_usd")
+                if pnl is None:
+                    continue
+                try:
+                    pnl = float(pnl)
+                except (TypeError, ValueError):
+                    continue
+                ts = row.get("ts") or row.get("exit_ts") or ""
+                # Parse ts; skip trades older than window
+                if ts:
+                    try:
+                        s = str(ts).replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                strat = row.get("strategy") or "?"
+                a = agg.setdefault(strat, {
+                    "strategy": strat,
+                    "pnl_usd": 0.0,
+                    "n_trades": 0,
+                    "n_wins": 0,
+                    "n_losses": 0,
+                    "best_trade_usd": float("-inf"),
+                    "worst_trade_usd": float("inf"),
+                })
+                a["pnl_usd"] += pnl
+                a["n_trades"] += 1
+                if pnl > 0:
+                    a["n_wins"] += 1
+                elif pnl < 0:
+                    a["n_losses"] += 1
+                a["best_trade_usd"] = max(a["best_trade_usd"], pnl)
+                a["worst_trade_usd"] = min(a["worst_trade_usd"], pnl)
+                total_fleet_pnl += pnl
+                total_fleet_trades += 1
+
+        # Finalize: compute win_rate; clean up sentinel best/worst
+        per_strategy = []
+        for s in sorted(agg.values(), key=lambda x: -x["pnl_usd"]):
+            n = s["n_trades"]
+            s["win_rate"] = round(s["n_wins"] / n, 3) if n else None
+            s["pnl_usd"] = round(s["pnl_usd"], 2)
+            if s["best_trade_usd"] == float("-inf"):
+                s["best_trade_usd"] = 0.0
+            if s["worst_trade_usd"] == float("inf"):
+                s["worst_trade_usd"] = 0.0
+            s["best_trade_usd"] = round(s["best_trade_usd"], 2)
+            s["worst_trade_usd"] = round(s["worst_trade_usd"], 2)
+            per_strategy.append(s)
+
+        return JSONResponse({
+            "window_days": window_days,
+            "n_strategies": len(per_strategy),
+            "per_strategy": per_strategy,
+            "fleet_total_pnl_usd": round(total_fleet_pnl, 2),
+            "fleet_n_trades": total_fleet_trades,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "pnl_attribution failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/variant_exposure")
+async def api_variant_exposure():
+    """Combined holdings exposure across the 5 xs_momentum variants.
+
+    Answers "what would the variants hold combined on the next
+    rebalance day, and is there hidden concentration risk?" Two
+    strategies with rho=0.07 return correlation can still hold the
+    same instrument in different months — this audit catches that.
+
+    Cheap (~5-10s — runs ranking pipeline per variant, no order
+    submission). Returns per-variant picks + combined per-ticker
+    exposure + WARN/RED concentration flags.
+    """
+    try:
+        from ops.audit.run_variant_exposure_audit import (
+            _compute_combined_exposure,
+            _get_picks_for_variant,
+        )
+        from forge.xs_momentum.runner import _VARIANT_REGISTRY
+        try:
+            from helio.fleet_sizing import get_sizing_anchor_usd
+            anchor = float(get_sizing_anchor_usd())
+        except Exception:
+            anchor = 250_000.0
+        picks = [_get_picks_for_variant(v) for v in _VARIANT_REGISTRY]
+        exposure = _compute_combined_exposure(picks, anchor_usd=anchor)
+        return JSONResponse({
+            "anchor_usd": anchor,
+            "picks_per_variant": picks,
+            "exposure": exposure,
+        })
+    except Exception as e:
+        return JSONResponse({"error": "variant_exposure failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/cohort_correlation")
+async def api_cohort_correlation():
+    """Pairwise Pearson correlation of monthly returns across the 5
+    variants + per-variant Sharpe/DD + all-5 equal-weight portfolio
+    stats. Reads the persisted artifact (last run via the CLI); does
+    NOT trigger a fresh backtest (those take ~30s each)."""
+    try:
+        from pathlib import Path
+        import json as _json
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "ops" / "reports" / "system_audit"
+                    / "xs_momentum_cohort_correlation.json")
+        if artifact.exists():
+            return JSONResponse(_json.loads(
+                artifact.read_text(encoding="utf-8")
+            ))
+        return JSONResponse({
+            "error": "no artifact",
+            "hint": "run `python -m ops.audit.run_xs_momentum_cohort_correlation`",
+        }, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": "cohort_correlation failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/order_lifecycle")
+async def api_order_lifecycle():
+    """Per-lineage order lifecycle reconciliation (Codex X7).
+
+    Every distinct strategy intent classified as COMPLETE /
+    ORPHAN_ENTRY / ORPHAN_EXIT / DUPLICATE_ENTRY / PARTIAL_EXIT /
+    LINEAGE_MISSING. Aggregated by strategy.
+
+    Cheap (~50ms — single scan of canonical_fills.jsonl, no network).
+    """
+    try:
+        from helio.order_lifecycle import reconcile_all
+        return JSONResponse(reconcile_all())
+    except Exception as e:
+        return JSONResponse({"error": "order_lifecycle failed",
+                              "detail": str(e)}, status_code=500)
+
+
+@app.get("/api/daily_health_check")
+async def api_daily_health_check():
+    """Latest run of the 6-component daily health check (auto_pause,
+    orphan_phantom, data_feed, preflight, roster_state, flag_check).
+
+    Reads the persisted artifact if present (cheap), else triggers a
+    live re-run. Pass ?fresh=1 to force a re-run regardless."""
+    try:
+        from pathlib import Path
+        import json as _json
+
+        artifact = (Path(__file__).resolve().parents[1]
+                    / "argus_flow" / "logs" / "daily_health_check.json")
+        # Trigger fresh run unless the artifact is recent (<1h)
+        fresh_requested = False
+        try:
+            from fastapi import Request  # noqa: F401  (already imported elsewhere)
+        except ImportError:
+            pass
+
+        if artifact.exists():
+            try:
+                data = _json.loads(artifact.read_text(encoding="utf-8"))
+                return JSONResponse(data)
+            except Exception:
+                pass
+
+        # Fallback: live evaluation (no Discord post)
+        from ops.daily_health_check import evaluate
+        return JSONResponse(evaluate(post_discord=False))
+    except Exception as e:
+        return JSONResponse({"error": "daily_health_check failed",
+                              "detail": str(e)}, status_code=500)
+
+
 @app.get("/api/governance_health")
 async def api_governance_health():
     """Governance report freshness — shows what's blocking transitions."""
@@ -3402,8 +4060,35 @@ from ops.dashboard_data import (
 @app.get("/api/fleet_health")
 async def api_fleet_health():
     """Canonical fleet health — from argus_flow/logs/fleet_status.json
-    (written by helio.fleet_monitor every 60s)."""
-    return JSONResponse(_read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180))
+    (written by helio.fleet_monitor every 60s).
+
+    2026-05-26: post-filter the systems list to demote killed/sunset
+    strategies into a separate `sunset_systems` bucket so the dashboard
+    can render the active roster prominently without 22+ DOWN-tile noise
+    from strategies that intentionally aren't running. Source of truth
+    for the kill list is helio.roi_filter.KILLED_STRATEGY_CUTOFFS.
+    Falls back to passthrough if the kill registry can't be imported."""
+    data = _read_canonical_with_freshness("argus_flow/logs/fleet_status.json", 180)
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS as _KILLED
+        killed_set = set(_KILLED.keys())
+        # Map fleet_monitor system names that don't exactly match canonical
+        # strategy IDs. The argus group monitors all 3 FX pairs under one
+        # "argus" entry; all 3 pairs are killed so the umbrella counts.
+        if all(f"argus_{p}" in killed_set for p in ("usdjpy", "gbpusd", "cadjpy")):
+            killed_set.add("argus")
+        systems = data.get("systems") or {}
+        active = {k: v for k, v in systems.items() if k not in killed_set}
+        sunset = {k: v for k, v in systems.items() if k in killed_set}
+        data["systems"] = active
+        data["sunset_systems"] = sunset
+        data["_filter_note"] = (
+            f"systems filtered to active v26 roster; {len(sunset)} sunset "
+            f"strategies moved to sunset_systems"
+        )
+    except Exception:
+        pass
+    return JSONResponse(data)
 
 
 @app.get("/api/exit_reasons")
@@ -4247,20 +4932,32 @@ async def api_tws_health():
 
 @app.get("/api/halt_status")
 async def api_halt_status():
-    """Returns whether the fleet kill-switch is engaged and the stated reason."""
-    from helio.ibkr_execution import is_fleet_halted, HALT_FLAG_PATH
-    halted, reason = is_fleet_halted()
+    """Returns whether the fleet kill-switch is engaged and the stated reason.
+
+    Backed by the reconciled halt-state reader so the dashboard panel cannot
+    drift from execution truth. Surfaces every source independently
+    (HALT.flag, FLATTEN_EOD.flag, broker_drift) so the UI can show *why*.
+    """
+    from helio.ibkr_execution import HALT_FLAG_PATH
+    from helio.halt_state import get_halt_state
+    state = get_halt_state()
     set_at = None
-    if halted and HALT_FLAG_PATH.exists():
+    if state.halt_flag_present and HALT_FLAG_PATH.exists():
         try:
             set_at = datetime.fromtimestamp(HALT_FLAG_PATH.stat().st_mtime, tz=timezone.utc).isoformat()
         except Exception:
             pass
     return JSONResponse({
-        "halted": halted,
-        "reason": reason,
+        "halted": state.halted,
+        "reason": state.reason,
         "set_at": set_at,
         "flag_path": str(HALT_FLAG_PATH),
+        "sources": list(state.sources),
+        "halt_flag_present": state.halt_flag_present,
+        "flatten_flag_present": state.flatten_flag_present,
+        "broker_drift_tripped": state.broker_drift_tripped,
+        "broker_drift_state_ts": state.broker_drift_state_ts,
+        "checked_at": state.checked_at,
     })
 
 
@@ -4842,9 +5539,28 @@ async def api_strategy_actions(window_days: int = 30):
     # Sort order: SCALE_UP, HOLD, REDUCE, QUARANTINE, KILL, OBSERVE
     action_order = {"SCALE_UP": 0, "HOLD": 1, "REDUCE": 2, "QUARANTINE": 3, "KILL": 4, "OBSERVE": 5}
     rows.sort(key=lambda r: (action_order.get(r["action"], 6), -r["pnl_usd"]))
+
+    # Surface the current evidence epoch so consumers can refuse acting
+    # on recommendations computed against a contaminated epoch (Codex X4
+    # follow-up). Epoch lookup is best-effort — keeps the endpoint
+    # working even if helio.evidence_epoch is unavailable.
+    epoch_info: dict = {}
+    try:
+        from helio.evidence_epoch import current_epoch
+        ep = current_epoch()
+        epoch_info = {
+            "id": ep.id,
+            "label": ep.label,
+            "started_at": ep.started_at.isoformat(),
+            "is_clean": ep.is_clean,
+        }
+    except Exception as exc:
+        epoch_info = {"error": str(exc)}
+
     return JSONResponse({
         "window_days": window_days,
         "rules_version": "v2_2026-04-28",
+        "evidence_epoch": epoch_info,
         "strategies": rows,
         "summary": {
             "scale_up":   sum(1 for r in rows if r["action"] == "SCALE_UP"),
@@ -6543,6 +7259,18 @@ async def api_positions_open():
         REPO / "hermes" / "logs",
         REPO / "titan" / "logs",
     ]
+    # 2026-05-26: filter out KILLED-strategy phantoms. Their heartbeat.json
+    # may still hold stale open_trade dicts from before the kill date. The
+    # cluster_exposure scan + dashboard were showing these as live positions,
+    # creating phantom risk numbers. Source of truth: helio.roi_filter
+    # KILLED_STRATEGY_CUTOFFS (the runtime invariant that submit_bracket
+    # uses to refuse new entries from killed strategies).
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS as _KILLED_CUTOFFS
+        _killed_set = set(_KILLED_CUTOFFS.keys())
+    except Exception:
+        _killed_set = set()
+
     for root in hb_roots:
         if not root.exists():
             continue
@@ -6556,6 +7284,16 @@ async def api_positions_open():
             open_trade = hb.get("open_trade")
             open_trades = hb.get("open_trades")  # some strategies use plural
             system = hb.get("system") or hb_path.parent.name
+            # Map common heartbeat-system labels back to canonical strategy
+            # IDs used by the kill registry. argus per-pair labels like
+            # "usdjpy"/"gbpusd"/"cadjpy" map to argus_<pair>.
+            canonical = system
+            if canonical in ("usdjpy", "gbpusd", "cadjpy") or canonical.lower() in ("usdjpy", "gbpusd", "cadjpy"):
+                canonical = f"argus_{canonical.lower()}"
+            elif not canonical.startswith(("argus_", "forge_", "apollo", "hermes", "titan")):
+                canonical = f"forge_{canonical}"
+            if canonical in _killed_set:
+                continue  # skip phantom open_trade from killed strategy
             if open_trade and isinstance(open_trade, dict):
                 positions.append({
                     "strategy": system,
@@ -6754,8 +7492,10 @@ async def api_operational_maturity():
     return JSONResponse({
         "generated_at": data.get("generated_at"),
         "post_clamp_cutoff": data.get("post_clamp_cutoff"),
+        "epoch_id": data.get("epoch_id"),                # 2026-05-26: surface epoch
         "totals": data.get("totals", {}),
         "strategies": data.get("strategies", []),
+        "sunset_strategies": data.get("sunset_strategies", []),  # 2026-05-26: historical
     })
 
 
@@ -7054,11 +7794,24 @@ async def api_recent_trades(limit: int = 50, window_days: int = 90, include_back
 
     ibkr_port = _env_from_file("IBKR_PORT", "7497")
     ibkr_account = _env_from_file("IBKR_ACCOUNT_ID", "")
+    # 2026-05-26: prefer broker equity (current ~$250K post-reset);
+    # fallback to risk_oversight cache; final fallback to $250K (the
+    # post-reset paper anchor) so % math stays meaningful. Old $10K
+    # fallback was the pre-reset anchor and made % calculations wrong.
+    anchor = None
     try:
         from helio.fleet_sizing import get_sizing_anchor_usd as _gs
-        anchor = _gs()
+        anchor = float(_gs())
     except Exception:
-        anchor = 10000.0
+        try:
+            ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+            eq = ro.get("broker_truth", {}).get("account_equity_usd")
+            if eq and float(eq) > 0:
+                anchor = float(eq)
+        except Exception:
+            pass
+    if anchor is None or anchor <= 0:
+        anchor = 250000.0  # post-reset paper anchor
     # Actual broker equity (from risk_oversight)
     try:
         ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
@@ -7097,34 +7850,31 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
     `window_days` (default 90) restricts to recent trades so the 20-year
     historical gdx_gld back-fill doesn't dominate the visual.
     """
+    # 2026-05-26: v26 active roster only — pre-sunset PnL was contaminated
+    # (CBOT bug, sizing-formula 38x leverage, JPY-decimal, etc.) and isn't
+    # honest evidence. Historical/killed strategies are tracked separately
+    # in operational_maturity.sunset_strategies if needed.
     specs = [
-        ("argus_usdjpy",            "argus_flow/logs/usdjpy/trades.csv",             "ts",        "pnl_usd", True),
-        ("argus_gbpusd",            "argus_flow/logs/gbpusd/trades.csv",             "ts",        "pnl_usd", True),
-        ("argus_cadjpy",            "argus_flow/logs/cadjpy/trades.csv",             "ts",        "pnl_usd", True),
-        ("forge_gld_pm_long",       "forge/logs/gld_pm_long/trades.csv",             "ts",        "pnl_usd", False),
-        ("forge_wick_gbpusd",       "forge/logs/wick_gbpusd/trades.csv",             "ts",        "pnl_usd", False),
-        ("forge_nq_overnight",      "forge/logs/nq_overnight/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_jpy_pm_short",      "forge/logs/jpy_pm_short/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_gdx_gld",           "forge/logs/gdx_gld/trades.csv",                 "exit_date", "pnl_usd", False),
-        ("forge_multi_orb",         "forge/logs/multi_orb/trades.csv",               "ts",        "pnl_usd", False),
-        ("forge_vix_intraday",      "forge/logs/vix_intraday/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_spy_mean_rev",      "forge/logs/spy_mean_rev/trades.csv",            "ts",        "pnl_usd", False),
-        ("forge_nq_london_close",   "forge/logs/nq_london_close/trades.csv",         "ts",        "pnl_usd", False),
-        ("forge_aud_asian_breakout","forge/logs/aud_asian_breakout/trades.csv",      "ts",        "pnl_usd", False),
-        ("forge_mamba",             "forge/logs/mamba/trades.csv",                   "ts",        "pnl_usd", False),
-        ("forge_tori",              "forge/logs/tori/trades.csv",                    "ts",        "pnl_usd", False),
-        ("forge_cuebanks",          "forge/logs/cuebanks/trades.csv",                "ts",        "pnl_usd", False),
-        ("forge_vix_revert",        "forge/logs/vix_revert/trades.csv",              "ts",        "pnl_usd", False),
-        ("forge_rebalance",         "forge/logs/rebalance/trades.csv",               "ts",        "pnl_usd", False),
-        ("apollo",                  "apollo/logs/trades.csv",                        "ts",        "pnl_usd", False),
-        ("hermes",                  "hermes/logs/trades.csv",                        "ts",        "pnl_usd", False),
-        ("titan",                   "titan/logs/trades.csv",                         "ts",        "pnl_usd", False),
-        ("forge_fomc_drift",        "forge/logs/fomc_drift/trades.csv",              "entry_ts",  "pnl_usd", False),
-        ("forge_tom_international", "forge/logs/tom_international/trades.csv",       "entry_ts",  "pnl_usd", False),
+        ("forge_xs_momentum",                  "forge/logs/xs_momentum/trades.csv",                 "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_sectors",          "forge/logs/xs_momentum_sectors/trades.csv",         "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_style",            "forge/logs/xs_momentum_style/trades.csv",           "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_legacy15",         "forge/logs/xs_momentum_legacy15/trades.csv",        "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_style_top3",       "forge/logs/xs_momentum_style_top3/trades.csv",      "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_legacy15_regime",  "forge/logs/xs_momentum_legacy15_regime/trades.csv", "exit_date", "pnl_usd", False),
+        ("forge_xs_momentum_global47",         "forge/logs/xs_momentum_global47/trades.csv",        "exit_date", "pnl_usd", False),
+        ("forge_tail_hedge",                   "forge/logs/tail_hedge/trades.csv",                  "exit_date", "pnl_usd", False),
+        ("forge_gld_pm_long",                  "forge/logs/gld_pm_long/trades.csv",                 "ts",        "pnl_usd", False),
+        ("forge_tom_spy",                      "forge/logs/tom_spy/trades.csv",                     "exit_date", "pnl_usd", False),
+        ("forge_nov_spy",                      "forge/logs/nov_spy/trades.csv",                     "exit_date", "pnl_usd", False),
     ]
-    cutoff = None
+    # 2026-05-26: enforce post-reset epoch cutoff. Even within window_days,
+    # any trade before 2026-05-22 18:14 UTC (post_reset_20260522 start) is
+    # excluded -- those were contaminated bug-sized trades.
+    EPOCH_START = datetime(2026, 5, 22, 18, 14, tzinfo=timezone.utc)
+    cutoff = EPOCH_START
     if window_days and window_days > 0:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+        win_cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+        cutoff = max(cutoff, win_cutoff)
     live_cutoffs = _strategy_live_cutoffs()
 
     events: list[tuple[datetime, str, float]] = []
@@ -7161,11 +7911,24 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
 
     events.sort(key=lambda e: e[0])
 
+    # 2026-05-26: prefer broker equity (current ~$250K post-reset);
+    # fallback to risk_oversight cache; final fallback to $250K (the
+    # post-reset paper anchor) so % math stays meaningful. Old $10K
+    # fallback was the pre-reset anchor and made % calculations wrong.
+    anchor = None
     try:
         from helio.fleet_sizing import get_sizing_anchor_usd as _gs
-        anchor = _gs()
+        anchor = float(_gs())
     except Exception:
-        anchor = 10000.0
+        try:
+            ro = json.loads((REPO / "argus_flow" / "logs" / "risk_oversight_report.json").read_text())
+            eq = ro.get("broker_truth", {}).get("account_equity_usd")
+            if eq and float(eq) > 0:
+                anchor = float(eq)
+        except Exception:
+            pass
+    if anchor is None or anchor <= 0:
+        anchor = 250000.0  # post-reset paper anchor
     cumulative = 0.0
     points = []
     by_strategy: dict[str, float] = {}
@@ -7242,43 +8005,55 @@ async def api_fleet_equity_curve(window_days: int = 90, include_backfill: bool =
 @app.get("/api/gateway_status")
 async def api_gateway_status():
     """IBKR gateway + broker health summary for the top-of-page banner.
-    Reads the latest Argus heartbeats + oversight report.
+
+    2026-05-26: rewritten for the v26 era. Pre-v26 this loop iterated
+    the 3 argus FX heartbeats which are now sunset (last write 5/22
+    pre-reset). Result: banner was perpetually RED. Now health is
+    derived from (a) port 4002 OR 7497 listening AND (b) broker
+    equity > 0. The legacy per_pair structure is preserved with the
+    sunset pairs explicitly tagged so any old JS handler doesn't choke.
     """
     out = {"all_healthy": False, "per_pair": {}, "pause_entries_present": False, "broker_equity_usd": None}
+    # Sunset FX pairs -- present-but-sunset, not used for health calc
     for sym in ("usdjpy", "gbpusd", "cadjpy"):
-        p = REPO / "argus_flow" / "logs" / sym / "heartbeat.json"
-        if not p.exists():
-            out["per_pair"][sym] = {"present": False}
-            continue
-        age = int(time.time() - p.stat().st_mtime)
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            out["per_pair"][sym] = {"present": True, "age_s": age, "error": "parse_failed"}
-            continue
-        out["per_pair"][sym] = {
-            "present": True,
-            "age_s": age,
-            "fresh": age < 300,
-            "broker_connected": d.get("broker_connected"),
-            "entries_blocked": d.get("entries_blocked"),
-            "entry_block_reason": d.get("entry_block_reason"),
-            "consecutive_errors": d.get("consecutive_errors"),
-            "position": d.get("position"),
-        }
-    out["all_healthy"] = all(
-        p.get("fresh") and p.get("broker_connected") is True and int(p.get("consecutive_errors") or 0) == 0
-        for p in out["per_pair"].values() if p.get("present")
-    ) and any(p.get("present") for p in out["per_pair"].values())
+        out["per_pair"][sym] = {"present": False, "sunset": True, "note": "argus FX sunset 2026-05-20"}
+    # Pause flag
     out["pause_entries_present"] = (REPO / "PAUSE_ENTRIES").exists()
+    # Broker equity from risk_oversight cache (refreshed by ManagedTruth)
     try:
         ro_path = REPO / "argus_flow" / "logs" / "risk_oversight_report.json"
         ro = json.loads(ro_path.read_text())
-        out["broker_equity_usd"] = ro.get("broker_truth", {}).get("account_equity_usd")
-        # Freshness — powers the stale-data dashboard banner
+        eq = ro.get("broker_truth", {}).get("account_equity_usd")
+        out["broker_equity_usd"] = float(eq) if eq is not None else None
         out["risk_oversight_age_s"] = int(time.time() - ro_path.stat().st_mtime)
     except Exception:
         pass
+    # Broker port check -- 4002 (Gateway paper) or 7497 (TWS paper)
+    port_listening = False
+    listening_port = None
+    try:
+        import socket as _sock
+        for p in (4002, 7497):
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(0.5)
+            try:
+                if s.connect_ex(("127.0.0.1", p)) == 0:
+                    port_listening = True
+                    listening_port = p
+                    s.close()
+                    break
+            except Exception:
+                pass
+            finally:
+                try: s.close()
+                except Exception: pass
+    except Exception:
+        pass
+    out["broker_port_listening"] = port_listening
+    out["broker_port"] = listening_port
+    # Headline health: port listening + broker equity > 0 + no pause flag
+    eq_ok = out["broker_equity_usd"] is not None and out["broker_equity_usd"] > 0
+    out["all_healthy"] = port_listening and eq_ok and not out["pause_entries_present"]
     return JSONResponse(out)
 
 
@@ -9502,8 +10277,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Blocked-entries-today widget — only renders when something has been blocked in last 24h -->
 <div id="blocked-entries-bar" style="display:none;margin-bottom:10px;"></div>
 
+<!-- PRE-MARKET READINESS — single READY/REVIEW/NOT_READY verdict before US open -->
+<div id="pre-market-readiness-banner" style="margin-bottom:10px;"></div>
+
+<!-- AUDIT HEALTH — 6-component daily check at a glance (Codex gap closure visibility) -->
+<div id="audit-health-banner" style="margin-bottom:10px;"></div>
+
+<!-- DATA FEED CONTRACTS — primary/fallback cache freshness per strategy (Codex gap #1) -->
+<div id="data-feed-contracts-panel" style="margin-bottom:12px;"></div>
+
+<!-- STRATEGY ROLES — offense/defense/hedge/research + role-aware PF floor (Codex gap #10) -->
+<div id="strategy-roles-panel" style="margin-bottom:12px;"></div>
+
+<!-- VARIANT EXPOSURE — combined xs_momentum cohort holdings + concentration warnings -->
+<div id="variant-exposure-panel" style="margin-bottom:12px;"></div>
+
+<!-- PROMOTION RECOMMENDATIONS — pending audit-driven allocation flips -->
+<div id="promotion-recommendations-panel" style="margin-bottom:12px;"></div>
+
+<!-- PNL vs BENCHMARK — fleet PnL minus SPY/MTUM return (alpha-relative read) -->
+<div id="pnl-vs-benchmark-panel" style="margin-bottom:12px;"></div>
+
+<!-- PNL ATTRIBUTION — per-strategy realized PnL over rolling window -->
+<div id="pnl-attribution-panel" style="margin-bottom:12px;"></div>
+
+<!-- EQUITY CURVES PER VARIANT — cumulative PnL sparklines, side-by-side -->
+<div id="equity-curves-panel" style="margin-bottom:12px;"></div>
+
+<!-- ACTIVE ALPHA READINESS — synthesis of what's blocking real-money scale per active strategy -->
+<div id="active-alpha-readiness-panel" style="margin-bottom:14px;"></div>
+
 <!-- RECOMMENDED ACTIONS — cross-panel synthesis, what to actually do now -->
 <div id="recommended-actions-panel" style="margin-bottom:14px;"></div>
+
+<!-- COHORT GATE STATUS — live vs disciplined-gate baseline per strategy -->
+<div id="cohort-gate-panel" style="margin-bottom:14px;"></div>
 
 <!-- 24H CHANGES — what moved last 24h (PnL/PF/n/verdict deltas) -->
 <div id="changes-24h-panel" style="margin-bottom:14px;"></div>
@@ -10275,6 +11083,622 @@ const ACTION_COLORS = {
   OBSERVE:    {bg:'#0d1321', border:'#1e2a42', fg:'#7b8ab8'},
 };
 
+// ─── PRE-MARKET READINESS BANNER ─────────────────────────────────
+// Composite verdict: READY / REVIEW / NOT_READY. Most actionable
+// pre-open signal — operator looks here first.
+const PRE_MARKET_COLORS = {
+  READY:     {bg:'#0d3320', border:'#00e676', fg:'#00e676', icon:'OK'},
+  REVIEW:    {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00', icon:'!!'},
+  NOT_READY: {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252', icon:'XX'},
+};
+function loadPreMarketReadiness() {
+  fetch('/api/pre_market_check').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pre-market-readiness-banner');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:6px 12px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PRE-MARKET READINESS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const verdict = data.verdict || 'REVIEW';
+    const c = PRE_MARKET_COLORS[verdict] || PRE_MARKET_COLORS.REVIEW;
+    const reasons = data.reasons || [];
+    const actions = (data.expected_actions_next_5_days || []).filter(a => a.action_in_next_5_days);
+    let html = '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:6px;padding:8px 14px;font-size:0.78em;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;">'
+      + '<div><span style="color:' + c.fg + ';font-weight:bold;letter-spacing:2px;">[' + c.icon + '] PRE-MARKET READINESS</span>'
+      + ' <span style="color:' + c.fg + ';font-weight:bold;margin-left:8px;">' + verdict + '</span>';
+    if (data.generated_at) {
+      html += ' <span style="color:#7b8ab8;margin-left:8px;">as of ' + data.generated_at.slice(11, 16) + ' UTC</span>';
+    }
+    html += '</div>';
+    if (actions.length) {
+      html += '<div style="color:#9da8c7;font-size:0.92em;">'
+        + actions.length + ' strateg' + (actions.length===1?'y':'ies') + ' active this week</div>';
+    }
+    html += '</div>';
+    if (reasons.length) {
+      html += '<div style="margin-top:6px;color:' + c.fg + ';font-size:0.92em;">';
+      for (const r of reasons) {
+        html += '<div>↳ ' + r + '</div>';
+      }
+      html += '</div>';
+    }
+    if (actions.length) {
+      html += '<div style="margin-top:6px;color:#7b8ab8;font-size:0.85em;">';
+      const labels = actions.map(a => {
+        const nm = a.strategy.replace(/^forge_/, '');
+        return '<b style="color:#e0e0e0;">' + nm + '</b>';
+      });
+      html += 'this week: ' + labels.join(' · ') + '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pre-market readiness error:', e);});
+}
+loadPreMarketReadiness();
+setInterval(loadPreMarketReadiness, 300000);  // 5min refresh; cheap to read artifact
+
+// ─── AUDIT HEALTH BANNER ─────────────────────────────────────────
+// 6-component daily check at a glance. Tiny banner, top of decision
+// region — single-line summary with worst-status badge.
+const HEALTH_COLORS = {
+  GREEN:  {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  YELLOW: {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  RED:    {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+  ERROR:  {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadAuditHealth() {
+  fetch('/api/daily_health_check').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('audit-health-banner');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:6px 12px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">AUDIT HEALTH</span> · ' + data.error + '</div>';
+      return;
+    }
+    const reports = data.reports || [];
+    const worst = data.worst_status || 'GREEN';
+    const wc = HEALTH_COLORS[worst] || HEALTH_COLORS.GREEN;
+    let html = '<div style="background:' + wc.bg + ';border:1px solid ' + wc.border + ';border-radius:6px;padding:6px 12px;font-size:0.78em;">'
+      + '<span style="color:' + wc.fg + ';font-weight:bold;letter-spacing:2px;">AUDIT HEALTH</span>'
+      + ' <span style="color:' + wc.fg + ';font-weight:bold;">' + worst + '</span>'
+      + ' <span style="color:#7b8ab8;margin-left:8px;">' + reports.length + ' components</span>';
+    html += '<span style="margin-left:14px;">';
+    for (const r of reports) {
+      const c = HEALTH_COLORS[r.status] || HEALTH_COLORS.GREEN;
+      const tip = (r.summary || '').replace(/"/g, '&quot;');
+      html += '<span title="' + tip + '" style="margin-right:10px;color:' + c.fg + ';">'
+        + (r.component || '?') + ' <b>' + (r.status || '?') + '</b></span>';
+    }
+    html += '</span>';
+    if (data.generated_at) {
+      html += '<span style="float:right;color:#7b8ab8;font-size:0.92em;">' + data.generated_at.slice(11, 19) + ' UTC</span>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('audit health error:', e);});
+}
+loadAuditHealth();
+setInterval(loadAuditHealth, 60000);
+
+// ─── DATA FEED CONTRACTS PANEL ───────────────────────────────────
+// Per-strategy GREEN/YELLOW/RED for the offline cache. RED here means
+// the strategy has NO insurance against a live data outage.
+function loadDataFeedContracts() {
+  fetch('/api/data_feed_contracts').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('data-feed-contracts-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">DATA FEED CONTRACTS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const contracts = data.contracts || {};
+    const counts = data.verdict_counts || {};
+    const items = Object.entries(contracts);
+    if (items.length === 0) { el.innerHTML = ''; return; }
+    const cc = HEALTH_COLORS[counts.RED ? 'RED' : (counts.YELLOW ? 'YELLOW' : 'GREEN')];
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">DATA FEED CONTRACTS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">offline cache freshness · Codex gap #1</span></div>'
+      + '<div style="font-size:0.78em;">';
+    if (counts.GREEN)  html += '<span style="color:#00e676;">' + counts.GREEN + ' green</span> ';
+    if (counts.YELLOW) html += '<span style="color:#ffaa00;">' + counts.YELLOW + ' yellow</span> ';
+    if (counts.RED)    html += '<span style="color:#ff5252;">' + counts.RED + ' red</span>';
+    html += '</div></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px;">';
+    for (const [name, r] of items) {
+      const v = HEALTH_COLORS[r.verdict] || HEALTH_COLORS.GREEN;
+      const present = (r.universe_present || []).length;
+      const required = (r.universe_required || []).length;
+      const missing = (r.universe_missing || []).length;
+      const stale = (r.stale_tickers || []).length;
+      const reasonText = (r.reasons || []).join('; ') || 'clean';
+      const displayName = name.replace(/^forge_/, '');
+      html += '<div style="background:' + v.bg + ';border:1px solid ' + v.border + ';border-radius:5px;padding:6px 10px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.82em;">' + displayName + '</span>'
+        + '<span style="color:' + v.fg + ';font-size:0.7em;font-weight:bold;letter-spacing:1px;">' + r.verdict + '</span>'
+        + '</div>'
+        + '<div style="color:#9da8c7;font-size:0.74em;margin-top:3px;">'
+        + present + '/' + required + ' present · ' + missing + ' missing · ' + stale + ' stale'
+        + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.7em;margin-top:2px;">' + reasonText + '</div>'
+        + '</div>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('data feed contracts error:', e);});
+}
+loadDataFeedContracts();
+setInterval(loadDataFeedContracts, 120000);
+
+// ─── STRATEGY ROLES PANEL ────────────────────────────────────────
+// Per-strategy role + role-aware PF floor (Codex gap #10). Read off
+// the fleet_snapshot which already aggregates strategy_roles.
+const ROLE_COLORS = {
+  OFFENSE:  {bg:'#1c1437', border:'#5b86f5', fg:'#88a8ff'},
+  DEFENSE:  {bg:'#0d2a1f', border:'#26a69a', fg:'#4dd0c0'},
+  HEDGE:    {bg:'#2a1a35', border:'#9c27b0', fg:'#ce93d8'},
+  RESEARCH: {bg:'#2a2210', border:'#ffa726', fg:'#ffcc80'},
+};
+function loadStrategyRoles() {
+  fetch('/api/fleet_snapshot').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('strategy-roles-panel');
+    if (!el) return;
+    if (data.error) { el.innerHTML = ''; return; }
+    const rows = (data.strategy_roles || []).filter(r => !r.error);
+    if (rows.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="margin-bottom:6px;"><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">STRATEGY ROLES &amp; GATE FLOORS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">role-aware disciplined gate · Codex gap #10</span></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Strategy</th>'
+      + '<th style="padding:4px 6px;">Role</th>'
+      + '<th style="padding:4px 6px;text-align:right;">PF floor</th>'
+      + '<th style="padding:4px 6px;">Active</th>'
+      + '<th style="padding:4px 6px;">Source</th>'
+      + '</tr></thead><tbody>';
+    for (const r of rows) {
+      const c = ROLE_COLORS[r.role] || {bg:'#0d1321', border:'#1e2a42', fg:'#9da8c7'};
+      const displayName = r.strategy.replace(/^forge_/, '');
+      const activeStr = r.is_active ? '<span style="color:#00e676;">yes</span>' : '<span style="color:#7b8ab8;">no</span>';
+      const explicitStr = r.explicit ? 'pinned' : '<span style="color:#ffaa00;">default</span>';
+      const floorStr = r.pf_floor === null ? '—'
+                     : (r.pf_floor === Infinity || r.pf_floor > 1000) ? '∞' : Number(r.pf_floor).toFixed(2);
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+        + '<td style="padding:4px 6px;"><span style="background:' + c.bg + ';color:' + c.fg + ';border:1px solid ' + c.border + ';padding:1px 6px;border-radius:3px;font-size:0.85em;font-weight:bold;">' + r.role + '</span></td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#e0e0e0;">' + floorStr + '</td>'
+        + '<td style="padding:4px 6px;">' + activeStr + '</td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;">' + explicitStr + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('strategy roles error:', e);});
+}
+loadStrategyRoles();
+setInterval(loadStrategyRoles, 300000);
+
+// ─── VARIANT EXPOSURE PANEL ──────────────────────────────────────
+// Combined holdings exposure across the 5 xs_momentum variants. Shows
+// per-variant picks + per-ticker fleet % + concentration WARN/RED
+// flags. Two strategies with rho=0.07 return correlation can hold
+// the same ticker in different months — this catches that.
+const EXPOSURE_LEVEL_COLORS = {
+  GREEN:  {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  WARN:   {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  YELLOW: {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  RED:    {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadVariantExposure() {
+  fetch('/api/variant_exposure').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('variant-exposure-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">VARIANT EXPOSURE</span> · ' + data.error + '</div>';
+      return;
+    }
+    const exp = data.exposure || {};
+    const tickers = exp.per_ticker || [];
+    const warnings = exp.warnings || [];
+    const picks = data.picks_per_variant || [];
+    if (tickers.length === 0) { el.innerHTML = ''; return; }
+    const level = warnings.find(w => w.level === 'RED') ? 'RED'
+                : warnings.length ? 'WARN' : 'GREEN';
+    const c = EXPOSURE_LEVEL_COLORS[level];
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">VARIANT EXPOSURE</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">combined xs_momentum cohort holdings</span></div>'
+      + '<div style="font-size:0.78em;">'
+      + '<span style="color:' + c.fg + ';font-weight:bold;">' + level + '</span>'
+      + ' <span style="color:#7b8ab8;margin-left:10px;">anchor $' + Number(data.anchor_usd || 0).toLocaleString()
+      + ' · fleet $' + Number(exp.fleet_notional_usd || 0).toLocaleString() + '</span>'
+      + '</div></div>';
+    // Picks per variant
+    html += '<div style="margin-bottom:8px;font-size:0.78em;color:#9da8c7;">';
+    for (const v of picks) {
+      if (v.error) continue;
+      const label = (v.strategy_label || '').replace('forge_xs_momentum_', '').replace('forge_xs_momentum', 'baseline');
+      const tickerStr = (v.picks || []).map(p => p.ticker + ' (' + (p.score>=0?'+':'') + p.score.toFixed(1) + '%)').join(', ');
+      html += '<div><b style="color:#e0e0e0;">' + label + '</b>: ' + tickerStr + '</div>';
+    }
+    html += '</div>';
+    // Per-ticker breakdown table
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Ticker</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Notional</th>'
+      + '<th style="padding:4px 6px;text-align:right;">% fleet</th>'
+      + '<th style="padding:4px 6px;">Holders</th>'
+      + '</tr></thead><tbody>';
+    for (const t of tickers) {
+      const warn = warnings.find(w => w.ticker === t.ticker);
+      const rowColor = warn ? EXPOSURE_LEVEL_COLORS[warn.level].fg : '#e0e0e0';
+      const holders = (t.held_by || []).map(h => h.replace('forge_xs_momentum_', '').replace('forge_xs_momentum', 'baseline')).join(', ');
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;font-weight:bold;color:' + rowColor + ';">' + t.ticker + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#e0e0e0;">$' + Number(t.notional_usd).toLocaleString() + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + rowColor + ';">' + t.pct_of_fleet.toFixed(1) + '%</td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;">' + holders + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    if (warnings.length) {
+      html += '<div style="margin-top:6px;color:' + c.fg + ';font-size:0.78em;">';
+      for (const w of warnings) {
+        html += '<div>↳ ' + w.level + ' — ' + w.ticker + ' = ' + w.pct_of_fleet + '% of fleet (' + w.held_by.length + ' variants: ' + w.held_by.join(', ') + ')</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('variant exposure error:', e);});
+}
+loadVariantExposure();
+setInterval(loadVariantExposure, 600000);  // 10min — picks change only on rebalance
+
+// ─── PROMOTION RECOMMENDATIONS PANEL ─────────────────────────────
+// Pending audit-driven allocation flips. Operator reviews here +
+// runs `python -m ops.auto_promotion --apply --confirm` in CLI to
+// actually flip allocations. Intentionally NOT a button: capital
+// moves require operator in the loop.
+const PROMOTION_CONFIDENCE_COLORS = {
+  HIGH: {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  MED:  {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  LOW:  {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+};
+function loadPromotionRecommendations() {
+  fetch('/api/promotion_recommendations').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('promotion-recommendations-panel');
+    if (!el) return;
+    if (data.error) { el.innerHTML = ''; return; }
+    const recs = data.recommendations || [];
+    if (recs.length === 0) {
+      // Hide the panel entirely when there's nothing pending
+      el.innerHTML = '';
+      return;
+    }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">PROMOTION RECOMMENDATIONS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">audit-driven allocation flips pending operator review</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + recs.length + ' pending</div>'
+      + '</div>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;margin-bottom:8px;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Strategy</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Current</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Proposed</th>'
+      + '<th style="padding:4px 6px;text-align:center;">Confidence</th>'
+      + '<th style="padding:4px 6px;">Reasons</th>'
+      + '</tr></thead><tbody>';
+    for (const r of recs) {
+      const c = PROMOTION_CONFIDENCE_COLORS[r.confidence] || PROMOTION_CONFIDENCE_COLORS.LOW;
+      const displayName = r.strategy.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + r.current_alloc.toFixed(2) + '</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#00e676;font-weight:bold;">' + r.proposed_alloc.toFixed(2) + '</td>'
+        + '<td style="padding:4px 6px;text-align:center;"><span style="background:' + c.bg + ';color:' + c.fg + ';border:1px solid ' + c.border + ';padding:1px 6px;border-radius:3px;font-size:0.85em;">' + r.confidence + '</span></td>'
+        + '<td style="padding:4px 6px;color:#9da8c7;font-size:0.85em;">' + (r.reasons || []).join('; ') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="background:#0a1a30;padding:6px 10px;border-radius:4px;font-size:0.72em;color:#88a8ff;font-family:monospace;">'
+      + '<b>To apply:</b> python -m ops.auto_promotion --apply --confirm'
+      + '<br><span style="color:#7b8ab8;">(operator-in-the-loop — capital moves require explicit confirmation)</span>'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('promotion recommendations error:', e);});
+}
+loadPromotionRecommendations();
+setInterval(loadPromotionRecommendations, 600000);
+
+// ─── PNL VS BENCHMARK ────────────────────────────────────────────
+// The honest read: is the fleet generating ALPHA, or just tracking
+// the factor beta that ETFs sell at 15bp? Per the 5/25 audit
+// (factor decomposition + short-side sweep), the fleet has zero
+// alpha vs MTUM+SPY+SMB+HML. This panel makes that visible to the
+// operator in real time.
+const ALPHA_SIGNAL_COLORS = {
+  outperforming:     {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  tracking_beta:     {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  underperforming:   {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+  insufficient_data: {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+  no_benchmark:      {bg:'#1f1f1f', border:'#5a6a8a', fg:'#9da8c7'},
+};
+const ALPHA_SIGNAL_LABEL = {
+  outperforming:     'OUTPERFORMING',
+  tracking_beta:     'TRACKING BETA',
+  underperforming:   'UNDERPERFORMING',
+  insufficient_data: 'INSUFFICIENT DATA (n < 20)',
+  no_benchmark:      'NO BENCHMARK',
+};
+function loadPnLVsBenchmark() {
+  fetch('/api/pnl_vs_benchmark?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pnl-vs-benchmark-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PNL vs BENCHMARK</span> · ' + data.error + '</div>';
+      return;
+    }
+    const signal = data.alpha_signal || 'insufficient_data';
+    const c = ALPHA_SIGNAL_COLORS[signal];
+    const fleetPnl = data.fleet_pnl_usd || 0;
+    const fleetPct = data.fleet_pnl_pct || 0;
+    const spy = data.spy_return_pct;
+    const mtum = data.mtum_return_pct;
+    const excSpy = data.excess_vs_spy_pct;
+    const excMtum = data.excess_vs_mtum_pct;
+    const nFills = data.fleet_n_fills || 0;
+    let html = '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+      + '<div><span style="color:' + c.fg + ';font-weight:bold;font-size:0.92em;letter-spacing:2px;">PNL vs BENCHMARK</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">honest alpha read · last ' + data.window_days + ' days</span></div>'
+      + '<div style="color:' + c.fg + ';font-weight:bold;font-size:0.85em;">' + ALPHA_SIGNAL_LABEL[signal] + '</div>'
+      + '</div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+      + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+      + '<th style="padding:4px 6px;">Series</th>'
+      + '<th style="padding:4px 6px;text-align:right;">Return</th>'
+      + '<th style="padding:4px 6px;text-align:right;">vs Fleet</th>'
+      + '</tr></thead><tbody>'
+      + '<tr style="border-bottom:1px solid #11172a;">'
+      + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">Fleet (' + nFills + ' fills)</td>'
+      + '<td style="padding:4px 6px;text-align:right;color:' + (fleetPct > 0 ? '#00e676' : fleetPct < 0 ? '#ff5252' : '#9da8c7') + ';font-weight:bold;">'
+      + fleetPct.toFixed(2) + '% ($' + fleetPnl.toLocaleString() + ')</td>'
+      + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">—</td>'
+      + '</tr>';
+    if (spy !== null) {
+      const excColor = excSpy > 0 ? '#00e676' : excSpy < 0 ? '#ff5252' : '#9da8c7';
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;">SPY (buy-and-hold)</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + spy.toFixed(2) + '%</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + excColor + ';font-weight:bold;">' + (excSpy >= 0 ? '+' : '') + excSpy.toFixed(2) + '%</td>'
+        + '</tr>';
+    }
+    if (mtum !== null) {
+      const excColor = excMtum > 0 ? '#00e676' : excMtum < 0 ? '#ff5252' : '#9da8c7';
+      html += '<tr style="border-bottom:1px solid #11172a;">'
+        + '<td style="padding:4px 6px;color:#e0e0e0;">MTUM (momentum ETF)</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + mtum.toFixed(2) + '%</td>'
+        + '<td style="padding:4px 6px;text-align:right;color:' + excColor + ';font-weight:bold;">' + (excMtum >= 0 ? '+' : '') + excMtum.toFixed(2) + '%</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div style="color:#7b8ab8;font-size:0.72em;margin-top:6px;">'
+      + '↳ "outperforming" requires excess > +1% vs MTUM. "tracking beta" means within ±1%. '
+      + 'Anything else is the strategy doing what an MTUM ETF would do for 15bp.'
+      + '</div>'
+      + '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pnl vs benchmark error:', e);});
+}
+loadPnLVsBenchmark();
+setInterval(loadPnLVsBenchmark, 600000);
+
+// ─── EQUITY CURVES PER VARIANT ───────────────────────────────────
+// Inline SVG sparklines, one per strategy. See whether variants are
+// converging or diverging in real time.
+function loadEquityCurves() {
+  fetch('/api/equity_curves_per_variant?window_days=90').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('equity-curves-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">EQUITY CURVES</span> · ' + data.error + '</div>';
+      return;
+    }
+    const curves = data.curves || {};
+    const names = Object.keys(curves).sort();
+    if (names.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="margin-bottom:6px;"><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">EQUITY CURVES PER VARIANT</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">cumulative realized PnL · last ' + data.window_days + ' days</span></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">';
+    for (const name of names) {
+      const series = curves[name];
+      const displayName = name.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+      if (series.length === 0) {
+        html += '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:5px;padding:8px 10px;font-size:0.78em;">'
+          + '<div style="color:#e0e0e0;font-weight:bold;">' + displayName + '</div>'
+          + '<div style="color:#7b8ab8;margin-top:6px;text-align:center;">no fills yet</div>'
+          + '</div>';
+        continue;
+      }
+      // Build SVG path
+      const lastPnl = series[series.length - 1].cum_pnl_usd;
+      const minPnl = Math.min(0, ...series.map(p => p.cum_pnl_usd));
+      const maxPnl = Math.max(0, ...series.map(p => p.cum_pnl_usd));
+      const range = (maxPnl - minPnl) || 1;
+      const w = 180, h = 36;
+      let pathD = '';
+      for (let i = 0; i < series.length; i++) {
+        const x = (i / Math.max(series.length - 1, 1)) * w;
+        const y = h - ((series[i].cum_pnl_usd - minPnl) / range) * h;
+        pathD += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+      }
+      const color = lastPnl > 0 ? '#00e676' : lastPnl < 0 ? '#ff5252' : '#9da8c7';
+      const zeroY = h - ((0 - minPnl) / range) * h;
+      html += '<div style="background:#0a1224;border:1px solid #1e2a42;border-radius:5px;padding:8px 10px;font-size:0.78em;">'
+        + '<div style="display:flex;justify-content:space-between;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;">' + displayName + '</span>'
+        + '<span style="color:' + color + ';font-weight:bold;">$' + lastPnl.toLocaleString() + '</span>'
+        + '</div>'
+        + '<svg width="' + w + '" height="' + h + '" style="margin-top:4px;display:block;">'
+        + '<line x1="0" y1="' + zeroY.toFixed(1) + '" x2="' + w + '" y2="' + zeroY.toFixed(1) + '" stroke="#1e2a42" stroke-width="0.5"/>'
+        + '<path d="' + pathD + '" stroke="' + color + '" stroke-width="1.5" fill="none"/>'
+        + '</svg>'
+        + '<div style="color:#7b8ab8;font-size:0.7em;">' + series.length + ' trades</div>'
+        + '</div>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('equity curves error:', e);});
+}
+loadEquityCurves();
+setInterval(loadEquityCurves, 300000);
+
+// ─── PNL ATTRIBUTION PANEL ───────────────────────────────────────
+// Per-strategy realized PnL over the last N days. The missing
+// visibility for "when money is made/lost, which sleeve did it?"
+function loadPnLAttribution() {
+  fetch('/api/pnl_attribution?window_days=30').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('pnl-attribution-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">PNL ATTRIBUTION</span> · ' + data.error + '</div>';
+      return;
+    }
+    const rows = data.per_strategy || [];
+    const total = data.fleet_total_pnl_usd || 0;
+    const totalTrades = data.fleet_n_trades || 0;
+    const totalColor = total > 0 ? '#00e676' : total < 0 ? '#ff5252' : '#9da8c7';
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">PNL ATTRIBUTION</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">realized closed-trade PnL · last ' + data.window_days + ' days</span></div>'
+      + '<div style="font-size:0.92em;">'
+      + '<span style="color:' + totalColor + ';font-weight:bold;">$' + total.toLocaleString() + '</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:4px;">across ' + totalTrades + ' trades</span>'
+      + '</div></div>';
+    if (rows.length === 0) {
+      html += '<div style="color:#7b8ab8;font-size:0.85em;text-align:center;padding:12px 0;">'
+        + 'no closed trades in window yet — first canonical fill creates the breakdown'
+        + (data.note ? ' (' + data.note + ')' : '')
+        + '</div>';
+    } else {
+      html += '<table style="width:100%;border-collapse:collapse;font-size:0.78em;">'
+        + '<thead><tr style="color:#7b8ab8;text-align:left;border-bottom:1px solid #1e2a42;">'
+        + '<th style="padding:4px 6px;">Strategy</th>'
+        + '<th style="padding:4px 6px;text-align:right;">PnL</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Trades</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Win %</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Best</th>'
+        + '<th style="padding:4px 6px;text-align:right;">Worst</th>'
+        + '</tr></thead><tbody>';
+      for (const r of rows) {
+        const displayName = r.strategy.replace(/^forge_xs_momentum_?/, 'xs_m_').replace(/^forge_xs_momentum$/, 'xs_m').replace(/^forge_/, '');
+        const pnlColor = r.pnl_usd > 0 ? '#00e676' : r.pnl_usd < 0 ? '#ff5252' : '#9da8c7';
+        const wr = r.win_rate !== null ? (r.win_rate * 100).toFixed(0) + '%' : '—';
+        html += '<tr style="border-bottom:1px solid #11172a;">'
+          + '<td style="padding:4px 6px;color:#e0e0e0;font-weight:bold;">' + displayName + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:' + pnlColor + ';font-weight:bold;">$' + r.pnl_usd.toLocaleString() + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + r.n_trades + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#9da8c7;">' + wr + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#00e676;">$' + r.best_trade_usd.toLocaleString() + '</td>'
+          + '<td style="padding:4px 6px;text-align:right;color:#ff5252;">$' + r.worst_trade_usd.toLocaleString() + '</td>'
+          + '</tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('pnl attribution error:', e);});
+}
+loadPnLAttribution();
+setInterval(loadPnLAttribution, 300000);
+
+// ─── ACTIVE ALPHA READINESS PANEL ────────────────────────────────
+// Synthesis: preflight + canonical_fills + blockers per active
+// strategy. The "what's blocking real-money scale" view.
+const READINESS_COLORS = {
+  READY_TO_SCALE:       {bg:'#0d3320', border:'#00e676', fg:'#00e676'},
+  REVIEW_BEFORE_SCALE:  {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  GATED_REVIEW:         {bg:'#3a2a0d', border:'#ffaa00', fg:'#ffaa00'},
+  EVIDENCE_BUILDING:    {bg:'#0a1a30', border:'#5b86f5', fg:'#88a8ff'},
+  BLOCKED:              {bg:'#3a1b1b', border:'#ff5252', fg:'#ff5252'},
+};
+function loadActiveAlphaReadiness() {
+  fetch('/api/active_alpha_readiness').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('active-alpha-readiness-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">ALPHA READINESS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const statuses = data.strategy_status || {};
+    const roles = data.roles || {};
+    const epoch = data.epoch || {};
+    const entries = Object.entries(statuses);
+    if (entries.length === 0) { el.innerHTML = ''; return; }
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:10px 14px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:0.92em;letter-spacing:2px;">ALPHA READINESS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">what\'s blocking real-money scale per active strategy</span></div>'
+      + '<div style="font-size:0.74em;color:#7b8ab8;">'
+      + 'epoch: <b>' + (epoch.id || '?') + '</b>'
+      + (epoch.is_clean === true ? ' <span style="color:#00e676;">clean</span>'
+         : epoch.is_clean === false ? ' <span style="color:#ff5252;">CONTAMINATED</span>' : '')
+      + '</div></div>';
+    for (const [name, s] of entries) {
+      const c = READINESS_COLORS[s.verdict] || READINESS_COLORS.BLOCKED;
+      const displayName = name.replace(/^forge_/, '');
+      const ev = s.canonical_evidence || {};
+      const blockers = s.blockers_30d || {};
+      const blockerStr = Object.entries(blockers).map(([k,v]) => k + '=' + v).join(' · ') || 'none';
+      const role = s.role || (roles[name] && roles[name].role) || '?';
+      const floor = s.pf_floor || (roles[name] && roles[name].pf_floor) || null;
+      const floorStr = floor === null ? '—'
+                     : (floor === Infinity || floor > 1000) ? '∞' : Number(floor).toFixed(2);
+      html += '<div style="background:' + c.bg + ';border:1px solid ' + c.border + ';border-radius:5px;padding:8px 12px;margin-bottom:6px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.88em;">' + displayName + '</span>'
+        + '<span style="color:' + c.fg + ';font-size:0.74em;font-weight:bold;letter-spacing:1px;">' + s.verdict + '</span>'
+        + '</div>'
+        + '<div style="color:#9da8c7;font-size:0.74em;line-height:1.4;">'
+        + 'role: <b>' + role + '</b> · floor: <b>' + floorStr + '</b>'
+        + ' · entries: ' + (ev.entries || 0) + ' · exits: ' + (ev.exits || 0)
+        + ' · closed PnL: $' + Number(ev.closed_pnl_usd || 0).toFixed(2)
+        + '</div>'
+        + '<div style="color:#7b8ab8;font-size:0.74em;margin-top:3px;">'
+        + 'blockers (30d): ' + blockerStr
+        + '</div>';
+      if ((s.reasons || []).length) {
+        html += '<div style="color:' + c.fg + ';font-size:0.74em;margin-top:3px;">'
+          + '↳ ' + s.reasons.join(' · ')
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('alpha readiness error:', e);});
+}
+loadActiveAlphaReadiness();
+setInterval(loadActiveAlphaReadiness, 120000);
+
 // ─── RECOMMENDED ACTIONS ──────────────────────────────────────────
 // Cross-panel synthesis: pulls findings from decision_engine + drilldown
 // + benchmark_alpha + trade_validity into a single priority-ranked do-list.
@@ -10344,6 +11768,80 @@ function loadRecommendedActions() {
 }
 loadRecommendedActions();
 setInterval(loadRecommendedActions, 60000);
+
+// ─── COHORT GATE STATUS PANEL ──────────────────────────────────────
+// Surfaces /api/cohort_gate_status. For each active strategy, shows the
+// disciplined-gate verdict (PASS_GATE / WARNING / FAIL / INSUFFICIENT_N)
+// alongside its baseline CI lower bound and current rolling live PF.
+// Lives between RECOMMENDED ACTIONS and 24H CHANGES (synthesis layer).
+const GATE_VERDICT_COLORS = {
+  PASS_GATE:        {bg:'#0d3320', border:'#00e676', label:'PASS'},
+  MARGINAL_PASS:    {bg:'#1f2a14', border:'#a5c34a', label:'MARGINAL'},
+  WARNING:          {bg:'#3a2a0d', border:'#ffaa00', label:'WARNING'},
+  FAIL:             {bg:'#3a1b1b', border:'#ff5252', label:'FAIL'},
+  INSUFFICIENT_N:   {bg:'#0a1224', border:'#1e2a42', label:'NO N'},
+  NO_BASELINE:      {bg:'#1f1f1f', border:'#5a6a8a', label:'NO BASELINE'},
+};
+
+function loadCohortGate() {
+  fetch('/api/cohort_gate_status').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('cohort-gate-panel');
+    if (!el) return;
+    if (data.error) {
+      el.innerHTML = '<div style="background:#3a1b1b;border:1px solid #ff5252;border-radius:6px;padding:8px 14px;font-size:0.78em;color:#ff5252;">'
+        + '<span style="font-weight:bold;letter-spacing:2px;">COHORT GATE STATUS</span> · ' + data.error + '</div>';
+      return;
+    }
+    const strategies = data.strategies || [];
+    if (strategies.length === 0) {
+      el.innerHTML = '';
+      return;
+    }
+    const counts = data.verdict_counts || {};
+    const countParts = [];
+    if (counts.PASS_GATE)        countParts.push('<span style="color:#00e676;">' + counts.PASS_GATE + ' pass</span>');
+    if (counts.MARGINAL_PASS)    countParts.push('<span style="color:#a5c34a;">' + counts.MARGINAL_PASS + ' marginal</span>');
+    if (counts.WARNING)          countParts.push('<span style="color:#ffaa00;">' + counts.WARNING + ' warn</span>');
+    if (counts.FAIL)             countParts.push('<span style="color:#ff5252;">' + counts.FAIL + ' fail</span>');
+    if (counts.INSUFFICIENT_N)   countParts.push('<span style="color:#7b8ab8;">' + counts.INSUFFICIENT_N + ' n/a</span>');
+    let html = '<div style="background:#141b2d;border:1px solid #00d4ff;border-radius:6px;padding:12px 16px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+      + '<div><span style="color:#00d4ff;font-weight:bold;font-size:1.0em;letter-spacing:2px;">COHORT GATE STATUS</span>'
+      + ' <span style="color:#7b8ab8;font-size:0.78em;margin-left:8px;">live PF vs disciplined-gate CI lower</span></div>'
+      + '<div style="font-size:0.78em;color:#7b8ab8;">' + countParts.join(' · ') + '</div></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">';
+    for (const s of strategies) {
+      const v = GATE_VERDICT_COLORS[s.verdict] || GATE_VERDICT_COLORS.NO_BASELINE;
+      const pf = s.live_pf_30trades;
+      const pfStr = (pf === null || pf === undefined) ? '—' : Number(pf).toFixed(2);
+      const ciLo = s.baseline_ci_lower;
+      const ciLoStr = (ciLo === null || ciLo === undefined) ? '—' : Number(ciLo).toFixed(2);
+      const n = s.n_live_trades || 0;
+      const pctStr = (s.pct_of_ci_lower === null || s.pct_of_ci_lower === undefined) ? '—' : (Number(s.pct_of_ci_lower) * 100).toFixed(0) + '%';
+      // Strip "forge_" prefix for compactness
+      const displayName = s.strategy.replace(/^forge_/, '');
+      html += '<div style="background:' + v.bg + ';border:1px solid ' + v.border + ';border-radius:5px;padding:8px 10px;">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'
+        + '<span style="color:#e0e0e0;font-weight:bold;font-size:0.82em;">' + displayName + '</span>'
+        + '<span style="color:' + v.border + ';font-size:0.7em;font-weight:bold;letter-spacing:1px;">' + v.label + '</span>'
+        + '</div>'
+        + '<div style="font-size:0.7em;color:#7b8ab8;line-height:1.5;">'
+        + '<div><span style="color:#9da8c7;">live PF (n=' + n + '):</span> <span style="color:#e0e0e0;font-weight:bold;">' + pfStr + '</span></div>'
+        + '<div><span style="color:#9da8c7;">baseline CI lower:</span> <span style="color:#e0e0e0;">' + ciLoStr + '</span></div>'
+        + '<div><span style="color:#9da8c7;">live/baseline:</span> <span style="color:#e0e0e0;">' + pctStr + '</span></div>'
+        + '</div></div>';
+    }
+    html += '</div>';
+    html += '<div style="margin-top:10px;font-size:0.68em;color:#7b8ab8;border-top:1px solid #1e2a42;padding-top:6px;">'
+      + 'Thresholds: live_pf &gt;= 0.85 × CI lower = PASS · 0.70–0.85 = WARNING · &lt; 0.70 = FAIL · n &lt; 20 = no-call. '
+      + 'Source: <code>/api/cohort_gate_status</code> · baseline <code>promotion_gate_baseline.json</code>.'
+      + '</div>';
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(e=>{console.error('cohort gate error:', e);});
+}
+loadCohortGate();
+setInterval(loadCohortGate, 60000);
 
 // ─── 24H CHANGES PANEL ─────────────────────────────────────────────
 // Diffs the two most-recent operational_maturity snapshots and shows
@@ -17497,8 +18995,15 @@ PANEL_IDS_ALL = [
     "halt-banner", "market-clock-bar", "data-epoch-bar", "blocked-entries-bar",
     "gateway-status-banner", "stale-data-banner", "silent-block-banner",
     "maturity-summary-banner",
+    # Audit-suite panels (Codex gap closures — 2026-05-24)
+    "audit-health-banner", "data-feed-contracts-panel",
+    "strategy-roles-panel", "variant-exposure-panel",
+    "promotion-recommendations-panel", "pnl-vs-benchmark-panel",
+    "pnl-attribution-panel", "equity-curves-panel",
+    "active-alpha-readiness-panel",
     # Decision / fleet panels
-    "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
+    "recommended-actions-panel", "cohort-gate-panel",
+    "changes-24h-panel", "active-bleeders-panel",
     "tom-outcome-panel", "decision-history-panel",
     "decision-engine-panel", "efficiency-panel", "opportunity-panel",
     "capital-deployment-panel", "target-capture-panel", "mfe-capture-panel",
@@ -17518,7 +19023,9 @@ VIEW_ALLOWLISTS = {
         "tws-health-banner", "circuit-breaker-banner", "capital-safety-bar",
         "halt-banner", "market-clock-bar", "blocked-entries-bar",
         "gateway-status-banner", "stale-data-banner", "silent-block-banner",
-        "maturity-summary-banner", "recommended-actions-panel",
+        "maturity-summary-banner", "audit-health-banner",
+        "recommended-actions-panel",
+        "cohort-gate-panel",
         "changes-24h-panel", "active-bleeders-panel",
         "fleet-health", "open-positions-panel",
     },
@@ -17526,7 +19033,13 @@ VIEW_ALLOWLISTS = {
     "ops": {
         "capital-safety-bar", "halt-banner", "circuit-breaker-banner",
         "market-clock-bar", "blocked-entries-bar",
-        "recommended-actions-panel", "changes-24h-panel", "active-bleeders-panel",
+        "audit-health-banner", "data-feed-contracts-panel",
+        "strategy-roles-panel", "variant-exposure-panel",
+        "promotion-recommendations-panel", "pnl-vs-benchmark-panel",
+    "pnl-attribution-panel", "equity-curves-panel",
+        "active-alpha-readiness-panel",
+        "recommended-actions-panel", "cohort-gate-panel",
+        "changes-24h-panel", "active-bleeders-panel",
         "decision-engine-panel", "three-state-panel", "dimensions-panel",
         "efficiency-panel", "fleet-health", "open-positions-panel",
     },

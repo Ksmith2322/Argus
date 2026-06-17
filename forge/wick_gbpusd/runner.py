@@ -308,6 +308,7 @@ def _open_paper_trade(state: dict, df: pd.DataFrame, feats: pd.DataFrame, signal
                 ib, contract, direction="long", size=pos_size,
                 stop_px=stop, target_px=target, price_decimals=5,
                 est_entry_px=entry_anchor,
+                strategy_label="forge_wick_gbpusd",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)

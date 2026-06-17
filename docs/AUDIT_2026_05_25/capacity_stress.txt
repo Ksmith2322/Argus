@@ -1,0 +1,15 @@
+capacity_stress report written to C:\Argus\repo\ops\reports\system_audit\capacity_stress.json
+anchor=$250,000  strategies=4  epoch=post_reset_20260522
+
+strategy                        symbol       current_$  max_safe_mult
+----------------------------------------------------------------------
+forge_nq_overnight              MNQ         $   29,529            5.0x
+forge_spy_mean_rev              SPY         $      718           10.0x
+forge_xs_momentum               SPY         $  100,000            1.0x
+forge_gld_pm_long               GLD         $  100,000            1.0x
+
+survivors by multiplier:
+  1x: 4/4 survive  ['forge_nq_overnight', 'forge_spy_mean_rev', 'forge_xs_momentum', 'forge_gld_pm_long']
+  2x: 2/4 survive  ['forge_nq_overnight', 'forge_spy_mean_rev']
+  5x: 2/4 survive  ['forge_nq_overnight', 'forge_spy_mean_rev']
+  10x: 1/4 survive  ['forge_spy_mean_rev']

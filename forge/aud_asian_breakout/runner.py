@@ -259,6 +259,7 @@ def _open(state: dict, df: pd.DataFrame, direction: str, ctx: dict, ib=None) -> 
                 ib, contract, direction=direction, size=pos_size,
                 stop_px=stop, target_px=target, price_decimals=5,
                 est_entry_px=plan_entry,
+                strategy_label="forge_aud_asian_breakout",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)

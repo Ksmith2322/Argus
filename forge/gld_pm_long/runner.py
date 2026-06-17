@@ -29,6 +29,7 @@ import pandas as pd
 import yfinance as yf
 
 from forge.logging_setup import setup_logging
+from helio.blocker_ledger import record_blocker
 from helio.fleet_sizing import compute_risk_usd, max_notional_usd, pnl_pct_of_fleet
 from helio import ibkr_execution as ibkr
 
@@ -177,6 +178,16 @@ def _write_heartbeat(state: dict, last_eval_ts: str) -> None:
     }, indent=2, default=str))
 
 
+def _last_eval_ts_from_heartbeat() -> str:
+    try:
+        if HEARTBEAT_PATH.exists():
+            data = json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+            return str(data.get("last_eval_ts") or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _append_trade(row: dict) -> None:
     _ensure_trade_csv()
     with open(TRADES_PATH, "a", newline="", encoding="utf-8") as f:
@@ -230,7 +241,33 @@ def evaluate_once() -> None:
         if state.get("open_trade"):
             ot = state["open_trade"]
 
-            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
+            # 2026-05-23 self-heal: stale signal_only open_trade from a prior
+            # connect-fail wake should NOT block real entries forever. If we
+            # now have a real IBKR connection and broker confirms flat,
+            # clear the phantom state so the signal evaluator can run.
+            if (ib is not None
+                and ot.get("execution_venue") == "signal_only"):
+                try:
+                    _check_contract = ibkr.make_contract("GLD", "etf")
+                    ib.qualifyContracts(_check_contract)
+                    _broker_qty = ibkr.query_position(ib, _check_contract)
+                except Exception as exc:
+                    log.warning("self-heal broker-position check failed: %s", exc)
+                    _broker_qty = None
+                if _broker_qty == 0:
+                    log.warning(
+                        "STALE_SIGNAL_ONLY: clearing phantom open_trade "
+                        "(entry_ts=%s, signal-only entry never had real "
+                        "broker position) so live signals can resume",
+                        ot.get("entry_ts"),
+                    )
+                    state["open_trade"] = None
+                    _save_state(state)
+                    ot = None  # fall through to signal evaluation below
+
+            if ot is None:
+                pass
+            elif ib is not None and ot.get("execution_venue") == "ibkr_paper":
                 # Real-order path: ask IBKR whether bracket stop/target filled
                 # between cycles, or whether we're still open.
                 contract = ibkr.make_contract("GLD", "etf")
@@ -332,7 +369,7 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     risk_budget_usd = compute_risk_usd(strategy_label="forge_gld_pm_long")
     # 2026-05-07 audit: same sizing-formula fix as multi_orb / vix_intraday.
     # ATR-based sizing floor prevents tight-stop explosion.
-    cap_usd = max_notional_usd("etf") if plan_entry > 0 else None
+    cap_usd = max_notional_usd("etf", strategy_label="forge_gld_pm_long") if plan_entry > 0 else None
     from helio.strategy_common import safe_position_size
     pos_size, sizing_policy = safe_position_size(
         risk_usd=risk_budget_usd,
@@ -345,6 +382,15 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     )
     if pos_size <= 0:
         log.warning("SIZE_ZERO: computed size <= 0, skipping entry (policy=%s)", sizing_policy)
+        record_blocker(
+            "forge_gld_pm_long",
+            "SIZE_ZERO",
+            symbol="GLD",
+            stage="entry",
+            action="BUY",
+            reason=f"safe_position_size returned {pos_size}",
+            context={"sizing_policy": sizing_policy},
+        )
         return
 
     entry_px = plan_entry
@@ -361,14 +407,43 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
             existing = ibkr.query_position(ib, contract)
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION: GLD qty=%s, skipping entry to avoid doubling", existing)
+                record_blocker(
+                    "forge_gld_pm_long",
+                    "BROKER_POSITION_EXISTS",
+                    symbol="GLD",
+                    stage="entry",
+                    action="BUY",
+                    qty=pos_size,
+                    notional_usd=pos_size * plan_entry,
+                    reason=f"broker existing qty={existing}",
+                )
                 return
             result = ibkr.submit_bracket(
                 ib, contract, direction="long", size=pos_size,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_gld_pm_long",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
+                reject = str(result.entry.reject_reason or "unknown")
+                code = "ORDER_REJECTED"
+                if "cluster_cap" in reject or "oversized_order" in reject:
+                    code = "CAP_EXCEEDED"
+                elif "market_closed" in reject:
+                    code = "MARKET_CLOSED"
+                elif "real_money_boundary" in reject:
+                    code = "REAL_MONEY_BOUNDARY"
+                record_blocker(
+                    "forge_gld_pm_long",
+                    code,
+                    symbol="GLD",
+                    stage="entry",
+                    action="BUY",
+                    qty=pos_size,
+                    notional_usd=pos_size * plan_entry,
+                    reason=reject,
+                )
                 return
             entry_px = float(result.entry.fill_price)
             stop_order_id = result.stop_order_id
@@ -379,6 +454,16 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
             execution_venue = "ibkr_paper"
         except Exception as exc:
             log.error("REAL_ENTRY EXCEPTION: %s", exc, exc_info=True)
+            record_blocker(
+                "forge_gld_pm_long",
+                "ENTRY_EXCEPTION",
+                symbol="GLD",
+                stage="entry",
+                action="BUY",
+                qty=pos_size,
+                notional_usd=pos_size * plan_entry,
+                reason=str(exc),
+            )
             return
 
     risk_usd = pos_size * max(entry_px - stop, 0.0)
@@ -412,6 +497,20 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
     pnl_usd = pnl_pts * ot["position_size"]
     state["trade_count"] += 1
     duration_min = (pd.to_datetime(exit_ts, utc=True) - pd.to_datetime(ot["entry_ts"], utc=True)).total_seconds() / 60
+    try:
+        pnl_pct_value = round(pnl_pct_of_fleet(pnl_usd), 4)
+    except Exception as exc:
+        log.warning("PNL_PCT_UNAVAILABLE: %s", exc)
+        pnl_pct_value = ""
+    try:
+        from helio.fleet_sizing import get_effective_risk_pct
+        risk_pct_value = round(
+            get_effective_risk_pct("forge_gld_pm_long")["risk_pct"] * 100,
+            3,
+        )
+    except Exception as exc:
+        log.warning("RISK_PCT_UNAVAILABLE: %s", exc)
+        risk_pct_value = ""
     _append_trade({
         "ts": ot["entry_ts"],
         "direction": "long",
@@ -422,10 +521,10 @@ def _close(state: dict, exit_ts, exit_px: float, reason: str) -> None:
         "duration_min": round(duration_min, 1),
         "trade_num": state["trade_count"],
         "pnl_usd": round(pnl_usd, 2),
-        "pnl_pct_of_fleet": round(pnl_pct_of_fleet(pnl_usd), 4),
+        "pnl_pct_of_fleet": pnl_pct_value,
         "position_size": ot["position_size"],
         "risk_usd": ot["risk_usd"],
-        "risk_pct_of_fleet": round(__import__("helio.fleet_sizing", fromlist=["get_effective_risk_pct"]).get_effective_risk_pct("forge_gld_pm_long")["risk_pct"] * 100, 3),
+        "risk_pct_of_fleet": risk_pct_value,
         "sizing_policy": "fleet_anchored_risk_pct",
         "entry_regime": "pm_session",
         "experiment_valid": "true",
@@ -535,6 +634,8 @@ def loop_mode():
     log.info("GLD PM Long --loop mode started. Signal hours UTC: %s", PARAMS["signal_hours_utc"])
     while True:
         try:
+            state = _load_state()
+            _write_heartbeat(state, _last_eval_ts_from_heartbeat())
             now = datetime.now(timezone.utc)
             # Find next firing time: top of next signal hour + 30s
             candidates = []
@@ -555,7 +656,13 @@ def loop_mode():
             next_fire = min(candidates)
             sleep_s = max(5, (next_fire - now).total_seconds())
             log.info("Next eval at %s UTC (sleep %.0fs)", next_fire.isoformat(), sleep_s)
-            time.sleep(sleep_s)
+            remaining = sleep_s
+            while remaining > 0:
+                chunk = min(300.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+                state = _load_state()
+                _write_heartbeat(state, _last_eval_ts_from_heartbeat())
             try:
                 evaluate_once()
             except Exception as e:
@@ -581,14 +688,23 @@ def main():
         global _SIGNAL_ONLY_MODE
         _SIGNAL_ONLY_MODE = True
         log.info("SIGNAL-ONLY MODE: no IBKR orders will be submitted")
-    if args.evaluate:
-        evaluate_once()
-    elif args.scan:
-        scan()
-    elif args.backtest:
+    if args.backtest:
         backtest(args.period)
-    elif args.loop:
-        loop_mode()
+        return
+    # Lock is only meaningful for live/loop modes — backtests are
+    # one-shot offline computations.
+    from helio.runner_lock import acquire_runner_lock, RunnerAlreadyRunning
+    try:
+        with acquire_runner_lock("forge_gld_pm_long"):
+            if args.evaluate:
+                evaluate_once()
+            elif args.scan:
+                scan()
+            elif args.loop:
+                loop_mode()
+    except RunnerAlreadyRunning as exc:
+        log.error("REFUSING_DUPLICATE_RUNNER: %s", exc)
+        sys.exit(75)  # EX_TEMPFAIL
 
 
 if __name__ == "__main__":

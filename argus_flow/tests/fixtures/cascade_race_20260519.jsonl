@@ -1,0 +1,9 @@
+{"ts": "2026-05-19T15:00:00.000+00:00", "monotonic_ms": 0, "event": "connected", "data": {"recorder_attached": true}}
+{"ts": "2026-05-19T15:00:00.100+00:00", "monotonic_ms": 100, "event": "position", "data": {"symbol": "CAD", "currency": "JPY", "local_symbol": "CAD.JPY", "position": 41479.0, "avg_cost": 91.234, "account": "DUP472829"}}
+{"ts": "2026-05-19T15:01:30.000+00:00", "monotonic_ms": 90000, "event": "newOrder", "data": {"order_id": 7421, "action": "SELL", "qty": 41479, "type": "LMT", "lmt_price": 90.450, "tif": "DAY", "symbol": "CAD"}}
+{"ts": "2026-05-19T15:01:30.050+00:00", "monotonic_ms": 90050, "event": "orderStatus", "data": {"order_id": 7421, "status": "Submitted", "filled": 0, "remaining": 41479, "avg_fill_price": 0, "symbol": "CAD"}}
+{"ts": "2026-05-19T15:01:30.450+00:00", "monotonic_ms": 90450, "event": "execDetails", "data": {"order_id": 7421, "exec_id": "0001.6478a3b1.01.01", "shares": 41479, "price": 90.451, "side": "SLD", "time": "2026-05-19T15:01:30+00:00", "symbol": "CAD"}}
+{"ts": "2026-05-19T15:01:30.500+00:00", "monotonic_ms": 90500, "event": "orderStatus", "data": {"order_id": 7421, "status": "Filled", "filled": 41479, "remaining": 0, "avg_fill_price": 90.451, "symbol": "CAD"}}
+{"ts": "2026-05-19T15:01:30.600+00:00", "monotonic_ms": 90600, "event": "position", "data": {"symbol": "CAD", "currency": "JPY", "local_symbol": "CAD.JPY", "position": 0, "avg_cost": 0, "account": "DUP472829"}}
+{"ts": "2026-05-19T15:02:30.100+00:00", "monotonic_ms": 150100, "event": "orderStatus", "data": {"order_id": 7421, "status": "PendingCancel", "filled": 41479, "remaining": 0, "avg_fill_price": 90.451, "symbol": "CAD"}}
+{"ts": "2026-05-19T15:02:32.150+00:00", "monotonic_ms": 152150, "event": "orderStatus", "data": {"order_id": 7421, "status": "Cancelled", "filled": 41479, "remaining": 0, "avg_fill_price": 90.451, "symbol": "CAD"}}

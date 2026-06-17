@@ -104,22 +104,12 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-log = logging.getLogger("gdx_gld")
-log.setLevel(logging.DEBUG)
-
-_console = logging.StreamHandler()
-_console.setLevel(logging.INFO)
-_console.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-))
-log.addHandler(_console)
-
-_file_handler = logging.FileHandler(LOG_DIR / "runner.log")
-_file_handler.setLevel(logging.DEBUG)
-_file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-))
-log.addHandler(_file_handler)
+# 2026-05-12: replaced custom FileHandler with setup_logging() so
+# helio.signal_executor + helio.ibkr_execution errors are visible in
+# forge/logs/gdx_gld/runner.log. See project_2026_05_12_capital_ladder_session
+# memory for the 4-layer silent-gate cascade this prevents.
+from forge.logging_setup import setup_logging
+log = setup_logging("gdx_gld")
 
 
 # ---------------------------------------------------------------------------
@@ -677,30 +667,40 @@ def _run_signal_only_loop(equity: float) -> None:
     log.info("Signal-only evaluation complete.")
 
 
-def _connect_with_backoff(ib, port: int, max_attempts: int = 12) -> bool:
+def _connect_with_backoff(ib, port: int, max_attempts: int | None = None) -> bool:
     """Connect to TWS with exponential backoff (5s -> 10s -> ... -> 300s cap).
 
-    Returns True on success, False if all attempts exhausted.
+    max_attempts=None (default) → retry forever. This is the right behavior
+    for a long-running daemon — better to patiently wait for TWS than die
+    and require a 23-hour watchdog cycle to restart (the failure mode we
+    hit 2026-05-16/17). Pass a finite max_attempts only for one-shot scripts
+    or when failure-to-connect should propagate up.
+
+    Returns True on success, False if max_attempts was set and exhausted.
     """
     delay = 5
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             ib.connect("127.0.0.1", port, clientId=IBKR_CLIENT_ID)
             log.info("Connected to IBKR on attempt %d", attempt)
             return True
         except Exception as e:
+            limit_str = f"/{max_attempts}" if max_attempts else "/inf"
             log.warning(
-                "TWS connect attempt %d/%d failed: %s. Retry in %ds...",
-                attempt, max_attempts, e, delay,
+                "TWS connect attempt %d%s failed: %s. Retry in %ds...",
+                attempt, limit_str, e, delay,
             )
             try:
                 ib.disconnect()
             except Exception:
                 pass
+            if max_attempts is not None and attempt >= max_attempts:
+                log.error("TWS connect exhausted %d attempts; giving up", max_attempts)
+                return False
             time.sleep(delay)
             delay = min(delay * 2, 300)
-    log.error("TWS connect exhausted %d attempts; giving up", max_attempts)
-    return False
 
 
 def _run_ibkr_live_loop(equity: float, port: int) -> None:
@@ -937,8 +937,15 @@ Examples:
                    help="Run signal-only continuously (evaluate every --interval-min)")
     p.add_argument("--interval-min", type=int, default=60,
                    help="Loop interval in minutes (default: 60)")
-    p.add_argument("--equity", type=float, default=get_initial_capital_usd(),
-                   help="Model equity in USD (default: 10000)")
+    # 2026-05-13: Lazy default — calling get_initial_capital_usd() here would
+    # raise BrokerEquityUnavailableError if risk_oversight_report.json reports
+    # account_equity_usd=0.0 (which happens transiently when the risk_oversight
+    # script can't reach the broker). That caused gdx_gld to die at startup,
+    # which the watchdog interpreted as a respawn-needed event, creating an
+    # infinite restart loop. Resolve at main() instead, so the runner can at
+    # least start and log a clear error if equity is genuinely unavailable.
+    p.add_argument("--equity", type=float, default=None,
+                   help="Model equity in USD (default: read from broker via fleet_sizing)")
     p.add_argument("--start", type=str, default="2006-05-22",
                    help="Backtest start date (default: 2006-05-22, GDX inception)")
     p.add_argument("--end", type=str, default="2026-04-11",
@@ -952,6 +959,16 @@ Examples:
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+
+    # Resolve --equity lazily so a transient broker-unavailable doesn't crash
+    # the runner at startup. If still unavailable when actually needed, the
+    # downstream code will surface a clear error.
+    if args.equity is None:
+        try:
+            args.equity = get_initial_capital_usd()
+        except Exception as exc:
+            log.warning("get_initial_capital_usd() failed (%s); falling back to $10,000 model equity", exc)
+            args.equity = 10_000.0
 
     if args.dry_run and args.backtest:
         log.info("[DRY-RUN] Would run backtest from %s to %s with equity=$%s",

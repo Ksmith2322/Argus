@@ -282,7 +282,7 @@ def run_live(configs: list[Path]):
     log.info(f"Stage: {stage} | execution_allowed={stage in ('paper', 'real')}")
 
     ib = IB()
-    ib.connect(os.getenv("IBKR_HOST", "127.0.0.1"), int(os.getenv("IBKR_PORT", "7496")), clientId=220, timeout=15)
+    ib.connect(os.getenv("IBKR_HOST", "127.0.0.1"), int(os.getenv("IBKR_PORT", "7497")), clientId=220, timeout=15)
     log.info(f"Connected. Account: {ib.managedAccounts()}")
 
     instruments = []

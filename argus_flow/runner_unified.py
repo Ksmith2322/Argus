@@ -118,7 +118,11 @@ log = logging.getLogger("unified")
 
 # ── Global connection settings from .env ─────────────────────
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
-IBKR_PORT = int(os.getenv("IBKR_PORT", "7496"))
+# 2026-05-18: default 7497 (paper). Previous 7496 (live) was the "port
+# split-brain" risk Codex flagged — a missing env var would silently
+# route argus FX entries to the live account. Real-money runs MUST set
+# IBKR_PORT=7496 explicitly + flip real_money_allowlist.global_enabled.
+IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))
 IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1096,9 +1100,27 @@ def _in_session(hour: int, start: int, end: int) -> bool:
 
 
 def check_trigger_fx(features: dict, cfg: dict) -> Optional[str]:
-    """FX trigger: range_pct + range_accel + vol_z + session + blocked hours."""
+    """FX trigger: range_pct + range_accel + vol_z + session + blocked hours.
+
+    2026-05-21: paper_stress_multiplier wired here for range_accel strategies
+    (GBPUSD). Mirrors the MTF-side wiring in InstrumentRunner.__init__ so the
+    full FX trio (USDJPY mtf, CADJPY mtf, GBPUSD range_accel) responds to the
+    same activity-multiplication knob. The multiplier only scales the barrier
+    threshold (range_pct_min) — the dist thresholds route direction, not
+    whether to enter, so they're left alone."""
     trigger = cfg.get("trigger", {})
-    if features["range_pct"] < trigger.get("range_pct_min", 0.0012):
+    stress_mult = cfg.get("paper_stress_multiplier", 1.0)
+    base_range_pct_min = trigger.get("range_pct_min", 0.0012)
+    if stress_mult != 1.0:
+        from helio.paper_stress import apply as _stress_apply
+        symbol_for_log = cfg.get("symbol") or "fx"
+        eff_range_pct_min = _stress_apply(
+            base_range_pct_min, stress_mult,
+            strategy=f"argus_{symbol_for_log}", knob="range_pct_min",
+        )
+    else:
+        eff_range_pct_min = base_range_pct_min
+    if features["range_pct"] < eff_range_pct_min:
         return None
     if features["range_accel"] <= trigger.get("range_accel_min", 0.0):
         return None
@@ -1332,15 +1354,27 @@ class InstrumentRunner:
         mtf_cfg = config.get("mtf", {})
         if mtf_cfg.get("enabled") and config.get("strategy") == "mtf_trend":
             from argus_flow.strategies.mtf_engine import MTFStrategyEngine
+            from helio.paper_stress import apply as _stress_apply
+            _stress_mult = mtf_cfg.get("paper_stress_multiplier", 1.0)
+            _trend_eff = _stress_apply(
+                mtf_cfg.get("min_trend_strength", 0.5),
+                _stress_mult,
+                strategy=f"argus_{self.symbol}", knob="min_trend_strength",
+            )
+            _conf_eff = _stress_apply(
+                mtf_cfg.get("min_confidence", 0.5),
+                _stress_mult,
+                strategy=f"argus_{self.symbol}", knob="min_confidence",
+            )
             self._mtf_strategy = MTFStrategyEngine(
                 symbol=self.symbol,
                 pip_size=self.pip_size,
                 trend_ema_fast=mtf_cfg.get("trend_ema_fast", 8),
                 trend_ema_slow=mtf_cfg.get("trend_ema_slow", 21),
                 rsi_period=mtf_cfg.get("rsi_period", 14),
-                min_trend_strength=mtf_cfg.get("min_trend_strength", 0.5),
+                min_trend_strength=_trend_eff,
             )
-            self._mtf_min_confidence = mtf_cfg.get("min_confidence", 0.5)
+            self._mtf_min_confidence = _conf_eff
             self._log.info(f"MTF Trend Strategy enabled (4H/1H/5M, min_conf={self._mtf_min_confidence})")
             # AI Overlay — adaptive ensemble voter layer on top of MTF signals
             from argus_flow.strategies.ai_overlay import AdaptiveOverlay
@@ -1349,7 +1383,11 @@ class InstrumentRunner:
                 pip_size=self.pip_size,
                 state_dir=log_dir,
             )
-            self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
+            _ai_disabled_at_boot = os.environ.get("ARGUS_DISABLE_AI_OVERLAY", "").strip() in ("1", "true", "yes")
+            if _ai_disabled_at_boot:
+                self._log.warning("AI Overlay DISABLED via ARGUS_DISABLE_AI_OVERLAY env (signals pass MTF directly)")
+            else:
+                self._log.info("AI Overlay enabled (15 voters, adaptive weights)")
             # LLM reasoning moved to nightly analysis (ops/nightly_analysis.py)
             # Real-time LLM gating disabled — adds latency, governor is better
             self._llm_reasoner = None
@@ -1517,9 +1555,9 @@ class InstrumentRunner:
         unavailable — keeps Argus safe even if the central config breaks.
         """
         try:
-            from helio.fleet_sizing import get_effective_risk_pct
+            from helio.fleet_sizing import get_allocation_factor, get_effective_risk_pct
             label = f"argus_{self.symbol.lower()}"
-            return float(get_effective_risk_pct(label)["risk_pct"])
+            return float(get_effective_risk_pct(label)["risk_pct"]) * float(get_allocation_factor(label))
         except Exception:
             return self.risk_pct
 
@@ -1527,7 +1565,14 @@ class InstrumentRunner:
         equity_usd = self._get_account_equity()
         # Resolve tier-based risk_pct each call so Argus auto-promotes as
         # measured live performance earns it (matches Forge tier behavior).
-        effective_risk = self._effective_risk_pct() or self.risk_pct
+        effective_risk = self._effective_risk_pct()
+        if effective_risk <= 0:
+            self._log.warning(
+                "ALLOCATION_BLOCK: effective_risk_pct<=0 symbol=%s stage=%s",
+                self.symbol,
+                self.deployment_stage,
+            )
+            return 0.0, 0.0, "allocation_factor_zero"
         if equity_usd < 100:
             self._log.warning(f"LOW_EQUITY_DEBUG: equity={equity_usd} stage={self.deployment_stage} model={self.risk_policy.get('model_start_equity_usd')} risk_pct={effective_risk}")
 
@@ -2231,6 +2276,8 @@ class InstrumentRunner:
         """Submit a market order for real entry. Returns True on success.
 
         Pre-trade guards (mirrors helio/ibkr_execution.py:submit_bracket):
+          0. Real-money boundary (allowlist + global flag) — 2026-05-18: was MISSING
+             until Codex audit; argus FX could submit live-account orders unchecked.
           1. Fleet kill-switch (HALT.flag)
           2. FX IdealPro minimum ($25K USD-equivalent)
           3. Cluster exposure cap (per-instrument + macro cluster + total notional)
@@ -2241,6 +2288,35 @@ class InstrumentRunner:
             self._log.error("REAL_ENTRY FAILED: no IB reference on runner")
             return False
 
+        # Guard 0: real-money boundary. No-op for paper connections but
+        # absolute must-check for real connections — strategy_label fed
+        # so the boundary can attribute (allowlist matches per-strategy).
+        try:
+            from helio.real_money import (
+                enforce_real_money_boundary, AccountBoundaryViolationError,
+            )
+            from helio.ibkr_execution import _fx_usd_notional
+            est_notional = _fx_usd_notional(self.symbol, float(size), float(stop_px))
+            strategy_label = f"argus_{self.symbol.lower().replace('.', '').replace('/', '')}"
+            enforce_real_money_boundary(
+                ib,
+                strategy_label=strategy_label,
+                notional_usd=est_notional if est_notional > 0 else None,
+            )
+        except AccountBoundaryViolationError as exc:
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY refused entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
+        except Exception as exc:
+            # Fail closed: any other boundary-check error blocks the trade
+            # rather than allowing it through unchecked.
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY check raised unexpected error "
+                f"({type(exc).__name__}: {exc}); failing closed and refusing entry"
+            )
+            return False
+
         # Guard 1: fleet halt
         try:
             from helio.ibkr_execution import is_fleet_halted
@@ -2248,8 +2324,13 @@ class InstrumentRunner:
             if halted:
                 self._log.warning(f"FLEET_HALTED: refusing entry {direction} {size} {self.symbol}. Reason: {halt_reason}")
                 return False
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail closed: if we can't tell whether the fleet is halted, refuse.
+            # Codex audit X5 doctrine — guards must fail closed.
+            self._log.error(
+                f"halt check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
 
         # Guard 2: FX IdealPro min — argus only trades FX, so always check
         try:
@@ -2263,7 +2344,11 @@ class InstrumentRunner:
                 )
                 return False
         except Exception as exc:
-            self._log.warning(f"FX min check failed (allowing trade): {exc}")
+            # Fail closed (Codex X5)
+            self._log.error(
+                f"FX min check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
 
         # Guard 3: cluster exposure cap
         try:
@@ -2280,7 +2365,33 @@ class InstrumentRunner:
                     )
                     return False
         except Exception as exc:
-            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed (Codex X5)
+            self._log.error(
+                f"cluster cap check failed, REFUSING entry {direction} {size} {self.symbol}: {exc}"
+            )
+            return False
+
+        # Guard 4: broker-position check (2026-05-19 incident follow-up).
+        # If broker already shows a position in this instrument, that's an
+        # orphan we don't know about. Submitting a new entry would either
+        # double our exposure (if same direction) or partially offset it
+        # (if opposite, briefly creating a smaller-net position with weird
+        # P&L tracking). Refuse and let reconciliation adopt the orphan
+        # first; next signal cycle can re-evaluate.
+        broker_qty = self._read_broker_position()
+        if broker_qty is None:
+            # Broker unreachable. Fail closed.
+            self._log.error(
+                f"REAL_ENTRY ABORTED: broker position query returned None — "
+                f"cannot verify clean entry state for {direction} {size} {self.symbol}"
+            )
+            return False
+        if abs(broker_qty) > 0:
+            self._log.warning(
+                f"REAL_ENTRY ABORTED: broker already has {broker_qty} {self.symbol} — "
+                f"refusing entry {direction} {size}. Reconciliation will adopt the orphan."
+            )
+            return False
 
         try:
             action = "BUY" if direction == "long" else "SELL"
@@ -2292,13 +2403,84 @@ class InstrumentRunner:
             if qty <= 0:
                 self._log.warning(f"REAL_ENTRY ABORTED: rounded size={qty} (was {size}); skipping")
                 return False
-            order = MarketOrder(action, qty)
+
+            # 2026-05-21 BUGFIX: FX entries must use LimitOrder + TIF=GTC,
+            # not MarketOrder which defaults to TIF=DAY and triggers
+            # Error 10349 ("Order TIF was set to DAY based on order preset").
+            # Same bug class as the 2026-05-19 exit-path fix
+            # (_build_exit_order) and the 2026-05-20 flatten_eod_executor
+            # fix; the entry path in _submit_real_entry was missed in both
+            # sweeps. Caught by the golden-trace recorder on the first
+            # live entry after activation (USDJPY orderId=13, 2026-05-21
+            # 18:05Z). TWS auto-retried the rejected order which masked
+            # the bug but the trace caught the rejection -> retry pattern.
+            # Pattern matches _build_exit_order: wide LMT (5% buffer)
+            # with JPY-aware decimals, GTC TIF, outsideRth.
+            is_cash = getattr(self.contract, "secType", "") == "CASH"
+            if is_cash:
+                ref_px = self._get_mid() or float(stop_px) or 1.0
+                buffer = 1.05 if action == "BUY" else 0.95
+                pair_tags = " ".join([
+                    str(getattr(self, "symbol", "")),
+                    str(getattr(self.contract, "symbol", "")),
+                    str(getattr(self.contract, "currency", "")),
+                    str(getattr(self.contract, "localSymbol", "")),
+                ]).upper()
+                is_jpy = "JPY" in pair_tags
+                decimals = 3 if is_jpy else 5
+                lmt = round(float(ref_px) * buffer, decimals)
+                order = LimitOrder(action, qty, lmt)
+                order.outsideRth = True
+                order.tif = "GTC"
+            else:
+                order = MarketOrder(action, qty)
             order.account = getattr(self, 'stage_account', '') or ''
-            trade = ib.placeOrder(self.contract, order)
-            s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
-            s.entry_pending = True
-            s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
-            s.save()
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder so any inbound execDetails for this order finds
+            # state populated. See _pre_allocate_order_id for full reasoning.
+            entry_pre_id = self._pre_allocate_order_id(ib)
+            if entry_pre_id is not None:
+                order.orderId = entry_pre_id
+                s.entry_order_id = str(entry_pre_id)
+                s.entry_pending = True
+                s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
+                trade = ib.placeOrder(self.contract, order)
+            else:
+                # Fallback: post-placeOrder write (legacy pattern with race)
+                trade = ib.placeOrder(self.contract, order)
+                s.entry_order_id = str(getattr(trade.order, 'orderId', ''))
+                s.entry_pending = True
+                s.entry_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
+
+            # 2026-05-20 BUGFIX: persist pending-entry to the crash-recovery
+            # queue. helio.pending_fills exists and is wired into forge's
+            # submit_bracket, but argus's _submit_real_entry was never
+            # connected — argus_flow/logs/_pending_fills.jsonl was 0 bytes.
+            # Without this, a runner crash during the 60s pending window
+            # falls back to synthetic-stop orphan adoption (the path that's
+            # been producing 2-5× wider stops on every adopted entry).
+            try:
+                from helio.pending_fills import write_pending
+                client_id = int(getattr(getattr(ib, 'client', None), 'clientId', 0) or 0)
+                est_entry_px = self._get_mid() or float(stop_px) or 1.0
+                write_pending(
+                    client_id=client_id,
+                    order_id=s.entry_order_id,
+                    strategy=f"argus_{self.symbol.lower().replace('.', '').replace('/', '')}",
+                    symbol=self.symbol,
+                    direction=direction,
+                    size=float(qty),
+                    est_entry_px=float(est_entry_px),
+                    stop_px=float(stop_px),
+                    target_px=float(target_px),
+                )
+            except Exception as exc:
+                # Don't block the trade on a queue-write failure — the
+                # queue is a crash-recovery backstop, not a guard
+                self._log.warning(f"pending_fills write failed (non-fatal): {exc}")
+
             self._log.info(
                 f"REAL_ENTRY SUBMITTED {action} {size} {self.symbol} "
                 f"orderId={s.entry_order_id} stop={stop_px} target={target_px}"
@@ -2331,21 +2513,71 @@ class InstrumentRunner:
             # opposite-direction position.
             oca_group = f"oca_{self.symbol}_{s.entry_order_id}_{int(time.time() * 1000) % 1_000_000}"
 
+            # 2026-05-20 BUGFIX: JPY-aware decimal rounding on bracket prices.
+            # Same fix as _build_exit_order. round(price, 5) on a JPY pair
+            # produces a sub-tick price that IBKR rejects with Warning 110.
+            # ib_insync Forex: contract.symbol = base (e.g. "USD"),
+            # contract.currency = quote (e.g. "JPY"), self.symbol = full
+            # pair (e.g. "USDJPY"). Check all three to be safe.
+            pair_tags = " ".join([
+                str(getattr(self, "symbol", "")),
+                str(getattr(self.contract, "symbol", "")),
+                str(getattr(self.contract, "currency", "")),
+                str(getattr(self.contract, "localSymbol", "")),
+            ]).upper()
+            is_jpy = "JPY" in pair_tags
+            price_decimals = 3 if is_jpy else 5
+
             # Stop order (protective) — OCA leg A
-            stop_order = StopOrder(close_action, abs(size), round(stop_px, 5))
+            stop_order = StopOrder(close_action, abs(size), round(stop_px, price_decimals))
             stop_order.ocaGroup = oca_group
             stop_order.ocaType = 1  # cancel all remaining orders with block
             stop_order.account = getattr(self, 'stage_account', '') or ''
-            stop_trade = ib.placeOrder(self.contract, stop_order)
-            s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder. See _pre_allocate_order_id.
+            stop_pre_id = self._pre_allocate_order_id(ib)
+            if stop_pre_id is not None:
+                stop_order.orderId = stop_pre_id
+                s.stop_order_id = str(stop_pre_id)
+                stop_trade = ib.placeOrder(self.contract, stop_order)
+            else:
+                stop_trade = ib.placeOrder(self.contract, stop_order)
+                s.stop_order_id = str(getattr(stop_trade.order, 'orderId', ''))
 
             # Target limit order — OCA leg B
-            limit_order = LimitOrder(close_action, abs(size), round(target_px, 5))
-            limit_order.ocaGroup = oca_group
-            limit_order.ocaType = 1
-            limit_order.account = getattr(self, 'stage_account', '') or ''
-            target_trade = ib.placeOrder(self.contract, limit_order)
-            s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+            # 2026-05-20 BUGFIX: half-armed-bracket race. If the target
+            # placeOrder throws (Error 110 price-decimal, throttle, network
+            # blip), the stop is already LIVE at the broker but this
+            # function returns False — caller then issues an emergency MKT
+            # exit ALONGSIDE the live OCA stop, producing a LONG→SHORT
+            # cascade similar to the 5/19 incident. Fix: wrap target
+            # placement in inner try; on failure, explicitly cancel the
+            # already-live stop before propagating the error.
+            try:
+                limit_order = LimitOrder(close_action, abs(size), round(target_px, price_decimals))
+                limit_order.ocaGroup = oca_group
+                limit_order.ocaType = 1
+                limit_order.account = getattr(self, 'stage_account', '') or ''
+                # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+                # placeOrder. See _pre_allocate_order_id.
+                tgt_pre_id = self._pre_allocate_order_id(ib)
+                if tgt_pre_id is not None:
+                    limit_order.orderId = tgt_pre_id
+                    s.target_order_id = str(tgt_pre_id)
+                    target_trade = ib.placeOrder(self.contract, limit_order)
+                else:
+                    target_trade = ib.placeOrder(self.contract, limit_order)
+                    s.target_order_id = str(getattr(target_trade.order, 'orderId', ''))
+            except Exception as target_exc:
+                self._log.error(
+                    f"BRACKET HALF-ARMED: target placeOrder failed ({target_exc}); "
+                    f"cancelling already-live stop {s.stop_order_id} to avoid "
+                    f"stop-alone + emergency-MKT cascade."
+                )
+                self._cancel_order_by_id(s.stop_order_id, "bracket_target_failed")
+                s.stop_order_id = ""
+                s.save()
+                return False
 
             s.save()
             self._log.info(
@@ -2357,6 +2589,221 @@ class InstrumentRunner:
         except Exception as exc:
             self._log.error(f"BRACKET FAILED: {exc}", exc_info=True)
             return False
+
+    def _dump_exit_forensics(self, order_id: str, stage: str) -> None:
+        """Capture full TWS state of a stuck exit order before we cancel/retry.
+
+        Background (2026-05-18): recurring argus_gbpusd EXIT FAILED cascade
+        (5/13, 5/15, 5/18) shows the LMT+outsideRth exit order sits pending
+        >30s without filling. Cancel-and-retry chain runs through IOC then
+        GTC, each also timing out. We've had ZERO visibility into WHAT TWS
+        was doing — runner only logs 'EXIT TIMEOUT' / 'EXIT STUCK' / 'EXIT
+        FAILED' with no order status, no whyHeld, no trade.log.
+
+        This writes the full forensic record to
+        `argus_flow/logs/unfilled_orders.jsonl` (same path as the
+        helio.ibkr_execution forensics from 2026-05-16) so each retry stage
+        captures orderStatus + trade.log at that moment.
+        """
+        if not order_id:
+            return
+        ib = getattr(self, '_ib', None)
+        if ib is None:
+            return
+        try:
+            # Locate the trade via ib.trades() (covers both open and closed)
+            target_trade = None
+            for t in ib.trades():
+                if str(getattr(t.order, 'orderId', '')) == str(order_id):
+                    target_trade = t
+                    break
+            if target_trade is None:
+                self._log.warning(
+                    f"EXIT_FORENSICS: orderId={order_id} not found in ib.trades()"
+                )
+                return
+            # Reuse the existing forensics dump from helio.ibkr_execution
+            from helio.ibkr_execution import _dump_unfilled_forensics
+            _dump_unfilled_forensics(target_trade, order_id=str(order_id))
+            # Also log a one-line summary inline so the diagnosis is in runner.log
+            os_obj = getattr(target_trade, 'orderStatus', None)
+            status = getattr(os_obj, 'status', '?') if os_obj else '?'
+            why_held = getattr(os_obj, 'whyHeld', '') if os_obj else ''
+            filled = getattr(os_obj, 'filled', 0) if os_obj else 0
+            remaining = getattr(os_obj, 'remaining', 0) if os_obj else 0
+            log_entries = getattr(target_trade, 'log', None) or []
+            last_msg = ""
+            for entry in reversed(log_entries):
+                msg = str(getattr(entry, 'message', '') or '').strip()
+                err = int(getattr(entry, 'errorCode', 0) or 0)
+                if err or msg:
+                    last_msg = f"err={err}:{msg[:120]}" if err else msg[:140]
+                    break
+            self._log.warning(
+                f"EXIT_FORENSICS stage={stage} order={order_id} status={status} "
+                f"filled={filled} remaining={remaining} whyHeld='{why_held}' "
+                f"last_log='{last_msg}'"
+            )
+        except Exception as exc:
+            self._log.warning(f"_dump_exit_forensics failed (non-fatal): {exc}")
+
+    def _build_exit_order(self, close_action: str, qty: int, ref_px: float, tif: str = "DAY"):
+        """Build the right exit order for this instrument type.
+
+        FX (CASH on IdealPro): wide LimitOrder + outsideRth=True + TIF=GTC.
+        MarketOrder on FX can stall around session boundaries — the symptom
+        we saw 2026-05-08 (orders 296/299/303/307 timing out with "EXIT
+        TIMEOUT" → "EXIT STUCK" → "EXIT FAILED: MANUAL BROKER CHECK
+        REQUIRED"). LMT with a 5% adverse buffer fills at NBBO without
+        sitting in the queue. TIF=GTC (overriding the DAY default for CASH)
+        avoids the speculative end-of-broker-day expiry race observed in
+        the argus_gbpusd EXIT FAILED cascade — DAY-flagged FX exits that
+        sat past the broker's daily roll boundary would silently expire.
+        Codex audit 2026-05-18 flagged this. The retry escalation already
+        ends in GTC; this change collapses the retry chain by starting
+        there for CASH.
+
+        STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles
+        itself), TIF=DAY is the right default for these.
+
+        2026-05-20 BUGFIX: JPY pairs use 0.001 minimum tick size on
+        IdealPro (3 decimals), not 0.00005 like EUR/USD-class pairs
+        (5 decimals). Rounding the LMT to 5 decimals on a JPY pair
+        produces a sub-tick price that IBKR rejects with Warning 110
+        "The price does not conform to the minimum price variation for
+        this contract". Caught live 2026-05-19 18:36 UTC: CADJPY exit
+        cascaded through all 3 retry stages with lmtPrice=109.87177 /
+        109.75983 — every retry got Warning 110 and the order stayed
+        PendingSubmit. Position remained stuck until manual intervention.
+        """
+        sec_type = getattr(self.contract, "secType", "") or ""
+        if sec_type == "CASH":
+            buffer = 1.05 if close_action == "BUY" else 0.95
+            # JPY-aware tick rounding (caught 2026-05-19 on CADJPY).
+            # JPY pairs: 3 decimals. Other FX: 5 decimals.
+            # IMPORTANT: on ib_insync Forex contracts, contract.symbol is the
+            # BASE currency (e.g. "USD" for USDJPY) and contract.currency is
+            # the QUOTE (e.g. "JPY"). The full pair lives in self.symbol on
+            # the runner OR contract.localSymbol ("USD.JPY"). Earlier draft
+            # of this fix checked contract.symbol and missed JPY pairs
+            # because contract.symbol="USD". This version checks all three.
+            pair_tags = " ".join([
+                str(getattr(self, "symbol", "")),
+                str(getattr(self.contract, "symbol", "")),
+                str(getattr(self.contract, "currency", "")),
+                str(getattr(self.contract, "localSymbol", "")),
+            ]).upper()
+            is_jpy = "JPY" in pair_tags
+            decimals = 3 if is_jpy else 5
+            lmt = round(float(ref_px or 1.0) * buffer, decimals)
+            order = LimitOrder(close_action, qty, lmt)
+            order.outsideRth = True
+            # FX: force GTC unless caller explicitly asked for a non-DAY tif
+            # (e.g., last-resort retry that already specified GTC). DAY is
+            # the historical default that triggered the EXIT FAILED cascade.
+            effective_tif = "GTC" if tif == "DAY" else tif
+        else:
+            order = MarketOrder(close_action, qty)
+            effective_tif = tif
+        order.tif = effective_tif
+        return order
+
+    def _pre_allocate_order_id(self, ib) -> int | None:
+        """Pre-allocate an orderId from ib_insync's client BEFORE placeOrder.
+
+        2026-05-21: eliminates the placeOrder -> state-write race. The
+        original pattern was:
+
+            trade = ib.placeOrder(contract, order)
+            s.entry_order_id = str(trade.order.orderId)
+            s.save()
+
+        Between placeOrder returning and s.save() completing, ib_insync's
+        event loop could process incoming TWS messages — including an
+        execDetails for this very order. The fill handler would look up
+        state by order_id and find it missing. By pre-allocating the
+        orderId, setting it on the order object, and writing state
+        BEFORE placeOrder, the race window is eliminated.
+
+        Returns the pre-allocated int orderId on success, or None if
+        ib.client.getReqId() isn't available — caller should fall back
+        to the post-placeOrder pattern in that case.
+        """
+        try:
+            return int(ib.client.getReqId())
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._log.warning(
+                f"pre_allocate_order_id failed ({exc}); "
+                f"falling back to post-placeOrder pattern (race window present)"
+            )
+            return None
+
+    def _read_broker_position(self) -> float | None:
+        """Query the broker for this instrument's current position.
+
+        Returns the signed quantity (positive=long, negative=short, 0=flat),
+        or None if the broker is unreachable / no IB reference. Used by every
+        exit-submission path to verify intent matches reality before placing
+        an order — see the 2026-05-19 cascade-double-sell post-mortem
+        (project_2026_05_19_cadjpy_jpy_decimal_bugs.md). Without this guard,
+        a fill that races our local state update produces a duplicate exit
+        order that REVERSES the position.
+        """
+        ib = getattr(self, "_ib", None)
+        if ib is None:
+            return None
+        try:
+            our_local = str(getattr(self.contract, "localSymbol", "")).upper()
+            our_sym = str(getattr(self.contract, "symbol", "")).upper()
+            our_curr = str(getattr(self.contract, "currency", "")).upper()
+            for p in ib.positions():
+                pc = p.contract
+                if str(getattr(pc, "localSymbol", "")).upper() == our_local and our_local:
+                    return float(p.position)
+                if (str(pc.symbol).upper() == our_sym
+                    and str(getattr(pc, "currency", "")).upper() == our_curr
+                    and our_sym):
+                    return float(p.position)
+            return 0.0  # not in positions list = flat
+        except Exception as exc:
+            self._log.warning(f"broker position query failed (non-fatal): {exc}")
+            return None
+
+    def _broker_state_allows_exit(self, close_action: str, qty: int) -> tuple[bool, str]:
+        """Verify the proposed exit makes sense against broker truth.
+
+        Returns (ok, reason). Refuses the exit when:
+          - Broker shows flat — our prior exit must have filled; emitting
+            another would create a new opposite-direction position (the
+            2026-05-19 CADJPY incident).
+          - Broker direction is opposite our local belief — local state
+            drifted; reconcile before submitting more orders.
+
+        Caller should clear local state on refusal and let the next
+        reconciliation cycle handle the broker truth."""
+        broker_qty = self._read_broker_position()
+        if broker_qty is None:
+            # 2026-05-20 BUGFIX: fail CLOSED on broker-unreachable. The
+            # previous "passthrough" was itself fail-open — comment claimed
+            # downstream submit_bracket / cluster_exposure would catch it,
+            # but _submit_real_exit calls ib.placeOrder directly, bypassing
+            # those layers entirely. A network blip during a cascade retry
+            # would silently produce a duplicate exit — exactly the 5/19
+            # catastrophe caused by network failure instead of order race.
+            # Better to under-trade for one cycle than double-exit.
+            return False, "broker_unreachable_fail_closed"
+        if broker_qty == 0.0:
+            return False, f"broker_flat_already (intended {close_action} {qty})"
+        if close_action == "SELL" and broker_qty < 0:
+            return False, f"broker_short_{broker_qty:.0f}_SELL_would_deepen"
+        if close_action == "BUY" and broker_qty > 0:
+            return False, f"broker_long_{broker_qty:.0f}_BUY_would_deepen"
+        # Direction matches but magnitude may differ. Caller should resize
+        # to the actual broker quantity, not the local belief. Return ok
+        # but with the magnitude info.
+        if abs(broker_qty) < qty:
+            return True, f"resize_needed_broker_has_{broker_qty:.0f}_local_thinks_{qty}"
+        return True, "ok"
 
     def _submit_real_exit(self, reason: str, mid: float) -> bool:
         """Cancel existing bracket orders and submit a market exit."""
@@ -2371,21 +2818,59 @@ class InstrumentRunner:
         if ib is None:
             self._log.error("REAL_EXIT FAILED: no IB reference on runner")
             return False
+
+        # 2026-05-19 BUGFIX: verify broker truth before submitting an exit.
+        # The cascade race observed today doubled CADJPY (LONG → SHORT)
+        # and quadrupled USDJPY (30K → 120K) because exits were submitted
+        # on stale local state. This guard short-circuits the runaway
+        # when broker shows the position is already gone.
+        close_action = "SELL" if s.position == "LONG" else "BUY"
+        ok, why = self._broker_state_allows_exit(close_action, int(qty))
+        if not ok:
+            self._log.error(
+                f"EXIT_ABORTED reason={reason} {close_action} {qty} {self.symbol}: {why}. "
+                f"Clearing local state to reconverge with broker on next cycle."
+            )
+            s.exit_pending = False
+            s.position = "FLAT"
+            s.position_size = 0
+            s.clear_trade_state()
+            s.save()
+            return False
+        if why != "ok" and "resize_needed" in why:
+            broker_qty = self._read_broker_position() or 0.0
+            new_qty = int(abs(broker_qty))
+            self._log.warning(
+                f"EXIT_RESIZE local={qty} -> broker={new_qty} reason={reason} {self.symbol}"
+            )
+            qty = new_qty
+
         try:
             # Cancel existing stop and target orders
             self._cancel_order_by_id(s.stop_order_id, "stop")
             self._cancel_order_by_id(s.target_order_id, "target")
 
-            close_action = "SELL" if s.position == "LONG" else "BUY"
-            order = MarketOrder(close_action, int(abs(s.position_size)))
+            ref_px = mid if mid and mid > 0 else (s.entry_price or 0)
+            order = self._build_exit_order(close_action, int(qty), ref_px, tif="DAY")
             order.account = getattr(self, 'stage_account', '') or ''
-            trade = ib.placeOrder(self.contract, order)
-            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-            s.exit_pending = True
-            s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
-            s.save()
+            # 2026-05-21 BUGFIX: pre-allocate orderId + write state BEFORE
+            # placeOrder. See _pre_allocate_order_id.
+            exit_pre_id = self._pre_allocate_order_id(ib)
+            if exit_pre_id is not None:
+                order.orderId = exit_pre_id
+                s.exit_order_id = str(exit_pre_id)
+                s.exit_pending = True
+                s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
+                trade = ib.placeOrder(self.contract, order)
+            else:
+                trade = ib.placeOrder(self.contract, order)
+                s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                s.exit_pending = True
+                s.exit_submitted_ts = datetime.now(timezone.utc).isoformat()
+                s.save()
             self._log.info(
-                f"REAL_EXIT SUBMITTED {close_action} {s.position_size} {self.symbol} "
+                f"REAL_EXIT SUBMITTED {close_action} {qty} {self.symbol} "
                 f"orderId={s.exit_order_id} reason={reason}"
             )
             self._pending_exit_reason = reason
@@ -2450,7 +2935,41 @@ class InstrumentRunner:
         2026-05-04: introduced after Friday's argus FX restart cycle left
         orphan positions that argus didn't know about, blocking entries
         via RECON_DRIFT permanently.
+
+        2026-05-20 BUGFIX: sanity-check broker_qty + broker_avg_cost. On
+        5/19 IBKR's position-update stream delivered two corrupted snapshots
+        (position=-1.0 avgCost=-202.13) — an odd-lot arithmetic glitch.
+        The runner blindly adopted both, submitted real LimitOrder against
+        negative prices, and one filled at 115.54 with odd-lot warning.
+        Reject obviously-bad values rather than acting on them.
         """
+        # Sanity checks — refuse to adopt corrupted values
+        if broker_avg_cost <= 0:
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_avg_cost={broker_avg_cost} "
+                f"for {self.symbol} (non-positive). IBKR position-update "
+                f"glitch. Local state unchanged; next reconcile will retry."
+            )
+            return
+        if abs(broker_qty) < 1:
+            # FX min lot is 1000; futures min is 1 contract. Anything below
+            # 1 unit is an odd-lot arithmetic artifact, not a real position.
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_qty={broker_qty} for "
+                f"{self.symbol} (sub-lot). Likely IBKR odd-lot glitch. "
+                f"Local state unchanged."
+            )
+            return
+        # Sanity: avg_cost must be within ±20% of last known mid
+        last_mid = self._get_mid() or 0.0
+        if last_mid > 0 and abs(broker_avg_cost - last_mid) / last_mid > 0.20:
+            self._log.error(
+                f"ADOPT_ORPHAN REFUSED: broker_avg_cost={broker_avg_cost} "
+                f"diverges >20% from last_mid={last_mid} for {self.symbol}. "
+                f"Likely IBKR position-update glitch."
+            )
+            return
+
         s = self.state
         s.position = broker_dir.upper()
         s.entry_price = broker_avg_cost
@@ -2563,6 +3082,62 @@ class InstrumentRunner:
                 f"size={size} stop={stop_px:.5f} target={target_px:.5f}"
             )
 
+            # 2026-05-20 BUGFIX: clear from the pending-fills queue now that
+            # we've confirmed the fill. Paired with write_pending in
+            # _submit_real_entry. Without this clear, the queue accumulates
+            # already-filled entries and reconcile_pending sees them as
+            # "still pending" on next runner restart, producing spurious
+            # ADOPTED ORPHAN events.
+            try:
+                from helio.pending_fills import clear_pending
+                if s.entry_order_id:
+                    clear_pending(order_id=s.entry_order_id)
+            except Exception as exc:
+                self._log.warning(f"pending_fills clear failed (non-fatal): {exc}")
+
+            # Dual-write an ENTRY row to canonical_fills. Mirrors the EXIT
+            # dual-write in _log_trade and the submit_bracket ENTRY dual-write
+            # on the forge side — without this, the fleet ledger has no entry
+            # anchor and orphan detection can't distinguish "took the entry,
+            # still open" from "never entered". Stamps lineage_id so the row
+            # is attributable by intent (Codex X3+X7). Wrapped in try/except
+            # so a broken canonical log cannot break paper trading.
+            try:
+                from helio.canonical_fills import write_fill_typed
+                from helio.domain import Fill, make_lineage_id
+                try:
+                    import os as _os
+                    ib = getattr(self, "_ib", None)
+                    client_id = getattr(getattr(ib, "client", None), "clientId", None) if ib else None
+                    session_id = (
+                        f"c{client_id}p{_os.getpid()}" if client_id is not None
+                        else f"p{_os.getpid()}"
+                    )
+                except Exception:
+                    session_id = None
+                lineage = make_lineage_id(
+                    strategy=f"argus_{self.symbol.lower()}",
+                    session_id=session_id,
+                    entry_order_id=str(s.entry_order_id) if s.entry_order_id else None,
+                )
+                write_fill_typed(Fill(
+                    strategy=f"argus_{self.symbol.lower()}",
+                    symbol=self.symbol,
+                    direction=direction.lower(),
+                    side="ENTRY",
+                    entry_ts=now.isoformat(),
+                    exit_ts=None,
+                    entry_px=float(fill_px),
+                    exit_px=None,
+                    size=float(fill_qty),
+                    risk_usd=float(s.entry_risk_usd or 0.0),
+                    pnl_usd=None,
+                    exit_reason=None,
+                    lineage_id=lineage,
+                ))
+            except Exception:
+                pass  # never let canonical log break paper trading
+
             # Submit protective bracket orders
             ok = self._submit_bracket_orders(stop_px, target_px)
             if not ok:
@@ -2581,14 +3156,38 @@ class InstrumentRunner:
 
         # ── Stop fill ──
         if order_id == s.stop_order_id and s.position != "FLAT":
-            # Stop filled — cancel the target order
+            # 2026-05-21 BUGFIX: partial-fill state-ordering race. Previously
+            # ANY stop fill (even partial) triggered _finalize_real_exit
+            # which clears trade state — but OCA-cancels the target leg,
+            # leaving the remaining position OPEN with no bracket protection.
+            # Now: broker-truth check before finalizing. If broker still has
+            # position, this was partial — log and wait. _check_bracket_health
+            # will re-arm a bracket on the remaining qty within 60s.
+            broker_pos = self._read_broker_position()
+            if broker_pos is not None and abs(broker_pos) > 0.5:
+                self._log.warning(
+                    f"PARTIAL_STOP_FILL: stop filled qty={fill_qty} but broker "
+                    f"shows {self.symbol} pos={broker_pos} (still open). "
+                    f"Waiting for closure. bracket_health will re-arm protection."
+                )
+                return
+            # Stop filled fully — cancel the target order
             self._cancel_order_by_id(s.target_order_id, "target")
             self._finalize_real_exit(fill_px, "stop", now)
             return
 
         # ── Target fill ──
         if order_id == s.target_order_id and s.position != "FLAT":
-            # Target filled — cancel the stop order
+            # 2026-05-21 BUGFIX: same partial-fill race as stop above.
+            broker_pos = self._read_broker_position()
+            if broker_pos is not None and abs(broker_pos) > 0.5:
+                self._log.warning(
+                    f"PARTIAL_TARGET_FILL: target filled qty={fill_qty} but broker "
+                    f"shows {self.symbol} pos={broker_pos} (still open). "
+                    f"Waiting for closure. bracket_health will re-arm protection."
+                )
+                return
+            # Target filled fully — cancel the stop order
             self._cancel_order_by_id(s.stop_order_id, "stop")
             self._finalize_real_exit(fill_px, "target", now)
             return
@@ -2687,9 +3286,47 @@ class InstrumentRunner:
         """Cancel stuck orders after timeout. Entry: 60s, Exit: 30s."""
         s = self.state
         if s.entry_pending and s.entry_submitted_ts:
+            # 2026-05-20 BUGFIX: ENTRY-side broker-truth check. Mirror of the
+            # exit-side fix from 5/19. The 60s entry timeout was firing AFTER
+            # the order had already filled but the execDetails callback hadn't
+            # yet arrived (instant-fill races on FX), causing the runner to:
+            #   1. Issue a cancel (which fails: order already filled at broker)
+            #   2. Clear local state INCLUDING _pending_stop_px/_pending_target_px
+            #   3. Later adopt via reconciliation as orphan with SYNTHETIC stops
+            #      (2-5× wider than the strategy designed)
+            # Observed 24× across 5/19+5/20. Every FX entry hit this path.
+            # The fix: query broker FIRST. If position exists, the order
+            # filled — adopt it with the strategy-intended stops still in
+            # memory at self._pending_stop_px / self._pending_target_px.
             try:
                 submitted = datetime.fromisoformat(s.entry_submitted_ts)
                 if (now - submitted).total_seconds() > 60:
+                    broker_qty = self._read_broker_position()
+                    if broker_qty is not None and abs(broker_qty) > 0:
+                        # Order filled — execDetails callback was lost. Don't
+                        # cancel-and-clear; adopt the position with the
+                        # strategy-intended stop/target stashed on self.
+                        direction = "long" if broker_qty > 0 else "short"
+                        pending_stop = getattr(self, '_pending_stop_px', 0.0)
+                        pending_target = getattr(self, '_pending_target_px', 0.0)
+                        self._log.warning(
+                            f"ENTRY_RACE_RESOLVED: broker has {broker_qty} {self.symbol} — "
+                            f"prior entry must have filled. Adopting with intended "
+                            f"stop={pending_stop} target={pending_target}."
+                        )
+                        s.position = direction.upper()
+                        s.position_size = abs(broker_qty)
+                        s.entry_price = self._get_mid() or s.entry_price or 0.0
+                        s.entry_time = now
+                        s.entry_pending = False
+                        s.stop_price = pending_stop or s.stop_price
+                        s.target_price = pending_target or s.target_price
+                        s.save()
+                        # Submit protective brackets at the intended levels
+                        if pending_stop and pending_target:
+                            self._submit_bracket_orders(pending_stop, pending_target)
+                        return
+                    # No broker position → genuine timeout, real cancel + clear
                     self._log.warning(
                         f"ENTRY TIMEOUT: order {s.entry_order_id} pending >60s — cancelling"
                     )
@@ -2700,6 +3337,27 @@ class InstrumentRunner:
                 pass
 
         if s.exit_pending and s.exit_submitted_ts:
+            # 2026-05-19 BUGFIX: cascade race. Caught live when CADJPY's IOC
+            # retry (order 1930) filled instantly but the GTC retry fired 60s
+            # later without checking, double-selling. Same pattern bit
+            # USDJPY (30K → 60K → 120K) + GBPUSD (22K → 45K → 90K) over a
+            # 2-hour window. The execDetails callback raced our local state
+            # update. Defensive: query broker via the centralized helper
+            # before each retry. If broker is flat, our exit succeeded —
+            # clear local state and skip retrying.
+            broker_qty = self._read_broker_position()
+            if broker_qty == 0.0:
+                self._log.info(
+                    f"EXIT_RACE_RESOLVED: broker shows {self.symbol} FLAT — "
+                    f"prior exit must have filled. Clearing local state, skipping retry."
+                )
+                s.exit_pending = False
+                s.position = "FLAT"
+                s.position_size = 0
+                self._exit_retry_count = 0
+                s.save()
+                return  # exit the timeout-check entirely
+
             try:
                 submitted = datetime.fromisoformat(s.exit_submitted_ts)
                 elapsed = (now - submitted).total_seconds()
@@ -2709,18 +3367,60 @@ class InstrumentRunner:
                         f"EXIT TIMEOUT: order {s.exit_order_id} pending >30s — "
                         f"cancelling and retrying with aggressive MKT"
                     )
+                    # 2026-05-18: capture forensics BEFORE cancel so we know what
+                    # TWS thinks (orderStatus.whyHeld, trade.log error codes).
+                    # Recurring argus_gbpusd EXIT FAILED cascade has no visibility
+                    # past "EXIT TIMEOUT" — this surfaces the actual TWS state.
+                    self._dump_exit_forensics(s.exit_order_id, stage="initial_timeout_30s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_timeout")
-                    # Retry with a fresh market order
+                    # 2026-05-20 BUGFIX: re-check broker AFTER the cancel
+                    # sleep. _cancel_order_by_id sleeps 2s and returns
+                    # "confirmed" if the order is no longer in openTrades —
+                    # but a fill during that 2s window ALSO removes it from
+                    # openTrades. Without this re-check, we'd submit a
+                    # duplicate exit on a position that's already closed.
+                    broker_qty = self._read_broker_position()
+                    if broker_qty == 0.0:
+                        self._log.info(
+                            f"EXIT_FILLED_DURING_CANCEL: broker shows {self.symbol} "
+                            f"FLAT after cancel — prior exit filled in 2s sleep window. "
+                            f"Skipping IOC retry."
+                        )
+                        s.exit_pending = False
+                        s.position = "FLAT"
+                        s.position_size = 0
+                        self._exit_retry_count = 0
+                        s.save()
+                        return
+                    # Retry with the right order type for this instrument
+                    # (FX => LimitOrder + outsideRth, equity/futures => MarketOrder).
+                    # Equity/futures still use IOC tif here for urgency; FX
+                    # cannot use IOC (IdealPro rejects it on FX) so the helper
+                    # downgrades CASH to DAY.
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, int(abs(s.position_size)))
+                        ref_px = s.entry_price or s.target_price or 0
+                        sec_type = getattr(self.contract, "secType", "") or ""
+                        retry_tif = "DAY" if sec_type == "CASH" else "IOC"
+                        order = self._build_exit_order(
+                            close_action, int(abs(s.position_size)), ref_px, tif=retry_tif,
+                        )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        order.tif = "IOC"  # Immediate-or-Cancel for urgency
-                        trade = ib.placeOrder(self.contract, order)
-                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-                        s.exit_submitted_ts = now.isoformat()
-                        s.save()
+                        # 2026-05-21 BUGFIX: pre-allocate orderId. See
+                        # _pre_allocate_order_id.
+                        retry_pre_id = self._pre_allocate_order_id(ib)
+                        if retry_pre_id is not None:
+                            order.orderId = retry_pre_id
+                            s.exit_order_id = str(retry_pre_id)
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
+                            trade = ib.placeOrder(self.contract, order)
+                        else:
+                            trade = ib.placeOrder(self.contract, order)
+                            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
                         self._exit_retry_count = 1
                         self._log.info(
                             f"EXIT RETRY (IOC MKT) orderId={s.exit_order_id}"
@@ -2731,17 +3431,45 @@ class InstrumentRunner:
                         f"EXIT STUCK: IOC retry also failed after 60s — "
                         f"submitting GTC MKT as last resort"
                     )
+                    self._dump_exit_forensics(s.exit_order_id, stage="ioc_retry_60s")
                     self._cancel_order_by_id(s.exit_order_id, "exit_stuck")
+                    # 2026-05-20 BUGFIX: same fill-during-cancel re-check as
+                    # the 30s arm above.
+                    broker_qty = self._read_broker_position()
+                    if broker_qty == 0.0:
+                        self._log.info(
+                            f"EXIT_FILLED_DURING_CANCEL: broker shows {self.symbol} "
+                            f"FLAT after cancel — IOC retry must have filled in 2s "
+                            f"sleep window. Skipping GTC retry."
+                        )
+                        s.exit_pending = False
+                        s.position = "FLAT"
+                        s.position_size = 0
+                        self._exit_retry_count = 0
+                        s.save()
+                        return
                     ib = getattr(self, '_ib', None)
                     if ib is not None and s.position != "FLAT":
                         close_action = "SELL" if s.position == "LONG" else "BUY"
-                        order = MarketOrder(close_action, int(abs(s.position_size)))
+                        ref_px = s.entry_price or s.target_price or 0
+                        order = self._build_exit_order(
+                            close_action, int(abs(s.position_size)), ref_px, tif="GTC",
+                        )
                         order.account = getattr(self, 'stage_account', '') or ''
-                        order.tif = "GTC"
-                        trade = ib.placeOrder(self.contract, order)
-                        s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
-                        s.exit_submitted_ts = now.isoformat()
-                        s.save()
+                        # 2026-05-21 BUGFIX: pre-allocate orderId. See
+                        # _pre_allocate_order_id.
+                        gtc_pre_id = self._pre_allocate_order_id(ib)
+                        if gtc_pre_id is not None:
+                            order.orderId = gtc_pre_id
+                            s.exit_order_id = str(gtc_pre_id)
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
+                            trade = ib.placeOrder(self.contract, order)
+                        else:
+                            trade = ib.placeOrder(self.contract, order)
+                            s.exit_order_id = str(getattr(trade.order, 'orderId', ''))
+                            s.exit_submitted_ts = now.isoformat()
+                            s.save()
                         self._exit_retry_count = 2
                         self._log.info(f"EXIT RETRY (GTC MKT) orderId={s.exit_order_id}")
                 elif elapsed > 120 and exit_retry_count >= 2:
@@ -2750,6 +3478,7 @@ class InstrumentRunner:
                         f"EXIT FAILED: all retries exhausted after 120s. "
                         f"Forcing local FLAT — MANUAL BROKER CHECK REQUIRED"
                     )
+                    self._dump_exit_forensics(s.exit_order_id, stage="gtc_retry_120s_failed")
                     _write_incident(self, "EXIT_FAILED",
                                     f"All exit retries exhausted, forced local FLAT",
                                     s.position, {"direction": s.position, "qty": s.position_size})
@@ -2935,7 +3664,14 @@ class InstrumentRunner:
                 self._log.info(f"MTF SIGNAL: {direction} {mtf_signal.reason}")
 
                 # ── AI Overlay gate ──────────────────────────────
-                if self._ai_overlay is not None and direction is not None:
+                # 2026-05-22: env-var bypass. The overlay was calibrated
+                # against tighter MTF candidates; once paper_stress_multiplier
+                # loosens MTF thresholds the overlay rejects most candidates
+                # (3-of-3 SKIPs observed 2026-05-22). Set
+                # ARGUS_DISABLE_AI_OVERLAY=1 to short-circuit during the
+                # exercise window; re-enable + retune post-5/31 reset.
+                _ai_disabled = os.environ.get("ARGUS_DISABLE_AI_OVERLAY", "").strip() in ("1", "true", "yes")
+                if self._ai_overlay is not None and direction is not None and not _ai_disabled:
                     from argus_flow.strategies.ai_overlay import MarketState
                     ai_state = MarketState(
                         price=mid,
@@ -4350,12 +5086,39 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     for inst in instruments:
         inst._ib = ib
 
+    # -- Optional golden-trace recorder (opt-in via GOLDEN_TRACE_PATH env)
+    # Captures every broker event to JSONL so live incidents can be
+    # converted into deterministic regression tests via helio.trace_replay.
+    _trace_path = os.environ.get("GOLDEN_TRACE_PATH", "").strip()
+    if _trace_path:
+        try:
+            from helio.event_recorder import attach_recorder
+            _trace_recorder = attach_recorder(ib, _trace_path)
+            log.warning(f"GOLDEN_TRACE_RECORDER attached -> {_trace_path}")
+        except Exception as e:
+            log.warning(f"GOLDEN_TRACE_RECORDER failed to attach: {e}")
+
     def _route_fill_to_runner(trade, fill):
-        """Route IB fill events to the correct InstrumentRunner."""
+        """Route IB fill events to the correct InstrumentRunner.
+
+        2026-05-22 BUGFIX: filter was `execution_mode != "real"` which
+        skipped paper-stage instruments. But paper-stage runners submit
+        real broker orders (to the paper account) and receive real
+        execDetails — they just don't risk real money. With the wrong
+        filter, every argus paper fill since 4/23 was silently dropped:
+          - _on_fill never invoked
+          - No 'FILL RECEIVED' log line
+          - No canonical_fills.jsonl write
+          - Drift detector accumulated unattributed P&L
+        Caught by investigating the 5/22 drift trip — runner thought
+        realized=-$799, broker showed -$1,223; the $424 gap was all the
+        unlogged argus exits. The runner body uses ("real", "paper") in
+        5 other places; this dispatcher just hadn't been updated. The
+        "observe" mode still doesn't submit orders so still skipped."""
         trade_symbol = getattr(trade.contract, 'symbol', '') or ''
         trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
         for inst in instruments:
-            if inst.execution_mode != "real":
+            if inst.execution_mode not in ("real", "paper"):
                 continue
             inst_key = _runner_to_ib_key(inst)
             if trade_key == inst_key or trade_symbol == inst.symbol:
@@ -4368,14 +5131,20 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
     ib.execDetailsEvent += _route_fill_to_runner
 
     def _route_order_status_to_runner(trade):
-        """Route IB order status events (Rejected/Cancelled) to correct runner."""
+        """Route IB order status events (Rejected/Cancelled) to correct runner.
+
+        2026-05-22 BUGFIX: same dispatcher gate as _route_fill_to_runner —
+        paper-stage instruments also need to receive Rejected/Cancelled
+        order status events to clear their state. Previously only "real"
+        runners received them; argus paper would have stale entry_pending
+        flags after a rejection. Same root cause."""
         status_str = getattr(trade.orderStatus, 'status', '') if trade.orderStatus else ''
         if status_str not in ('Rejected', 'Cancelled'):
             return
         trade_key = _normalize_ib_key(trade.contract) if trade.contract else ''
         order_id = str(getattr(trade.order, 'orderId', ''))
         for inst in instruments:
-            if inst.execution_mode != "real":
+            if inst.execution_mode not in ("real", "paper"):
                 continue
             inst_key = _runner_to_ib_key(inst)
             if trade_key != inst_key:
@@ -4429,6 +5198,12 @@ def main(config_paths: Optional[list[str]] = None, exclude: Optional[list[str]] 
         size, risk_usd, policy = inst._resolve_position_size(mid, stop_px)
         equity = inst._get_account_equity()
         if size <= 0:
+            if policy == "allocation_factor_zero":
+                log.warning(
+                    f"  Sizing disabled {inst.label}: allocation_factor_zero "
+                    f"(reconcile/exit management allowed)"
+                )
+                continue
             log.critical(
                 f"FATAL SIZING: [{inst.label}] dry-run size=0 | equity=${equity:,.2f} "
                 f"risk_pct={inst.risk_pct} policy={policy} "

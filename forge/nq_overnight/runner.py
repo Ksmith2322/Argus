@@ -173,10 +173,34 @@ def evaluate_once() -> None:
         if state.get("open_trade"):
             ot = state["open_trade"]
 
-            if ib is not None and ot.get("execution_venue") == "ibkr_paper":
-                contract = ibkr.make_contract("MNQ", "micro_future")
+            # 2026-05-23 self-heal: stale signal_only open_trade from a prior
+            # connect-fail wake should NOT block real entries forever. If we
+            # now have a real IBKR connection and broker confirms flat,
+            # clear the phantom state so the signal evaluator can run.
+            if (ib is not None
+                and ot.get("execution_venue") == "signal_only"):
                 try:
-                    ib.qualifyContracts(contract)
+                    contract_check = ibkr.qualify_front_month_future(ib, "MNQ")
+                    broker_qty = ibkr.query_position(ib, contract_check)
+                except Exception as exc:
+                    log.warning("self-heal broker-position check failed: %s", exc)
+                    broker_qty = None
+                if broker_qty == 0:
+                    log.warning(
+                        "STALE_SIGNAL_ONLY: clearing phantom open_trade "
+                        "(entry_ts=%s, signal-only entry never had real "
+                        "broker position) so live signals can resume",
+                        ot.get("entry_ts"),
+                    )
+                    state["open_trade"] = None
+                    _save_state(state)
+                    ot = None  # fall through to signal evaluation below
+
+            if ot is None:
+                pass
+            elif ib is not None and ot.get("execution_venue") == "ibkr_paper":
+                contract = ibkr.qualify_front_month_future(ib, "MNQ")
+                try:
                     outcome = ibkr.check_bracket_filled(
                         ib, contract, ot.get("stop_order_id"), ot.get("target_order_id"),
                         entry_direction=ot.get("direction"),
@@ -277,9 +301,8 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
     execution_venue = "signal_only"
 
     if ib is not None and not _SIGNAL_ONLY_MODE:
-        contract = ibkr.make_contract("MNQ", "micro_future")
+        contract = ibkr.qualify_front_month_future(ib, "MNQ")
         try:
-            ib.qualifyContracts(contract)
             existing = ibkr.query_position(ib, contract)
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION: MNQ qty=%s, skipping to avoid doubling", existing)
@@ -288,6 +311,7 @@ def _open(state: dict, df: pd.DataFrame, idx: int, a: float, ib=None) -> None:
                 ib, contract, direction="long", size=contracts,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_nq_overnight",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED: %s", result.entry.reject_reason)
@@ -396,7 +420,14 @@ def scan() -> None:
     print(f"  Would trigger: {'LONG' if last_ts.hour in PARAMS['signal_hours_utc'] else 'no'}")
 
 
-def backtest(period: str = "2y") -> None:
+def backtest(period: str = "2y", return_trades: bool = False):
+    """Run the NQ overnight backtest.
+
+    When return_trades=False (default), prints summary stats and returns None
+    (back-compat). When return_trades=True, returns a list of trade dicts each
+    with date/hour/entry/exit/pnl_pts/pnl_atr/pnl_pct for downstream analysis
+    (e.g. slippage recalibration via promotion_panel).
+    """
     df = yf.download("NQ=F", period=period, interval="1h", progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -427,8 +458,14 @@ def backtest(period: str = "2y") -> None:
         if exit_px is None:
             exit_idx = min(i + PARAMS["hold_bars"], len(df) - 1)
             exit_px = C[exit_idx]
-        trades.append({"date": df.index[i], "hour": int(df.index[i].hour), "entry": entry, "exit": exit_px, "pnl_pts": exit_px - entry, "pnl_atr": (exit_px - entry) / a})
+        pnl_pct = (exit_px / entry - 1.0) * 100.0 if entry > 0 else 0.0
+        trades.append({"date": df.index[i], "hour": int(df.index[i].hour),
+                        "entry": entry, "exit": exit_px,
+                        "pnl_pts": exit_px - entry, "pnl_atr": (exit_px - entry) / a,
+                        "pnl_pct": pnl_pct})
         open_until = exit_idx
+    if return_trades:
+        return trades
     td = pd.DataFrame(trades)
     if td.empty:
         print("No trades.")

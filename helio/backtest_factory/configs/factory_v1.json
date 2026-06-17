@@ -1,0 +1,37 @@
+{
+  "_comment": "Backtest factory v1 starter specs. One spec per primitive family. All are long-only, all use ATR stop+target as the exit so the test is purely entry-quality. The goal of this set is NOT to find a winner; it's to exercise the engine end-to-end on existing data. Real edge candidates get their own files.",
+  "version": "1.0.0",
+  "created": "2026-05-22",
+  "specs": [
+    {
+      "name": "sma_20_50_cross",
+      "timeframe": "1d",
+      "entry": {"kind": "sma_cross", "fast": 20, "slow": 50},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "ema_12_26_cross",
+      "timeframe": "1d",
+      "entry": {"kind": "ema_cross", "fast": 12, "slow": 26},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 40}
+    },
+    {
+      "name": "rsi14_oversold_30",
+      "timeframe": "1d",
+      "entry": {"kind": "rsi_oversold", "n": 14, "threshold": 30.0},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 3.0, "max_hold_bars": 20}
+    },
+    {
+      "name": "donchian_20_breakout",
+      "timeframe": "1d",
+      "entry": {"kind": "donchian_breakout", "n": 20},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 2.0, "target_mult": 4.0, "max_hold_bars": 60}
+    },
+    {
+      "name": "bollinger_revert_20_2",
+      "timeframe": "1d",
+      "entry": {"kind": "bollinger_revert", "n": 20, "k": 2.0},
+      "exit": {"kind": "atr_stop_target", "atr_n": 14, "stop_mult": 1.5, "target_mult": 2.0, "max_hold_bars": 10}
+    }
+  ]
+}

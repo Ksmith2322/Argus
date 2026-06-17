@@ -115,37 +115,20 @@ class StrategyWatch:
     setup_selective: bool = False     # if True, uses a longer rolling window before flagging
 
 
-# Per-strategy calibration: session windows + how selective the strategy is.
-# "setup_selective" strategies (mamba, cuebanks, gld_pm_long, nq_overnight, jpy_pm_short)
-# only fire on specific setups — they can legitimately be quiet for hours during
-# their session. For those, use a longer rolling window (240min = 4hr) so we
-# don't false-positive every cycle.
-#
-# Fast-eval strategies (argus, spy_mean_rev, multi_orb, vix_intraday) evaluate
-# every 5min bar during their sessions — if they're mute for 60min, something
-# is genuinely wrong (data feed dead, runner crashed mid-loop, etc.).
+# 2026-05-26: v26 roster only. The silent-block detector is built for
+# intraday strategies that should produce a per-bar signal during their
+# session window; if they're alive but mute for >N minutes, something is
+# broken (data feed dead, gate stuck, eval loop crashed mid-call). Of the
+# v26 active roster, only gld_pm_long is intraday. xs_momentum variants
+# evaluate once per month-end. tom_spy / nov_spy / tail_hedge are
+# day-of / regime-gated and don't fit the "alive-but-mute during active
+# session" failure mode. They have their own watchdogs (heartbeat
+# freshness, allocation gates, real_money_preflight).
 STRATEGIES: list[StrategyWatch] = [
-    # Fast-eval: 5m bars, signal every bar if eval loop is healthy
-    StrategyWatch("argus_usdjpy",        "argus_flow/logs/usdjpy/signals.csv",        "ts",  7, 21, 60, 1, setup_selective=False),
-    StrategyWatch("argus_gbpusd",        "argus_flow/logs/gbpusd/signals.csv",        "ts",  7, 21, 60, 1, setup_selective=False),
-    StrategyWatch("argus_cadjpy",        "argus_flow/logs/cadjpy/signals.csv",        "ts",  7, 21, 60, 1, setup_selective=False),
-    StrategyWatch("forge_spy_mean_rev",  "forge/logs/spy_mean_rev/signals.csv",       "ts", 14, 20, 60, 1, setup_selective=False),
-    StrategyWatch("forge_multi_orb",     "forge/logs/multi_orb/signals.csv",          "ts", 14, 20, 60, 1, setup_selective=False),
-    StrategyWatch("forge_vix_intraday",  "forge/logs/vix_intraday/signals.csv",       "ts", 14, 20, 60, 1, setup_selective=False),
-
-    # Setup-selective: naturally sparse; 4hr window + still 1-signal floor for "totally mute"
+    # Setup-selective: gld_pm_long only fires when GLD intraday setup
+    # matches; 4hr window + 1-signal floor catches "alive but data feed
+    # dead". PM window: 18:00-21:00 UTC weekdays.
     StrategyWatch("forge_gld_pm_long",   "forge/logs/gld_pm_long/signals.csv",        "ts", 18, 21, 240, 1, setup_selective=True),
-    StrategyWatch("forge_jpy_pm_short",  "forge/logs/jpy_pm_short/signals.csv",       "ts", 19, 20, 240, 1, setup_selective=True),
-    StrategyWatch("forge_nq_overnight",  "forge/logs/nq_overnight/signals.csv",       "ts", 20, 24, 240, 1, setup_selective=True),
-    StrategyWatch("forge_nq_london_close",    "forge/logs/nq_london_close/signals.csv",    "ts", 15, 17, 120, 1, setup_selective=True),
-    StrategyWatch("forge_aud_asian_breakout", "forge/logs/aud_asian_breakout/signals.csv", "ts",  0,  3, 120, 1, setup_selective=True),
-    # Mamba uses 'timestamp' col (not 'ts') + narrow 13:25-14:30 UTC NY-open window (DST);
-    # session_end=15 covers both DST and STD. setup_selective=True + 180min window
-    # tolerates its sparse nature (signals often cluster at open then taper).
-    StrategyWatch("forge_mamba",         "forge/logs/mamba/signals.csv",              "timestamp", 13, 16, 180, 1, setup_selective=True),
-    # cuebanks: skip until its runner actually writes signals.csv (hasn't yet).
-    # Adding back once the bridge starts producing data.
-    # StrategyWatch("forge_cuebanks",   ...),
 ]
 
 

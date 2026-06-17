@@ -57,13 +57,8 @@ _SIGNAL_ONLY_MODE = False
 # Capped at etf notional cap (1.0× anchor).
 NOTIONAL_FRACTION_MULTIPLIER = 100
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] fomc_drift | %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
-    stream=sys.stderr,
-)
-log = logging.getLogger("fomc_drift.runner")
+from forge.logging_setup import setup_logging
+log = setup_logging("fomc_drift")
 
 
 def _load_state() -> dict:

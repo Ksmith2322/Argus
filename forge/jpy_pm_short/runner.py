@@ -303,10 +303,16 @@ def _open(state: dict, sym: str, df: pd.DataFrame, idx: int, a: float, ib=None) 
             if existing != 0:
                 log.warning("BROKER_HAS_POSITION: %s qty=%s, skipping to avoid doubling", sym, existing)
                 return
+            # 2026-05-20 BUGFIX: JPY pairs use 0.001 min tick on IdealPro;
+            # passing price_decimals=5 produces sub-tick prices rejected
+            # with Warning 110. The strategy trades USDJPY/CADJPY/EURJPY
+            # — all JPY pairs — so price_decimals=3 is correct here.
+            # (Same bug fix as runner_unified._build_exit_order.)
             result = ibkr.submit_bracket(
                 ib, contract, direction="short", size=pos_size,
-                stop_px=stop, target_px=target, price_decimals=5,
+                stop_px=stop, target_px=target, price_decimals=3,
                 est_entry_px=plan_entry,
+                strategy_label="forge_jpy_pm_short",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED %s: %s", sym, result.entry.reject_reason)

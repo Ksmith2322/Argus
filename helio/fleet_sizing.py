@@ -404,10 +404,24 @@ def pnl_pct_of_fleet(pnl_usd: float) -> float:
 
 # ── Notional cap (buying-power ceiling) ──────────────────────────
 
-def max_notional_usd(asset_class: str) -> float:
+def max_notional_usd(asset_class: str, strategy_label: str | None = None) -> float:
     """Max position notional that a real funded account at this anchor could
-    actually hold, given the asset class's typical leverage."""
-    caps = _load_config().get("notional_caps_by_asset_class", {})
+    actually hold, given the asset class's typical leverage.
+
+    If `strategy_label` is provided and matches an entry in
+    `notional_caps_by_strategy`, the per-strategy multiplier overrides the
+    asset-class default. Used for single-position intraday strategies whose
+    ATR-floor sizing legitimately needs a higher concentration than the
+    survival-first fleet defaults allow."""
+    cfg = _load_config()
+    if strategy_label:
+        overrides = cfg.get("notional_caps_by_strategy", {}) or {}
+        if strategy_label in overrides:
+            try:
+                return get_sizing_anchor_usd() * float(overrides[strategy_label])
+            except (TypeError, ValueError):
+                pass
+    caps = cfg.get("notional_caps_by_asset_class", {})
     mult = float(caps.get(asset_class, 1.0))
     return get_sizing_anchor_usd() * mult
 

@@ -27,6 +27,14 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# 2026-05-13: NY_OPEN_HOUR / NY_CLOSE_HOUR are expressed in Eastern time
+# (NYSE session). System clock is CDT (UTC-5), so datetime.now() without
+# tz returned local CDT and the strategy treated CDT 9:30 as "NY open" —
+# one hour AFTER actual 9:30 EDT. Use America/New_York to get the
+# correct wall-clock hour regardless of where the host runs.
+_NY_TZ = ZoneInfo("America/New_York")
 from pathlib import Path
 from typing import Optional
 
@@ -73,7 +81,13 @@ POINT_VALUE_MYM = 0.50
 # Session: NY 9:30-16:00 EST
 NY_OPEN_HOUR, NY_OPEN_MIN = 9, 30
 NY_CLOSE_HOUR, NY_CLOSE_MIN = 16, 0
-MAX_TRADES_PER_DAY = 2
+# 2026-05-13: cap originally from MambaFX/Cue Banks human-trader rulebook
+# (max 2 trades/day was an EMOTIONAL discipline for discretionary traders).
+# A systematic bot doesn't tilt, so the cap is kept for documentation
+# reference only — NOT enforced in run_backtest or run_live. If post-cap
+# trades (#3+) prove to be negative expectancy, the cap may be reintroduced
+# based on EVIDENCE rather than copied from a human's rulebook.
+MAX_TRADES_PER_DAY = 2  # reference only, not enforced
 MIN_RR = 5.0  # Conservative (rulebook says 1:7-1:8)
 
 # 2026-04-25: was 108 which collided with aud_asian_breakout. Realigned to
@@ -253,9 +267,10 @@ def run_backtest():
             break_tracker.register_levels(h4_sr_levels)
 
         for i in range(5, len(ny_bars)):
-            if day_trades >= MAX_TRADES_PER_DAY:
-                break
-
+            # 2026-05-13: removed `if day_trades >= MAX_TRADES_PER_DAY: break`.
+            # The cap was a human-trader emotional rule, not a systematic
+            # edge constraint. Backtest now evaluates ALL valid setups so
+            # we can measure whether trades 3+ degrade or hold expectancy.
             bar = ny_bars.iloc[i]
             bar_ts = ny_bars.index[i]
             if break_tracker is not None:
@@ -801,7 +816,7 @@ def run_loop():
     signal_csv = LOG_DIR / "cuebanks_signals.csv"
 
     while True:
-        now = datetime.now()
+        now = datetime.now(_NY_TZ)
         # Check if NY session
         h, m = now.hour, now.minute
         t = h * 60 + m
@@ -932,7 +947,7 @@ def run_live():
 
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(_NY_TZ)
             h, m = now.hour, now.minute
             t = h * 60 + m
             ny_start = NY_OPEN_HOUR * 60 + NY_OPEN_MIN
@@ -941,9 +956,13 @@ def run_live():
 
             ib = None
             try:
-                ib = ibkr.connect(LIVE_CLIENT_ID)
+                # 2026-05-18: connect_with_retry covers the post-TWS-restart
+                # client_id slot-stuck window (1-5 min). Without retry, this
+                # runner went silent for full sleep cycle (was 1-4 hrs) after
+                # any TWS restart caught us mid-cycle.
+                ib = ibkr.connect_with_retry(LIVE_CLIENT_ID, max_attempts=5, backoff_s=60.0)
             except Exception as exc:
-                log.warning("IBKR connect failed: %s", exc)
+                log.warning("IBKR connect failed after retry: %s", exc)
 
             try:
                 # 1. Manage open positions
@@ -1019,6 +1038,7 @@ def run_live():
                                 stop_px=stop_px, target_px=target_px,
                                 instrument_type="micro_future", price_decimals=0,
                                 max_hold_bars=24,  # 2 hours at 5min
+                                strategy_label="forge_cuebanks",
                             )
                             if sx.submit_signal(state, ib, sig):
                                 log.info(f"LIVE {result['direction']} MYM entry={entry:.0f} stop={stop_px:.0f} target={target_px:.0f}")

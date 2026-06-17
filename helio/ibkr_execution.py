@@ -35,14 +35,10 @@ HALT_FLAG_PATH = Path(__file__).resolve().parents[1] / "argus_flow" / "logs" / "
 
 
 def is_fleet_halted() -> tuple[bool, str]:
-    """Returns (halted, reason). Reason is the file contents if available."""
-    if not HALT_FLAG_PATH.exists():
-        return False, ""
-    try:
-        reason = HALT_FLAG_PATH.read_text(encoding="utf-8").strip()
-    except Exception:
-        reason = "(unable to read flag file)"
-    return True, reason or "no reason provided"
+    """Returns (halted, reason) from the reconciled halt-state reader."""
+    from helio.halt_state import is_fleet_halted as _is_fleet_halted
+
+    return _is_fleet_halted()
 
 
 # FLATTEN_EOD flag — when present, runners should:
@@ -97,6 +93,76 @@ _BASE_TO_USD = {
     "NZD": 0.60,
     "JPY": 0.0067,
 }
+
+# Futures contract multipliers — USD per index point. Used to convert
+# `size × price` (which would equal index_value * contracts) into actual
+# USD notional. Stocks/ETFs/FX get multiplier=1.0 (default).
+#
+# E-minis: ES=$50/pt, NQ=$20/pt, YM=$5/pt, RTY=$50/pt (full size)
+# Micros:  MES=$5/pt, MNQ=$2/pt, MYM=$0.50/pt, M2K=$5/pt
+# Rates:   ZN/ZF/ZT use $1000/pt notional but trade in 1/32 ticks; treated
+#          conservatively at 1.0 here since strategies trading them are
+#          rare. Refine if a runner needs precision on them.
+_FUTURES_MULTIPLIER_USD_PER_POINT: dict[str, float] = {
+    "MYM": 0.50,
+    "MES": 5.00,
+    "MNQ": 2.00,
+    "M2K": 5.00,
+    "YM":  5.00,
+    "ES":  50.00,
+    "NQ":  20.00,
+    "RTY": 50.00,
+}
+
+
+def _futures_multiplier(symbol: str) -> float:
+    """Return USD-per-index-point multiplier for a futures symbol, or 1.0 for
+    non-futures (stocks, ETFs, FX). 1.0 means ``size × price`` already equals
+    USD notional, which is correct for stocks/ETFs/FX."""
+    return _FUTURES_MULTIPLIER_USD_PER_POINT.get((symbol or "").upper(), 1.0)
+
+
+# OVERSIZED_ORDER hard-sanity threshold as multiple of NetLiq anchor, by
+# asset class. Values are calibrated to allow legitimate sizing per
+# fleet_sizing.json's notional_caps_by_asset_class with ~25% buffer,
+# while still catching phantom-oversized orders (the 1,400-share QQQ /
+# 417-contract NQ pattern this guard was added to catch on 2026-05-07).
+#
+# Stocks/ETFs cap=0.3× → guard at 0.5× (67% headroom).
+# FX cap=1.0× → guard at 1.5× (50% headroom).
+# Futures cap=2.0× → guard at 2.5× (25% headroom — futures are intrinsically
+#                   large in notional but bounded by margin).
+_OVERSIZE_THRESHOLD_X = {
+    "stock":          0.5,
+    "etf":            0.5,
+    "leveraged_etf":  0.5,
+    "fx":             1.5,
+    "micro_future":   2.5,
+    "future":         2.5,
+}
+
+
+def _classify_symbol(symbol: str) -> str:
+    """Map symbol to the asset class key used by _OVERSIZE_THRESHOLD_X."""
+    sym = (symbol or "").upper()
+    if sym in _FUTURES_MULTIPLIER_USD_PER_POINT:
+        # Micro contracts (multiplier < 10) treated as micro_future, full
+        # contracts (>= 10) treated as future. Threshold is the same either
+        # way for now; split kept for future divergence.
+        return "micro_future" if _FUTURES_MULTIPLIER_USD_PER_POINT[sym] < 10 else "future"
+    if len(sym) == 6 and sym[:3].isalpha() and sym[3:].isalpha():
+        # 6-char alpha = FX pair (USDJPY, GBPUSD, etc.)
+        return "fx"
+    # Default everything else (stocks, ETFs, unknown) to stock threshold.
+    return "stock"
+
+
+def _oversize_threshold_usd(symbol: str, anchor_usd: float) -> float:
+    """USD threshold above which a single order is considered phantom-oversized
+    for this symbol. Pulls per-asset-class multiplier from
+    _OVERSIZE_THRESHOLD_X."""
+    factor = _OVERSIZE_THRESHOLD_X.get(_classify_symbol(symbol), 0.5)
+    return factor * float(anchor_usd)
 
 
 def _fx_usd_notional(symbol: str, size: float, price: float) -> float:
@@ -201,12 +267,16 @@ def connect(client_id: int, timeout: int = 15) -> IB:
     """Connect to TWS/gateway. Caller must call disconnect() when done.
 
     Each runner must use a unique client_id (forge range: 100-199).
+
+    If env var GOLDEN_TRACE_PATH is set, a golden-trace recorder is
+    attached to the returned IB instance for forensic capture. Failure
+    to attach is logged but does NOT raise — recording must never take
+    down a strategy.
     """
     ib = IB()
     try:
         log.info(f"Connecting to IBKR {IBKR_HOST}:{IBKR_PORT} client_id={client_id}")
         ib.connect(IBKR_HOST, IBKR_PORT, clientId=client_id, timeout=timeout)
-        return ib
     except Exception as exc:
         # Include exception type + repr so empty-message failures (TimeoutError,
         # asyncio CancelledError, etc.) still surface a diagnosable trace.
@@ -214,6 +284,12 @@ def connect(client_id: int, timeout: int = 15) -> IB:
         # for hours with no clue why — see 2026-05-08 investigation.
         msg = f"connect failed: {type(exc).__name__}: {exc!r} (host={IBKR_HOST} port={IBKR_PORT} client_id={client_id})"
         raise IBKRExecutionError(msg) from exc
+    try:
+        from helio.event_recorder import attach_via_env
+        attach_via_env(ib)  # no-op if GOLDEN_TRACE_PATH not set
+    except Exception as exc:
+        log.warning(f"golden-trace recorder attach failed (continuing): {exc}")
+    return ib
 
 
 def disconnect(ib: IB) -> None:
@@ -223,6 +299,55 @@ def disconnect(ib: IB) -> None:
             ib.disconnect()
     except Exception as exc:
         log.warning(f"disconnect raised (ignored): {exc}")
+
+
+def connect_with_retry(client_id: int, timeout: int = 15,
+                        max_attempts: int = 5, backoff_s: float = 60.0) -> IB:
+    """Connect to TWS with retry. Addresses the post-TWS-restart client_id
+    slot pattern (TWS Error 326): after TWS is restarted, the client_id
+    slots from the previous TWS session stay "in use" for 1-5 minutes
+    before clearing. The single-attempt `connect()` fails during that
+    window, and wake-and-sleep runners with 1-4hr cycles then go silent
+    until the next cycle.
+
+    This helper:
+      - Retries up to `max_attempts` times with `backoff_s` between
+        attempts (default: 5 × 60s = 5min total wait, which covers the
+        typical TWS-slot-clear window)
+      - Logs each attempt + the reason for failure (caught from improved
+        `connect()` diagnostics)
+      - Returns the connected IB on success, raises IBKRExecutionError
+        with all attempt history on final failure
+
+    Use this when:
+      - A runner is in a periodic-wake loop and shouldn't go silent for
+        hours after a transient connect failure
+      - Right after a TWS restart when slot recovery is expected
+
+    Don't use this when:
+      - The caller has its own outer retry loop (gdx_gld has retry-forever
+        via `_connect_with_backoff` — that's the right shape for it)
+      - The failure should propagate immediately (one-shot scripts)
+    """
+    last_exc: Exception | None = None
+    attempt_log: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return connect(client_id, timeout=timeout)
+        except IBKRExecutionError as exc:
+            last_exc = exc
+            attempt_log.append(f"attempt {attempt}/{max_attempts}: {exc}")
+            if attempt < max_attempts:
+                log.warning(
+                    f"connect_with_retry: attempt {attempt}/{max_attempts} "
+                    f"failed for client_id={client_id}, retrying in {backoff_s}s"
+                )
+                time.sleep(backoff_s)
+    # Exhausted all attempts
+    history = "; ".join(attempt_log)
+    raise IBKRExecutionError(
+        f"connect_with_retry exhausted {max_attempts} attempts for client_id={client_id}: {history}"
+    ) from last_exc
 
 
 def recover_pending_at_startup(ib: IB, strategy: str) -> list[dict]:
@@ -257,8 +382,16 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
     instrument_type:
       "stock" / "etf"   - SMART/USD routing (GLD, SPY, UVXY, GDX, etc.)
       "fx" / "forex"    - IDEALPRO cash FX (GBPUSD, USDJPY, etc.)
-      "future"          - CME/GLOBEX (NQ, ES)
-      "micro_future"    - micro contracts (MNQ, MES, MYM, M2K)
+      "future"          - exchange-specific routing (NQ/ES on CME, YM/RTY on CBOT)
+      "micro_future"    - micros (MNQ/MES on CME, MYM/M2K on CBOT)
+
+    Exchange routing (2026-05-16 fix): CME Group splits products across two
+    exchanges. NQ/MNQ (Nasdaq-100) and ES/MES (S&P-500) route to CME; YM/MYM
+    (Dow) and RTY/M2K (Russell-2000) route to CBOT. Sending a Dow/Russell
+    contract with exchange="CME" causes a SILENT order Cancellation from TWS
+    (no errorCode, no whyHeld message). This bug kept tori/cuebanks/mamba at
+    0 fills across 22+ days of MYM signals — they detected, submitted, and
+    got silently rejected with no diagnostic trail.
     """
     t = instrument_type.lower()
     if t in ("stock", "etf"):
@@ -266,12 +399,172 @@ def make_contract(symbol: str, instrument_type: str) -> Contract:
     if t in ("fx", "forex"):
         # IB FX uses concatenated pair, e.g. "EURUSD" or "USDJPY"
         return Forex(symbol)
-    if t == "future":
-        # Front-month continuous — caller should qualify to pin month
-        return Future(symbol, exchange="CME")
-    if t == "micro_future":
-        return Future(symbol, exchange="CME")
+    if t in ("future", "micro_future"):
+        sym_u = symbol.upper()
+        # CBOT-listed: Dow + Russell 2000 (both full-size and micros)
+        if sym_u in {"YM", "MYM", "RTY", "M2K"}:
+            return Future(symbol, exchange="CBOT", currency="USD")
+        # Default CME for everything else (NQ/MNQ, ES/MES, etc.)
+        return Future(symbol, exchange="CME", currency="USD")
     raise IBKRExecutionError(f"unknown instrument_type: {instrument_type!r}")
+
+
+def qualify_front_month_future(ib: IB, symbol: str, exchange: str = None,
+                                 min_days_to_expiry: int = 7) -> Contract:
+    """Resolve the front-month futures contract for a symbol.
+
+    Background (2026-05-18): `ib.qualifyContracts()` silently fails on
+    multi-expiry futures contracts when given just `Future(symbol, exchange)`
+    with no expiry hint. ib_insync sees multiple ContractDetails returned
+    (Jun/Sep/Dec quarterly contracts), can't disambiguate, and returns the
+    contract un-mutated. The resulting order has empty lastTradeDateOrContractMonth
+    + empty localSymbol + conId=0, which TWS rejects with Error 321
+    "Please enter a local symbol or an expiry". Bug discovered when
+    cuebanks/mamba/tori MYM orders cancelled on CBOT first thing 2026-05-18.
+
+    This helper enumerates all matching contracts via `reqContractDetails`,
+    filters out expiries within `min_days_to_expiry` (avoid roll-week
+    drama), sorts by expiry, and returns the front qualified contract.
+
+    Returns a fully-populated Contract (conId, localSymbol, expiry all set).
+    Raises IBKRExecutionError if no contracts found.
+    """
+    from datetime import datetime, timedelta
+    sym_u = symbol.upper()
+    if exchange is None:
+        # Default routing: CBOT for Dow/Russell, CME for everything else
+        exchange = "CBOT" if sym_u in {"YM", "MYM", "RTY", "M2K"} else "CME"
+    probe = Future(symbol, exchange=exchange, currency="USD")
+    try:
+        details = ib.reqContractDetails(probe)
+    except Exception as exc:
+        raise IBKRExecutionError(
+            f"reqContractDetails failed for {symbol}@{exchange}: {exc}"
+        ) from exc
+    if not details:
+        raise IBKRExecutionError(
+            f"no contract details returned for {symbol}@{exchange}"
+        )
+    # Filter to expiries that aren't about to roll
+    today = datetime.now()
+    candidates = []
+    for d in details:
+        c = d.contract
+        ltd = getattr(c, "lastTradeDateOrContractMonth", "")
+        if not ltd:
+            continue
+        # Format: "YYYYMMDD" or "YYYYMM"
+        try:
+            if len(ltd) >= 8:
+                exp = datetime.strptime(ltd[:8], "%Y%m%d")
+            elif len(ltd) >= 6:
+                # Month-only — assume end of month
+                exp = datetime.strptime(ltd[:6] + "28", "%Y%m%d")
+            else:
+                continue
+        except ValueError:
+            continue
+        days_out = (exp - today).days
+        if days_out < min_days_to_expiry:
+            continue
+        candidates.append((exp, c))
+    if not candidates:
+        raise IBKRExecutionError(
+            f"no front-month {symbol}@{exchange} contracts >={min_days_to_expiry}d out "
+            f"(found {len(details)} total)"
+        )
+    candidates.sort(key=lambda x: x[0])
+    front = candidates[0][1]
+    log.info(
+        f"qualify_front_month_future({symbol}@{exchange}): "
+        f"selected {front.localSymbol} expiry={front.lastTradeDateOrContractMonth} "
+        f"conId={front.conId}"
+    )
+    return front
+
+
+def _dump_unfilled_forensics(trade, order_id: Optional[str]) -> None:
+    """Persist a full forensic record of an unfilled order to disk.
+
+    Background (2026-05-16): the MYM contract-routing bug (cuebanks/mamba/tori
+    silently dead 22+ days) lived undetected because `_wait_for_fill`'s log
+    only surfaced `reject_reason=Cancelled` with no error code or whyHeld.
+    Even with the 5/13 trade.log capture (last 3 entries), TWS produced no
+    useful message — the order just came back Cancelled with empty diagnostics.
+
+    To catch the NEXT silent-failure class faster, dump every field of the
+    trade object that might explain the failure to a JSONL forensics log.
+    Each unfilled order gets one line. Grep this file when a strategy goes
+    quiet — the answer is in here even if the live logger missed it.
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        repo = _Path(__file__).resolve().parents[1]
+        forensics = repo / "argus_flow" / "logs" / "unfilled_orders.jsonl"
+        forensics.parent.mkdir(parents=True, exist_ok=True)
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id,
+        }
+        # Contract details
+        c = getattr(trade, "contract", None)
+        if c is not None:
+            record["contract"] = {
+                "symbol": getattr(c, "symbol", None),
+                "secType": getattr(c, "secType", None),
+                "exchange": getattr(c, "exchange", None),
+                "primaryExchange": getattr(c, "primaryExchange", None),
+                "currency": getattr(c, "currency", None),
+                "localSymbol": getattr(c, "localSymbol", None),
+                "lastTradeDateOrContractMonth": getattr(c, "lastTradeDateOrContractMonth", None),
+                "conId": getattr(c, "conId", None),
+            }
+        # Order details
+        o = getattr(trade, "order", None)
+        if o is not None:
+            record["order"] = {
+                "action": getattr(o, "action", None),
+                "orderType": getattr(o, "orderType", None),
+                "totalQuantity": getattr(o, "totalQuantity", None),
+                "lmtPrice": getattr(o, "lmtPrice", None),
+                "auxPrice": getattr(o, "auxPrice", None),
+                "tif": getattr(o, "tif", None),
+                "outsideRth": getattr(o, "outsideRth", None),
+                "account": getattr(o, "account", None),
+            }
+        # All orderStatus fields (every one TWS sets)
+        os_obj = getattr(trade, "orderStatus", None)
+        if os_obj is not None:
+            record["orderStatus"] = {
+                "status": getattr(os_obj, "status", None),
+                "filled": getattr(os_obj, "filled", None),
+                "remaining": getattr(os_obj, "remaining", None),
+                "avgFillPrice": getattr(os_obj, "avgFillPrice", None),
+                "permId": getattr(os_obj, "permId", None),
+                "parentId": getattr(os_obj, "parentId", None),
+                "lastFillPrice": getattr(os_obj, "lastFillPrice", None),
+                "clientId": getattr(os_obj, "clientId", None),
+                "whyHeld": getattr(os_obj, "whyHeld", None),
+                "mktCapPrice": getattr(os_obj, "mktCapPrice", None),
+            }
+        # FULL trade.log (every entry, not just last 3)
+        log_entries = []
+        for entry in (getattr(trade, "log", None) or []):
+            log_entries.append({
+                "time": entry.time.isoformat() if hasattr(getattr(entry, "time", None), "isoformat") else str(getattr(entry, "time", "")),
+                "status": getattr(entry, "status", None),
+                "message": str(getattr(entry, "message", "") or "")[:200],
+                "errorCode": int(getattr(entry, "errorCode", 0) or 0),
+            })
+        record["log"] = log_entries
+
+        with open(forensics, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record, default=str) + "\n")
+    except Exception as exc:
+        # Forensics dump must never break the order path
+        log.warning(f"_dump_unfilled_forensics failed (non-fatal): {exc}")
 
 
 def _wait_for_fill(ib: IB, trade, timeout_s: float = 10.0) -> FillResult:
@@ -292,6 +585,30 @@ def _wait_for_fill(ib: IB, trade, timeout_s: float = 10.0) -> FillResult:
         )
     status = getattr(trade.orderStatus, "status", "")
     reject = getattr(trade.orderStatus, "whyHeld", "") or status
+
+    # 2026-05-13: capture the last few TradeLogEntry messages so the
+    # actual TWS error (e.g. "Error 10349: Order TIF was set to DAY based
+    # on order preset") surfaces in the reject_reason instead of just
+    # "Cancelled". Same pattern as the silent-gate logging fix —
+    # diagnose before fixing.
+    try:
+        log_msgs: list[str] = []
+        for entry in (getattr(trade, "log", None) or [])[-3:]:
+            err_code = int(getattr(entry, "errorCode", 0) or 0)
+            msg = str(getattr(entry, "message", "") or "").strip()
+            if err_code or msg:
+                log_msgs.append(f"err={err_code}:{msg[:120]}" if err_code else msg[:140])
+        if log_msgs:
+            reject = f"{reject} | {' / '.join(log_msgs)}"
+    except Exception:
+        pass
+
+    # 2026-05-16: dump full forensic record so the NEXT silent-failure class
+    # surfaces in minutes, not weeks. The MYM bug was invisible because the
+    # live logger only had the last 3 trade.log entries — and TWS produced
+    # no useful messages. This writes everything to a JSONL file for grep.
+    _dump_unfilled_forensics(trade, order_id)
+
     return FillResult(filled=False, order_id=order_id, reject_reason=reject or "timeout")
 
 
@@ -320,6 +637,13 @@ def submit_bracket(
 
     Returns BracketResult. Check .entry.filled before trusting stop/target IDs.
     """
+    # Accept either case ('long'/'short' or 'LONG'/'SHORT'). cuebanks/mamba/tori
+    # all emit uppercase from their signal-detection layer; multi_orb/fomc_drift
+    # emit lowercase. Pre-2026-05-12 the uppercase callers were silently failing
+    # with IBKRExecutionError caught + swallowed inside signal_executor's
+    # try/except, with the error message going to a logger that wasn't attached
+    # to those runners' file handlers (see forge/logging_setup.py).
+    direction = (direction or "").lower()
     if direction not in ("long", "short"):
         raise IBKRExecutionError(f"bad direction: {direction!r}")
     if size <= 0:
@@ -351,6 +675,61 @@ def submit_bracket(
             filled=False,
             reject_reason=f"real_money_boundary:{str(exc)[:80]}",
         ))
+
+    # Killed-strategy runtime invariant (Codex audit 2026-05-18 X6).
+    # The static-config test guarantees killed strategies have factor=0.0
+    # and no_restart=True. This is the runtime fail-safe: even if the
+    # config sync got out of step (or an operator hand-started a killed
+    # runner), the executor refuses entry. Belt-and-suspenders against
+    # resurrecting a thesis-exhausted strategy.
+    if strategy_label:
+        try:
+            from helio.roi_filter import KILLED_STRATEGY_CUTOFFS
+            if strategy_label in KILLED_STRATEGY_CUTOFFS:
+                cutoff = KILLED_STRATEGY_CUTOFFS[strategy_label]
+                log.error(
+                    f"KILLED_STRATEGY: refusing entry {direction} {size} "
+                    f"{contract.symbol} — {strategy_label} was killed on {cutoff}. "
+                    f"Remove from KILLED_STRATEGY_CUTOFFS only with operator approval."
+                )
+                return BracketResult(entry=FillResult(
+                    filled=False,
+                    reject_reason=f"killed_strategy:{strategy_label}:{cutoff}",
+                ))
+        except ImportError:
+            # If the kill registry can't be loaded, fail closed.
+            log.error(f"KILL_REGISTRY_UNREADABLE: refusing entry {strategy_label}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason="kill_registry_unreadable",
+            ))
+
+    # Pre-trade replay-health bridge (Creative agent #1, 2026-05-25).
+    # See helio/replay_health.py module docstring. Refuses entry when the
+    # nightly replay-vs-ledger diff shows blocking-class mismatches
+    # (REPLAY_ONLY or TICKER_DIVERGENT) for this strategy, or when the
+    # health-check artifact is stale (>36h, default). Allows when the
+    # strategy isn't in the supported list, no health file exists yet, or
+    # the operator has set REPLAY_BRIDGE_DISABLED=1. Exits are NOT blocked.
+    if strategy_label:
+        try:
+            from helio.replay_health import check_replay_health
+            health = check_replay_health(strategy_label)
+            if not health.allow:
+                log.warning(
+                    f"REPLAY_BRIDGE_BLOCK: refusing entry {direction} {size} "
+                    f"{contract.symbol} strategy={strategy_label} "
+                    f"reason={health.reason} — {health.detail}"
+                )
+                return BracketResult(entry=FillResult(
+                    filled=False,
+                    reject_reason=f"replay_bridge_{health.reason}:{health.detail[:80]}",
+                ))
+        except ImportError:
+            # Bridge module not importable — don't break the fleet. Log and continue.
+            log.warning("REPLAY_BRIDGE_UNAVAILABLE: helio.replay_health not importable; bypassing")
+        except Exception as exc:
+            log.warning(f"REPLAY_BRIDGE_ERROR: {exc!r}; bypassing")
 
     # Kill-switch — fleet-wide halt. Refuses all new entries; existing positions
     # can still exit via close_position_market.
@@ -399,8 +778,16 @@ def submit_bracket(
                 reject_reason=f"orphan_at_broker:{existing_qty:.2f}",
             ))
     except Exception as exc:
-        # Don't block on a transient query failure — but log it so we know
-        log.warning(f"pre-entry broker query failed (allowing trade): {exc}")
+        # Fail closed: a query failure here means we cannot tell whether
+        # the broker already has a position. Refusing avoids accidental
+        # doubling up. Previously this logged and continued, which let
+        # entries through when the broker query itself was the bug
+        # (Codex audit 2026-05-18 X5 — guards must fail closed).
+        log.error(f"pre-entry broker query failed, REFUSING entry: {exc}")
+        return BracketResult(entry=FillResult(
+            filled=False,
+            reject_reason=f"broker_query_failed:{type(exc).__name__}",
+        ))
 
     # FX-specific: floor at IdealPro's $25K USD-equivalent minimum lot.
     # Below that, IBKR routes as odd-lot with materially worse spread; we'd
@@ -417,7 +804,13 @@ def submit_bracket(
 
     # Cluster cap pre-trade check (only when caller passes est_entry_px)
     if est_entry_px is not None and est_entry_px > 0:
-        est_notional = float(size) * float(est_entry_px)
+        # 2026-05-12: futures contracts have a multiplier (MYM=$0.50/pt,
+        # MNQ=$2/pt, etc.). Without it, `size × price` for 2 MYM at index
+        # value 49,862 reports $99K notional when the actual USD exposure
+        # is $49K. That false-positive triggered the 50%-of-NetLiq guard
+        # and silently dropped every cuebanks signal. For stocks/ETFs/FX,
+        # multiplier=1.0 and the math is unchanged.
+        est_notional = float(size) * float(est_entry_px) * _futures_multiplier(contract.symbol)
 
         # 2026-05-07: hard sanity cap independent of cluster math. Catches
         # sizing-layer bugs that produce phantom oversized orders (the
@@ -429,19 +822,30 @@ def submit_bracket(
         try:
             from helio.fleet_sizing import get_sizing_anchor_usd
             anchor = float(get_sizing_anchor_usd())
-            if anchor > 0 and est_notional > 0.5 * anchor:
+            oversize_threshold = _oversize_threshold_usd(contract.symbol, anchor)
+            if anchor > 0 and est_notional > oversize_threshold:
+                threshold_pct = (oversize_threshold / anchor) * 100.0 if anchor > 0 else 0.0
                 log.error(
                     f"OVERSIZED_ORDER_REJECTED: {direction} {size} "
                     f"{contract.symbol} notional=${est_notional:,.0f} > "
-                    f"50% of NetLiq=${anchor:,.0f} ({est_notional/anchor*100:.0f}%). "
+                    f"{threshold_pct:.0f}% of NetLiq=${anchor:,.0f} "
+                    f"({est_notional/anchor*100:.0f}%). "
                     f"Sizing-layer likely buggy; refusing to submit."
                 )
                 return BracketResult(entry=FillResult(
                     filled=False,
-                    reject_reason=f"oversized_order:{est_notional:.0f}>{0.5*anchor:.0f}"
+                    reject_reason=f"oversized_order:{est_notional:.0f}>{oversize_threshold:.0f}"
                 ))
         except Exception as exc:
-            log.warning(f"hard size cap check failed (allowing trade): {exc}")
+            # Fail closed: if the size-cap check itself raises (e.g., anchor
+            # reader broken), we cannot evaluate whether this is a phantom
+            # oversized order. Refuse rather than ship a potentially huge
+            # entry. Codex audit 2026-05-18 X5 — guards must fail closed.
+            log.error(f"hard size cap check failed, REFUSING entry: {exc}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason=f"size_cap_check_failed:{type(exc).__name__}",
+            ))
 
         try:
             from helio.cluster_exposure import would_breach_cluster_cap
@@ -457,7 +861,16 @@ def submit_bracket(
                 )
                 return BracketResult(entry=FillResult(filled=False, reject_reason=f"cluster_cap_breach:{breach}"))
         except Exception as exc:
-            log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed: cluster-cap exception means the exposure ledger
+            # is unreadable. Without it we cannot tell whether this trade
+            # would push the FX_USD / EQUITY_BETA / METALS / etc. clusters
+            # past their caps. Refuse rather than risk a cluster-blowup.
+            # Codex audit 2026-05-18 X5 — guards must fail closed.
+            log.error(f"cluster cap check failed, REFUSING entry: {exc}")
+            return BracketResult(entry=FillResult(
+                filled=False,
+                reject_reason=f"cluster_cap_check_failed:{type(exc).__name__}",
+            ))
 
     entry_action = "BUY" if direction == "long" else "SELL"
     close_action = "SELL" if direction == "long" else "BUY"
@@ -518,6 +931,49 @@ def submit_bracket(
         f"orderId={entry_fill.order_id}"
     )
 
+    # Dual-write an ENTRY row to canonical_fills so the fleet ledger captures
+    # entries at submission time, not only on EXIT. Without this, post-mortem
+    # reconciliation cannot distinguish "took the entry, exit is still open"
+    # from "never entered" — and orphan detection has no entry-side anchor.
+    # Also stamps lineage_id so the row can be attributed by intent (Codex
+    # X3+X7) rather than only by symbol. Wrapped in try/except so a
+    # canonical-log failure cannot break a live trade.
+    try:
+        from helio.canonical_fills import write_fill_typed
+        from helio.domain import Fill, make_lineage_id
+        from datetime import datetime, timezone
+        # session_id heuristic: use the IB client id + process pid so the
+        # lineage namespace flips on every runner restart. Entry-order-id
+        # comes from the just-filled order.
+        try:
+            import os as _os
+            client_id = getattr(getattr(ib, "client", None), "clientId", None)
+            session_id = f"c{client_id}p{_os.getpid()}" if client_id is not None else f"p{_os.getpid()}"
+        except Exception:
+            session_id = None
+        lineage = make_lineage_id(
+            strategy=strategy_label or "unknown",
+            session_id=session_id,
+            entry_order_id=str(entry_fill.order_id) if entry_fill.order_id else None,
+        )
+        write_fill_typed(Fill(
+            strategy=strategy_label or "unknown",
+            symbol=contract.symbol,
+            direction=direction,
+            side="ENTRY",
+            entry_ts=datetime.now(timezone.utc).isoformat(),
+            exit_ts=None,
+            entry_px=float(entry_fill.fill_price),
+            exit_px=None,
+            size=float(abs(size)),
+            risk_usd=None,
+            pnl_usd=None,
+            exit_reason=None,
+            lineage_id=lineage,
+        ))
+    except Exception as exc:
+        log.warning(f"canonical_fills ENTRY write failed (non-fatal): {exc}")
+
     # OCA group — when one bracket leg fills, the other auto-cancels.
     # Unique per bracket so concurrent brackets on different symbols don't interfere.
     oca_group = f"oca_{contract.symbol}_{entry_fill.order_id}_{int(time.time() * 1000) % 1_000_000}"
@@ -577,6 +1033,58 @@ def cancel_order_by_id(ib: IB, order_id: Optional[str]) -> bool:
     return False
 
 
+def _recover_close_fill_from_executions(
+    ib: IB,
+    contract: Contract,
+    entry_direction: str,
+    after_ts: Optional[float] = None,
+) -> Optional[FillResult]:
+    """Look up the most recent closing fill via reqExecutions.
+
+    Used when the synchronous market-close wait times out but the order may
+    actually have filled — TWS can report `Cancelled` while a separate fill
+    still made it through, or the wait window expired while the fill was
+    in-flight. Without this lookup, the runner records exit_px=None and the
+    trade silently disappears from trades.csv (the gating `if exit_px is not
+    None` filter drops it). Same recovery pattern as check_bracket_filled.
+
+    Returns None if no matching execution found. Otherwise a FillResult with
+    filled=True and fill_price/fill_ts populated from the broker's record.
+
+    after_ts: optional unix timestamp; only fills newer than this count
+    (defends against picking up the entry fill as the close).
+    """
+    ef = ExecutionFilter()
+    ef.symbol = contract.symbol
+    ef.secType = getattr(contract, "secType", "") or ""
+    try:
+        fills = ib.reqExecutions(ef)
+    except Exception as exc:
+        log.warning(f"reqExecutions failed for {contract.symbol}: {exc}")
+        return None
+    if not fills:
+        return None
+    close_side = "SLD" if entry_direction == "long" else "BOT"
+    candidates = [f for f in fills if f.execution.side == close_side]
+    if after_ts is not None:
+        def _ts(f) -> float:
+            t = f.time
+            try:
+                return t.timestamp() if hasattr(t, "timestamp") else 0.0
+            except Exception:
+                return 0.0
+        candidates = [f for f in candidates if _ts(f) >= after_ts]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda f: f.time)
+    return FillResult(
+        filled=True,
+        fill_price=float(latest.execution.price),
+        fill_ts=latest.time.isoformat() if hasattr(latest.time, "isoformat") else str(latest.time),
+        order_id=str(getattr(latest.execution, "orderId", "")) or None,
+    )
+
+
 def close_position_market(
     ib: IB,
     contract: Contract,
@@ -612,16 +1120,134 @@ def close_position_market(
     order = MarketOrder(close_action, abs(size))
     if account:
         order.account = account
+    submit_ts = time.time()
     trade = ib.placeOrder(contract, order)
     fill = _wait_for_fill(ib, trade, timeout_s=timeout_s)
     if fill.filled:
         log.info(
             f"CLOSE FILLED: {close_action} {size} {contract.symbol} @ {fill.fill_price:.5f}"
         )
+        return fill
+
+    # 2026-05-13: _wait_for_fill timed out or reported Cancelled — try to
+    # recover the actual fill from reqExecutions. TWS can report Cancelled
+    # while a fill still goes through (timing race), and the wait window
+    # can expire mid-fill. Without this fallback fomc_drift / tom_international
+    # silently lose trades (audit S7).
+    recovered = _recover_close_fill_from_executions(
+        ib, contract, entry_direction=direction, after_ts=submit_ts - 5.0,
+    )
+    if recovered is not None and recovered.filled:
+        log.warning(
+            f"CLOSE RECOVERED via reqExecutions: {close_action} {size} "
+            f"{contract.symbol} @ {recovered.fill_price:.5f} "
+            f"(wait reported: {fill.reject_reason})"
+        )
+        return recovered
+
+    log.error(
+        f"CLOSE NOT FILLED: {close_action} {size} {contract.symbol} "
+        f"reason={fill.reject_reason}"
+    )
+    return fill
+
+
+def submit_market_with_boundary(
+    ib: IB,
+    contract: Contract,
+    action: str,            # "BUY" or "SELL"
+    size: int,
+    *,
+    strategy_label: str,
+    est_px: float,
+    timeout_s: float = 30.0,
+) -> Optional[FillResult]:
+    """Plain market-order submission gated by the same safety chain as
+    submit_bracket() — without requiring stop/target brackets.
+
+    Used by calendar-cadence strategies (forge_xs_momentum monthly
+    rebalance, forge_tom_spy / forge_nov_spy event-window holds) whose
+    exit is calendar-based, not price-stop-based. Centralises the
+    real-money boundary + halt + flatten + market-open checks so the
+    static safety-invariant test passes (only this helper + a small
+    allowlist call ib.placeOrder directly).
+
+    Returns:
+      FillResult with filled=True on success
+      FillResult with filled=False + reject_reason on guard failure
+      None on REAL_MONEY_BOUNDARY refusal (logged as ERROR)
+    """
+    # 1. Real-money boundary — must come first so a forbidden order can
+    #    be refused before any broker round-trip.
+    try:
+        from helio.real_money import (
+            enforce_real_money_boundary,
+            AccountBoundaryViolationError,
+        )
+        est_notional = abs(size) * float(est_px) if est_px and size else None
+        enforce_real_money_boundary(
+            ib, strategy_label=strategy_label, notional_usd=est_notional,
+        )
+    except AccountBoundaryViolationError as exc:
+        log.error(
+            f"REAL_MONEY_BOUNDARY: refusing {action} {size} {contract.symbol} "
+            f"strategy={strategy_label} — {exc}"
+        )
+        return None
+
+    # 2. Killed-strategy runtime invariant.
+    try:
+        from helio.roi_filter import KILLED_STRATEGY_CUTOFFS
+        if strategy_label in KILLED_STRATEGY_CUTOFFS:
+            cutoff = KILLED_STRATEGY_CUTOFFS[strategy_label]
+            log.error(
+                f"KILLED_STRATEGY: refusing {action} {size} {contract.symbol} "
+                f"— {strategy_label} killed on {cutoff}"
+            )
+            return FillResult(filled=False,
+                                reject_reason=f"killed_strategy:{strategy_label}:{cutoff}")
+    except ImportError:
+        log.error(f"KILL_REGISTRY_UNREADABLE: refusing {strategy_label}")
+        return FillResult(filled=False, reject_reason="kill_registry_unreadable")
+
+    # 3. Fleet-wide halt.
+    halted, halt_reason = is_fleet_halted()
+    if halted:
+        log.warning(
+            f"FLEET_HALTED: refusing {action} {size} {contract.symbol}. "
+            f"Reason: {halt_reason}"
+        )
+        return FillResult(filled=False,
+                            reject_reason=f"fleet_halted:{halt_reason[:64]}")
+
+    # 4. Emergency flatten flag.
+    flatten_active, flatten_reason = is_flatten_active()
+    if flatten_active:
+        log.warning(
+            f"FLATTEN_EOD active: refusing {action} {size} {contract.symbol}"
+        )
+        return FillResult(filled=False,
+                            reject_reason=f"flatten_eod:{flatten_reason[:64]}")
+
+    # 5. Market open check.
+    if not is_market_open(contract):
+        log.warning(
+            f"MARKET_CLOSED: refusing {action} {size} {contract.symbol}"
+        )
+        return FillResult(filled=False, reject_reason="market_closed")
+
+    # 6. All guards passed — submit.
+    order = MarketOrder(action, abs(size))
+    trade = ib.placeOrder(contract, order)
+    fill = _wait_for_fill(ib, trade, timeout_s=timeout_s)
+    if fill.filled:
+        log.info(
+            f"MARKET {action} {size} {contract.symbol} @ {fill.fill_price:.4f}"
+        )
     else:
         log.error(
-            f"CLOSE NOT FILLED: {close_action} {size} {contract.symbol} "
-            f"reason={fill.reject_reason}"
+            f"MARKET {action} {size} {contract.symbol} FAILED: "
+            f"{fill.reject_reason}"
         )
     return fill
 

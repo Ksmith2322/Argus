@@ -139,6 +139,34 @@ _CANONICAL_GLOB = "canonical_fills*.jsonl"
 _ROTATION_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
+def _norm_backfill_ts(value) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00").replace(" ", "T")
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return text
+
+
+def _norm_backfill_symbol(value) -> str | None:
+    symbol = str(value or "").strip().upper()
+    if not symbol:
+        return None
+    if symbol == "NQ":
+        return "MNQ"
+    return symbol
+
+
+def _backfill_dedup_key(strat, entry_ts, exit_ts, symbol) -> tuple:
+    if str(strat).startswith("argus_"):
+        logical_ts = exit_ts or entry_ts
+    else:
+        logical_ts = entry_ts
+    return (strat, _norm_backfill_ts(logical_ts), _norm_backfill_symbol(symbol))
+
+
 def _iter_canonical_paths() -> list[Path]:
     """Return all canonical fill files (current + any rotated archives),
     oldest-first by filename. A rotation that writes
@@ -279,6 +307,14 @@ def write_fill_typed(fill, extra: dict[str, Any] | None = None) -> None:
             "exit_reason": getattr(fill, "exit_reason", None),
             "broker_anchor_at_fill_usd": _current_anchor(),
         }
+        # 2026-05-19: propagate lineage_id from the Fill object when present.
+        # The 5/18 batch added the field to helio.domain.Fill + the runner
+        # call sites, but this writer was silently dropping it because it
+        # didn't list lineage_id in the row dict. Discovered via end-to-end
+        # smoke test (argus_flow/tests/test_entry_write_smoke.py).
+        lineage = getattr(fill, "lineage_id", None)
+        if lineage is not None:
+            row["lineage_id"] = lineage
         if extra:
             row["extra"] = extra
         CANONICAL_FILLS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -362,8 +398,26 @@ def backfill_from_trade_csvs() -> int:
     # trading USDJPY+CADJPY) can open two rows at the same entry_ts with no
     # exit_ts yet. Without the symbol discriminator, the second row gets
     # collapsed as a duplicate and never reaches canonical.
+    def _norm_ts(value) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("Z", "+00:00").replace(" ", "T")
+        try:
+            return datetime.fromisoformat(text).isoformat()
+        except ValueError:
+            return text
+
+    def _norm_symbol(value) -> str | None:
+        symbol = str(value or "").strip().upper()
+        if not symbol:
+            return None
+        if symbol == "NQ":
+            return "MNQ"
+        return symbol
+
     def _key(strat, ets, xts, sym) -> tuple:
-        return (strat, ets or None, xts or None, sym or None)
+        return _backfill_dedup_key(strat, ets, xts, sym)
 
     existing_keys = set()
     for path in _iter_canonical_paths():
@@ -395,7 +449,7 @@ def backfill_from_trade_csvs() -> int:
         ("argus_cadjpy",       "argus_flow/logs/cadjpy/trades.csv",   "ts",        True,  "CADJPY"),
         ("forge_gld_pm_long",  "forge/logs/gld_pm_long/trades.csv",   "ts",        False, "GLD"),
         ("forge_wick_gbpusd",  "forge/logs/wick_gbpusd/trades.csv",   "ts",        False, "GBPUSD"),
-        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",        False, "NQ"),
+        ("forge_nq_overnight", "forge/logs/nq_overnight/trades.csv",  "ts",        False, "MNQ"),
         ("forge_jpy_pm_short", "forge/logs/jpy_pm_short/trades.csv",  "ts",        False, None),
         ("forge_gdx_gld",      "forge/logs/gdx_gld/trades.csv",       "entry_date", False, None),
     ]

@@ -1,0 +1,4 @@
+{
+  "_comment": "Unwind tickets for killed strategies. A ticket explicitly authorizes a broker position belonging to a killed strategy for a bounded time + qty. Without a matching active ticket, helio.killed_strategy_invariant.find_killed_strategy_orphans flags the position as CRITICAL. Schema per ticket: strategy, symbol, max_qty, operator, signed_at, expires_at, reason. Empty list = no killed-strategy positions authorized. See project_codex_sweep_20260518.md X6 + project_real_money_boundary.md.",
+  "tickets": []
+}

@@ -122,6 +122,29 @@ def check_runner(config_path: Path) -> dict:
             return result
 
         if len(trades) >= PAPER_MIN_TRADES and pf >= 1.3:
+            # READY_FOR_REAL requires a CLEAN evidence epoch in addition to
+            # the PF + sample threshold. If we're still in the pre-freeze
+            # (contaminated) epoch, downgrade to COLLECTING and add the
+            # epoch as a blocker. Codex audit 2026-05-18 X4 — promotion
+            # decisions cannot use pre-reset evidence.
+            try:
+                from helio import evidence_epoch as _ee
+                epoch = _ee.current_epoch()
+                if not epoch.is_clean:
+                    result["verdict"] = "COLLECTING"
+                    result["blockers"].append(
+                        f"contaminated_epoch:{epoch.id} (post-reset epoch required)"
+                    )
+                    result["epoch_id"] = epoch.id
+                    result["epoch_is_clean"] = False
+                    return result
+                result["epoch_id"] = epoch.id
+                result["epoch_is_clean"] = True
+            except Exception as exc:
+                # Fail closed: cannot read the epoch → block promotion.
+                result["verdict"] = "NOT_READY"
+                result["blockers"].append(f"evidence_epoch_unreadable:{exc}")
+                return result
             result["verdict"] = "READY_FOR_REAL"
         elif not result["blockers"]:
             result["verdict"] = "COLLECTING"

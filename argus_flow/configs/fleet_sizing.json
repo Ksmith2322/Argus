@@ -29,5 +29,10 @@
   },
   "_notional_caps_note": "Position notional_usd must be <= anchor × multiplier. Hard ceiling expressed as % of equity for stock/etf/fx. Futures get higher multiplier because they're risk-managed by margin (~10% of notional), not raw notional — 1 MNQ contract is ~$54K notional but only ~$5.4K margin = 18% of $30K equity. v8 (2026-04-27): bumped micro_future 0.5→2.0 to allow 1 contract on $30K anchor; otherwise nq_overnight, nq_london_close, mamba/tori/cuebanks couldn't trade at all. Stock/etf 0.3× and fx 1.0× kept tight for survival-first.",
 
-  "version": "2026-04-27.v8"
+  "notional_caps_by_strategy": {
+    "forge_gld_pm_long": 0.4
+  },
+  "_notional_caps_by_strategy_note": "Optional per-strategy override of the asset-class default. Takes precedence over notional_caps_by_asset_class when present. forge_gld_pm_long 0.4× (2026-05-18 v10): reverted from 2.2× because cluster_exposure.PER_STRATEGY_NOTIONAL_CAP_X[forge_gld_pm_long]=0.4 silently hard-blocked the 2.2× override. Four cap layers disagreed (fleet=2.2, cluster=0.4, ETF=0.6, METALS=0.9 — smaller wins). The 2.2× concentration sleeve will be re-evaluated post-5/31 reset with clean evidence epoch. Until then: align to the binding cluster cap (0.4×) so all layers agree and trade size is predictable.",
+
+  "version": "2026-05-18.v10"
 }

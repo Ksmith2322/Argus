@@ -40,6 +40,13 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     Writes to forge/logs/<name>/runner.log with 10MB rotation, 5 backups.
     Idempotent — safe to call from a runner that's also called by tests.
 
+    Shared library loggers (``helio.signal_executor``, ``helio.ibkr_execution``)
+    are also attached to the runner's file handler so silent-drop diagnostics
+    (e.g. ``REAL_ENTRY FAILED``, ``BROKER_HAS_POSITION``, ``signal skipped``)
+    surface in the runner's own log. Without this, runners using
+    ``helio.signal_executor`` (cuebanks, multi_orb, etc) drop signals
+    silently because the shared logger has no file handler attached.
+
     When running under pytest/unittest, the file handler is suppressed so test
     invocations don't pollute the production runner.log.
     """
@@ -55,6 +62,7 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     if any(getattr(h, "_forge_setup", False) for h in logger.handlers):
         return logger  # already configured
 
+    file_handler = None
     if not _in_test_context():
         file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
         file_handler.setFormatter(fmt)
@@ -67,4 +75,20 @@ def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(stream_handler)
 
     logger.propagate = False
+
+    # Pipe shared-library loggers into this runner's file handler so
+    # signal_executor's drop reasons (REAL_ENTRY FAILED, BROKER_HAS_POSITION,
+    # signal skipped, REAL_ENTRY EXCEPTION) are visible in the runner's log.
+    # Each runner process has its own logging tree, so attaching here only
+    # affects this process — no cross-runner duplication.
+    for shared_name in ("helio.signal_executor", "helio.ibkr_execution"):
+        shared = logging.getLogger(shared_name)
+        if any(getattr(h, "_forge_setup", False) for h in shared.handlers):
+            continue  # already wired by an earlier setup_logging() in this process
+        shared.setLevel(level)
+        if file_handler is not None:
+            shared.addHandler(file_handler)
+        shared.addHandler(stream_handler)
+        shared.propagate = False
+
     return logger

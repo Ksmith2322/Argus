@@ -16,6 +16,16 @@ import pytest
 from helio import real_money as rm
 
 
+@pytest.fixture
+def real_money_module_enabled(monkeypatch):
+    """Flip the module-level REAL_MONEY_ENABLED kill-switch for the duration of
+    a test. The boundary has two kill-switches by design (allowlist.global_enabled
+    AND the module constant); tests that exercise the post-switch paths must
+    enable both. test_module_default_is_off intentionally does NOT use this."""
+    monkeypatch.setattr(rm, "REAL_MONEY_ENABLED", True)
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -166,7 +176,7 @@ def test_real_with_allowlist_disabled_rejects():
         )
 
 
-def test_real_with_strategy_not_allowlisted_rejects():
+def test_real_with_strategy_not_allowlisted_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -181,7 +191,7 @@ def test_real_with_strategy_not_allowlisted_rejects():
         )
 
 
-def test_real_with_oversized_notional_rejects():
+def test_real_with_oversized_notional_rejects(monkeypatch, real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -190,6 +200,7 @@ def test_real_with_oversized_notional_rejects():
         ledger_entry_id="abc-1",
         approver="ksmith2322",
     )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 100_000.0)
     too_big = rm.REAL_MONEY_MAX_NOTIONAL_PER_ORDER * 2
     with pytest.raises(rm.AccountBoundaryViolationError, match="oversize_real_order"):
         rm.enforce_real_money_boundary(
@@ -200,7 +211,7 @@ def test_real_with_oversized_notional_rejects():
         )
 
 
-def test_real_within_cap_with_allowlisted_strategy_passes():
+def test_real_without_capital_ladder_approval_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     al = rm.Allowlist(
         global_enabled=True,
@@ -209,6 +220,26 @@ def test_real_within_cap_with_allowlisted_strategy_passes():
         ledger_entry_id="abc-1",
         approver="ksmith2322",
     )
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_blocked"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=100.0,
+            allowlist=al,
+        )
+
+
+def test_real_within_cap_with_allowlisted_strategy_passes(monkeypatch, real_money_module_enabled):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 10_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 0.0)
     # No exception:
     rm.enforce_real_money_boundary(
         ib,
@@ -218,7 +249,66 @@ def test_real_within_cap_with_allowlisted_strategy_passes():
     )
 
 
-def test_real_invalid_allowlist_rejects():
+def test_real_gross_above_ladder_cap_rejects(monkeypatch, real_money_module_enabled):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 5_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 4_500.0)
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_gross_oversize"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=600.0,
+            allowlist=al,
+        )
+
+
+def test_real_gross_under_ladder_cap_passes(monkeypatch, real_money_module_enabled):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 5_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 1_000.0)
+    rm.enforce_real_money_boundary(
+        ib,
+        strategy_label="forge_vix_intraday",
+        notional_usd=500.0,
+        allowlist=al,
+    )
+
+
+def test_real_above_ladder_cap_rejects(monkeypatch, real_money_module_enabled):
+    ib = _FakeIB(port=rm.REAL_PORT)
+    al = rm.Allowlist(
+        global_enabled=True,
+        strategies=("forge_vix_intraday",),
+        max_strategies_real=1,
+        ledger_entry_id="abc-1",
+        approver="ksmith2322",
+    )
+    monkeypatch.setattr(rm, "_capital_ladder_approved_capital_usd", lambda: 1_000.0)
+    monkeypatch.setattr(rm, "_existing_real_money_notional_usd", lambda allowlist: 0.0)
+    with pytest.raises(rm.AccountBoundaryViolationError, match="capital_ladder_oversize"):
+        rm.enforce_real_money_boundary(
+            ib,
+            strategy_label="forge_vix_intraday",
+            notional_usd=1_001.0,
+            allowlist=al,
+        )
+
+
+def test_real_invalid_allowlist_rejects(real_money_module_enabled):
     ib = _FakeIB(port=rm.REAL_PORT)
     # global_enabled=True but missing approver/ledger — internally invalid.
     al = rm.Allowlist(
@@ -267,3 +357,62 @@ def test_default_allowlist_file_is_paper_only():
     al = rm.load_allowlist()  # default path
     assert al.global_enabled is False
     assert al.strategies == ()
+
+
+# ---------------------------------------------------------------------------
+# real-money mismatch detector
+# ---------------------------------------------------------------------------
+
+def test_mismatch_detector_flags_untagged_position():
+    from helio.real_money_mismatch_daemon import scan_ibkr
+
+    class _Contract:
+        symbol = "SPY"
+
+    class _Position:
+        account = "U1234567"
+        contract = _Contract()
+        position = 3
+        avgCost = 500.0
+
+    class _IB:
+        def positions(self):
+            return [_Position()]
+
+        def trades(self):
+            return []
+
+    positions, violations = scan_ibkr(_IB(), rm.Allowlist(global_enabled=True, strategies=("forge_vix_intraday",)))
+    assert positions[0].symbol == "SPY"
+    assert violations[0].code == "REAL_POSITION_TAG_MISSING"
+
+
+def test_mismatch_detector_accepts_allowlisted_argus_real_tag():
+    from helio.real_money_mismatch_daemon import scan_ibkr
+
+    class _Contract:
+        symbol = "UVXY"
+
+    class _Position:
+        account = "U1234567"
+        contract = _Contract()
+        position = 10
+        avgCost = 20.0
+
+    class _Order:
+        orderRef = "argus-real-forge_vix_intraday-ledger-1"
+
+    class _Trade:
+        contract = _Contract()
+        order = _Order()
+
+    class _IB:
+        def positions(self):
+            return [_Position()]
+
+        def trades(self):
+            return [_Trade()]
+
+    al = rm.Allowlist(global_enabled=True, strategies=("forge_vix_intraday",), ledger_entry_id="ledger-1")
+    _, violations = scan_ibkr(_IB(), al)
+    assert violations == []

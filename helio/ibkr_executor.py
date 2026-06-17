@@ -68,7 +68,7 @@ class IBKRExecutor:
         self.client_id = client_id
         self.system = system
         self.host = host or os.getenv("IBKR_HOST", "127.0.0.1")
-        self.port = port or int(os.getenv("IBKR_PORT", "7496"))
+        self.port = port or int(os.getenv("IBKR_PORT", "7497"))
         self.paper = paper
         self.model_equity_usd = model_equity_usd
         self._ib = IB()
@@ -139,8 +139,12 @@ class IBKRExecutor:
             if halted:
                 self._log.warning(f"FLEET_HALTED: refusing {direction} {quantity} {symbol}. Reason: {halt_reason}")
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail closed: if the halt check itself raises, we cannot tell
+            # whether a fleet-wide halt is in effect. Refuse rather than
+            # potentially trade through a HALT.flag. Codex audit 2026-05-18 X5.
+            self._log.error(f"fleet halt check failed, REFUSING entry: {exc}")
+            return None
 
         # Guard 2: cluster exposure cap
         try:
@@ -155,7 +159,47 @@ class IBKRExecutor:
                     )
                     return None
         except Exception as exc:
-            self._log.warning(f"cluster cap check failed (allowing trade): {exc}")
+            # Fail closed: cluster-cap exception means we cannot evaluate
+            # cluster exposure. Refuse rather than risk a cluster blowup.
+            # Codex audit 2026-05-18 X5 — guards must fail closed.
+            self._log.error(f"cluster cap check failed, REFUSING entry: {exc}")
+            return None
+
+        # Guard 3: real-money boundary. No-op for paper connections; fail-closed
+        # for real-account connections unless this system is explicitly
+        # allowlisted and within the real-money order cap.
+        try:
+            from helio.real_money import (
+                AccountBoundaryViolationError,
+                enforce_real_money_boundary,
+                real_money_order_tag,
+            )
+            est_notional = float(quantity) * float(entry_price)
+            enforce_real_money_boundary(
+                self._ib,
+                strategy_label=self.system,
+                notional_usd=est_notional,
+            )
+            real_order_ref = real_money_order_tag(self.system)
+        except AccountBoundaryViolationError as exc:
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY: refusing {direction} {quantity} {symbol} "
+                f"system={self.system} — {exc}"
+            )
+            return None
+        except Exception as exc:
+            # 2026-05-20 BUGFIX: fail CLOSED on any unexpected error. The
+            # previous "allowing paper path" behaviour silently let orders
+            # through if enforce_real_money_boundary itself raised (ImportError
+            # after refactor, allowlist file unreadable, AccountValidationError
+            # typo). If port is ever switched to 7496 with this code path
+            # active, that would submit live-account orders unchecked. Codex
+            # X5 doctrine applied — guards must fail closed.
+            self._log.error(
+                f"REAL_MONEY_BOUNDARY: REFUSING {direction} {quantity} {symbol} — "
+                f"unexpected error in boundary check: {type(exc).__name__}: {exc}"
+            )
+            return None
 
         try:
             contract = Stock(symbol, "SMART", "USD")
@@ -177,6 +221,10 @@ class IBKRExecutor:
             if order_type == "MKT":
                 bracket.parent.orderType = "MKT"
                 bracket.parent.lmtPrice = 0
+
+            if real_order_ref:
+                for o in bracket:
+                    o.orderRef = real_order_ref
 
             # Submit all 3 orders
             for o in bracket:
@@ -214,6 +262,36 @@ class IBKRExecutor:
 
             action = "BUY" if direction.lower() == "long" else "SELL"
             order = MarketOrder(action, quantity)
+
+            try:
+                from helio.real_money import (
+                    AccountBoundaryViolationError,
+                    enforce_real_money_boundary,
+                    real_money_order_tag,
+                )
+                price = self.get_current_price(symbol) or 0.0
+                enforce_real_money_boundary(
+                    self._ib,
+                    strategy_label=self.system,
+                    notional_usd=(float(quantity) * float(price)) if price else None,
+                )
+                tag = real_money_order_tag(self.system)
+                if tag:
+                    order.orderRef = tag
+            except AccountBoundaryViolationError as exc:
+                self._log.error(
+                    f"REAL_MONEY_BOUNDARY: refusing market {direction} {quantity} "
+                    f"{symbol} system={self.system} — {exc}"
+                )
+                return None
+            except Exception as exc:
+                # 2026-05-20 BUGFIX: fail CLOSED — see submit_bracket above
+                self._log.error(
+                    f"REAL_MONEY_BOUNDARY: REFUSING market {direction} {quantity} "
+                    f"{symbol} — unexpected error: {type(exc).__name__}: {exc}"
+                )
+                return None
+
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
 

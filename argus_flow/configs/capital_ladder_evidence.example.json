@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy to capital_ladder_evidence.json when operator-attested evidence exists. Do not fake missing fields; missing evidence blocks stage promotion by design.",
+  "portfolio": {
+    "fleet_live_ir": null,
+    "fleet_max_drawdown_pct": null,
+    "worst_single_day_pct": null
+  },
+  "ops": {
+    "clean_ops_days": 0,
+    "silent_failures_30d": 0,
+    "phantom_fills_30d": 0,
+    "tws_cascades_30d": 0,
+    "margin_alerts_30d": 0,
+    "broker_reconcile_passed_days": 0,
+    "kill_switch_tested": false,
+    "open_p0_incidents": 0
+  },
+  "diversification": {
+    "max_pairwise_corr_abs": null,
+    "effective_independent_bets": null
+  },
+  "strategies": {
+    "forge_example": {
+      "cluster": "METALS",
+      "real_fill_trades": 0,
+      "live_days": 0,
+      "live_ir": null,
+      "paper_ir": null,
+      "paper_live_ir_delta_abs": null,
+      "spy_coverage_pct": null,
+      "max_drawdown_pct": null,
+      "capacity_test_usd": 0
+    }
+  }
+}

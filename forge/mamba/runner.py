@@ -27,6 +27,12 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# 2026-05-13: mamba previously used datetime.now(timezone(timedelta(hours=-4)))
+# which hardcodes UTC-4 (EDT). Correct during EDT, off by 1 hour during EST.
+# Use America/New_York for DST-aware NY session math.
+_NY_TZ = ZoneInfo("America/New_York")
 from pathlib import Path
 from typing import Optional
 
@@ -65,7 +71,13 @@ NY_OPEN_MIN = 30
 NY_CUTOFF_HOUR = 10
 NY_CUTOFF_MIN = 30
 
-MAX_TRADES_PER_DAY = 2
+# 2026-05-13: cap originally from MambaFX human-trader rulebook (max 2/day
+# was emotional discipline for discretionary traders avoiding tilt). A
+# systematic bot doesn't tilt. Constant kept for documentation reference
+# only — NOT enforced in run_backtest or run_live. If post-cap trades
+# (#3+) prove negative expectancy, the cap may be reintroduced based on
+# EVIDENCE rather than copied from a human's rulebook.
+MAX_TRADES_PER_DAY = 2  # reference only, not enforced
 MAX_HOLD_BARS_5MIN = 12  # 60 min max on 5-min bars (safety)
 RR_CONSERVATIVE = 3.0    # 50% off at 1:3
 RR_FULL = 5.0            # trail remainder to 1:5
@@ -530,9 +542,10 @@ def run_backtest(
 
                     continue  # Don't open new trade while managing one
 
-                # --- Check daily trade cap ---
-                if daily_trade_count[day_str] >= MAX_TRADES_PER_DAY:
-                    continue
+                # 2026-05-13: removed `if daily_trade_count[day_str] >= MAX_TRADES_PER_DAY: continue`.
+                # The cap was a human-trader emotional rule, not a systematic
+                # edge constraint. Backtest now evaluates ALL valid setups so
+                # we can measure whether trades 3+ degrade or hold expectancy.
 
                 # --- Check for breakout signals ---
                 # Determine direction from bias
@@ -1019,7 +1032,7 @@ def run_signal_loop():
 
     while True:
         try:
-            now = datetime.now(timezone(timedelta(hours=-4)))  # EST approx
+            now = datetime.now(_NY_TZ)  # DST-aware NY wall-clock
             in_window = is_ny_session(now, phase="trade")
 
             if not in_window:
@@ -1100,14 +1113,15 @@ def run_live():
 
     while True:
         try:
-            now = datetime.now(timezone(timedelta(hours=-4)))  # EST approx
+            now = datetime.now(_NY_TZ)  # DST-aware NY wall-clock
             in_window = is_ny_session(now, phase="trade")
 
             ib = None
             try:
-                ib = ibkr.connect(IBKR_CLIENT_ID)
+                # 2026-05-18: connect_with_retry covers post-TWS-restart slot-stuck window
+                ib = ibkr.connect_with_retry(IBKR_CLIENT_ID, max_attempts=5, backoff_s=60.0)
             except Exception as exc:
-                log.warning("IBKR connect failed: %s", exc)
+                log.warning("IBKR connect failed after retry: %s", exc)
 
             try:
                 # 1. Check existing open positions for bracket fills / time stops
@@ -1176,6 +1190,7 @@ def run_live():
                                         instrument_type="micro_future",
                                         price_decimals=0,
                                         max_hold_bars=12,  # 1 hour at 5min bars
+                                        strategy_label="forge_mamba",
                                     )
                                     submitted = sx.submit_signal(state, ib, sig)
                                     if submitted:

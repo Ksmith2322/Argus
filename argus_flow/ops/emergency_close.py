@@ -17,14 +17,15 @@ import time
 from datetime import datetime, timezone
 
 try:
-    from ib_insync import IB, MarketOrder
+    from ib_insync import IB, MarketOrder, LimitOrder
 except ImportError:
     print("ERROR: ib-insync not installed. Run: pip install ib-insync")
     sys.exit(1)
 
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 7496
+# 2026-05-18: default 7497 (paper); was 7496 live — split-brain risk
+DEFAULT_PORT = 7497
 # Use high client ID to avoid conflicting with runner (which uses 1 or 2)
 EMERGENCY_CLIENT_ID = 999
 
@@ -55,19 +56,66 @@ def _get_positions(ib: IB) -> list[dict]:
     return positions
 
 
+def _build_close_order(side: str, qty: int, contract, ref_px: float):
+    """Build the right order type for this contract's secType.
+
+    FX (CASH on IdealPro): wide LimitOrder + outsideRth=True + TIF=GTC,
+    JPY-aware decimal rounding. MarketOrder on FX stalls around session
+    boundaries (the 2026-05-08 EXIT FAILED cascade) AND IBKR rejects
+    MarketOrder on FX with Error 321 if exchange isn't set on the
+    contract — which is exactly what happened to this script on 5/19.
+    Mirrors the runner_unified._build_exit_order fix.
+
+    STK/FUT/ETF: MarketOrder is correct (RTH-only routing handles
+    itself).
+    """
+    sec_type = getattr(contract, "secType", "") or ""
+    if sec_type == "CASH":
+        buffer = 1.05 if side == "BUY" else 0.95
+        # Check all places JPY might live on an ib_insync Forex contract.
+        pair_tags = " ".join([
+            str(getattr(contract, "symbol", "")),
+            str(getattr(contract, "currency", "")),
+            str(getattr(contract, "localSymbol", "")),
+        ]).upper()
+        is_jpy = "JPY" in pair_tags
+        decimals = 3 if is_jpy else 5
+        lmt = round(float(ref_px or 1.0) * buffer, decimals)
+        order = LimitOrder(side, qty, lmt)
+        order.outsideRth = True
+        order.tif = "GTC"
+        return order
+    return MarketOrder(side, qty)
+
+
 def _close_position(ib: IB, pos: dict, dry_run: bool = False) -> bool:
     qty = abs(pos["qty"])
     side = "SELL" if pos["direction"] == "LONG" else "BUY"
     contract = pos["contract"]
 
+    # IBKR Error 321 "Missing order exchange": contracts pulled from
+    # ib.positions() lack the exchange field on FX. Qualify so it's set.
+    # Caught 2026-05-19 when this script was needed during the CADJPY
+    # incident and failed with Error 321 on the first FX position.
+    try:
+        qualified = ib.qualifyContracts(contract)
+        if qualified:
+            contract = qualified[0]
+    except Exception as exc:
+        print(f"    WARNING: contract qualification failed ({exc}); proceeding with raw contract")
+
     desc = f"{pos['symbol']}{('/' + pos['currency']) if pos['currency'] else ''}"
+    sec_type = getattr(contract, "secType", "") or ""
+    order_type = "LMT(wide)" if sec_type == "CASH" else "MARKET"
     print(f"  {'[DRY RUN] Would close' if dry_run else 'Closing'}: "
-          f"{desc} {pos['direction']} qty={qty} via {side} MARKET")
+          f"{desc} {pos['direction']} qty={qty} via {side} {order_type}")
 
     if dry_run:
         return True
 
-    order = MarketOrder(side, qty)
+    order = _build_close_order(side, qty, contract, ref_px=pos.get("avg_cost", 0.0))
+    if isinstance(order, LimitOrder):
+        print(f"    LMT @ {order.lmtPrice} tif={order.tif} outsideRth={order.outsideRth}")
     trade = ib.placeOrder(contract, order)
 
     # Wait for fill (up to 30 seconds)

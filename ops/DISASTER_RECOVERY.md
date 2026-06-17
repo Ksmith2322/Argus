@@ -112,7 +112,7 @@ git clone https://github.com/Ksmith2322/Argus.git C:\Argus\repo
 # PC1: push
 git add -A && git commit -m "sync" && git push
 # PC2: pull
-ssh "ksmith2322@yahoo.com@192.168.1.98"
+ssh "ksmith2322@yahoo.com@192.168.1.101"
 cd C:\Argus\repo && git pull
 .\argus_flow\launch_all.ps1
 ```

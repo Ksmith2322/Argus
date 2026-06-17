@@ -150,17 +150,38 @@ def main() -> int:
 
             # FLATTEN_EOD executor — runs ONLY if FLATTEN_EOD.flag exists.
             # The script no-ops if flag is absent, so safe to call every cycle.
+            # 2026-05-09: explicit invocation logging added because the 5/7
+            # incident left positions open while the flag was set, with no
+            # evidence in logs that the executor had actually run. Capturing
+            # stdout/stderr + return code makes future incidents diagnosable.
             _flatten_flag = _REPO / "argus_flow" / "logs" / "FLATTEN_EOD.flag"
             if _flatten_flag.exists() and _FLATTEN_EXECUTOR_SCRIPT.exists():
+                log.info("[FLATTEN_EOD] flag present — invoking flatten_eod_executor")
                 try:
-                    subprocess.run(
+                    proc = subprocess.run(
                         [sys.executable, str(_FLATTEN_EXECUTOR_SCRIPT)],
                         cwd=str(_REPO),
                         capture_output=True,
+                        text=True,
                         timeout=60,
                     )
+                    stdout_tail = (proc.stdout or "").strip().splitlines()[-6:]
+                    stderr_tail = (proc.stderr or "").strip().splitlines()[-3:]
+                    log.info(
+                        "[FLATTEN_EOD] executor finished rc=%d stdout_tail=%s stderr_tail=%s",
+                        proc.returncode,
+                        " | ".join(stdout_tail) if stdout_tail else "(empty)",
+                        " | ".join(stderr_tail) if stderr_tail else "(empty)",
+                    )
+                    if proc.returncode != 0:
+                        log.warning(
+                            "[FLATTEN_EOD] executor returned non-zero rc=%d — see exit-code map in flatten_eod_executor.py",
+                            proc.returncode,
+                        )
+                except subprocess.TimeoutExpired:
+                    log.error("[FLATTEN_EOD] executor timed out after 60s — broker connection or close-loop stuck")
                 except Exception as e:
-                    log.warning("flatten_eod_executor failed this cycle: %s", e)
+                    log.warning("[FLATTEN_EOD] executor invocation raised: %s", e)
 
             # Hourly: schema validation + canonical reconcile + orphan lock cleanup.
             global _last_hourly_epoch
@@ -265,6 +286,32 @@ def main() -> int:
                         )
                     except Exception as e:
                         log.warning("daily_fleet_vs_spy failed: %s", e)
+
+                # Ops reliability report — append one snapshot per day so the
+                # capital ladder's clean_ops_days streak math has authoritative
+                # input. Cheap (just reads existing report JSONs + a log tail).
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "helio.ops_reliability"],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    log.warning("helio.ops_reliability daily refresh failed: %s", e)
+
+                # Capital ladder report — re-evaluate after ops_reliability has
+                # written the latest snapshot. Output gates the real-money
+                # boundary, so a stale report = unnecessarily blocked orders.
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "helio.capital_ladder"],
+                        cwd=str(_REPO),
+                        capture_output=True,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    log.warning("helio.capital_ladder daily refresh failed: %s", e)
             consecutive_failures = 0
             elapsed = time.monotonic() - start
             log.info("cycle %d OK (%.2fs)", cycle, elapsed)

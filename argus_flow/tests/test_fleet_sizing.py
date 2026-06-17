@@ -220,21 +220,66 @@ class TestNotionalCaps(unittest.TestCase):
     def setUp(self):
         fs.invalidate_cache()
 
-    def test_stock_cap_is_2x_anchor(self):
-        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000):
-            self.assertAlmostEqual(fs.max_notional_usd("stock"), 20_000, places=2)
+    def test_stock_cap_uses_configured_multiplier(self):
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"stock": 0.3},
+             }):
+            self.assertAlmostEqual(fs.max_notional_usd("stock"), 3_000, places=2)
 
-    def test_fx_cap_is_20x_anchor(self):
-        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000):
-            self.assertAlmostEqual(fs.max_notional_usd("fx"), 200_000, places=2)
+    def test_fx_cap_uses_configured_multiplier(self):
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"fx": 1.0},
+             }):
+            self.assertAlmostEqual(fs.max_notional_usd("fx"), 10_000, places=2)
 
-    def test_micro_future_cap_is_5x(self):
-        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000):
-            self.assertAlmostEqual(fs.max_notional_usd("micro_future"), 50_000, places=2)
+    def test_micro_future_cap_uses_configured_multiplier(self):
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"micro_future": 2.0},
+             }):
+            self.assertAlmostEqual(fs.max_notional_usd("micro_future"), 20_000, places=2)
 
     def test_unknown_asset_class_defaults_to_1x(self):
         with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000):
             self.assertAlmostEqual(fs.max_notional_usd("some_unknown"), 10_000, places=2)
+
+    def test_strategy_label_override_takes_precedence(self):
+        """Per-strategy override in `notional_caps_by_strategy` wins over the
+        asset-class default. Used for single-position intraday strategies
+        whose ATR-floor sizing legitimately needs more concentration than
+        the survival-first fleet defaults (e.g. forge_gld_pm_long 2.2x)."""
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"etf": 0.3},
+                "notional_caps_by_strategy": {"forge_gld_pm_long": 2.2},
+             }):
+            default = fs.max_notional_usd("etf")
+            override = fs.max_notional_usd("etf", strategy_label="forge_gld_pm_long")
+        self.assertAlmostEqual(default, 3000.0, places=2)
+        self.assertAlmostEqual(override, 22000.0, places=2)
+
+    def test_strategy_label_falls_back_to_asset_class_when_not_in_overrides(self):
+        """Unknown strategy label uses the asset-class cap."""
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"etf": 0.3},
+                "notional_caps_by_strategy": {"forge_gld_pm_long": 2.2},
+             }):
+            cap = fs.max_notional_usd("etf", strategy_label="forge_some_other")
+        self.assertAlmostEqual(cap, 3000.0, places=2)
+
+    def test_strategy_label_with_bad_value_falls_back_silently(self):
+        """If the override value is non-numeric, fall back to asset-class default
+        rather than raising — config drift shouldn't break sizing."""
+        with mock.patch.object(fs, "get_sizing_anchor_usd", return_value=10_000), \
+             mock.patch.object(fs, "_load_config", return_value={
+                "notional_caps_by_asset_class": {"etf": 0.3},
+                "notional_caps_by_strategy": {"forge_gld_pm_long": "not_a_number"},
+             }):
+            cap = fs.max_notional_usd("etf", strategy_label="forge_gld_pm_long")
+        self.assertAlmostEqual(cap, 3000.0, places=2)
 
 
 class TestFleetMaxOpenRisk(unittest.TestCase):

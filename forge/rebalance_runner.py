@@ -49,22 +49,12 @@ HOLD_DAYS = 5  # event-driven: hold each addition for 5 trading days post-buy
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-log = logging.getLogger("rebalance_runner")
-log.setLevel(logging.DEBUG)
-
-_console = logging.StreamHandler()
-_console.setLevel(logging.INFO)
-_console.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-))
-log.addHandler(_console)
-
-_file_handler = logging.FileHandler(LOG_DIR / "runner.log")
-_file_handler.setLevel(logging.DEBUG)
-_file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-))
-log.addHandler(_file_handler)
+# 2026-05-12: replaced custom FileHandler with setup_logging() so
+# helio.signal_executor + helio.ibkr_execution errors are visible in
+# forge/logs/rebalance/runner.log. See project_2026_05_12_capital_ladder_session
+# memory for the 4-layer silent-gate cascade this prevents.
+from forge.logging_setup import setup_logging
+log = setup_logging("rebalance")
 
 # ---------------------------------------------------------------------------
 # Helpers

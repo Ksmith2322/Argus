@@ -1,0 +1,83 @@
+{
+    "strategy": "mtf_trend",
+    "version": "paper_v1",
+    "symbol": "NZDCAD",
+    "instrument_type": "forex",
+    "ibkr_client_id": 2463,
+    "direction": "both",
+    "eval_timeframe": "5m",
+    "strategy_variant": "mtf_4h_1h_5m",
+    "regime_gate": "LOG_ONLY",
+    "stage": "watcher",
+    "_note": "WATCHER: Only 1 trade. Keep observing. BT PF 1.01, high WR but thin edge.",
+    "mtf": {
+        "_2026-04-26_change": "min_trend_strength 0.5->0.3, min_confidence 0.5->0.3: 90d 0 signals; AI consensus often ~0.1-0.3. Loosening to capture observations; re-tighten after 50+ trades show real distribution.",
+        "enabled": true,
+        "trend_ema_fast": 8,
+        "trend_ema_slow": 21,
+        "rsi_period": 14,
+        "min_trend_strength": 0.3,
+        "min_confidence": 0.3,
+        "paper_stress_multiplier": 0.7
+    },
+    "trigger": {
+        "range_pct_min": 0.0,
+        "range_accel_min": 0.0,
+        "session_start_utc": 0,
+        "session_end_utc": 23,
+        "sequencing_gap_minutes": 180
+    },
+    "risk": {
+        "stop_pips": 15,
+        "target_pips": 8,
+        "timeout_minutes": 120,
+        "min_signal_gap_minutes": 180,
+        "risk_pct": 0.015,
+        "lot_size": 1000,
+        "atr_stop_mult": 1.5,
+        "atr_target_mult": 3.0,
+        "_note_atr": "ATR-scaled stops replace fixed pip stops. Adapts to volatility."
+    },
+    "hour_filter": {
+        "enabled": false,
+        "_note": "Disabled 2026-04-09: calibrated for range_accel not MTF. Re-enable after 50+ trades.",
+        "hours": [
+            0,
+            1,
+            4,
+            8,
+            14,
+            15,
+            20
+        ]
+    },
+    "replay_expectations": {
+        "signals_per_day": 2.29,
+        "signals_per_day_range": [
+            1.15,
+            3.44
+        ],
+        "win_rate": 0.67,
+        "win_rate_range": [
+            0.55,
+            0.79
+        ],
+        "exp_pips_per_trade": 5.967,
+        "stop_rate": 0.04,
+        "target_rate": 0.41,
+        "timeout_rate": 0.55
+    },
+    "deployment": {
+        "managed": true,
+        "stage": "watcher",
+        "risk_policy": {
+            "model_start_equity_usd": "fleet_anchor"
+        },
+        "log_dir": "argus_flow/logs/nzdcad"
+    },
+    "discovery": {
+        "source": "weekly_pair_onboarding",
+        "template_config": "argus_flow/configs/cadjpy_mtf_paper_v1.json",
+        "selected_at": "2026-05-22T23:43:06.393612+00:00"
+    }
+}

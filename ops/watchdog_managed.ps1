@@ -344,6 +344,7 @@ $script:tradeCounts = @{}
 $script:dailySummarySent = $false
 $script:maxRestartAlertSent = $false
 $script:lastGovernanceRefresh = Get-Date "2000-01-01T00:00:00Z"
+$script:killSwitchPausedAt = $null
 
 Log "=========================================="
 Log "Argus Managed Watchdog started"
@@ -354,12 +355,26 @@ Send-Discord "Argus managed watchdog started. Monitoring watcher/paper + real la
 while ($true) {
     Start-Sleep -Seconds $checkIntervalSeconds
 
-    # Kill switch check
+    # Kill switch check.
+    # When the flag is present the fleet is intentionally being halted, so the
+    # watchdog must NOT attempt respawns. But it should stay alive — exiting
+    # leaves observability dark until watchdog_health_check notices and
+    # respawns (10min staleness threshold + 30min cooldown). Pause the loop
+    # while the flag is held and resume when it clears.
     $killFile = Join-Path "C:\Argus\repo" "KILL_SWITCH"
     if (Test-Path $killFile) {
-        Log "KILL_SWITCH detected. Watchdog exiting - fleet should already be halted."
-        Send-Discord "**KILL_SWITCH detected.** Watchdog exiting." "red"
-        exit 0
+        if (-not $script:killSwitchPausedAt) {
+            Log "KILL_SWITCH detected. Pausing watcher loop; will resume when flag clears."
+            Send-Discord "**KILL_SWITCH detected.** Watchdog pausing monitoring." "yellow"
+            $script:killSwitchPausedAt = Get-Date
+        }
+        continue
+    } elseif ($script:killSwitchPausedAt) {
+        $pausedFor = (Get-Date) - $script:killSwitchPausedAt
+        $pausedSec = [int]$pausedFor.TotalSeconds
+        Log "KILL_SWITCH cleared after ${pausedSec}s. Resuming watcher loop."
+        Send-Discord "KILL_SWITCH cleared after ${pausedSec}s. Watchdog resuming." "green"
+        $script:killSwitchPausedAt = $null
     }
     $pauseFile = Join-Path "C:\Argus\repo" "PAUSE_ENTRIES"
     if (Test-Path $pauseFile) {
@@ -527,31 +542,48 @@ while ($true) {
         }
     }
 
+    # 2026-05-26: check BOTH the legacy TWS port (7496/7497) AND the
+    # Gateway paper port (4002). After the Gateway migration, runners
+    # connect to 4002, not 7497. Previously this only checked 7496 so it
+    # was perpetually false-alarming PAUSE_ENTRIES creation downstream.
     $portListening = $false
     try {
-        $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 7496 -WarningAction SilentlyContinue
-        $portListening = $conn.TcpTestSucceeded
+        foreach ($p in @(4002, 4001, 7497, 7496)) {
+            $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port $p -WarningAction SilentlyContinue
+            if ($conn.TcpTestSucceeded) { $portListening = $true; break }
+        }
     } catch {}
 
     $anyLaneHealthy = $paperState.Healthy -or ($realState.Expected -and $realState.Healthy)
     if (-not $portListening -and $anyLaneHealthy) {
         if (-not $script:portWarnSent) {
-            Log "ALERT: API port 7496 NOT LISTENING while managed runners are healthy"
-            Send-Discord "**WARNING: IBKR API port 7496 not responding**`nManaged runners are alive but may not be receiving data." "red"
+            Log "ALERT: NO IBKR API port (4002/4001/7497/7496) listening while managed runners are healthy"
+            Send-Discord "**WARNING: no IBKR API port responding**`nManaged runners are alive but may not be receiving data." "red"
             $script:portWarnSent = $true
         }
     } elseif ($portListening -and $script:portWarnSent) {
-        Log "API port 7496 restored"
-        Send-Discord "API port 7496 is **BACK** and listening." "green"
+        Log "API port restored"
+        Send-Discord "IBKR API port is **BACK** and listening." "green"
         $script:portWarnSent = $false
     }
 
-    # IB Gateway / TWS process supervision - fail-closed on sustained outage
+    # IB Gateway / TWS process supervision - fail-closed on sustained outage.
+    # 2026-05-26: Gateway launched via IBC runs as 'java.exe' (IbcGateway
+    # entry point) not 'ibgateway.exe'. Detect the IBC-managed Gateway by
+    # looking for java processes with the IbcGateway classpath, OR fall
+    # back to the legacy ibgateway/tws process names for non-IBC launches.
     $gatewayAlive = $false
     try {
         $twsProc = Get-Process -Name "tws" -ErrorAction SilentlyContinue
         $gatewayProc = Get-Process -Name "ibgateway" -ErrorAction SilentlyContinue
-        $gatewayAlive = ($null -ne $twsProc) -or ($null -ne $gatewayProc)
+        $javaIbcProc = $null
+        if (-not $twsProc -and -not $gatewayProc) {
+            # Look for java running IBC's Gateway entry point
+            $javaIbcProc = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match 'ibcalpha\.ibc\.IbcGateway|IBC\.jar.*ibgateway' } |
+                Select-Object -First 1
+        }
+        $gatewayAlive = ($null -ne $twsProc) -or ($null -ne $gatewayProc) -or ($null -ne $javaIbcProc)
     } catch {}
     if (-not $gatewayAlive -and -not $portListening) {
         $script:gatewayDownCount++

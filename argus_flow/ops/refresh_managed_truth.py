@@ -49,6 +49,12 @@ STEPS = [
     {"id": "demotion_check", "module": "argus_flow.ops.demotion_check", "critical": False},
     {"id": "position_monitor", "module": "argus_flow.ops.position_monitor", "critical": False},
     {"id": "risk_oversight", "module": "argus_flow.ops.risk_oversight", "critical": False},
+    # 2026-05-26: risk_oversight sources equity from runner state files,
+    # which report 0.0 immediately after a Gateway restart (before any
+    # runner has connected + written its state). This re-patches equity
+    # from IBKR directly so helio.fleet_sizing.get_sizing_anchor_usd
+    # doesn't fail on a stale 0.0 read. Fail-open if Gateway unreachable.
+    {"id": "refresh_broker_equity", "module": "argus_flow.ops.refresh_broker_equity", "critical": False},
     {"id": "qa_learning", "module": "argus_flow.ops.qa_learning", "critical": False},
     {"id": "edge_allocation", "module": "argus_flow.ops.edge_allocation", "critical": False},
     {"id": "alert_escalation_v2", "module": "argus_flow.ops.alert_escalation_v2", "critical": True},

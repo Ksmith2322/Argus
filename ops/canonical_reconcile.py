@@ -39,23 +39,95 @@ log = logging.getLogger("canonical_reconcile")
 # Map per-strategy CSV → canonical strategy name.
 # Keep in sync with ops/schema_validator.py + operational_maturity.py.
 STRATEGY_CSVS = {
-    "argus_usdjpy":            ("argus_flow/logs/usdjpy/trades.csv",         "ts",        True),   # valid_filter
-    "argus_gbpusd":            ("argus_flow/logs/gbpusd/trades.csv",         "ts",        True),
-    "argus_cadjpy":            ("argus_flow/logs/cadjpy/trades.csv",         "ts",        True),
-    "forge_gdx_gld":           ("forge/logs/gdx_gld/trades.csv",             "exit_date", False),
-    "forge_gld_pm_long":       ("forge/logs/gld_pm_long/trades.csv",         "ts",        False),
-    "forge_jpy_pm_short":      ("forge/logs/jpy_pm_short/trades.csv",        "ts",        False),
-    "forge_nq_overnight":      ("forge/logs/nq_overnight/trades.csv",        "ts",        False),
-    "forge_spy_mean_rev":      ("forge/logs/spy_mean_rev/trades.csv",        "ts",        False),
-    "forge_multi_orb":         ("forge/logs/multi_orb/trades.csv",           "ts",        False),
-    "forge_vix_intraday":      ("forge/logs/vix_intraday/trades.csv",        "ts",        False),
+    "argus_usdjpy":            ("argus_flow/logs/usdjpy/trades.csv",         "ts",        True,  "USDJPY"),   # valid_filter
+    "argus_gbpusd":            ("argus_flow/logs/gbpusd/trades.csv",         "ts",        True,  "GBPUSD"),
+    "argus_cadjpy":            ("argus_flow/logs/cadjpy/trades.csv",         "ts",        True,  "CADJPY"),
+    "forge_gdx_gld":           ("forge/logs/gdx_gld/trades.csv",             "exit_date", False, None),
+    "forge_gld_pm_long":       ("forge/logs/gld_pm_long/trades.csv",         "ts",        False, "GLD"),
+    "forge_jpy_pm_short":      ("forge/logs/jpy_pm_short/trades.csv",        "ts",        False, None),
+    "forge_nq_overnight":      ("forge/logs/nq_overnight/trades.csv",        "ts",        False, "MNQ"),
+    "forge_spy_mean_rev":      ("forge/logs/spy_mean_rev/trades.csv",        "ts",        False, "SPY"),
+    "forge_multi_orb":         ("forge/logs/multi_orb/trades.csv",           "ts",        False, None),
+    "forge_vix_intraday":      ("forge/logs/vix_intraday/trades.csv",        "ts",        False, "VIX"),
 }
+
+
+def _norm_ts(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("Z", "+00:00").replace(" ", "T")
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return text
+
+
+def _norm_symbol(value: str | None) -> str:
+    symbol = str(value or "").strip().upper()
+    if symbol == "NQ":
+        return "MNQ"
+    return symbol
+
+
+def _logical_key(strategy: str, row: dict, symbol_hint: str | None) -> tuple:
+    symbol = _norm_symbol(row.get("symbol") or symbol_hint or "")
+    if strategy.startswith("argus_"):
+        logical_ts = row.get("exit_ts") or row.get("entry_ts")
+    else:
+        logical_ts = row.get("entry_ts")
+    return (
+        _norm_ts(logical_ts),
+        symbol,
+        str(row.get("direction") or ""),
+        str(row.get("entry_px") or ""),
+        str(row.get("exit_px") or ""),
+        str(row.get("pnl_usd") or ""),
+    )
+
+
+def _dedup_rows(strategy: str, rows: list[dict], symbol_hint: str | None) -> list[dict]:
+    by_key: dict[tuple, dict] = {}
+    for row in rows:
+        key = _logical_key(strategy, row, symbol_hint)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = row
+            continue
+        existing_is_backfill = existing.get("source") == "backfill_from_trade_csv"
+        row_is_backfill = row.get("source") == "backfill_from_trade_csv"
+        if existing_is_backfill and not row_is_backfill:
+            by_key[key] = row
+        elif existing_is_backfill == row_is_backfill and str(row.get("ts", "")) > str(existing.get("ts", "")):
+            by_key[key] = row
+    return list(by_key.values())
+
+
+def _duplicate_stats(strategy: str, rows: list[dict], symbol_hint: str | None) -> dict:
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for row in rows:
+        groups[_logical_key(strategy, row, symbol_hint)].append(row)
+
+    duplicate_same_source = 0
+    shadowed_backfills = 0
+    for group in groups.values():
+        live_rows = [r for r in group if r.get("source") != "backfill_from_trade_csv"]
+        backfill_rows = [r for r in group if r.get("source") == "backfill_from_trade_csv"]
+        if live_rows:
+            duplicate_same_source += max(0, len(live_rows) - 1)
+            shadowed_backfills += len(backfill_rows)
+        else:
+            duplicate_same_source += max(0, len(backfill_rows) - 1)
+    return {
+        "duplicate_same_source": duplicate_same_source,
+        "shadowed_backfills": shadowed_backfills,
+    }
 
 
 def load_canonical_counts() -> dict:
     """Return dict of strategy -> {count, duplicate_count, unique_count}
     keyed from canonical_fills.jsonl EXIT records."""
-    counts: dict = defaultdict(lambda: {"total": 0, "unique_keys": set()})
+    rows_by_strategy: dict = defaultdict(list)
     if not CANONICAL_PATH.exists():
         return {}
     with CANONICAL_PATH.open(encoding="utf-8") as f:
@@ -72,14 +144,21 @@ def load_canonical_counts() -> dict:
             strat = r.get("strategy", "")
             if not strat:
                 continue
-            key = (r.get("entry_ts", ""), r.get("exit_ts", ""), r.get("direction", ""),
-                   str(r.get("entry_px", "")), str(r.get("pnl_usd", "")))
-            counts[strat]["total"] += 1
-            counts[strat]["unique_keys"].add(key)
+            rows_by_strategy[strat].append(r)
     # Flatten set → count
-    return {k: {"total": v["total"], "unique": len(v["unique_keys"]),
-                "duplicates": v["total"] - len(v["unique_keys"])}
-            for k, v in counts.items()}
+    out = {}
+    for strategy, rows in rows_by_strategy.items():
+        symbol_hint = STRATEGY_CSVS[strategy][3] if strategy in STRATEGY_CSVS else None
+        deduped = _dedup_rows(strategy, rows, symbol_hint)
+        duplicate_stats = _duplicate_stats(strategy, rows, symbol_hint)
+        out[strategy] = {
+            "total": len(deduped),
+            "unique": len({_logical_key(strategy, r, symbol_hint) for r in deduped}),
+            "duplicates": duplicate_stats["duplicate_same_source"],
+            "shadowed_backfills": duplicate_stats["shadowed_backfills"],
+            "raw_total": len(rows),
+        }
+    return out
 
 
 def load_csv_count(csv_path: Path, ts_col: str, valid_filter: bool) -> dict:
@@ -108,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     canon_counts = load_canonical_counts()
     results = []
     drift_detected = False
-    for strategy, (csv_rel, ts_col, valid_filter) in STRATEGY_CSVS.items():
+    for strategy, (csv_rel, ts_col, valid_filter, _symbol_hint) in STRATEGY_CSVS.items():
         csv_stats = load_csv_count(REPO / csv_rel, ts_col, valid_filter)
         canon = canon_counts.get(strategy, {"total": 0, "unique": 0, "duplicates": 0})
         diff = canon["total"] - csv_stats["count"]

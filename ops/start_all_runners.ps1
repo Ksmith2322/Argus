@@ -44,7 +44,12 @@ $runners = @(
     # via allocation_factors.json; no point spawning the process. Re-add
     # if a successor mean-reversion strategy is built.
     # @{Module='forge.spy_mean_rev.runner';     Args=@('--loop')},
-    @{Module='forge.vix_intraday.runner';     Args=@('--loop')},
+    # 2026-05-12: forge.vix_intraday.runner KILLED. Already at factor 0.0 via
+    # allocation_factors.json. n=61 real trades, drift -175%, IR=-4.36 vs SPY
+    # (FAILS_SPY_BENCHMARK in ROI engine), confidence=100% per decision engine.
+    # Open UVXY position left under existing OCO bracket in TWS to exit on
+    # TP/SL. Re-add only if a successor vol strategy is built with new evidence.
+    # @{Module='forge.vix_intraday.runner';     Args=@('--loop')},
     @{Module='forge.nq_london_close.runner';  Args=@('--loop')},
     @{Module='forge.aud_asian_breakout.runner'; Args=@('--loop')},
     # 2026-05-07: forge.multi_orb.runner KILLED. Already at factor 0.0 via

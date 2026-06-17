@@ -245,6 +245,7 @@ def _open(state, ticker, df, direction, ctx, ib=None):
                 ib, contract, direction=direction, size=shares,
                 stop_px=stop, target_px=target, price_decimals=2,
                 est_entry_px=plan_entry,
+                strategy_label="forge_multi_orb",
             )
             if not result.entry.filled:
                 log.error("REAL_ENTRY FAILED %s: %s", ticker, result.entry.reject_reason)
